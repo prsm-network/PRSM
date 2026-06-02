@@ -701,8 +701,28 @@ class ContentProvider:
         if cid in self._local_content:
             local_bytes = await self._fetch_local(cid, timeout=timeout)
             if local_bytes is not None:
-                logger.debug(f"Retrieved {cid[:12]}... locally")
-                return local_bytes
+                # sp923 — honor verify_hash on the local shortcut too. The
+                # remote path verifies returned bytes against the expected
+                # SHA-256 (_get_content_hash); the local shortcut previously
+                # returned bytes UNVERIFIED, so a caller passing verify_hash
+                # got an unchecked local copy (inconsistent with remote + misses
+                # local disk corruption of this node's own content). When the
+                # CID has no known content hash (e.g. a BitTorrent infohash, not
+                # a SHA-256 content address) _get_content_hash returns None and
+                # there is nothing to verify by hash — return as before.
+                if verify_hash:
+                    expected = self._get_content_hash(cid)
+                    if expected and hashlib.sha256(local_bytes).hexdigest() != expected:
+                        logger.warning(
+                            "local content for %s failed SHA-256 verification "
+                            "(possible disk corruption) — not serving the local "
+                            "copy; trying network providers",
+                            cid[:12],
+                        )
+                        local_bytes = None
+                if local_bytes is not None:
+                    logger.debug(f"Retrieved {cid[:12]}... locally")
+                    return local_bytes
         
         # Find providers
         providers = self._find_providers(cid)
