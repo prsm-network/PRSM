@@ -301,8 +301,34 @@ class ComputeRequester:
         if not job:
             return
 
+        # sp924 — IDEMPOTENCY: once a job is COMPLETED (and the provider paid),
+        # ignore any further result. The transport nonce-dedup only covers a
+        # ~300s window; a JOB_RESULT re-delivered after expiry (peer reconnect /
+        # re-broadcast) would otherwise re-run this handler and re-pay (the
+        # sp898/899 gossip-money double-credit class). A cross-restart replay is
+        # already safe — the job is gone from submitted_jobs above.
+        if job.status == JobStatus.COMPLETED:
+            return
+
         provider_id = data.get("provider_id", origin)
         status = data.get("status", "")
+
+        # sp924 — WRONG-PAYEE guard: provider_id (and public_key, below) come
+        # from the UNTRUSTED gossip message. Without binding them to the
+        # provider this requester ACCEPTED (job.provider_id / provider_public_key,
+        # set at job-accept time), a third party can publish a JOB_RESULT for
+        # someone else's job signed with their OWN key + their OWN payout id —
+        # the signature verifies (against the attacker's key) and payment is
+        # redirected to the attacker. Reject a result that isn't from the
+        # accepted provider. (Enforced only once a provider was accepted;
+        # self-compute sets provider_id == own node id and passes.)
+        if job.provider_id and provider_id != job.provider_id:
+            logger.warning(
+                "Job %s: result from unexpected provider %s (accepted %s) — "
+                "ignoring (possible payment redirect)",
+                job_id[:8], str(provider_id)[:8], str(job.provider_id)[:8],
+            )
+            return
 
         if status == "failed":
             job.status = JobStatus.FAILED
@@ -319,6 +345,18 @@ class ComputeRequester:
         result = data.get("result", {})
         signature = data.get("signature", "")
         pub_key = data.get("public_key", job.provider_public_key or "")
+
+        # sp924 — bind the verifying key to the accepted provider's key too
+        # (defense-in-depth alongside the provider_id check): a valid signature
+        # under an ATTACKER's key must not authorize payment. Enforced only when
+        # the accepted provider's key is known.
+        if job.provider_public_key and pub_key != job.provider_public_key:
+            logger.warning(
+                "Job %s: result public key does not match the accepted "
+                "provider's key — ignoring (possible payment redirect)",
+                job_id[:8],
+            )
+            return
 
         verified = False
         if pub_key and signature:
