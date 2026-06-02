@@ -13,6 +13,7 @@ import collections
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -24,6 +25,18 @@ import websockets.server
 import websockets.client
 
 from prsm.node.identity import NodeIdentity, verify_signature
+
+def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+    """Read a float from env, falling back to `default` on unset/invalid, and
+    clamping to `minimum` (sp936 rate-limit knobs)."""
+    raw = os.getenv(name)
+    if raw is None:
+        return max(minimum, float(default))
+    try:
+        return max(minimum, float(raw))
+    except (TypeError, ValueError):
+        return max(minimum, float(default))
+
 
 if TYPE_CHECKING:
     from prsm.node.jurisdiction_filter import PeerJurisdictionFilter
@@ -170,6 +183,8 @@ class WebSocketTransport:
         nonce_cleanup_interval: float = 60.0,
         transport_adapter: Optional["TransportAdapter"] = None,
         jurisdiction_filter: Optional["PeerJurisdictionFilter"] = None,
+        peer_msg_rate: float = 100.0,
+        peer_msg_burst: float = 200.0,
     ):
         self.identity = identity
         self.host = host
@@ -208,6 +223,15 @@ class WebSocketTransport:
         # Thread safety locks for concurrent access to shared state
         self._peers_lock = asyncio.Lock()  # Protects self.peers dictionary
         self._nonces_lock = asyncio.Lock()  # Protects _seen_nonces and _nonce_timestamps
+
+        # sp936 — per-peer message rate limit (token bucket). Without it a single
+        # connected peer can flood messages: each unique nonce grows _seen_nonces
+        # (bounded only by the ~300s window), each is parsed + dispatched, and
+        # gossip re-propagates it (amplification) — a single-peer DoS. Defaults
+        # are generous (legit gossip is a few msgs/sec/peer); env-tunable.
+        self._peer_msg_rate = _env_float("PRSM_PEER_MSG_RATE", peer_msg_rate, minimum=1.0)
+        self._peer_msg_burst = _env_float("PRSM_PEER_MSG_BURST", peer_msg_burst, minimum=1.0)
+        self._peer_buckets: Dict[str, List[float]] = {}  # peer_id -> [tokens, last_refill]
 
         # Additive observability counters (must never alter protocol behavior)
         self._telemetry: Dict[str, Any] = {
@@ -727,6 +751,25 @@ class WebSocketTransport:
 
     # ── Internal message loop ────────────────────────────────────
 
+    def _allow_peer_message(self, peer_id: str, now: Optional[float] = None) -> bool:
+        """sp936 — per-peer token bucket. Returns False when the peer has
+        exceeded its message budget (caller drops the message). `burst` tokens
+        refill at `rate`/sec, capped at `burst`. Sync + await-free, and each
+        peer's bucket is touched only by that peer's read-loop, so no lock is
+        needed."""
+        now = time.time() if now is None else now
+        bucket = self._peer_buckets.get(peer_id)
+        if bucket is None:
+            bucket = [self._peer_msg_burst, now]   # start full
+            self._peer_buckets[peer_id] = bucket
+        tokens = min(self._peer_msg_burst, bucket[0] + (now - bucket[1]) * self._peer_msg_rate)
+        bucket[1] = now
+        if tokens < 1.0:
+            bucket[0] = tokens
+            return False
+        bucket[0] = tokens - 1.0
+        return True
+
     async def _read_loop(self, peer: PeerConnection) -> None:
         """Read messages from a peer until disconnect."""
         try:
@@ -734,6 +777,15 @@ class WebSocketTransport:
                 try:
                     msg = P2PMessage.from_json(raw)
                     peer.last_seen = time.time()
+
+                    # sp936 — drop messages from a peer exceeding its rate budget
+                    # BEFORE dedup/dispatch, so a flood can't grow the nonce set,
+                    # burn dispatch CPU, or be amplified by gossip re-propagation.
+                    if not self._allow_peer_message(peer.peer_id):
+                        self._telemetry["peer_rate_limited_total"] = (
+                            self._telemetry.get("peer_rate_limited_total", 0) + 1
+                        )
+                        continue
 
                     # Thread-safe dedup by nonce
                     async with self._nonces_lock:
@@ -768,6 +820,9 @@ class WebSocketTransport:
                 if peer.peer_id in self.peers:
                     del self.peers[peer.peer_id]
                     logger.info(f"Peer disconnected: {peer.peer_id[:8]}...")
+            # sp936 — drop the peer's rate-limit bucket so the dict doesn't grow
+            # with churned peers.
+            self._peer_buckets.pop(peer.peer_id, None)
             # Dispatch outside lock to prevent deadlock
             await self._dispatch(
                 P2PMessage(msg_type="peer_disconnected", sender_id=peer.peer_id, payload={}),
