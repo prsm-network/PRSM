@@ -31,6 +31,26 @@ from prsm.cli_helpers.bootstrap_probe import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _restore_node_config_module():
+    """sp948 — cross-file leak guard. Two tests here (canonical_urls_*)
+    call importlib.reload(prsm.node.config) INSIDE a patch.dict(os.environ,
+    {"BOOTSTRAP_PRIMARY": ...}) block to rebuild DEFAULT_BOOTSTRAP_NODES under
+    the patched env. reload re-executes the module body, but patch.dict only
+    restores os.environ — the already-executed module global stays polluted in
+    sys.modules for the rest of the suite, so unrelated tests (e.g. the
+    legacy-bootstrap-migration canaries) later read a leaked DEFAULT and fail.
+    This teardown reloads the config module after each test; because the
+    patch.dict context managers have already exited by teardown, the reload
+    rebuilds DEFAULT_BOOTSTRAP_NODES from the real (un-patched) env. The probe
+    tests still reload-under-patch and assert override/dedup as before — no
+    coverage lost; only the leak is closed."""
+    yield
+    import importlib
+    import prsm.node.config as _cfg
+    importlib.reload(_cfg)
+
+
 # ── parse_bootstrap_url ──────────────────────────────
 
 

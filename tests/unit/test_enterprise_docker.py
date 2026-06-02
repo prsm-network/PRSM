@@ -267,15 +267,36 @@ def real_subprocess(monkeypatch):
     return _real_subprocess
 
 
+def _daemon_responds(sock_path) -> bool:
+    """sp948 — actually ping the Docker daemon over its UDS (HTTP /_ping)
+    rather than trusting socket-file presence. Docker Desktop for Mac leaves a
+    STALE socket FILE in place when the VM is stopped, so the old
+    `exists() and S_ISSOCK` probe returned True against a dead daemon and the
+    live tests FAILED (rc=1 "Cannot connect to the Docker daemon") instead of
+    skipping. Uses a raw AF_UNIX socket only (NOT subprocess.run, which
+    conftest mocks session-wide), so it stays safe at collection time."""
+    import socket as _socket
+    s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    s.settimeout(2.0)
+    try:
+        s.connect(str(sock_path))
+        s.sendall(b"GET /_ping HTTP/1.1\r\nHost: docker\r\n\r\n")
+        return b"200" in s.recv(64).split(b"\r\n")[0]
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
 def _docker_available() -> bool:
-    """Probe at test-collection time. Uses os/shutil only
+    """Probe at test-collection time. Uses os/shutil/socket only
     (not subprocess.run, which conftest has mocked) — so
     we can decide whether to even attempt the live tests."""
     if shutil.which("docker") is None:
         return False
-    # Cheap socket probe: the daemon listens on a UDS at
-    # this path on Docker Desktop for Mac. If the file
-    # exists + is a socket, the daemon is up.
+    # Liveness probe: the daemon listens on a UDS at one of these
+    # paths on Docker Desktop for Mac. A socket FILE existing is NOT
+    # enough (a stopped VM leaves a stale socket), so we ping /_ping.
     import stat
     candidates = [
         Path.home() / ".docker/run/docker.sock",
@@ -285,7 +306,7 @@ def _docker_available() -> bool:
         try:
             if path.exists() and stat.S_ISSOCK(
                 path.stat().st_mode,
-            ):
+            ) and _daemon_responds(path):
                 return True
         except (OSError, PermissionError):
             continue

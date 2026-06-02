@@ -43,6 +43,14 @@ def _install_fake_tokenizer_and_model():
     fake_model.get_input_embeddings = MagicMock(return_value=fake_embed_layer)
     fake_model.eval = MagicMock(return_value=fake_model)
     fake_model.to = MagicMock(return_value=fake_model)
+    # sp948 — model a LLaMA/rotary-style architecture (NO learned positional-
+    # embedding matrix): no `.wpe` and not GPT-NeoX. A bare MagicMock auto-
+    # vivifies `transformer.wpe`, sending production down the sprint-688
+    # position-embedding ADD branch where `embeddings + pos_embeds` yields an
+    # unconfigured mock instead of the pre-set ndarray. Pinning the wte-only
+    # path is exactly what this sprint-614 test validates.
+    fake_model.transformer = MagicMock(spec=[])  # no `.wpe` attribute
+    del fake_model.gpt_neox                       # hasattr(...,'gpt_neox') -> False
 
     fake_tf = MagicMock()
     fake_tf.AutoTokenizer = MagicMock()

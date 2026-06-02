@@ -163,14 +163,27 @@ class TestLazyLoading:
     model-load cost up-front would slow every cold start."""
 
     def test_constructor_does_not_load_model(self):
+        # Sprint 460 (F18 fix, commit becc2e4e) made the
+        # `sentence_transformers` import lazy — it now lives inside
+        # `_ensure_loaded()`, not at module top-level — so there is no
+        # `sentence_transformer_embedder.SentenceTransformer` attribute
+        # to patch. Patch the real import target (the
+        # sentence_transformers module's class) so the assertion still
+        # proves the load-bearing invariant: the constructor must not
+        # instantiate the model. We additionally assert `_model is None`
+        # post-construction, which is the lazy-state invariant that
+        # survives the refactor.
         with patch(
-            "prsm.compute.query_orchestrator.sentence_transformer_embedder."
-            "SentenceTransformer"
+            "sentence_transformers.SentenceTransformer"
         ) as mock_st:
-            SentenceTransformerEmbedder()
+            embedder = SentenceTransformerEmbedder()
             assert mock_st.call_count == 0, (
                 "Constructor must not instantiate SentenceTransformer; "
                 "model load is deferred to first encode()."
+            )
+            assert embedder._model is None, (
+                "Constructor must leave _model unmaterialized; the "
+                "model object only exists after first encode()."
             )
 
     def test_first_encode_loads_model_once(self):

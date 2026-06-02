@@ -27,7 +27,9 @@ class TestContentUploadCli:
     """Tests for prsm storage upload CLI command."""
 
     def test_upload_calls_correct_endpoint(self, tmp_path, monkeypatch, cli_runner):
-        """prsm storage upload calls /api/v1/content/upload (not /api/v1/storage/upload)."""
+        """prsm storage upload calls /content/upload (sprint 832 F29 fix — NOT the
+        phantom /api/v1/content/upload, whose router is unmounted on production
+        daemons and 404s every operator)."""
         # Write a temp file to upload
         tmp_file = tmp_path / "test_upload.txt"
         tmp_file.write_text("test content")
@@ -65,12 +67,18 @@ class TestContentUploadCli:
         with patch("httpx.post", side_effect=capture_post):
             result = cli_runner.invoke(main, ["storage", "upload", str(tmp_file)])
 
-        # Assert captured URL ends with "/api/v1/content/upload"
+        # Assert captured URL ends with the working "/content/upload" path and
+        # NEVER the phantom "/api/v1/content/upload" (F29 404 regression guard).
         assert len(captured_url) == 1
-        assert captured_url[0].endswith("/api/v1/content/upload")
+        assert captured_url[0].endswith("/content/upload")
+        assert "/api/v1/content/upload" not in captured_url[0]
 
-    def test_upload_requires_login(self, tmp_path, monkeypatch, cli_runner):
-        """prsm storage upload exits 1 with login hint when not authenticated."""
+    def test_upload_no_auth_does_not_require_login(self, tmp_path, monkeypatch, cli_runner):
+        """Sprint 832 — the inline /content/upload endpoint is intentionally
+        unauthenticated (the legacy auth-gated router was unmounted), so the CLI
+        no longer hard-fails on a missing JWT. With no creds AND no server it
+        still exits 1, but via the connect-error path with an actionable
+        "start the server" hint — NOT a "prsm login" gate."""
         # Create a real temp file (click.Path(exists=True) requires it to exist)
         tmp_file = tmp_path / "test_upload.txt"
         tmp_file.write_text("test content")
@@ -82,10 +90,12 @@ class TestContentUploadCli:
         # Invoke upload
         result = cli_runner.invoke(main, ["storage", "upload", str(tmp_file)])
 
-        # Assert exit_code == 1
+        # Still exits 1 (no server to connect to), but pins the sprint-832
+        # contract: login is no longer required; the actionable hint is to
+        # start the node, not to log in.
         assert result.exit_code == 1
-        # Assert "prsm login" in output
-        assert "prsm login" in result.output
+        assert "prsm node start" in result.output
+        assert "prsm login" not in result.output
 
     def test_upload_sends_auth_header(self, tmp_path, monkeypatch, cli_runner):
         """prsm storage upload includes Authorization: Bearer in the request."""
