@@ -1503,3 +1503,67 @@ class TestStakingConcurrency:
         successes = [r for r in results if not isinstance(r, Exception)]
         assert len(successes) == 1, f"exactly one appeal resolution should succeed, got {results}"
         mock_ftns_service.mint_tokens.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_resolve_appeal_serializes_against_stake_mutations(self, staking_manager, mock_ftns_service):
+        """sp945 — CROSS-ENTITY race. resolve_appeal's approved path refunds
+        stake_row.amount and flips SLASHED→ACTIVE; unstake / slash / withdraw
+        mutate the SAME stake_row.amount/status. sp933 locked resolve_appeal on
+        ``slash:{slash_id}`` while those lock ``stake:{stake_id}`` — different
+        keys, so an appeal resolution could interleave between an unstake's read
+        and commit, overwriting the decrement with a stale-base + refund value
+        (lost update) and flipping an UNSTAKING/SLASHED stake back to ACTIVE
+        while its unstake request still stands (double-withdraw path).
+
+        resolve_appeal must serialize behind the SAME stake lock. Deterministic
+        check: hold ``stake:{stake_id}`` exactly as unstake/slash/withdraw do,
+        then resolve_appeal MUST block until it frees (pre-fix it only takes the
+        slash lock, so it runs straight through)."""
+        import asyncio
+        from prsm.core.database import get_async_session, SlashEventModel
+        from sqlalchemy import update
+        from uuid import UUID
+
+        stake = await staking_manager.stake(user_id="u4", amount=Decimal('5000'))
+        slash = await staking_manager.slash(user_id="u4", stake_id=stake.stake_id,
+                                            reason=SlashReason.MISCONDUCT, evidence={"d": "x"})
+        async with get_async_session() as session:
+            await session.execute(
+                update(SlashEventModel)
+                .where(SlashEventModel.slash_id == UUID(slash.slash_id))
+                .values(appeal_status="pending")
+            )
+            await session.commit()
+
+        # Natural runtime of resolve_appeal in this harness is ~2ms; we poll with
+        # many short yields (a single long sleep does not pump the aiosqlite-backed
+        # awaits) so an UNblocked resolve_appeal would finish well within the window.
+        async def _poll_until_done(task, max_iters=50):
+            for _ in range(max_iters):
+                await asyncio.sleep(0.01)
+                if task.done():
+                    return True
+            return task.done()
+
+        # A stake-level op (unstake/slash/withdraw) is mid-critical-section.
+        stake_lock = staking_manager._lock_for(f"stake:{stake.stake_id}")
+        await stake_lock.acquire()
+        try:
+            task = asyncio.create_task(
+                staking_manager.resolve_appeal(
+                    slash_id=slash.slash_id, approved=True, resolution_note="ok"
+                )
+            )
+            # ~0.5s of polling >> the ~2ms it takes when NOT serialized.
+            done = await _poll_until_done(task)
+            assert not done, (
+                "resolve_appeal completed while a stake:{id} lock was held — it is "
+                "NOT mutually exclusive with unstake/slash/withdraw on the same "
+                "stake (cross-entity lost-update / orphaned-unstake race)"
+            )
+        finally:
+            stake_lock.release()
+        # Lock freed → resolve_appeal proceeds, refunds once.
+        result = await asyncio.wait_for(task, timeout=2.0)
+        assert result is True
+        mock_ftns_service.mint_tokens.assert_called_once()

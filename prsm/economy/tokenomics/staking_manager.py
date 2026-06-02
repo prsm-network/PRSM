@@ -997,15 +997,46 @@ class StakingManager:
             
             return True
     
+    async def _stake_id_for_slash(self, slash_id: str) -> Optional[str]:
+        """sp945 — the stake a slash belongs to, used by resolve_appeal to take
+        the stake-level lock. Returns None for an unknown/malformed slash_id so
+        the caller can defer to the inner method's canonical "not found" error
+        without holding an irrelevant lock."""
+        try:
+            sid = UUID(slash_id)
+        except (ValueError, TypeError, AttributeError):
+            return None
+        async with get_async_session() as db:
+            row = (await db.execute(
+                select(SlashEventModel.stake_id).where(
+                    SlashEventModel.slash_id == sid
+                )
+            )).scalar_one_or_none()
+            return str(row) if row is not None else None
+
     async def resolve_appeal(
         self,
         slash_id: str,
         approved: bool,
         resolution_note: str
     ) -> bool:
-        # sp933 — serialize resolutions of this slash so two concurrent/replayed
-        # approvals can't both mint the refund (double-mint).
-        async with self._lock_for(f"slash:{slash_id}"):
+        # sp945 — serialize on the STAKE, not just the slash. The approved path
+        # refunds stake_row.amount and flips SLASHED→ACTIVE; unstake / slash /
+        # withdraw mutate that SAME row under stake:{stake_id}. sp933 locked only
+        # slash:{slash_id}, leaving resolve_appeal cross-entity with those: an
+        # appeal resolution could interleave between an unstake's read and commit,
+        # overwriting the decrement (lost update) and reviving an UNSTAKING/SLASHED
+        # stake to ACTIVE while its unstake request still stands (double-withdraw).
+        # The stake lock STILL serializes same-slash double-resolve (same stake →
+        # second call sees appeal_status != "pending" and raises → mint once) and
+        # now also serializes concurrent refunds of MULTIPLE slashes on the same
+        # stake, which the slash-keyed lock did not.
+        stake_id = await self._stake_id_for_slash(slash_id)
+        if stake_id is None:
+            # Unknown slash — no stake state to mutate; let _resolve_appeal_locked
+            # raise the canonical "not found" error without an irrelevant lock.
+            return await self._resolve_appeal_locked(slash_id, approved, resolution_note)
+        async with self._lock_for(f"stake:{stake_id}"):
             return await self._resolve_appeal_locked(slash_id, approved, resolution_note)
 
     async def _resolve_appeal_locked(
