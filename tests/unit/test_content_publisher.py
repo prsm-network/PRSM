@@ -293,12 +293,19 @@ class TestContentPublisher:
             await pub.publish(b"x", provenance_id="0xp", tier=ContentTier.B)
 
     @pytest.mark.asyncio
-    async def test_publish_seed_failure_preserves_staged_file(
+    async def test_publish_seed_failure_cleans_up_staged_file(
         self,
         publisher: ContentPublisher,
         provider: _FakeBitTorrentProvider,
         staging_dir: Path,
     ) -> None:
+        # Sprint 495 (F37) reversed the old "preserve for retry" behaviour:
+        # under sustained BT seed failure, preserved staged files accumulated
+        # (a 60s soak leaked 36,337 files). publish() now UNLINKS the staged
+        # file on a seed failure (raise OR None-return) to bound staging-dir
+        # growth — see prsm/node/content_publisher.py:317-343 + the
+        # authoritative test_sprint_495_f37_staging_cleanup.py. (This test was
+        # stale: it still asserted the pre-F37 preserve behaviour.)
         provider.next_return = None  # default behaviour
         # Override provider to return None (simulating seed failure).
 
@@ -314,10 +321,9 @@ class TestContentPublisher:
         with pytest.raises(RuntimeError, match="seed_content returned None"):
             await pub.publish(data, provenance_id="0xp")
 
-        # Staged file is preserved for retry.
+        # F37: the staged file is cleaned up on seed failure (not leaked).
         staged = staging_dir / hashlib.sha256(data).hexdigest()
-        assert staged.exists()
-        assert staged.read_bytes() == data
+        assert not staged.exists()
 
     @pytest.mark.asyncio
     async def test_publish_custom_name_passed_through(
