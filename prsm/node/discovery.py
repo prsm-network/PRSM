@@ -56,6 +56,12 @@ class PeerInfo:
     job_failure_count: int = 0
     last_failure_time: float = 0.0
     startup_timestamp: float = 0.0
+    # sp941 — the signed announce_time of the last ACCEPTED announce from this
+    # peer (monotonic replay defense). An announce whose announce_time is not
+    # strictly newer is rejected, so a captured genuine announce replayed after
+    # the transport nonce-dedup window cannot re-assert a stale address. 0.0
+    # means no attested announce seen yet (legacy/no-timestamp announces).
+    last_announce_time: float = 0.0
     # Sprint 680 — opt-in hardware advertisement. Carries serialized
     # HardwareProfile.to_dict() (or a subset). Consumed by the DHT-
     # backed GpuPoolProvider (sprint 681+) to construct ParallaxGPU
@@ -211,6 +217,22 @@ def _authenticated_announce_node_id(msg: "P2PMessage", peer: "PeerConnection") -
     if authenticated_peer and claimed == authenticated_peer:
         return claimed
     return None
+
+
+def _announce_is_stale_replay(payload: Dict[str, Any], prev_announce_time: float) -> bool:
+    """sp941 — True iff the announce carries a signed announce_time that is NOT
+    strictly newer than the last ACCEPTED one for this peer — i.e. a replay of a
+    captured genuine announce (e.g. after the transport nonce-dedup window). The
+    timestamp is covered by the sp937 attestation, so it can't be forged. Legacy
+    announces (no announce_time) are not treated as replays here — sp937 already
+    drops their forged/relayed variants."""
+    ts = payload.get("announce_time")
+    if ts is None:
+        return False
+    try:
+        return float(ts) <= float(prev_announce_time)
+    except (TypeError, ValueError):
+        return False
 
 
 class PeerDiscovery:
@@ -741,6 +763,9 @@ class PeerDiscovery:
         # for peers that don't parse this field yet.
         if self._local_hardware_profile is not None:
             payload["hardware_profile"] = self._local_hardware_profile
+        # sp941 — signed freshness stamp (monotonic replay defense). Set BEFORE
+        # attesting so it's covered by the signature.
+        payload["announce_time"] = time.time()
         # sp937 — sign the announce so receivers can authenticate our node_id
         # (and reject forgeries) across multi-hop relay.
         nonce = uuid.uuid4().hex[:16]
@@ -950,6 +975,11 @@ class PeerDiscovery:
         node_id = _authenticated_announce_node_id(msg, peer)
         if node_id is None:
             return
+        # sp941 — reject a replayed (stale-timestamp) announce so it can't
+        # re-assert an old address/capabilities after the dedup window.
+        _prev = self.known_peers.get(node_id)
+        if _prev is not None and _announce_is_stale_replay(msg.payload, _prev.last_announce_time):
+            return
         # Sprint 570 F28 defense-in-depth: ignore 0.0.0.0:* from
         # legacy pre-sprint-570 peers. The bind-to-all listen host
         # is not a routable advertise value — falling back to
@@ -978,6 +1008,8 @@ class PeerDiscovery:
             # key entirely; .get() returns None, matching the
             # dataclass default.
             hardware_profile=msg.payload.get("hardware_profile"),
+            # sp941 — record the accepted announce_time for the next replay check.
+            last_announce_time=float(msg.payload.get("announce_time") or 0.0),
         )
         # Re-gossip if TTL > 0
         if msg.ttl > 1:
@@ -1078,6 +1110,11 @@ class PeerDiscovery:
         node_id = _authenticated_announce_node_id(msg, peer)
         if node_id is None:
             return
+        # sp941 — reject a replayed (stale-timestamp) capability announce.
+        _prev = self.known_peers.get(node_id)
+        if _prev is not None and _announce_is_stale_replay(msg.payload, _prev.last_announce_time):
+            return
+        announce_time = float(msg.payload.get("announce_time") or 0.0)
         capabilities = msg.payload.get("capabilities", [])
         supported_backends = msg.payload.get("supported_backends", [])
         gpu_available = msg.payload.get("gpu_available", False)
@@ -1090,6 +1127,7 @@ class PeerDiscovery:
             existing.gpu_available = gpu_available
             existing.last_seen = time.time()
             existing.last_capability_update = time.time()
+            existing.last_announce_time = announce_time
             logger.debug(
                 f"Updated capabilities for peer {node_id[:8]}: "
                 f"caps={capabilities}, backends={supported_backends}, gpu={gpu_available}"
@@ -1106,6 +1144,7 @@ class PeerDiscovery:
                 gpu_available=gpu_available,
                 last_seen=time.time(),
                 last_capability_update=time.time(),
+                last_announce_time=announce_time,
             )
             logger.debug(
                 f"Created new peer entry from capability announce: {node_id[:8]}"
@@ -1134,6 +1173,7 @@ class PeerDiscovery:
             "capabilities": self._local_capabilities,
             "supported_backends": self._local_backends,
             "gpu_available": self._local_gpu_available,
+            "announce_time": time.time(),  # sp941 — signed freshness stamp (replay defense)
         }
         # sp937 — sign the capability announce (see announce_self).
         nonce = uuid.uuid4().hex[:16]
