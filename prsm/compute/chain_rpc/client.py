@@ -81,6 +81,7 @@ from prsm.compute.chain_rpc.protocol import (
     RollbackCacheResponse,
     RunLayerSliceRequest,
     RunLayerSliceResponse,
+    response_input_commitment_for_request,
     StageError,
     StreamFinalFrame,
     TokenFrame,
@@ -2303,7 +2304,12 @@ class RpcChainExecutor:
         # anchor-registered peer impersonating another is rejected at
         # verify_with_anchor's cross-field check.
         if not response.verify_with_anchor(
-            self._anchor, expected_stage_node_id=stage_node_id
+            self._anchor, expected_stage_node_id=stage_node_id,
+            # sp927 — bind the response to the input WE sent this iteration so a
+            # malicious stage can't replay a prior iteration's signed response.
+            expected_input_commitment=response_input_commitment_for_request(
+                request,
+            ),
         ):
             raise ChainExecutionError(
                 stage_index=stage_index,
@@ -3000,7 +3006,12 @@ class RpcChainExecutor:
         # invariant). Substitution by any anchor-registered peer
         # rejected at the cross-field check inside verify_with_anchor.
         if not response.verify_with_anchor(
-            self._anchor, expected_stage_node_id=stage_node_id
+            self._anchor, expected_stage_node_id=stage_node_id,
+            # sp927 — bind the response to the input WE sent this iteration so a
+            # malicious stage can't replay a prior iteration's signed response.
+            expected_input_commitment=response_input_commitment_for_request(
+                request,
+            ),
         ):
             raise ChainExecutionError(
                 stage_index=stage_index,

@@ -61,6 +61,7 @@ from prsm.compute.chain_rpc.protocol import (
     HandoffToken,
     RunLayerSliceRequest,
     RunLayerSliceResponse,
+    response_input_commitment_for_request,
     StageError,
     StageErrorCode,
     StreamFinalFrame,
@@ -805,6 +806,7 @@ class LayerStageServer:
             tee_attestation=result.tee_attestation,
             tee_type=result.tee_type,
             epsilon_spent=result.epsilon_spent,
+            input_commitment=response_input_commitment_for_request(request),
         )
         return encode_message(response)
 
@@ -1049,6 +1051,7 @@ class LayerStageServer:
             is_terminal=result.is_terminal,
             verified_token_ids=getattr(result, "verified_token_ids", None),
             accepted_count=getattr(result, "accepted_count", None),
+            input_commitment=response_input_commitment_for_request(request),
         )
         return encode_message(response)
 
@@ -1187,6 +1190,7 @@ class LayerStageServer:
             tee_type=result.tee_type,
             epsilon_spent=result.epsilon_spent,
             activation_manifest=chunked_out.manifest,
+            input_commitment=response_input_commitment_for_request(request),
         )
         response_manifest_bytes = encode_message(response)
 
@@ -1406,6 +1410,7 @@ class LayerStageServer:
             activation_manifest=chunked_out.manifest,
             next_token_id=result.next_token_id,
             is_terminal=result.is_terminal,
+            input_commitment=response_input_commitment_for_request(request),
         )
         response_manifest_bytes = encode_message(response)
 
@@ -1993,6 +1998,7 @@ class LayerStageServer:
             tee_attestation=result.tee_attestation,
             tee_type=result.tee_type,
             epsilon_spent=result.epsilon_spent,
+            input_commitment=response_input_commitment_for_request(request),
         )
         return encode_message(response)
 

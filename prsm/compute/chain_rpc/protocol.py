@@ -42,6 +42,7 @@ wire types here just carry the encoded bytes + shape + dtype string.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from enum import Enum
@@ -51,6 +52,50 @@ from prsm.compute.inference.models import ContentTier
 from prsm.compute.tee.models import PrivacyLevel, TEEType
 from prsm.node.identity import NodeIdentity, verify_signature
 from prsm.node.shard_streaming import ShardManifest
+
+
+def request_input_commitment(
+    activation_blob: bytes,
+    activation_manifest: Optional["ShardManifest"] = None,
+) -> str:
+    """sp927 — per-iteration commitment to the activation INPUT a stage
+    processed.
+
+    For inline inputs it is ``sha256(activation_blob)``; for streamed inputs the
+    manifest's ``payload_sha256`` already commits the to-be-assembled bytes.
+    Binding this into the stage's RESPONSE signature ties each response to the
+    specific input it answered. The KV-cache is keyed on ``request_id`` so
+    prefill + every incremental token in a decode session share one request_id;
+    without this commitment a malicious non-tail stage could REPLAY a prior
+    iteration's signed response (e.g. its prefill output) on a later step and the
+    signature would still verify (silent, undetectable output corruption). The
+    executor supplies the EXPECTED commitment from the request IT sent — which
+    differs every iteration — so a replayed response (bound to a different input)
+    fails verification. Both signer and verifier compute it identically here."""
+    if activation_manifest is not None:
+        return str(activation_manifest.payload_sha256)
+    return hashlib.sha256(bytes(activation_blob)).hexdigest()
+
+
+def response_input_commitment_for_request(request: Any) -> Optional[str]:
+    """sp927 — the input commitment a stage binds into its RESPONSE for THIS
+    request (and the executor expects at verify), or ``None`` when no binding
+    applies.
+
+    Bound ONLY for non-PREFILL decode (INCREMENTAL / VERIFY), where prefill +
+    every incremental token in a session share one ``request_id`` (KV-cache key)
+    so a prior response could be replayed. PREFILL / non-decode return None →
+    the field is omitted from the signing payload → byte-equivalent with pre-fix
+    signed bytes. BOTH the signer (stage server) and the verifier (executor)
+    call THIS one function on the same request, so the gating decision + the
+    committed value are identical by construction — no lockstep drift."""
+    decode_mode = getattr(request, "decode_mode", DecodeMode.PREFILL)
+    if decode_mode == DecodeMode.PREFILL:
+        return None
+    return request_input_commitment(
+        getattr(request, "activation_blob", b"") or b"",
+        getattr(request, "activation_manifest", None),
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1467,6 +1512,7 @@ class RunLayerSliceResponse:
         is_terminal: bool = False,
         verified_token_ids: Optional[Tuple[int, ...]] = None,
         accepted_count: Optional[int] = None,
+        input_commitment: Optional[str] = None,
     ) -> bytes:
         """Canonical bytes the stage signs over the response.
 
@@ -1552,6 +1598,13 @@ class RunLayerSliceResponse:
                 int(t) for t in verified_token_ids
             ]
             payload["accepted_count"] = int(accepted_count)
+        # sp927 — per-iteration INPUT commitment. Omit-when-None preserves
+        # byte-equivalence: prefill / non-decode / pre-fix callers pass None and
+        # produce identical signed bytes. When set (incremental/verify decode),
+        # the response is bound to the specific input it answered, so a malicious
+        # stage cannot replay a prior iteration's signed response.
+        if input_commitment is not None:
+            payload["input_commitment"] = str(input_commitment)
         return json.dumps(payload, sort_keys=True).encode("utf-8")
 
     @classmethod
@@ -1571,6 +1624,7 @@ class RunLayerSliceResponse:
         is_terminal: bool = False,
         verified_token_ids: Optional[Tuple[int, ...]] = None,
         accepted_count: Optional[int] = None,
+        input_commitment: Optional[str] = None,
     ) -> "RunLayerSliceResponse":
         """Construct + sign a fresh response under the stage ``identity``.
 
@@ -1601,6 +1655,7 @@ class RunLayerSliceResponse:
             is_terminal=is_terminal,
             verified_token_ids=verified_token_ids,
             accepted_count=accepted_count,
+            input_commitment=input_commitment,
         )
         sig = identity.sign(payload)
         return cls(
@@ -1625,7 +1680,8 @@ class RunLayerSliceResponse:
         )
 
     def verify_with_anchor(
-        self, anchor: Any, *, expected_stage_node_id: str
+        self, anchor: Any, *, expected_stage_node_id: str,
+        expected_input_commitment: Optional[str] = None,
     ) -> bool:
         """Verify this response's stage signature against the EXPECTED
         stage's pubkey resolved from the on-chain anchor.
@@ -1683,6 +1739,12 @@ class RunLayerSliceResponse:
             is_terminal=self.is_terminal,
             verified_token_ids=self.verified_token_ids,
             accepted_count=self.accepted_count,
+            # sp927 — the EXPECTED input commitment is supplied EXTERNALLY by
+            # the executor (from the request it sent this iteration), NOT taken
+            # from the response — mirroring expected_stage_node_id. A replayed
+            # response (signed over a different input) reconstructs to different
+            # bytes here and fails verification.
+            input_commitment=expected_input_commitment,
         )
         return verify_signature(
             stage_pubkey_b64, payload, self.stage_signature_b64
