@@ -25,8 +25,13 @@ def test_module_exposes_build_address_resolver_and_peer_not_found():
     assert issubclass(m.PeerNotFound, RuntimeError)
 
 
-def test_resolver_returns_peer_address_for_known_node_id():
-    """Known node_id in transport.peers → returns peer.address."""
+def test_resolver_returns_peer_id_for_known_node_id():
+    """Known node_id in transport.peers → resolves successfully.
+
+    sp695 F45 / sp596: the resolver returns the node_id (peer_id) itself, NOT
+    peer.address — the send_message adapter calls transport.send_to_peer(addr)
+    which looks the peer up by peer_id, not network address. The peer-existence
+    check still gates it (unknown node_id raises PeerNotFound, below)."""
     from prsm.node.chain_executor_adapters import build_address_resolver
 
     peer = MagicMock()
@@ -35,7 +40,7 @@ def test_resolver_returns_peer_address_for_known_node_id():
     node.transport.peers = {"remote-node-id": peer}
 
     resolve = build_address_resolver(node)
-    assert resolve("remote-node-id") == "1.2.3.4:9001"
+    assert resolve("remote-node-id") == "remote-node-id"
 
 
 def test_resolver_raises_peer_not_found_for_unknown_node_id():
@@ -68,19 +73,17 @@ def test_resolver_error_message_includes_node_id():
 
 
 def test_resolver_handles_self_node_id():
-    """Self-node_id should resolve to the local advertise address
-    when present (chain stage MAY run on the settler itself).
-    Edge case: if self isn't in transport.peers (typical), raises
-    PeerNotFound consistently — chain executor wraps the dispatch
-    differently for self-stages.
+    """sp687 F34 — a stage routed to the LOCAL node resolves to its own node_id
+    (the self-dispatch sentinel the send adapter detects to short-circuit to the
+    local StageExecutor), NOT a PeerNotFound. Self is never in transport.peers
+    (only remote connections are), so without the sentinel the whole chain would
+    abort even though local execution needs no peer connection.
     """
-    from prsm.node.chain_executor_adapters import (
-        build_address_resolver, PeerNotFound,
-    )
+    from prsm.node.chain_executor_adapters import build_address_resolver
+
     node = MagicMock()
     node.transport.peers = {}
     node.identity.node_id = "self-node-id"
 
     resolve = build_address_resolver(node)
-    with pytest.raises(PeerNotFound):
-        resolve("self-node-id")
+    assert resolve("self-node-id") == "self-node-id"

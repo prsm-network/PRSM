@@ -33,11 +33,16 @@ def _transport():
 
 @pytest.mark.asyncio
 async def test_missing_p2p_suffix_returns_none(caplog):
-    """Bootstrap URL without peer ID: clear warning + None."""
+    """A real libp2p multiaddr without /p2p/<peerID>: clear warning + None.
+
+    sp479 — the warning is reserved for genuine libp2p multiaddrs that DO need
+    /p2p/ (a /dns4/.../ws or /ip4/... address). ws:// / wss:// inputs take the
+    documented BootstrapClient WS fallback and are demoted to debug (see the
+    next test), so this case uses a real multiaddr."""
     t = _transport()
     with caplog.at_level(logging.WARNING):
         result = await t.connect_to_peer(
-            "wss://bootstrap1.prsm-network.com:8765",
+            "/dns4/bootstrap1.prsm-network.com/tcp/8765/ws",
         )
     assert result is None
     # Warning text should mention the missing suffix
@@ -49,6 +54,22 @@ async def test_missing_p2p_suffix_returns_none(caplog):
     # Telemetry incremented
     assert t._telemetry["error_count"] == 1
     # PrsmConnect was NOT called (short-circuited)
+    t._lib.PrsmConnect.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ws_scheme_missing_p2p_is_debug_not_warning(caplog):
+    """sp479 — a ws:// / wss:// bootstrap URL without /p2p/ is the documented
+    BootstrapClient WS-fallback path: return None WITHOUT a warning or an
+    error-count bump (it is not a misconfiguration)."""
+    t = _transport()
+    with caplog.at_level(logging.WARNING):
+        result = await t.connect_to_peer("wss://bootstrap1.prsm-network.com:8765")
+    assert result is None
+    assert not any(
+        "missing /p2p" in rec.getMessage() for rec in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+    assert t._telemetry["error_count"] == 0
     t._lib.PrsmConnect.assert_not_called()
 
 
