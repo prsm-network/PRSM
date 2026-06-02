@@ -99,6 +99,12 @@ class BatchSettlementManager:
         # Transfer queue
         self._queue: List[PendingTransfer] = []
         self._lock = asyncio.Lock()
+        # sp930 — serialize reconcile_in_flight() against itself. flush() calls
+        # it OUTSIDE self._lock (line 239) and a threshold-triggered flush can
+        # run concurrently with the periodic one, so without this two reconciles
+        # both iterate the same in-flight set and both re-queue a reverted tx →
+        # the next flush broadcasts it twice → double-pay.
+        self._reconcile_lock = asyncio.Lock()
 
         # Deduplication
         self._settled_ids: Set[str] = set()
@@ -276,7 +282,11 @@ class BatchSettlementManager:
                 from_wallet=from_addr,
                 to_wallet=to_addr,
                 amount=net_amount,
-                job_id=f"requeue-{int(time.time())}",
+                # sp930 — uuid, not int(time.time()): a whole-second job_id
+                # collides for two transfers in the same flush second and the
+                # on-chain audit table (job_id PK, INSERT OR REPLACE) silently
+                # overwrites the first row.
+                job_id=f"requeue-{uuid.uuid4().hex[:12]}",
                 description="re-queued: on-chain transfer never broadcast (sp914)",
             ))
 
@@ -285,7 +295,7 @@ class BatchSettlementManager:
                 continue
             try:
                 tx_record = await self._ftns_ledger.transfer(
-                    job_id=f"batch-{int(time.time())}",
+                    job_id=f"batch-{uuid.uuid4().hex[:12]}",  # sp930 — collision-free (see _mark_requeue)
                     to_address=to_addr,
                     amount_ftns=net_amount,
                 )
@@ -384,6 +394,13 @@ class BatchSettlementManager:
                     auto-requeue (re-queuing a tx that could still confirm would
                     double-pay) and surfaced for manual operator reconciliation.
         """
+        # sp930 — serialize against concurrent reconciles (two flushes can each
+        # call this). Without it both iterate the same in-flight set and both
+        # re-queue a reverted tx → double-pay.
+        async with self._reconcile_lock:
+            return await self._reconcile_in_flight_locked()
+
+    async def _reconcile_in_flight_locked(self) -> Dict[str, int]:
         if not self._in_flight:
             return {"confirmed": 0, "reverted": 0, "still_pending": 0,
                     "abandoned": 0}
@@ -394,7 +411,15 @@ class BatchSettlementManager:
         survivors: List[Dict[str, Any]] = []
         requeue: List[PendingTransfer] = []
 
-        for entry in self._in_flight:
+        # sp930 — iterate a SNAPSHOT, not the live list. Entries that a
+        # concurrent flush's _track_in_flight appends while we await receipt
+        # polls are merged back (by identity) at the end so they are never
+        # dropped — including the >max_in_flight trim edge where _track replaces
+        # the list object out from under us.
+        snapshot = list(self._in_flight)
+        snapshot_ids = {id(e) for e in snapshot}
+
+        for entry in snapshot:
             tx_hash = entry.get("tx_hash") or ""
             receipt = None
             polled = False
@@ -421,7 +446,7 @@ class BatchSettlementManager:
                     from_wallet=entry["from_addr"],
                     to_wallet=entry["to_addr"],
                     amount=entry["amount"],
-                    job_id=f"requeue-{int(time.time())}",
+                    job_id=f"requeue-{uuid.uuid4().hex[:12]}",  # sp930 — collision-free
                     description=(
                         "re-queued: batch settlement tx reverted on-chain "
                         "(sp917)"
@@ -444,7 +469,10 @@ class BatchSettlementManager:
             still_pending += 1
             survivors.append(entry)
 
-        self._in_flight = survivors
+        # Preserve any entries a concurrent flush tracked during our awaits
+        # (they are not in the snapshot we processed).
+        concurrent = [e for e in self._in_flight if id(e) not in snapshot_ids]
+        self._in_flight = survivors + concurrent
         if requeue:
             async with self._lock:
                 self._queue.extend(requeue)
