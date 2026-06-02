@@ -17,7 +17,8 @@ pragma solidity ^0.8.22;
 ///         the documented range.
 ///
 /// @dev Coverage:
-///   StorageSlashing.setHeartbeatGrace    → INV-SS-1, INV-SS-2
+///   StorageSlashing.setHeartbeatGrace      → INV-SS-1, INV-SS-2
+///   StorageSlashing.setSlashGraceMultiplier→ INV-SS-3, INV-SS-4 (sp940)
 ///   StakeBond.setUnbondDelay             → INV-SB-1, INV-SB-2
 ///   StakeBond.CHALLENGER_BOUNTY_BPS      → INV-SB-3 (constant)
 ///   CompensationDistributor.updateWeights→ INV-CD-1 (anti-rugpull
@@ -33,14 +34,21 @@ pragma solidity ^0.8.22;
 ///   value-range arithmetic.
 ///
 ///   StorageSlashing.setHeartbeatGrace → contracts/contracts/
-///     StorageSlashing.sol:239-247
+///     StorageSlashing.sol:258-267
+///   StorageSlashing.setSlashGraceMultiplier → contracts/contracts/
+///     StorageSlashing.sol:272-286
 ///   StakeBond.setUnbondDelay         → contracts/contracts/
 ///     StakeBond.sol:464-470
 
 contract StorageSlashingBounded {
     uint256 public constant MIN_HEARTBEAT_GRACE = 1 hours;
     uint256 public constant MAX_HEARTBEAT_GRACE = 30 days;
+    // sp940 — whole grace windows a provider must miss before a
+    // permissionless heartbeat slash applies. Bounded [1, 10].
+    uint256 public constant MIN_SLASH_GRACE_MULTIPLIER = 1;
+    uint256 public constant MAX_SLASH_GRACE_MULTIPLIER = 10;
     uint256 public heartbeatGraceSeconds;
+    uint256 public slashGraceMultiplier;
 
     constructor(uint256 initial) {
         require(
@@ -48,6 +56,9 @@ contract StorageSlashingBounded {
             && initial <= MAX_HEARTBEAT_GRACE
         );
         heartbeatGraceSeconds = initial;
+        // Constructor seeds a valid mid-range default (2),
+        // mirroring StorageSlashing.sol's constructor.
+        slashGraceMultiplier = 2;
     }
 
     function setHeartbeatGrace(uint256 newGrace) external {
@@ -58,6 +69,16 @@ contract StorageSlashingBounded {
             revert("OutOfRange");
         }
         heartbeatGraceSeconds = newGrace;
+    }
+
+    function setSlashGraceMultiplier(uint256 newMultiplier) external {
+        if (
+            newMultiplier < MIN_SLASH_GRACE_MULTIPLIER
+            || newMultiplier > MAX_SLASH_GRACE_MULTIPLIER
+        ) {
+            revert("OutOfRange");
+        }
+        slashGraceMultiplier = newMultiplier;
     }
 }
 
@@ -191,6 +212,48 @@ contract AdminBoundedSettersSpec {
     {
         assert(ss.MIN_HEARTBEAT_GRACE() == 1 hours);
         assert(ss.MAX_HEARTBEAT_GRACE() == 30 days);
+    }
+
+    /// sp940 — THE bounded-setter invariant for the new
+    /// slashGraceMultiplier. For ALL symbolic inputs, the
+    /// post-state MUST stay in [MIN, MAX] — so an honest
+    /// operator's anti-griefing grace can never be set to 0
+    /// (which would re-enable single-window slashing) nor to
+    /// an absurd value. Mirrors INV-SS-3.
+    function check_storage_slashing_multiplier_always_in_range(
+        uint256 newMultiplier
+    ) public {
+        try ss.setSlashGraceMultiplier(newMultiplier) {}
+        catch {}
+        uint256 post = ss.slashGraceMultiplier();
+        assert(post >= ss.MIN_SLASH_GRACE_MULTIPLIER());
+        assert(post <= ss.MAX_SLASH_GRACE_MULTIPLIER());
+    }
+
+    /// MIN/MAX constants pinned for the multiplier. Mirrors
+    /// INV-SS-4. The lower bound of 1 is load-bearing: it
+    /// forbids a 0-multiplier that would zero out the grace
+    /// window and re-open the one-blip slash hole sp940 closed.
+    function check_storage_slashing_multiplier_constants()
+        public view
+    {
+        assert(ss.MIN_SLASH_GRACE_MULTIPLIER() == 1);
+        assert(ss.MAX_SLASH_GRACE_MULTIPLIER() == 10);
+    }
+
+    /// Negative direction for the multiplier: an out-of-range
+    /// (below-min, i.e. 0) input MUST revert — proves the
+    /// revert path actually fires, not just that state stays
+    /// in range by luck.
+    function check_storage_slashing_multiplier_rejects_below_min(
+        uint256 newMultiplier
+    ) public {
+        vm_assume(newMultiplier < ss.MIN_SLASH_GRACE_MULTIPLIER());
+        try ss.setSlashGraceMultiplier(newMultiplier) {
+            assert(false);
+        } catch {
+            assert(true);
+        }
     }
 
     /// Bounded-setter invariant for StakeBond.

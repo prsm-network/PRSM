@@ -5,12 +5,12 @@
     "contracts/contracts/RoyaltyDistributor.sol:111-155": "e0b6a5d6d44d026dede08c48ae3edf9f442fe702c7d09de640235a4edac5af5f",
     "contracts/contracts/RoyaltyDistributor.sol:161-170": "92f12456027a5de39b27697965a0877296e57c10f55146c6aff60b02b89da20f",
     "contracts/contracts/RoyaltyDistributor.sol:186-193": "a7365c841343ded2361bdf1e0b3a1c7ac38dc500c50c02cdcca6d0d7791fdaff",
-    "prsm/compute/chain_rpc/client.py:1359-1367": "8258a61605a769004fa4300f2d2ba91bc25931fffe221883841e9c98d017cf05",
-    "prsm/compute/chain_rpc/client.py:1431": "9f620168c30b17229c6ad3be094272f46e07fcba6e89b3298839570cb6c63bea",
-    "prsm/compute/chain_rpc/client.py:1463-1466": "26bb991b79cc3b97e5943b057be0b6164e1be773fa59b3bb2f64eac1b2e58929",
+    "prsm/compute/chain_rpc/client.py:1376-1384": "8258a61605a769004fa4300f2d2ba91bc25931fffe221883841e9c98d017cf05",
+    "prsm/compute/chain_rpc/client.py:1448": "9f620168c30b17229c6ad3be094272f46e07fcba6e89b3298839570cb6c63bea",
+    "prsm/compute/chain_rpc/client.py:1480-1483": "26bb991b79cc3b97e5943b057be0b6164e1be773fa59b3bb2f64eac1b2e58929",
     "prsm/compute/chain_rpc/kv_cache.py:201-249": "6b74b4b0d511d19a106406529a93127f4208f3be69245ccdc24d1aefa4d6f859",
-    "prsm/compute/chain_rpc/protocol.py:956-998": "cafae563dbdbb059721db3b177054c2ef83005841f496ce2362d4985a75f8b27",
-    "prsm/compute/chain_rpc/server.py:1960-1994": "bce32e9d09d2a9a8e161ca903c264f9d69a0af0d95aac81aa51919af92a90679",
+    "prsm/compute/chain_rpc/protocol.py:1001-1043": "cafae563dbdbb059721db3b177054c2ef83005841f496ce2362d4985a75f8b27",
+    "prsm/compute/chain_rpc/server.py:2183-2217": "bce32e9d09d2a9a8e161ca903c264f9d69a0af0d95aac81aa51919af92a90679",
     "prsm/data/dedup/thresholds.py:55-99": "be7ac6d5b92b0a87a4a13510c2fa6e186783d789d879abed25c2a828bd912168"
   }
 }

@@ -11,7 +11,7 @@ pragma solidity ^0.8.22;
 ///         charge the requester past their budget.
 ///
 /// @dev STRUCTURAL EQUIVALENCE (audit-visible):
-///   prsm/compute/chain_rpc/client.py:1359-1367 — the
+///   prsm/compute/chain_rpc/client.py:1376-1384 — the
 ///   cap-bound + truncation block:
 ///
 ///     emitted = list(verified[: accepted_count + 1])
