@@ -10,14 +10,22 @@ Supports capability-based smart routing to target capable peers first.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Set, TYPE_CHECKING
 
 from prsm.node.compute_provider import JobStatus, JobType
+from prsm.node.compute_result_sampler import (
+    DEFAULT_SAMPLE_RATE,
+    ComputeResultSampler,
+    ReExecResult,
+    VerificationVerdict,
+)
 from prsm.node.gossip import (
     GOSSIP_JOB_ACCEPT,
     GOSSIP_JOB_CONFIRM,
@@ -67,6 +75,15 @@ class SubmittedJob:
     created_at: float = field(default_factory=time.time)
     completed_at: Optional[float] = None
     error: Optional[str] = None
+    # sp928 — a verification re-run of another job; suppresses nested sampling
+    # and is itself never re-verified (avoids verification regress).
+    verification_run: bool = False
+    # sp928 — when set, ONLY these providers may be confirmed for this job
+    # (ENFORCED in _on_job_accept). For verification re-runs this is the
+    # independent capable set with the original provider excluded, so the
+    # provider under test cannot grab its own re-run and self-confirm a forged
+    # result (target_peers in the offer is only a hint a malicious peer ignores).
+    allowed_providers: Optional[Set[str]] = None
     _result_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -104,16 +121,50 @@ class ComputeRequester:
         self._running = False
         self.ledger_sync = None  # Set by node.py after construction
         self.escrow: Optional["PaymentEscrow"] = None  # Set by node.py after construction
+        # sp928 — optimistic verification of the single-provider pay path.
+        # Built lazily in start() (or injected by node.py / tests before start).
+        self.sampler: Optional[ComputeResultSampler] = None
+        self._verify_tasks: Set[asyncio.Task] = set()
 
     async def start(self) -> None:
         """Register gossip handlers."""
         self._running = True
+        if self.sampler is None:
+            self.sampler = self._build_default_sampler()
         self.gossip.subscribe(GOSSIP_JOB_ACCEPT, self._on_job_accept)
         self.gossip.subscribe(GOSSIP_JOB_RESULT, self._on_job_result)
         logger.info("Compute requester started")
 
+    def _build_default_sampler(self) -> ComputeResultSampler:
+        """Wire the sampler over this requester's live re-dispatch + reputation.
+
+        Sample rate is env-tunable (``PRSM_COMPUTE_VERIFY_SAMPLE_RATE``).
+        Verification re-runs are always free (see ``_reexec_for_verification``).
+        On-chain CONSENSUS_MISMATCH challenge routing for bonded providers is a
+        documented follow-on (challenge_sink left None) that must thread the
+        provider's bonded status + a StakeBond lookup; until then the active
+        deterrent is reputation / eligibility removal — which is strictly more
+        verification than the single-provider pay path had before (none).
+        """
+        rate = DEFAULT_SAMPLE_RATE
+        try:
+            rate = float(os.getenv("PRSM_COMPUTE_VERIFY_SAMPLE_RATE", str(DEFAULT_SAMPLE_RATE)))
+        except (TypeError, ValueError):
+            logger.warning("sp928: bad PRSM_COMPUTE_VERIFY_SAMPLE_RATE — using default")
+        return ComputeResultSampler(
+            re_executor=self._reexec_for_verification,
+            reputation_sink=self._record_verification_failure,
+            challenge_sink=None,
+            sample_rate=rate,
+        )
+
     async def stop(self) -> None:
         self._running = False
+        # sp928 — cancel any in-flight verification tasks so they don't outlive
+        # the requester / dangle on the event loop at shutdown.
+        for task in list(self._verify_tasks):
+            task.cancel()
+        self._verify_tasks.clear()
 
     def set_discovery(self, discovery: "PeerDiscovery") -> None:
         """Set the peer discovery instance for smart routing."""
@@ -163,12 +214,17 @@ class ComputeRequester:
         target_peers: Optional[List[str]] = None,
         use_escrow: bool = True,
         job_id: Optional[str] = None,
+        verification_run: bool = False,
+        allowed_providers: Optional[Set[str]] = None,
     ) -> SubmittedJob:
         """Submit a compute job to the network, optionally with escrow.
 
         Args:
             job_id: Optional pre-assigned job ID (e.g. from API escrow).
                     If None, a new UUID is generated.
+            verification_run: sp928 — mark this as a re-execution issued to
+                    verify another job's result. Such jobs are never themselves
+                    sampled (no verification regress).
         """
         if ftns_budget > 0:
             balance = await self.ledger.get_balance(self.identity.node_id)
@@ -180,6 +236,8 @@ class ComputeRequester:
             job_type=job_type,
             payload=payload,
             ftns_budget=ftns_budget,
+            verification_run=verification_run,
+            allowed_providers=allowed_providers,
         )
         self.submitted_jobs[job.job_id] = job
 
@@ -280,6 +338,20 @@ class ComputeRequester:
             return
 
         provider_id = data.get("provider_id", origin)
+
+        # sp928 — ENFORCE the allowed-provider restriction. target_peers in the
+        # job offer is only a routing hint a malicious provider can ignore; the
+        # binding decision is made HERE. For a verification re-run this rejects
+        # an accept from the provider under test (excluded), so it cannot
+        # self-confirm its own re-run and forge agreement with its forged result.
+        if job.allowed_providers is not None and provider_id not in job.allowed_providers:
+            logger.warning(
+                "Job %s: rejecting accept from disallowed provider %s "
+                "(verification re-run / targeted job)",
+                job_id[:8], str(provider_id)[:8],
+            )
+            return
+
         job.status = JobStatus.ACCEPTED
         job.provider_id = provider_id
         job.provider_public_key = data.get("public_key", "")
@@ -416,6 +488,100 @@ class ComputeRequester:
             f"Job {job_id[:8]} completed by {provider_id[:8]}, "
             f"verified={verified}, paid {job.ftns_budget} FTNS"
         )
+
+        # sp928 — OPTIMISTIC VERIFICATION (mis-pay #2). A valid signature proves
+        # WHO produced the result, not that the work was done. With probability
+        # sample_rate, re-execute this job on an independent provider and
+        # penalize the outlier on a mismatch. Fire-and-forget: a verification
+        # error must never block or unwind the pay path above.
+        if (
+            self.sampler is not None
+            and not job.verification_run
+            and provider_id != self.identity.node_id
+            and self.sampler.should_sample()
+        ):
+            original_hash = hashlib.sha256(
+                json.dumps(result, sort_keys=True).encode()
+            ).hexdigest()
+            task = asyncio.create_task(
+                self._run_verification(job, provider_id, original_hash)
+            )
+            # Keep a strong ref so the task is not GC'd mid-flight.
+            self._verify_tasks.add(task)
+            task.add_done_callback(self._verify_tasks.discard)
+
+    async def _run_verification(
+        self, job: SubmittedJob, provider_id: str, original_hash: str
+    ) -> None:
+        """Drive sampler.verify() for a completed job (fire-and-forget safe)."""
+        try:
+            outcome = await self.sampler.verify(
+                job_id=job.job_id,
+                job_type=job.job_type,
+                payload=job.payload,
+                original_provider_id=provider_id,
+                original_output_hash=original_hash,
+            )
+            if outcome.verdict == VerificationVerdict.MISMATCH:
+                logger.warning(
+                    "sp928: job %s FAILED verification — provider %s is the "
+                    "outlier vs the re-execution majority (penalized)",
+                    job.job_id[:8], provider_id[:8],
+                )
+            elif outcome.verdict == VerificationVerdict.VERIFIED:
+                logger.info("sp928: job %s passed re-execution verification", job.job_id[:8])
+            else:
+                logger.debug("sp928: job %s verification %s", job.job_id[:8], outcome.verdict.value)
+        except Exception as e:
+            logger.warning("sp928: verification task errored for job %s: %s", job.job_id[:8], e)
+
+    async def _reexec_for_verification(
+        self, job_type: JobType, payload: Dict[str, Any], exclude: Set[str]
+    ) -> Optional[ReExecResult]:
+        """Re-dispatch a job to an INDEPENDENT provider and hash its result.
+
+        Returns None (→ verification SKIPPED, never a false slash) when no other
+        capable provider is available or the re-run produces no result.
+        """
+        capable = [p for p in self._get_capable_peers(job_type) if p not in exclude]
+        if not capable:
+            return None
+        allowed = set(capable)
+
+        # Re-runs are ALWAYS free (ftns_budget=0). Paying a verification provider
+        # on its signature alone would reintroduce mis-pay #2 on the re-run (the
+        # re-run is itself never sampled), so a paid-verification policy must wait
+        # for conditional, comparison-gated payment (follow-on). A provider that
+        # declines the free re-run simply yields no result → verification SKIPPED
+        # (safe degrade), never a false slash.
+        try:
+            rerun = await self.submit_job(
+                job_type, payload,
+                ftns_budget=0.0,
+                target_peers=list(allowed),
+                use_escrow=False,
+                verification_run=True,
+                allowed_providers=allowed,
+            )
+        except Exception as e:
+            logger.warning("sp928: verification re-dispatch failed: %s", e)
+            return None
+
+        res = await self.get_result(rerun.job_id, timeout=self.result_timeout)
+        if res is None:
+            return None
+        rerun_job = self.submitted_jobs.get(rerun.job_id)
+        rerun_provider = (rerun_job.provider_id if rerun_job else None) or capable[0]
+        out_hash = hashlib.sha256(json.dumps(res, sort_keys=True).encode()).hexdigest()
+        return ReExecResult(provider_id=rerun_provider, output_hash=out_hash)
+
+    def _record_verification_failure(self, provider_id: str, outcome) -> None:
+        """Reputation deterrent — drop a caught liar's reliability score."""
+        if self.discovery:
+            try:
+                self.discovery.record_job_failure(provider_id)
+            except Exception as e:
+                logger.warning("sp928: failed to record reputation hit for %s: %s", provider_id[:8], e)
 
     def get_stats(self) -> Dict[str, Any]:
         """Return requester statistics."""
