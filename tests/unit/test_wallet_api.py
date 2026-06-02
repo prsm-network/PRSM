@@ -8,7 +8,7 @@ dependency injection is overridden to swap services per test.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Iterator
 
@@ -362,8 +362,12 @@ class TestBindEndpoint:
         # still-load-bearing 409 conflict is NODE-side: a different wallet may
         # not bind a node_id already claimed by another wallet (otherwise an
         # operator could steal another node's identity).
+        # sp946 — Issued-At must be within the binding freshness window; use
+        # recent (distinct) timestamps since these flow through the HTTP /bind
+        # endpoint, which has no now_unix test hook.
+        _base = datetime.now(timezone.utc)
         node_a = "a" * 32
-        issued_a = "2026-04-27T00:00:00Z"
+        issued_a = _base.strftime("%Y-%m-%dT%H:%M:%SZ")
         services.binding_service.bind(
             wallet_address=alice.address,
             node_id_hex=node_a,
@@ -373,7 +377,7 @@ class TestBindEndpoint:
 
         # Sprint 786: alice binding a DIFFERENT node (multi-device) SUCCEEDS.
         node_b = "b" * 32
-        issued_b = "2026-04-27T00:01:00Z"
+        issued_b = (_base + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         ok = client.post(
             "/api/v1/auth/wallet/bind",
             json={
@@ -386,7 +390,7 @@ class TestBindEndpoint:
         assert ok.status_code == 200, ok.text
 
         # But BOB binding alice's node_a is a node-side conflict → 409.
-        issued_c = "2026-04-27T00:02:00Z"
+        issued_c = (_base + timedelta(seconds=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
         r = client.post(
             "/api/v1/auth/wallet/bind",
             json={

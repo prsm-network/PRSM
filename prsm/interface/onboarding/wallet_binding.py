@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Protocol
@@ -37,6 +38,7 @@ from prsm.node.identity import NodeIdentity, generate_node_identity
 __all__ = [
     "BindingConflictError",
     "BindingError",
+    "BindingExpiredError",
     "BindingSignatureError",
     "IdentityBinding",
     "InMemoryWalletBindingStore",
@@ -58,6 +60,39 @@ class BindingSignatureError(BindingError):
 class BindingConflictError(BindingError):
     """A conflicting binding exists — either the wallet is already bound to a
     different node, or the node is already bound to a different wallet."""
+
+
+class BindingExpiredError(BindingError):
+    """The binding attestation's Issued-At is outside the freshness window —
+    too old (a stale/replayed signature) or dated too far in the future."""
+
+
+# sp946 — a binding attestation is valid only for a bounded window after the
+# Issued-At it was minted with (server-minted at /siwe/verify and signed by the
+# wallet, so a client cannot forge a fresh Issued-At without invalidating the
+# signature). The window is generous enough for the verify → wallet-sign → bind
+# round trip (the ~300s SIWE-nonce window plus headroom) yet tight enough that a
+# captured genuine binding signature can't be replayed indefinitely (e.g. to
+# re-bind a node after a revocation). The future-skew tolerance absorbs benign
+# client/server clock drift while rejecting an arbitrary future-dated Issued-At.
+MAX_BINDING_AGE_SECONDS = 600
+MAX_BINDING_FUTURE_SKEW_SECONDS = 120
+
+
+def _parse_issued_at_unix(issued_at_iso: str) -> Optional[int]:
+    """Parse the canonical Issued-At ISO-8601 string to a unix timestamp, or
+    None if it cannot be parsed. Tolerates a trailing 'Z' (UTC) and treats a
+    naive timestamp as UTC."""
+    try:
+        s = issued_at_iso.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 @dataclass(frozen=True)
@@ -305,6 +340,30 @@ class WalletBindingService:
             raise BindingConflictError(
                 f"node {node_id_hex} already bound to wallet "
                 f"{existing_by_node.wallet_address}"
+            )
+
+        # sp946 — freshness gate. Reject a stale or future-dated attestation so a
+        # captured binding signature cannot be replayed long after it was issued
+        # (the idempotency short-circuit above already lets a still-bound pair
+        # re-submit harmlessly; this guards the create-new-binding path, e.g. a
+        # replay after a revocation). Checked before the (relatively expensive)
+        # signature recovery.
+        now_unix_effective = now_unix if now_unix is not None else int(time.time())
+        issued_unix = _parse_issued_at_unix(issued_at_iso)
+        if issued_unix is None:
+            raise BindingSignatureError(
+                f"unparseable Issued-At: {issued_at_iso!r}"
+            )
+        age = now_unix_effective - issued_unix
+        if age > MAX_BINDING_AGE_SECONDS:
+            raise BindingExpiredError(
+                f"binding attestation is stale: issued {age}s ago "
+                f"(max {MAX_BINDING_AGE_SECONDS}s) — re-run wallet sign-in"
+            )
+        if -age > MAX_BINDING_FUTURE_SKEW_SECONDS:
+            raise BindingExpiredError(
+                f"binding attestation is dated {-age}s in the future "
+                f"(max skew {MAX_BINDING_FUTURE_SKEW_SECONDS}s)"
             )
 
         message = build_binding_message(checksum, node_id_hex, issued_at_iso)

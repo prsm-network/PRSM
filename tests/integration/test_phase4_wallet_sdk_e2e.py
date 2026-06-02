@@ -60,6 +60,11 @@ URI = "https://app.prsm-network.com/login"
 VERSION = "1"
 STATEMENT = "Sign in to PRSM."
 BINDING_ISSUED_AT = "2026-04-22T12:00:00Z"
+# sp946 — unix of BINDING_ISSUED_AT; pass as now_unix so the freshness window
+# treats the fixed-timestamp binding signatures as freshly issued (age 0).
+BINDING_ISSUED_AT_UNIX = int(
+    datetime.fromisoformat(BINDING_ISSUED_AT.replace("Z", "+00:00")).timestamp()
+)
 
 
 @pytest.fixture
@@ -153,7 +158,7 @@ def test_full_new_user_onboarding_flow(now, price_source):
 
     # 6. Server binds wallet <-> node_id.
     binding = binding_svc.bind(
-        acct.address, node_id, binding_sig, BINDING_ISSUED_AT
+        acct.address, node_id, binding_sig, BINDING_ISSUED_AT, now_unix=BINDING_ISSUED_AT_UNIX
     )
     assert binding.wallet_address == to_checksum_address(acct.address)
     assert binding.node_id_hex == node_id
@@ -173,7 +178,7 @@ def test_returning_user_onboarding_reuses_bound_node_id(now, price_source):
     node_id_1, is_new_user_1 = binding_svc.sign_in(acct.address)
     assert is_new_user_1 is True
     sig = _sign_binding(acct, acct.address, node_id_1)
-    binding_svc.bind(acct.address, node_id_1, sig, BINDING_ISSUED_AT)
+    binding_svc.bind(acct.address, node_id_1, sig, BINDING_ISSUED_AT, now_unix=BINDING_ISSUED_AT_UNIX)
 
     # Second session — same wallet, returning user.
     node_id_2, is_new_user_2 = binding_svc.sign_in(acct.address)
@@ -220,13 +225,13 @@ def test_binding_cross_wallet_conflict_rejected(now):
     # A signs in + binds.
     node_id_a, _ = binding_svc.sign_in(acct_a.address)
     sig_a = _sign_binding(acct_a, acct_a.address, node_id_a)
-    binding_svc.bind(acct_a.address, node_id_a, sig_a, BINDING_ISSUED_AT)
+    binding_svc.bind(acct_a.address, node_id_a, sig_a, BINDING_ISSUED_AT, now_unix=BINDING_ISSUED_AT_UNIX)
 
     # B attempts to bind the SAME node_id to B's wallet.
     sig_b = _sign_binding(acct_b, acct_b.address, node_id_a)
     from prsm.interface.onboarding.wallet_binding import BindingConflictError
     with pytest.raises(BindingConflictError):
-        binding_svc.bind(acct_b.address, node_id_a, sig_b, BINDING_ISSUED_AT)
+        binding_svc.bind(acct_b.address, node_id_a, sig_b, BINDING_ISSUED_AT, now_unix=BINDING_ISSUED_AT_UNIX)
 
 
 def test_binding_rejects_signature_from_different_wallet(now):
@@ -240,7 +245,7 @@ def test_binding_rejects_signature_from_different_wallet(now):
     # A signs for B's address — signature recovers to A, not B.
     bad_sig = _sign_binding(acct_a, acct_b.address, node_id)
     with pytest.raises(BindingSignatureError):
-        binding_svc.bind(acct_b.address, node_id, bad_sig, BINDING_ISSUED_AT)
+        binding_svc.bind(acct_b.address, node_id, bad_sig, BINDING_ISSUED_AT, now_unix=BINDING_ISSUED_AT_UNIX)
 
 
 # -----------------------------------------------------------------------------
@@ -254,7 +259,7 @@ def test_display_preference_keyed_by_bound_node_id(now, price_source):
     binding_svc = WalletBindingService(store=InMemoryWalletBindingStore())
     node_id, _ = binding_svc.sign_in(acct.address)
     sig = _sign_binding(acct, acct.address, node_id)
-    binding_svc.bind(acct.address, node_id, sig, BINDING_ISSUED_AT)
+    binding_svc.bind(acct.address, node_id, sig, BINDING_ISSUED_AT, now_unix=BINDING_ISSUED_AT_UNIX)
 
     pref_store = InMemoryDisplayPreferenceStore(default="usd")
 
@@ -279,7 +284,7 @@ def test_display_preference_persistence_across_sessions(now, price_source):
     binding_svc = WalletBindingService(store=InMemoryWalletBindingStore())
     node_id, _ = binding_svc.sign_in(acct.address)
     sig = _sign_binding(acct, acct.address, node_id)
-    binding_svc.bind(acct.address, node_id, sig, BINDING_ISSUED_AT)
+    binding_svc.bind(acct.address, node_id, sig, BINDING_ISSUED_AT, now_unix=BINDING_ISSUED_AT_UNIX)
 
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "prefs.sqlite"
@@ -313,7 +318,7 @@ def test_full_flow_survives_sqlite_restart(now, price_source):
         node_id, is_new = svc_1.sign_in(acct.address)
         assert is_new is True
         sig = _sign_binding(acct, acct.address, node_id)
-        binding_1 = svc_1.bind(acct.address, node_id, sig, BINDING_ISSUED_AT)
+        binding_1 = svc_1.bind(acct.address, node_id, sig, BINDING_ISSUED_AT, now_unix=BINDING_ISSUED_AT_UNIX)
 
         # Session 2 — same sqlite file, new service instance.
         store_2 = SqliteWalletBindingStore(db_path)

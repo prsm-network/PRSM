@@ -25,8 +25,13 @@ from eth_account import Account
 from eth_account.messages import encode_defunct
 from eth_utils import to_checksum_address
 
+from datetime import datetime, timezone
+
 from prsm.interface.onboarding.wallet_binding import (
+    MAX_BINDING_AGE_SECONDS,
+    MAX_BINDING_FUTURE_SKEW_SECONDS,
     BindingConflictError,
+    BindingExpiredError,
     BindingSignatureError,
     IdentityBinding,
     InMemoryWalletBindingStore,
@@ -36,6 +41,9 @@ from prsm.interface.onboarding.wallet_binding import (
 )
 
 ISSUED_AT = "2026-04-22T12:00:00Z"
+# sp946 — the unix value of ISSUED_AT; pass as now_unix so the freshness window
+# treats these fixed-timestamp signatures as freshly issued (age 0).
+ISSUED_AT_UNIX = int(datetime.fromisoformat(ISSUED_AT.replace("Z", "+00:00")).timestamp())
 
 
 def _account(tag: str = "a"):
@@ -72,7 +80,7 @@ def test_sign_in_returning_user_returns_existing_binding(service):
     acct = _account("a")
     node_id, _ = service.sign_in(acct.address)
     sig = _sign_binding(acct, acct.address, node_id)
-    service.bind(acct.address, node_id, sig, ISSUED_AT)
+    service.bind(acct.address, node_id, sig, ISSUED_AT, now_unix=ISSUED_AT_UNIX)
 
     # Second sign_in for same wallet returns the already-bound node_id.
     node_id_again, is_new_user = service.sign_in(acct.address)
@@ -88,12 +96,12 @@ def test_bind_stores_record_on_valid_signature(service):
     node_id, _ = service.sign_in(acct.address)
     sig = _sign_binding(acct, acct.address, node_id)
 
-    binding = service.bind(acct.address, node_id, sig, ISSUED_AT, now_unix=1713787200)
+    binding = service.bind(acct.address, node_id, sig, ISSUED_AT, now_unix=ISSUED_AT_UNIX)
 
     assert isinstance(binding, IdentityBinding)
     assert binding.wallet_address == to_checksum_address(acct.address)
     assert binding.node_id_hex == node_id
-    assert binding.bound_at_unix == 1713787200
+    assert binding.bound_at_unix == ISSUED_AT_UNIX
     assert binding.wallet_signature == sig
     assert binding.signing_message_hash.startswith("0x")
     assert len(binding.signing_message_hash) == 66  # 0x + 64 hex
@@ -104,10 +112,49 @@ def test_bind_is_idempotent(service):
     node_id, _ = service.sign_in(acct.address)
     sig = _sign_binding(acct, acct.address, node_id)
 
-    first = service.bind(acct.address, node_id, sig, ISSUED_AT)
-    second = service.bind(acct.address, node_id, sig, ISSUED_AT)
+    first = service.bind(acct.address, node_id, sig, ISSUED_AT, now_unix=ISSUED_AT_UNIX)
+    second = service.bind(acct.address, node_id, sig, ISSUED_AT, now_unix=ISSUED_AT_UNIX)
 
     assert first == second
+
+
+def test_bind_rejects_stale_attestation(service):
+    """sp946 — a binding attestation older than the freshness window is
+    rejected, so a captured (genuinely wallet-signed) binding signature cannot
+    be replayed later (e.g. to re-bind a node after a revocation)."""
+    acct = _account("a")
+    node_id, _ = service.sign_in(acct.address)
+    sig = _sign_binding(acct, acct.address, node_id)
+
+    stale_now = ISSUED_AT_UNIX + MAX_BINDING_AGE_SECONDS + 60
+    with pytest.raises(BindingExpiredError):
+        service.bind(acct.address, node_id, sig, ISSUED_AT, now_unix=stale_now)
+
+
+def test_bind_rejects_future_dated_attestation(service):
+    """sp946 — an Issued-At dated beyond the future-skew tolerance is rejected
+    (defends against a client supplying an arbitrary future timestamp)."""
+    acct = _account("a")
+    node_id, _ = service.sign_in(acct.address)
+    sig = _sign_binding(acct, acct.address, node_id)
+
+    future_now = ISSUED_AT_UNIX - MAX_BINDING_FUTURE_SKEW_SECONDS - 60
+    with pytest.raises(BindingExpiredError):
+        service.bind(acct.address, node_id, sig, ISSUED_AT, now_unix=future_now)
+
+
+def test_bind_accepts_attestation_within_window(service):
+    """sp946 — an attestation bound a little after it was issued (within the
+    window) still binds normally."""
+    acct = _account("a")
+    node_id, _ = service.sign_in(acct.address)
+    sig = _sign_binding(acct, acct.address, node_id)
+
+    binding = service.bind(
+        acct.address, node_id, sig, ISSUED_AT,
+        now_unix=ISSUED_AT_UNIX + MAX_BINDING_AGE_SECONDS - 1,
+    )
+    assert binding.node_id_hex == node_id
 
 
 def test_bind_rejects_wrong_signature(service):
@@ -119,7 +166,7 @@ def test_bind_rejects_wrong_signature(service):
     bad_sig = _sign_binding(acct_b, acct_a.address, node_id)
 
     with pytest.raises(BindingSignatureError):
-        service.bind(acct_a.address, node_id, bad_sig, ISSUED_AT)
+        service.bind(acct_a.address, node_id, bad_sig, ISSUED_AT, now_unix=ISSUED_AT_UNIX)
 
 
 def test_bind_rejects_node_already_bound_to_other_wallet(service):
@@ -129,12 +176,12 @@ def test_bind_rejects_node_already_bound_to_other_wallet(service):
 
     # A binds the node.
     sig_a = _sign_binding(acct_a, acct_a.address, node_id)
-    service.bind(acct_a.address, node_id, sig_a, ISSUED_AT)
+    service.bind(acct_a.address, node_id, sig_a, ISSUED_AT, now_unix=ISSUED_AT_UNIX)
 
     # B attempts to bind the same node to B's wallet — must be rejected.
     sig_b = _sign_binding(acct_b, acct_b.address, node_id)
     with pytest.raises(BindingConflictError):
-        service.bind(acct_b.address, node_id, sig_b, ISSUED_AT)
+        service.bind(acct_b.address, node_id, sig_b, ISSUED_AT, now_unix=ISSUED_AT_UNIX)
 
 
 def test_bind_allows_multi_device_per_wallet(service):
@@ -146,12 +193,12 @@ def test_bind_allows_multi_device_per_wallet(service):
     acct = _account("a")
     node_id_1, _ = service.sign_in(acct.address)
     sig_1 = _sign_binding(acct, acct.address, node_id_1)
-    b1 = service.bind(acct.address, node_id_1, sig_1, ISSUED_AT)
+    b1 = service.bind(acct.address, node_id_1, sig_1, ISSUED_AT, now_unix=ISSUED_AT_UNIX)
 
     # Same wallet binds a second device — succeeds (multi-device).
     node_id_2 = "f" * 32
     sig_2 = _sign_binding(acct, acct.address, node_id_2)
-    b2 = service.bind(acct.address, node_id_2, sig_2, ISSUED_AT)
+    b2 = service.bind(acct.address, node_id_2, sig_2, ISSUED_AT, now_unix=ISSUED_AT_UNIX)
 
     assert b1.node_id_hex == node_id_1
     assert b2.node_id_hex == node_id_2
@@ -167,7 +214,7 @@ def test_get_by_wallet(service):
     acct = _account("a")
     node_id, _ = service.sign_in(acct.address)
     sig = _sign_binding(acct, acct.address, node_id)
-    service.bind(acct.address, node_id, sig, ISSUED_AT)
+    service.bind(acct.address, node_id, sig, ISSUED_AT, now_unix=ISSUED_AT_UNIX)
 
     found = service.get_by_wallet(acct.address)
     assert found is not None
@@ -178,7 +225,7 @@ def test_get_by_node_id(service):
     acct = _account("a")
     node_id, _ = service.sign_in(acct.address)
     sig = _sign_binding(acct, acct.address, node_id)
-    service.bind(acct.address, node_id, sig, ISSUED_AT)
+    service.bind(acct.address, node_id, sig, ISSUED_AT, now_unix=ISSUED_AT_UNIX)
 
     found = service.get_by_node_id(node_id)
     assert found is not None
@@ -202,7 +249,7 @@ def test_sqlite_store_roundtrip():
         service = WalletBindingService(store=store)
         node_id, _ = service.sign_in(acct.address)
         sig = _sign_binding(acct, acct.address, node_id)
-        binding = service.bind(acct.address, node_id, sig, ISSUED_AT, now_unix=1713787200)
+        binding = service.bind(acct.address, node_id, sig, ISSUED_AT, now_unix=ISSUED_AT_UNIX)
 
         # New store instance against same file — must reload the binding.
         store2 = SqliteWalletBindingStore(db_path)
