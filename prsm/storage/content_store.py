@@ -13,8 +13,16 @@ Usage::
 
 from __future__ import annotations
 
+import os
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+
+# sp920 — default ceiling on the in-memory manifest cache (LRU). Each entry is
+# ciphertext + Shamir key-shares + a manifest (~few KB); 4096 ≈ low-MB. Tunable
+# via PRSM_MANIFEST_CACHE_MAX. Eviction is safe: a miss falls back to the seeded
+# BitTorrent torrent (artefacts persist on disk).
+_DEFAULT_MANIFEST_CACHE_MAX = 4096
 
 from prsm.storage.blob_store import BlobStore
 from prsm.storage.exceptions import ContentNotFoundError
@@ -124,6 +132,7 @@ class ContentStore:
         shard_size: int = 262_144,
         transport: Optional[Any] = None,
         discovery: Optional[Any] = None,
+        manifest_cache_max: Optional[int] = None,
     ) -> None:
         self.data_dir = data_dir
         self.node_id = node_id
@@ -138,8 +147,35 @@ class ContentStore:
         )
         self.key_manager = KeyManager()
 
-        # content_hash hex -> (ciphertext, key_shares, manifest)
-        self._manifest_cache: Dict[str, Tuple[bytes, List[KeyShare], ShardManifest]] = {}
+        # sp920 — LRU-bounded so repeated publishes can't grow it to OOM.
+        if manifest_cache_max is None:
+            try:
+                manifest_cache_max = int(os.environ.get(
+                    "PRSM_MANIFEST_CACHE_MAX", _DEFAULT_MANIFEST_CACHE_MAX,
+                ))
+            except (TypeError, ValueError):
+                manifest_cache_max = _DEFAULT_MANIFEST_CACHE_MAX
+        self._manifest_cache_max = max(1, int(manifest_cache_max))
+
+        # content_hash hex -> (ciphertext, key_shares, manifest). OrderedDict so
+        # _cache_put/_cache_get can evict the least-recently-used entry.
+        self._manifest_cache: "OrderedDict[str, Tuple[bytes, List[KeyShare], ShardManifest]]" = OrderedDict()
+
+    def _cache_put(self, key: str, value) -> None:
+        """sp920 — insert into the manifest cache, marking it most-recently-used
+        and evicting the least-recently-used entry once over the bound. Eviction
+        is safe: a later miss falls back to the seeded BitTorrent torrent."""
+        self._manifest_cache[key] = value
+        self._manifest_cache.move_to_end(key)
+        while len(self._manifest_cache) > self._manifest_cache_max:
+            self._manifest_cache.popitem(last=False)
+
+    def _cache_get(self, key: str):
+        """sp920 — fetch + mark most-recently-used (LRU touch). None if absent."""
+        if key not in self._manifest_cache:
+            return None
+        self._manifest_cache.move_to_end(key)
+        return self._manifest_cache[key]
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -220,7 +256,7 @@ class ContentStore:
             owner_node_id=self.node_id,
             replication_factor=replication_factor,
         )
-        self._manifest_cache[content_hash.hex()] = (ciphertext, key_shares, manifest)
+        self._cache_put(content_hash.hex(), (ciphertext, key_shares, manifest))
         return content_hash
 
     async def retrieve_local(self, content_hash: ContentHash) -> bytes:
@@ -234,10 +270,11 @@ class ContentStore:
             If the content hash is not present in :attr:`_manifest_cache`.
         """
         cache_key = content_hash.hex()
-        if cache_key not in self._manifest_cache:
+        entry = self._cache_get(cache_key)   # sp920 — LRU touch on use
+        if entry is None:
             raise ContentNotFoundError(cache_key)
 
-        ciphertext, key_shares, manifest = self._manifest_cache[cache_key]
+        ciphertext, key_shares, manifest = entry
         return await self.shard_engine.reassemble(manifest)
 
     async def exists_local(self, content_hash: ContentHash) -> bool:
@@ -295,8 +332,9 @@ class ContentStore:
         )
         # Cache the manifest so subsequent local retrievals on this node
         # skip the BlobStore round-trip — keeps store_local + this method
-        # observationally interchangeable from the local-fetch side.
-        self._manifest_cache[content_hash.hex()] = (ciphertext, key_shares, manifest)
+        # observationally interchangeable from the local-fetch side. sp920 —
+        # LRU-bounded.
+        self._cache_put(content_hash.hex(), (ciphertext, key_shares, manifest))
 
         shard_paths = [
             self.blob_store._path_for(shard_hash)
