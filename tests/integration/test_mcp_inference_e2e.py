@@ -115,6 +115,25 @@ class _FakeEscrow:
             entry.completed_at = 1745625610.0
         return True
 
+    async def release_escrow_split(self, job_id, splits, consensus_reached=True, **_kw):
+        # sp951 — the production receipt-aware inference settle (api.py) releases
+        # via the multi-recipient split API, NOT release_escrow. This mock
+        # predated that path, so the settle AttributeError'd and the escrow never
+        # released (assert len(release_calls)==1 failed). Mirror release_escrow's
+        # bookkeeping: splits is a list of (recipient_id, amount) tuples; in the
+        # single-node case the sole recipient is the operator node.
+        provider_id = splits[0][0] if splits else None
+        self.release_calls.append({
+            "job_id": job_id, "provider_id": provider_id, "splits": list(splits),
+        })
+        entry = self._entries.get(job_id)
+        if entry:
+            entry.status.value = "released"
+            entry.provider_winner = provider_id
+            entry.tx_release = f"0xrelease-{job_id}"
+            entry.completed_at = 1745625610.0
+        return True
+
     async def refund_escrow(self, job_id, reason, **_kw):
         self.refund_calls.append({"job_id": job_id, "reason": reason})
         entry = self._entries.get(job_id)
