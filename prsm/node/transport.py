@@ -386,28 +386,104 @@ class WebSocketTransport:
         self._tasks.append(asyncio.create_task(self._nonce_cleanup_loop()))
         logger.info(f"P2P transport listening on ws://{self.host}:{self.port}")
 
+    # sp953 — graceful shutdown must be BOUNDED. A peer's websocket close
+    # handshake (and the server's wait_closed) can hang indefinitely when the
+    # peer is gone or unresponsive — e.g. a requester that disconnects while the
+    # server is mid-stream, so the close-ack never round-trips (it deadlocks:
+    # the requester's close awaits the server's ack, but the server only stops
+    # sending once its socket errors, which only happens once the requester's
+    # socket is actually closed). An unbounded await there hangs node shutdown
+    # forever (and hung the F54 disconnect-during-stream test). A legitimate
+    # close on localhost/WAN completes in well under a second; only a stalled
+    # handshake reaches this bound, at which point we force the socket closed.
+    _SHUTDOWN_CLOSE_TIMEOUT_SECONDS = 2.0
+
     async def stop(self) -> None:
-        """Gracefully shut down server and all peer connections."""
+        """Gracefully shut down server and all peer connections.
+
+        Bounded (sp953): no peer/server close can block shutdown beyond
+        ``_SHUTDOWN_CLOSE_TIMEOUT_SECONDS``. Peers are snapshotted + cleared
+        under the lock, then closed CONCURRENTLY outside it, so one stalled
+        close neither holds the peers lock nor serializes behind the others —
+        total peer-close latency is bounded by the timeout, not timeout×N."""
         self._running = False
         for task in self._tasks:
             task.cancel()
         self._tasks.clear()
 
-        # Close all peer connections with proper locking
+        # Snapshot + clear peers under the lock (so no concurrent send finds a
+        # closing peer), then close concurrently + bounded OUTSIDE the lock.
         async with self._peers_lock:
-            for peer in list(self.peers.values()):
-                try:
-                    await peer.websocket.close()
-                except Exception:
-                    pass
+            peers = list(self.peers.values())
             self.peers.clear()
+        if peers:
+            await asyncio.gather(
+                *(self._bounded_close(p.websocket) for p in peers),
+                return_exceptions=True,
+            )
 
         if self._server:
             self._server.close()
-            await self._server.wait_closed()
+            try:
+                await asyncio.wait_for(
+                    self._server.wait_closed(),
+                    timeout=self._SHUTDOWN_CLOSE_TIMEOUT_SECONDS,
+                )
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                # Server had in-flight connection handlers that didn't drain in
+                # time (e.g. a handler blocked mid-stream). The listener is
+                # already closed by .close(); abandon the stragglers.
+                pass
             self._server = None
 
         logger.info("P2P transport stopped")
+
+    @staticmethod
+    def _force_close_transport(websocket: Any) -> None:
+        """Force the underlying TCP transport closed (synchronous, instant).
+        This makes any in-flight graceful close() resolve immediately instead of
+        awaiting the websockets library's internal close_timeout."""
+        for _attr in ("transport", "_transport"):
+            _t = getattr(websocket, _attr, None)
+            if _t is not None:
+                try:
+                    _t.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                break
+
+    async def _bounded_close(self, websocket: Any) -> None:
+        """Close a websocket without letting a stalled handshake hang shutdown
+        (sp953). Try a GRACEFUL close first (sends the CLOSE frame so a
+        responsive peer deregisters us cleanly), bounded by
+        ``_SHUTDOWN_CLOSE_TIMEOUT_SECONDS``. If it stalls — a gone/busy peer
+        whose close-ack never round-trips, where websockets' own close() would
+        otherwise run to its internal ~10s close_timeout — force the underlying
+        transport closed, which resolves the pending close() immediately.
+
+        `asyncio.wait` is used (not `wait_for`) for the bound because websockets'
+        close() resists cancellation; wait returns at the timeout regardless and
+        we then force the transport rather than relying on cancelling close()."""
+        close_task = asyncio.ensure_future(websocket.close())
+        try:
+            done, _pending = await asyncio.wait(
+                {close_task}, timeout=self._SHUTDOWN_CLOSE_TIMEOUT_SECONDS,
+            )
+            if close_task not in done:
+                # Graceful close stalled — force the transport (instant), which
+                # unblocks the pending close(), then reap it.
+                self._force_close_transport(websocket)
+                try:
+                    await asyncio.wait_for(
+                        close_task,
+                        timeout=self._SHUTDOWN_CLOSE_TIMEOUT_SECONDS,
+                    )
+                except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                    close_task.cancel()
+        except Exception:  # noqa: BLE001
+            self._force_close_transport(websocket)
+            if not close_task.done():
+                close_task.cancel()
 
     async def _handle_incoming(self, websocket: Any) -> None:
         """Handle a new incoming WebSocket connection."""
