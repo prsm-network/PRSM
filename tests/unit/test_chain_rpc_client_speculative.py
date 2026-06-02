@@ -43,6 +43,7 @@ from prsm.compute.chain_rpc.protocol import (
     RunLayerSliceResponse,
     encode_message,
     parse_message,
+    response_input_commitment_for_request,
 )
 from prsm.compute.chain_rpc.activation_codec import (
     decode_activation,
@@ -171,6 +172,12 @@ class _SpecStageSim:
             is_terminal=is_terminal,
             verified_token_ids=verified_token_ids,
             accepted_count=accepted_count,
+            # sp950 — mirror the real LayerStageServer: bind the per-stage input
+            # commitment so the executor's (now-correct) anchor verification of
+            # non-PREFILL stages succeeds. Without this the sim modelled the
+            # pre-sp950 buggy contract (executor expected None) rather than the
+            # real server.
+            input_commitment=response_input_commitment_for_request(request),
         )
         return encode_message(response)
 

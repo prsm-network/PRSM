@@ -2305,11 +2305,13 @@ class RpcChainExecutor:
         # verify_with_anchor's cross-field check.
         if not response.verify_with_anchor(
             self._anchor, expected_stage_node_id=stage_node_id,
-            # sp927 — bind the response to the input WE sent this iteration so a
-            # malicious stage can't replay a prior iteration's signed response.
-            expected_input_commitment=response_input_commitment_for_request(
-                request,
-            ),
+            # sp927/sp950 — the streaming-tail final frame is signed by the
+            # server WITHOUT an input commitment (server.py tail sign site stays
+            # default-None: it carries a bare request_id, not the non-tail
+            # activation-replay vector), so the tail is verified with None too.
+            # Explicit here rather than relying on the outer InferenceRequest
+            # incidentally yielding None.
+            expected_input_commitment=None,
         ):
             raise ChainExecutionError(
                 stage_index=stage_index,
@@ -2599,6 +2601,11 @@ class RpcChainExecutor:
             stage_node_id=stage_node_id,
             request=request,
             response_bytes=response_bytes,
+            # sp950 — derive the expected input commitment from the per-stage
+            # wire request we actually dispatched (not the outer InferenceRequest).
+            expected_input_commitment=response_input_commitment_for_request(
+                wire_request,
+            ),
         )
 
         # Decode the inline activation blob → next-stage input.
@@ -2730,6 +2737,12 @@ class RpcChainExecutor:
             stage_node_id=stage_node_id,
             request=request,
             response_bytes=response_manifest_bytes,
+            # sp950 — per-stage commitment from the wire request we dispatched.
+            # The streamed wire request commits the input via its manifest's
+            # payload_sha256, matching the server's same-request computation.
+            expected_input_commitment=response_input_commitment_for_request(
+                wire_request,
+            ),
         )
 
         # Streamed responses MUST carry a manifest. If the server sent
@@ -2942,9 +2955,18 @@ class RpcChainExecutor:
         stage_node_id: str,
         request: InferenceRequest,
         response_bytes: bytes,
+        expected_input_commitment: Optional[str] = None,
     ) -> RunLayerSliceResponse:
         """Parse + cross-field check + anchor-verify the response.
-        Shared by inline + streamed paths."""
+        Shared by inline + streamed paths.
+
+        sp950 — ``expected_input_commitment`` MUST be derived by the caller from
+        the per-stage ``RunLayerSliceRequest`` it actually dispatched (NOT from
+        the outer ``InferenceRequest`` ``request``, which has no ``decode_mode``
+        and so always yields None). The server signs each stage response with the
+        per-stage commitment; computing the expected value from the wrong object
+        made every non-PREFILL (INCREMENTAL/VERIFY) stage fail anchor
+        verification — and silently made sp927's replay binding a no-op."""
         try:
             response = parse_message(response_bytes)
         except ChainRpcVersionMismatchError as exc:
@@ -3009,9 +3031,10 @@ class RpcChainExecutor:
             self._anchor, expected_stage_node_id=stage_node_id,
             # sp927 — bind the response to the input WE sent this iteration so a
             # malicious stage can't replay a prior iteration's signed response.
-            expected_input_commitment=response_input_commitment_for_request(
-                request,
-            ),
+            # sp950 — supplied by the caller from the per-stage wire request (see
+            # docstring); deriving it here from the outer InferenceRequest was
+            # the regression that broke every non-PREFILL stage verification.
+            expected_input_commitment=expected_input_commitment,
         ):
             raise ChainExecutionError(
                 stage_index=stage_index,

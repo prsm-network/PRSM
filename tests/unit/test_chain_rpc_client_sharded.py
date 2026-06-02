@@ -42,6 +42,7 @@ from prsm.compute.chain_rpc.protocol import (
     RunLayerSliceResponse,
     encode_message,
     parse_message,
+    response_input_commitment_for_request,
 )
 from prsm.compute.inference.multi_stage_attestation import (
     decode_multi_iteration_attestation,
@@ -179,6 +180,11 @@ class _ShardedStageSim:
             epsilon_spent=self.epsilon,
             next_token_id=next_token_id,
             is_terminal=is_terminal,
+            # sp950 — mirror the real LayerStageServer's per-stage input-
+            # commitment binding so the executor's corrected anchor verification
+            # of non-PREFILL stages succeeds (pre-sp950 the sim signed without
+            # it, matching the buggy executor-expects-None contract).
+            input_commitment=response_input_commitment_for_request(request),
         )
         return encode_message(response)
 
