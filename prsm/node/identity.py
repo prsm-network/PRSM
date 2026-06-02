@@ -8,6 +8,7 @@ Each PRSM node has a unique identity derived from its public key.
 
 import hashlib
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -116,9 +117,32 @@ def generate_node_identity(display_name: str = "prsm-node") -> NodeIdentity:
 
 
 def save_node_identity(identity: NodeIdentity, path: Path) -> None:
-    """Save identity to a JSON file."""
+    """Save identity to a JSON file with OWNER-ONLY permissions.
+
+    sp942 — the identity JSON contains the node's ed25519 PRIVATE key, so it is
+    written 0o600 (and its parent dir 0o700). The previous ``path.write_text``
+    left the key world-readable (default 0o644), exposing the node's signing key
+    to any other local user / co-tenant container process. The file is created
+    with 0o600 BEFORE the key bytes are written (no world-readable window for a
+    new file); a chmod afterwards also tightens a pre-existing file.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(identity.to_dict(), indent=2))
+    try:
+        path.parent.chmod(0o700)
+    except OSError:  # pragma: no cover — non-POSIX / permission-denied; best-effort
+        pass
+    payload = json.dumps(identity.to_dict(), indent=2)
+    # os.open with mode 0o600 sets perms atomically on a NEW file (no 0o644
+    # window); for a pre-existing file the mode arg is ignored, so chmod after.
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(payload)
+    finally:
+        try:
+            path.chmod(0o600)
+        except OSError:  # pragma: no cover
+            pass
 
 
 def load_node_identity(path: Path) -> Optional[NodeIdentity]:
