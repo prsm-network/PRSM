@@ -1422,3 +1422,84 @@ class TestStakingBenefits:
             await staking_manager.stake(
                 user_id="staker-tiny", amount=Decimal('500'), lock_period_days=90,
             )
+
+# === Sprint 933 — concurrency / double-spend tests ===
+
+class TestStakingConcurrency:
+    """sp933 — staking mutations did check-then-act with NO per-entity lock and
+    a money side-effect (unlock/burn/mint) AFTER commit, so two concurrent (or
+    replayed) calls on the same entity both pass the stale-read status check and
+    both apply the side-effect → double-withdraw / double-burn / double-mint.
+    A per-entity lock must serialize them (same sp929 class)."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_withdraw_unlocks_tokens_once(self, staking_manager, mock_ftns_service):
+        import asyncio
+        from prsm.core.database import get_async_session, UnstakeRequestModel
+        from sqlalchemy import update
+        from uuid import UUID
+
+        stake = await staking_manager.stake(user_id="u1", amount=Decimal('5000'))
+        request = await staking_manager.unstake(user_id="u1", stake_id=stake.stake_id)
+        async with get_async_session() as session:
+            await session.execute(
+                update(UnstakeRequestModel)
+                .where(UnstakeRequestModel.request_id == UUID(request.request_id))
+                .values(available_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+                        status=UnstakeRequestStatus.AVAILABLE.value)
+            )
+            await session.commit()
+
+        results = await asyncio.gather(
+            staking_manager.withdraw(user_id="u1", request_id=request.request_id),
+            staking_manager.withdraw(user_id="u1", request_id=request.request_id),
+            return_exceptions=True,
+        )
+        successes = [r for r in results if not isinstance(r, Exception)]
+        assert len(successes) == 1, f"exactly one withdraw should succeed, got {results}"
+        mock_ftns_service.unlock_tokens.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_slash_burn_matches_stake_decrement(self, staking_manager, mock_ftns_service):
+        import asyncio
+        stake = await staking_manager.stake(user_id="u2", amount=Decimal('5000'))
+        await asyncio.gather(
+            staking_manager.slash(user_id="u2", stake_id=stake.stake_id,
+                                  reason=SlashReason.MISCONDUCT, evidence={"d": "x"}),
+            staking_manager.slash(user_id="u2", stake_id=stake.stake_id,
+                                  reason=SlashReason.MISCONDUCT, evidence={"d": "y"}),
+            return_exceptions=True,
+        )
+        final = await staking_manager.get_stake(stake.stake_id)
+        burned = sum(Decimal(str(c.args[1])) for c in mock_ftns_service.burn_tokens.call_args_list)
+        decrement = Decimal('5000') - Decimal(str(final.amount))
+        assert abs(burned - decrement) < Decimal('0.0001'), (
+            f"burned {burned} != stake decrement {decrement} (double-burn inconsistency)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_concurrent_resolve_appeal_mints_once(self, staking_manager, mock_ftns_service):
+        import asyncio
+        from prsm.core.database import get_async_session, SlashEventModel
+        from sqlalchemy import update
+        from uuid import UUID
+
+        stake = await staking_manager.stake(user_id="u3", amount=Decimal('5000'))
+        slash = await staking_manager.slash(user_id="u3", stake_id=stake.stake_id,
+                                            reason=SlashReason.MISCONDUCT, evidence={"d": "x"})
+        async with get_async_session() as session:
+            await session.execute(
+                update(SlashEventModel)
+                .where(SlashEventModel.slash_id == UUID(slash.slash_id))
+                .values(appeal_status="pending")
+            )
+            await session.commit()
+
+        results = await asyncio.gather(
+            staking_manager.resolve_appeal(slash_id=slash.slash_id, approved=True, resolution_note="ok"),
+            staking_manager.resolve_appeal(slash_id=slash.slash_id, approved=True, resolution_note="ok"),
+            return_exceptions=True,
+        )
+        successes = [r for r in results if not isinstance(r, Exception)]
+        assert len(successes) == 1, f"exactly one appeal resolution should succeed, got {results}"
+        mock_ftns_service.mint_tokens.assert_called_once()

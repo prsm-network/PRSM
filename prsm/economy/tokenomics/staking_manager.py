@@ -23,6 +23,7 @@ Security Considerations:
 - Rate limits prevent rapid stake manipulation
 """
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, Any, List, Optional, Tuple
@@ -324,6 +325,15 @@ class StakingManager:
         
         # Rate limiting (stays in-memory for performance)
         self._daily_operations: Dict[str, List[datetime]] = {}  # user_id -> [timestamps]
+
+        # sp933 — per-entity locks. The balance-mutating operations
+        # (withdraw/cancel/unstake/slash/resolve_appeal) each open their OWN
+        # session, read a row's status, then commit + apply a money side-effect
+        # (unlock/burn/mint) — with nothing held between. Two concurrent or
+        # replayed calls on the same entity both pass the stale-read check and
+        # both apply the side-effect (double-withdraw / double-burn / double-
+        # mint). Serializing per entity closes that (same class as sp929).
+        self._entity_locks: Dict[str, asyncio.Lock] = {}
         
         logger.info(
             "StakingManager initialized",
@@ -332,6 +342,18 @@ class StakingManager:
             reward_rate=self.config.reward_rate_annual
         )
     
+    def _lock_for(self, key: str) -> asyncio.Lock:
+        """sp933 — return the process-local lock for an entity key, creating it
+        on first use. Sync + await-free, so the get-or-create is atomic under
+        asyncio (no interleaving). Operations sharing a key serialize: withdraw
+        and cancel share the request key; unstake and slash share the stake key.
+        """
+        lock = self._entity_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._entity_locks[key] = lock
+        return lock
+
     # === Conversion Helper Methods ===
 
     @staticmethod
@@ -535,6 +557,17 @@ class StakingManager:
         stake_id: str,
         amount: Optional[Decimal] = None
     ) -> UnstakeRequest:
+        # sp933 — serialize ops on this stake (unstake + slash) so concurrent
+        # partial-unstakes can't each pass on the same stale balance.
+        async with self._lock_for(f"stake:{stake_id}"):
+            return await self._unstake_locked(user_id, stake_id, amount)
+
+    async def _unstake_locked(
+        self,
+        user_id: str,
+        stake_id: str,
+        amount: Optional[Decimal] = None
+    ) -> UnstakeRequest:
         """
         Request to unstake tokens
         
@@ -638,6 +671,16 @@ class StakingManager:
         user_id: str,
         request_id: str
     ) -> Tuple[bool, Decimal]:
+        # sp933 — serialize all ops on this unstake request (withdraw + cancel)
+        # so two concurrent/replayed calls can't both unlock the tokens.
+        async with self._lock_for(f"req:{request_id}"):
+            return await self._withdraw_locked(user_id, request_id)
+
+    async def _withdraw_locked(
+        self,
+        user_id: str,
+        request_id: str
+    ) -> Tuple[bool, Decimal]:
         """
         Withdraw unstaked tokens after period
         
@@ -710,6 +753,17 @@ class StakingManager:
         request_id: str,
         reason: Optional[str] = None
     ) -> bool:
+        # sp933 — same request lock as withdraw: a withdraw and a cancel (or two
+        # cancels) on the same request must not both restore/unlock.
+        async with self._lock_for(f"req:{request_id}"):
+            return await self._cancel_unstake_locked(user_id, request_id, reason)
+
+    async def _cancel_unstake_locked(
+        self,
+        user_id: str,
+        request_id: str,
+        reason: Optional[str] = None
+    ) -> bool:
         """
         Cancel an unstake request
         
@@ -773,6 +827,22 @@ class StakingManager:
     # === Slashing Operations ===
     
     async def slash(
+        self,
+        user_id: str,
+        stake_id: str,
+        reason: SlashReason,
+        evidence: Dict[str, Any],
+        slash_rate: Optional[float] = None,
+        slashed_by: str = "system"
+    ) -> SlashRecord:
+        # sp933 — same stake lock as unstake: concurrent slashes must serialize
+        # so each burn matches a stake decrement (no double-burn / divergence).
+        async with self._lock_for(f"stake:{stake_id}"):
+            return await self._slash_locked(
+                user_id, stake_id, reason, evidence, slash_rate, slashed_by
+            )
+
+    async def _slash_locked(
         self,
         user_id: str,
         stake_id: str,
@@ -928,6 +998,17 @@ class StakingManager:
             return True
     
     async def resolve_appeal(
+        self,
+        slash_id: str,
+        approved: bool,
+        resolution_note: str
+    ) -> bool:
+        # sp933 — serialize resolutions of this slash so two concurrent/replayed
+        # approvals can't both mint the refund (double-mint).
+        async with self._lock_for(f"slash:{slash_id}"):
+            return await self._resolve_appeal_locked(slash_id, approved, resolution_note)
+
+    async def _resolve_appeal_locked(
         self,
         slash_id: str,
         approved: bool,
