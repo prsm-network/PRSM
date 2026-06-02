@@ -7,10 +7,22 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Cancel any in-progress runs for the same branch / PR when a new push lands.
+# Concurrency policy (sprint 949):
+#   - PR / feature-branch pushes: cancel superseded in-progress runs — only the
+#     latest commit matters there, and cancelling saves runner minutes.
+#   - main: NEVER cancel, and give every commit its OWN concurrency group
+#     (keyed by sha) so a rapid direct-push cadence cannot cancel in-flight runs.
+#     Before this, `cancel-in-progress: true` with a shared `ci-main` group meant
+#     each new push to main cancelled the previous run mid-flight: 37 of the last
+#     40 main runs were `cancelled` (0 success), so main CI never reported a
+#     green/red verdict and a real test regression sat undetected for 16 commits
+#     (sp927 -> sp943). Every commit to the protected branch must get a complete
+#     verdict. (Cost: main runs can overlap under a fast cadence — fine for a
+#     20-min-capped suite. If runner minutes get tight, switch main back to a
+#     shared group `ci-main` with cancel-in-progress:false to SERIALIZE instead.)
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.ref == 'refs/heads/main' && format('ci-main-{0}', github.sha) || format('ci-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Default to a read-only token — specific jobs opt into more if they need it.
 permissions:
