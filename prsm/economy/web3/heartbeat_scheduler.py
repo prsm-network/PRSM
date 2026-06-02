@@ -52,6 +52,11 @@ logger = logging.getLogger(__name__)
 SuccessCallback = Callable[[str], Union[None, Awaitable[None]]]
 """Called as ``callback(tx_hash_hex)`` after each successful heartbeat."""
 
+CriticalCallback = Callable[[int], None]
+"""sp939 — called as ``callback(consecutive_failures)`` when heartbeats have
+failed CRITICAL_CONSECUTIVE_FAILURES times in a row (slashing imminent — the
+operator should intervene before the on-chain grace window elapses)."""
+
 
 class HeartbeatScheduler:
     """Periodically calls ``client.record_heartbeat()``.
@@ -92,12 +97,20 @@ class HeartbeatScheduler:
     # hammering the chain.
     AUTO_TUNE_MIN_INTERVAL_SECONDS = 60.0
 
+    # sp939 — consecutive failures before escalating to CRITICAL + on_critical.
+    # With the grace/4 auto-tune (3-tick buffer), 3 consecutive misses means
+    # ~3/4 of the grace window has elapsed with no on-chain progress — roughly
+    # one interval before the provider becomes slashable, i.e. the last moment
+    # an operator can still intervene.
+    CRITICAL_CONSECUTIVE_FAILURES = 3
+
     def __init__(
         self,
         client,
         *,
         interval_seconds: Optional[float] = None,
         on_success: Optional[SuccessCallback] = None,
+        on_critical: Optional[CriticalCallback] = None,
     ) -> None:
         # interval_seconds resolution:
         #   None (default) → auto-tune from client.heartbeat_grace_seconds()
@@ -117,9 +130,13 @@ class HeartbeatScheduler:
         self._client = client
         self._interval = float(interval_seconds)
         self._on_success = on_success
+        self._on_critical = on_critical
         self._stop_event = asyncio.Event()
         self.success_count = 0
         self.failure_count = 0
+        # sp939 — consecutive failures since the last success. Reset on success;
+        # crossing CRITICAL_CONSECUTIVE_FAILURES escalates (slashing imminent).
+        self.consecutive_failures = 0
         # Sprint 399 — track last successful tick timestamp.
         # /health/detailed and Prometheus surface this so
         # operators can distinguish "task running but no
@@ -204,6 +221,31 @@ class HeartbeatScheduler:
         """Signal the loop to exit at the next iteration boundary."""
         self._stop_event.set()
 
+    def _note_failure(self) -> None:
+        """sp939 — record a failed tick and escalate when slashing is imminent.
+
+        Increments the cumulative + consecutive counters; once the consecutive
+        streak reaches CRITICAL_CONSECUTIVE_FAILURES, logs CRITICAL and invokes
+        the optional on_critical alert hook so the operator can intervene before
+        the on-chain grace window elapses and the stake becomes slashable."""
+        self.failure_count += 1
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= self.CRITICAL_CONSECUTIVE_FAILURES:
+            logger.critical(
+                "HeartbeatScheduler: %d consecutive heartbeat failures — the "
+                "provider stake is at risk of being slashed for a missed "
+                "heartbeat once the on-chain grace window elapses. Operator "
+                "intervention needed (check RPC / wallet gas / connectivity).",
+                self.consecutive_failures,
+            )
+            if self._on_critical is not None:
+                try:
+                    self._on_critical(self.consecutive_failures)
+                except Exception:  # pragma: no cover — alert hook must not crash the loop
+                    logger.exception(
+                        "HeartbeatScheduler: on_critical callback raised"
+                    )
+
     async def tick(self) -> None:
         """Run one heartbeat attempt. Always returns; never raises.
 
@@ -215,7 +257,7 @@ class HeartbeatScheduler:
         except OnChainPendingError as exc:
             # Concerning but not fatal — receipt unknown means the tx
             # may or may not have landed. Next tick will resubmit.
-            self.failure_count += 1
+            self._note_failure()
             logger.warning(
                 "heartbeat tx pending (receipt unknown): %s; will retry "
                 "next tick (heartbeat is idempotent)",
@@ -223,13 +265,13 @@ class HeartbeatScheduler:
             )
             return
         except BroadcastFailedError as exc:
-            self.failure_count += 1
+            self._note_failure()
             logger.info(
                 "heartbeat broadcast failed: %s; will retry next tick", exc,
             )
             return
         except OnChainRevertedError as exc:
-            self.failure_count += 1
+            self._note_failure()
             logger.warning(
                 "heartbeat reverted unexpectedly (recordHeartbeat has no "
                 "real revert path): %s",
@@ -237,11 +279,12 @@ class HeartbeatScheduler:
             )
             return
         except Exception:  # pragma: no cover — defensive
-            self.failure_count += 1
+            self._note_failure()
             logger.exception("heartbeat tick failed with unexpected exception")
             return
 
         self.success_count += 1
+        self.consecutive_failures = 0  # sp939 — forward progress; clear the streak
         # Sprint 399 — only bump on actual on-chain success.
         # All failure paths above return early without
         # updating this timestamp, which is what lets ops
