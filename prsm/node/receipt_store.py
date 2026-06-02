@@ -24,6 +24,16 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_ENTRIES = 1024
+_DEFAULT_LIST_MAX = 10000   # sp925 — cap on list_for_node_ids results
+
+
+def _receipt_list_max() -> int:
+    """sp925 — max receipts returned by list_for_node_ids (bounds the disk
+    scan reachable via the public /devices/earnings). PRSM_RECEIPT_LIST_MAX."""
+    try:
+        return max(1, int(os.environ.get("PRSM_RECEIPT_LIST_MAX", _DEFAULT_LIST_MAX)))
+    except (TypeError, ValueError):
+        return _DEFAULT_LIST_MAX
 
 
 class ReceiptStore:
@@ -126,6 +136,8 @@ class ReceiptStore:
     def list_for_node_ids(
         self,
         node_ids: "Iterable[str]",
+        *,
+        max_results: Optional[int] = None,
     ) -> "List[Dict[str, Any]]":
         """Sprint 801 — return ALL receipts whose
         ``settler_node_id`` is in ``node_ids``.
@@ -147,8 +159,14 @@ class ReceiptStore:
         if not ids:
             return []
         allowed = set(ids)
+        # sp925 — hard cap so this O(N) scan can't be amplified into a DoS via
+        # the PUBLIC, zero-cost /devices/earnings endpoint when persist_dir
+        # holds a huge receipt history. Default PRSM_RECEIPT_LIST_MAX (10000);
+        # truncation is logged (never silent).
+        if max_results is None:
+            max_results = _receipt_list_max()
 
-        # Persistence path: scan disk, uncapped.
+        # Persistence path: scan disk, capped.
         if self._persist_dir is not None:
             results: List[Dict[str, Any]] = []
             for path in self._persist_dir.glob("*.json"):
@@ -161,14 +179,23 @@ class ReceiptStore:
                     continue
                 if data.get("settler_node_id") in allowed:
                     results.append(data)
+                    if len(results) >= max_results:
+                        logger.warning(
+                            "ReceiptStore.list_for_node_ids hit cap %d — "
+                            "results truncated (raise PRSM_RECEIPT_LIST_MAX "
+                            "if the operator needs more)", max_results,
+                        )
+                        break
             return results
 
-        # In-memory fallback: scan the cache.
-        return [
-            r for r in self._cache.values()
-            if isinstance(r, dict)
-            and r.get("settler_node_id") in allowed
-        ]
+        # In-memory fallback: scan the cache (also capped).
+        out: List[Dict[str, Any]] = []
+        for r in self._cache.values():
+            if isinstance(r, dict) and r.get("settler_node_id") in allowed:
+                out.append(r)
+                if len(out) >= max_results:
+                    break
+        return out
 
     def list(
         self,

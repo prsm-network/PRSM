@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
@@ -28,6 +29,24 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_MAX_RESPONSE_CHARS = 65536   # sp925 — per-record response cap
+
+
+def _max_response_chars() -> int:
+    """sp925 — cap on the persisted response field (bounds per-record memory +
+    disk; a single job's response is otherwise unbounded). Env override:
+    PRSM_JOB_HISTORY_MAX_RESPONSE_BYTES (chars)."""
+    try:
+        return max(
+            1,
+            int(os.environ.get(
+                "PRSM_JOB_HISTORY_MAX_RESPONSE_BYTES",
+                _DEFAULT_MAX_RESPONSE_CHARS,
+            )),
+        )
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_RESPONSE_CHARS
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -274,6 +293,18 @@ class JobHistoryStore:
         recently-used; new inserts may trigger LRU eviction of the
         oldest entry. When persist_dir is set, the record is also
         written through to disk."""
+        # sp925 — bound the response field so a single job's (untrusted,
+        # provider/executor-supplied) response can't bloat memory + the .json
+        # file unboundedly. Truncate with a marker; the cap is configurable.
+        resp = record.response
+        if resp is not None:
+            cap = _max_response_chars()
+            if len(resp) > cap:
+                record.response = (
+                    resp[:cap]
+                    + f"...[truncated {len(resp) - cap} chars — raise "
+                    f"PRSM_JOB_HISTORY_MAX_RESPONSE_BYTES to retain more]"
+                )
         if record.job_id in self._records:
             # Overwrite + promote.
             self._records[record.job_id] = record
