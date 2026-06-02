@@ -32,6 +32,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import AsyncIterator, Dict, List, Optional, Tuple, Union
 
 import pytest
@@ -64,9 +65,23 @@ class _FakeEscrow:
 
     async def create_escrow(self, *, job_id, amount, requester_id):
         self.create_count += 1
-        return {"job_id": job_id, "amount": amount}
+        # sp952 — the real create_escrow returns an EscrowEntry OBJECT; the
+        # streaming settle path reads getattr(escrow_entry, "amount", ...) to size
+        # the credit-policy decision. A plain dict has no .amount attribute, so
+        # getattr fell back to 0 -> the policy released nothing -> the escrow was
+        # never settled (assert release_count==1 failed). Return an object.
+        return SimpleNamespace(job_id=job_id, amount=amount, requester_id=requester_id)
 
-    async def release_escrow(self, *, job_id, provider_id):
+    async def release_escrow(self, job_id, provider_id, consensus_reached=True, partial_amount=None, **_kw):
+        # sp952 — match the REAL PaymentEscrow.release_escrow signature
+        # (positional). settle_inference_receipt calls release_escrow(job_id,
+        # operator_id) positionally; the prior keyword-only mock raised TypeError
+        # on that path (caught upstream), leaving the escrow unreleased.
+        self.release_count += 1
+
+    async def release_escrow_split(self, job_id, splits, consensus_reached=True, **_kw):
+        # sp952 — mirror the real split-release API (positional); the receipt-
+        # aware settle uses it when a partial release+refund decision applies.
         self.release_count += 1
 
     async def refund_escrow(self, job_id, reason):
