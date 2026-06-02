@@ -138,6 +138,7 @@ async def test_handle_announce_parses_hardware_profile_into_peer_info():
     )
     peer = MagicMock()
     peer.address = "10.0.0.5:9001"
+    peer.peer_id = "peerA"   # sp937 — direct announce from the handshake-authenticated peer
     await pd._handle_announce(msg, peer)
     info = pd.known_peers["peerA"]
     assert info.hardware_profile == profile
@@ -169,6 +170,7 @@ async def test_handle_announce_tolerates_missing_hardware_profile():
     )
     peer = MagicMock()
     peer.address = "10.0.0.6:9001"
+    peer.peer_id = "peerLegacy"   # sp937 — direct announce from the handshake-authenticated peer
     await pd._handle_announce(msg, peer)
     assert pd.known_peers["peerLegacy"].hardware_profile is None
 

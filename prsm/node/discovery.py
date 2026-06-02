@@ -8,15 +8,21 @@ and periodically share their own presence on the network.
 """
 
 import asyncio
+import base64
 import collections
+import hashlib
+import json
 import logging
 import os
 import random
 import time
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+
+from prsm.node.identity import verify_signature
 
 from prsm.node.transport import (
     MSG_GOSSIP,
@@ -150,6 +156,61 @@ def _rewrite_co_located_address(
         return peer_address
 
     return f"127.0.0.1:{peer_port}"
+
+
+# ── sp937: authenticated discovery announces ──────────────────────────────
+# Discovery announces are MSG_GOSSIP, which sp731 excludes from sender_id
+# re-binding, and there is no per-message signature check — so a gossip
+# announce's `sender_id` is attacker-controlled. The handlers keyed known_peers
+# on it, letting a peer forge `sender_id=victim` + a malicious address to poison
+# the routing table (eclipse). An announce now carries a self-verifying
+# attestation (node_id == sha256(pubkey)[:32], plus a signature over the
+# content); the handler trusts the claimed node_id only if it verifies, else
+# accepts it only when it equals the handshake-authenticated peer.peer_id, else
+# drops it. Mirrors the sp934 gossip-origin fix.
+
+_ANNOUNCE_ATTEST_KEYS = ("origin_pubkey", "origin_sig")
+
+
+def _announce_signing_bytes(node_id: str, payload: Dict[str, Any], nonce: str) -> bytes:
+    """Canonical bytes an announcer signs / a receiver verifies. Covers the full
+    announce content (minus the attestation fields) bound to node_id + nonce, so
+    a relayer cannot tamper with the advertised address/capabilities."""
+    content = {k: v for k, v in payload.items() if k not in _ANNOUNCE_ATTEST_KEYS}
+    return json.dumps(
+        {"node_id": node_id, "payload": content, "nonce": nonce},
+        sort_keys=True, separators=(",", ":"),
+    ).encode()
+
+
+def _attest_announce_payload(identity, payload: Dict[str, Any], nonce: str) -> None:
+    """Add a self-verifying origin attestation to a discovery announce payload."""
+    payload["origin_pubkey"] = identity.public_key_b64
+    payload["origin_sig"] = identity.sign(
+        _announce_signing_bytes(identity.node_id, payload, nonce)
+    )
+
+
+def _authenticated_announce_node_id(msg: "P2PMessage", peer: "PeerConnection") -> Optional[str]:
+    """Authenticated identity for a discovery announce, or None to DROP it."""
+    claimed = msg.sender_id
+    pubkey = msg.payload.get("origin_pubkey", "")
+    sig = msg.payload.get("origin_sig", "")
+    if pubkey and sig:
+        try:
+            derived = hashlib.sha256(base64.b64decode(pubkey)).hexdigest()[:32]
+            if derived == claimed and verify_signature(
+                pubkey, _announce_signing_bytes(claimed, msg.payload, msg.nonce), sig
+            ):
+                return claimed
+        except Exception:
+            pass
+    # Not attested: accept only a DIRECT announce from the handshake-
+    # authenticated peer; never the raw, unverified gossip sender_id.
+    authenticated_peer = getattr(peer, "peer_id", None)
+    if authenticated_peer and claimed == authenticated_peer:
+        return claimed
+    return None
 
 
 class PeerDiscovery:
@@ -680,10 +741,15 @@ class PeerDiscovery:
         # for peers that don't parse this field yet.
         if self._local_hardware_profile is not None:
             payload["hardware_profile"] = self._local_hardware_profile
+        # sp937 — sign the announce so receivers can authenticate our node_id
+        # (and reject forgeries) across multi-hop relay.
+        nonce = uuid.uuid4().hex[:16]
+        _attest_announce_payload(self.transport.identity, payload, nonce)
         msg = P2PMessage(
             msg_type=MSG_GOSSIP,
             sender_id=self.transport.identity.node_id,
             payload=payload,
+            nonce=nonce,
         )
         return await self.transport.gossip(msg, fanout=3)
 
@@ -879,6 +945,11 @@ class PeerDiscovery:
 
     async def _handle_announce(self, msg: P2PMessage, peer: PeerConnection) -> None:
         """Record a peer announcement."""
+        # sp937 — authenticate the announcer's node_id. A forged/unauthenticated
+        # gossip sender_id is dropped so it can't poison the routing table.
+        node_id = _authenticated_announce_node_id(msg, peer)
+        if node_id is None:
+            return
         # Sprint 570 F28 defense-in-depth: ignore 0.0.0.0:* from
         # legacy pre-sprint-570 peers. The bind-to-all listen host
         # is not a routable advertise value — falling back to
@@ -893,8 +964,8 @@ class PeerDiscovery:
             address = peer.address
         else:
             address = raw_address
-        self.known_peers[msg.sender_id] = PeerInfo(
-            node_id=msg.sender_id,
+        self.known_peers[node_id] = PeerInfo(
+            node_id=node_id,
             address=address,
             display_name=msg.payload.get("display_name", ""),
             roles=msg.payload.get("roles", []),
@@ -1003,7 +1074,10 @@ class PeerDiscovery:
         Updates the peer's capability information in the known_peers dict.
         This allows late-joining nodes to receive capability updates.
         """
-        node_id = msg.sender_id
+        # sp937 — authenticate the announcer's node_id (see _handle_announce).
+        node_id = _authenticated_announce_node_id(msg, peer)
+        if node_id is None:
+            return
         capabilities = msg.payload.get("capabilities", [])
         supported_backends = msg.payload.get("supported_backends", [])
         gpu_available = msg.payload.get("gpu_available", False)
@@ -1054,16 +1128,21 @@ class PeerDiscovery:
         This should be called on node startup and when capabilities change.
         Returns the number of peers the announcement was sent to.
         """
+        cap_payload = {
+            "subtype": DISCOVERY_CAPABILITY_ANNOUNCE,
+            "node_id": self.transport.identity.node_id,
+            "capabilities": self._local_capabilities,
+            "supported_backends": self._local_backends,
+            "gpu_available": self._local_gpu_available,
+        }
+        # sp937 — sign the capability announce (see announce_self).
+        nonce = uuid.uuid4().hex[:16]
+        _attest_announce_payload(self.transport.identity, cap_payload, nonce)
         msg = P2PMessage(
             msg_type=MSG_GOSSIP,
             sender_id=self.transport.identity.node_id,
-            payload={
-                "subtype": DISCOVERY_CAPABILITY_ANNOUNCE,
-                "node_id": self.transport.identity.node_id,
-                "capabilities": self._local_capabilities,
-                "supported_backends": self._local_backends,
-                "gpu_available": self._local_gpu_available,
-            },
+            payload=cap_payload,
+            nonce=nonce,
         )
         logger.info(
             f"Announcing capabilities: caps={self._local_capabilities}, "

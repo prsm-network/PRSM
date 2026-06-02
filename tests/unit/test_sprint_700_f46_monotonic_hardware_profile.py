@@ -207,6 +207,7 @@ async def test_handle_announce_replaces_authoritatively():
     )
     p = MagicMock()
     p.address = "146.235.193.143:9001"
+    p.peer_id = "lambda"   # sp937 — direct announce from the handshake-authenticated peer
     await pd._handle_announce(msg, p)
     # Authoritative announce REPLACES (latest write wins)
     assert pd.known_peers["lambda"].hardware_profile == new_profile
