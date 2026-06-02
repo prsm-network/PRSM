@@ -24,8 +24,10 @@ from typing import Any, Dict, List, Optional, Tuple
 # BitTorrent torrent (artefacts persist on disk).
 _DEFAULT_MANIFEST_CACHE_MAX = 4096
 
+from cryptography.exceptions import InvalidTag
+
 from prsm.storage.blob_store import BlobStore
-from prsm.storage.exceptions import ContentNotFoundError
+from prsm.storage.exceptions import ContentNotFoundError, ManifestError
 from prsm.storage.key_manager import KeyManager
 from prsm.storage.models import ContentHash, KeyShare, ShardManifest
 from prsm.storage.shard_engine import ShardEngine
@@ -221,9 +223,31 @@ class ContentStore:
         return content_hash, manifest, ciphertext, key_shares
 
     def _decode_manifest(self, ciphertext: bytes, key_shares: List[KeyShare]) -> ShardManifest:
-        """Reconstruct key from *key_shares* and decrypt the manifest ciphertext."""
-        manifest_bytes = self.key_manager.decrypt_manifest(ciphertext, key_shares)
-        return ShardManifest.from_json(manifest_bytes.decode("utf-8"))
+        """Reconstruct key from *key_shares* and decrypt the manifest ciphertext.
+
+        sp922 (content data-plane review) — a failure here means the manifest is
+        corrupt/tampered or the key shares are wrong/insufficient. Surface it as
+        a TYPED ManifestError with a clear message instead of letting a raw
+        cryptography.InvalidTag (AEAD tag mismatch) or UnicodeDecodeError/JSON
+        error propagate — callers previously logged those as cryptic,
+        hard-to-triage failures indistinguishable from "content not found".
+        Behaviour is otherwise unchanged (callers still fall back / return
+        not-found for availability); only the surfaced error is now legible.
+        """
+        try:
+            manifest_bytes = self.key_manager.decrypt_manifest(ciphertext, key_shares)
+        except InvalidTag as exc:
+            raise ManifestError(
+                "manifest decryption failed (AEAD tag mismatch) — corrupt or "
+                "tampered ciphertext, or wrong/insufficient key shares"
+            ) from exc
+        try:
+            return ShardManifest.from_json(manifest_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ManifestError(
+                f"manifest decode failed — decrypted bytes are not valid "
+                f"UTF-8 JSON (corrupt manifest): {exc}"
+            ) from exc
 
     # ------------------------------------------------------------------
     # Public local API
