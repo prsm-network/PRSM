@@ -33,12 +33,12 @@ pragma solidity ^0.8.22;
 ///   ReentrancyGuard) omitted — they don't affect the
 ///   value-range arithmetic.
 ///
-///   StorageSlashing.setHeartbeatGrace → contracts/contracts/
-///     StorageSlashing.sol:258-267
-///   StorageSlashing.setSlashGraceMultiplier → contracts/contracts/
-///     StorageSlashing.sol:272-286
-///   StakeBond.setUnbondDelay         → contracts/contracts/
-///     StakeBond.sol:464-470
+///   StorageSlashing.setHeartbeatGrace →
+///     contracts/contracts/StorageSlashing.sol:258-267
+///   StorageSlashing.setSlashGraceMultiplier →
+///     contracts/contracts/StorageSlashing.sol:272-286
+///   StakeBond.setUnbondDelay →
+///     contracts/contracts/StakeBond.sol:464-470
 
 contract StorageSlashingBounded {
     uint256 public constant MIN_HEARTBEAT_GRACE = 1 hours;
