@@ -1227,34 +1227,46 @@ class OnChainFTNSLedger:
                 import asyncio
                 loop = asyncio.get_running_loop()
 
-                # Use "pending" block so concurrent txs under the shared
-                # FTNS_WALLET_PRIVATE_KEY (this ledger + RoyaltyDistributorClient,
-                # which locks independently) don't collide on nonce. Matches the
-                # pattern in royalty_distributor.py:215.
-                nonce = await loop.run_in_executor(
-                    None,
-                    lambda: self.w3.eth.get_transaction_count(
-                        self._connected_address, "pending"
-                    ),
-                )
+                # sp931 — serialize the nonce-fetch→sign→send on the PROCESS-WIDE
+                # per-account lock. The "pending" block alone does NOT prevent a
+                # collision: a co-resident client signing from the same
+                # FTNS_WALLET_PRIVATE_KEY (RoyaltyDistributorClient, StakeManager,
+                # …) locking independently reads the SAME "pending" nonce and
+                # broadcasts a colliding tx that is silently dropped ("nonce too
+                # low"). The registry hands every such client the SAME
+                # threading.Lock for this account. Acquire it OFF the event loop
+                # (it's a blocking lock) and hold it ONLY across nonce→send — NOT
+                # the multi-second receipt wait below.
+                from prsm.economy.web3.tx_lock_registry import TX_LOCK_REGISTRY
+                tx_lock = TX_LOCK_REGISTRY.get_lock(self._connected_address)
+                await loop.run_in_executor(None, tx_lock.acquire)
+                try:
+                    nonce = await loop.run_in_executor(
+                        None,
+                        lambda: self.w3.eth.get_transaction_count(
+                            self._connected_address, "pending"
+                        ),
+                    )
 
-                # Build tx
-                tx = {
-                    "chainId": self.chain_id,
-                    "nonce": nonce,
-                    "gasPrice": estimate_gas_price(self.w3),
-                    "gas": 100000,
-                    "to": self.contract_address,
-                    "value": 0,
-                    "data": self._token.functions.transfer(
-                        to_checksum_address(to_address), amount_wei
-                    )._encode_transaction_data(),
-                }
+                    # Build tx
+                    tx = {
+                        "chainId": self.chain_id,
+                        "nonce": nonce,
+                        "gasPrice": estimate_gas_price(self.w3),
+                        "gas": 100000,
+                        "to": self.contract_address,
+                        "value": 0,
+                        "data": self._token.functions.transfer(
+                            to_checksum_address(to_address), amount_wei
+                        )._encode_transaction_data(),
+                    }
 
-                signed = self.w3.eth.account.sign_transaction(tx, self._account.key)
-                tx_hash = await loop.run_in_executor(
-                    None, self.w3.eth.send_raw_transaction, signed.raw_transaction
-                )
+                    signed = self.w3.eth.account.sign_transaction(tx, self._account.key)
+                    tx_hash = await loop.run_in_executor(
+                        None, self.w3.eth.send_raw_transaction, signed.raw_transaction
+                    )
+                finally:
+                    tx_lock.release()
 
                 tx_record.tx_hash = tx_hash.hex()
                 tx_record.status = "pending"

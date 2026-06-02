@@ -164,7 +164,17 @@ class RoyaltyDistributorClient:
 
         # Phase 1.1 Task 5: lock makes the approve+distribute pair atomic
         # per client, and serializes nonce reads under concurrent callers.
-        self._tx_lock = threading.Lock()
+        # sp931 — use the PROCESS-WIDE per-account lock so every client signing
+        # from this same account (OnChainFTNSLedger, StakeManager, …) serializes
+        # its nonce-fetch→sign→send through the SAME lock; two independent locks
+        # let both read the same "pending" nonce and broadcast a colliding tx
+        # that is silently dropped ("nonce too low"). Falls back to a private
+        # lock only when no signing account is configured.
+        if self._account is not None:
+            from prsm.economy.web3.tx_lock_registry import TX_LOCK_REGISTRY
+            self._tx_lock = TX_LOCK_REGISTRY.get_lock(self._account.address)
+        else:
+            self._tx_lock = threading.Lock()
 
     @property
     def address(self) -> Optional[str]:
