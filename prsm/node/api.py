@@ -3977,7 +3977,12 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             )
             if from_block == 0:
                 latest = w3.eth.block_number
-                start = max(0, latest - lookback_blocks)
+                # sp932 — inclusive range, so subtract (lookback_blocks - 1) to
+                # scan EXACTLY lookback_blocks. The prior `latest - lookback_blocks`
+                # spanned lookback_blocks+1 blocks, which (at the 9000 default)
+                # exceeded scan_inbound_transfers_chunked's 9000-block window and
+                # forced a spurious extra boundary chunk.
+                start = max(0, latest - lookback_blocks + 1)
                 end = latest
             else:
                 start = from_block
@@ -4038,7 +4043,12 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             )
             if from_block == 0:
                 latest = w3.eth.block_number
-                start = max(0, latest - lookback_blocks)
+                # sp932 — inclusive range, so subtract (lookback_blocks - 1) to
+                # scan EXACTLY lookback_blocks. The prior `latest - lookback_blocks`
+                # spanned lookback_blocks+1 blocks, which (at the 9000 default)
+                # exceeded scan_inbound_transfers_chunked's 9000-block window and
+                # forced a spurious extra boundary chunk.
+                start = max(0, latest - lookback_blocks + 1)
                 end = latest
             else:
                 start = from_block

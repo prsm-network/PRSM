@@ -297,10 +297,20 @@ class TestFullToolSuite:
 
     @pytest.mark.asyncio
     async def test_stake_handler(self):
+        # sp932 — refreshed for the sp904/sp906 staking model: staking confers
+        # UTILITY benefits (lock-based service discount + dispatch priority), NOT
+        # token yield, so the old ProsumerTier "DEDICATED"/"1.5x yield" preview is
+        # gone. With no lock the preview says so; with a lock it shows the benefit.
         from prsm.mcp_server import handle_prsm_stake
-        result = await handle_prsm_stake({"amount": 1000})
-        assert "DEDICATED" in result
-        assert "1.5" in result
+
+        no_lock = await handle_prsm_stake({"amount": 1000})
+        assert "Staking Preview" in no_lock
+        assert "no utility benefit" in no_lock
+
+        locked = await handle_prsm_stake({"amount": 1000, "lock_period_days": 365})
+        assert "Staking Preview" in locked
+        assert "discount" in locked
+        assert "priority" in locked
 
     @pytest.mark.asyncio
     async def test_privacy_status_handler(self):

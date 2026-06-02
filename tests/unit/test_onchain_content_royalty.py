@@ -151,8 +151,14 @@ def test_failed_tx_doesnt_break_batch():
         serving_node_address="0x" + "1" * 40,
         gross_per_shard_wei=1,
     )
+    # sp932 — sp918 status vocabulary: an UNTYPED exception (here a bare
+    # RuntimeError, not a BroadcastFailedError) yields "error", NOT "failed".
+    # "error" is the fail-safe — the chain state is unknown so the idempotency
+    # claim is kept (excluded from keys_to_release) to avoid a double-pay; only
+    # a typed BroadcastFailedError ("nothing reached the chain") yields "failed"
+    # and is safe to release. The batch still continues past the failure.
     assert [r.status for r in results] == [
-        "sent", "failed", "sent",
+        "sent", "error", "sent",
     ]
     assert "rpc down" in results[1].error
 

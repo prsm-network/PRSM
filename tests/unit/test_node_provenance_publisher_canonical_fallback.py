@@ -43,28 +43,35 @@ class TestBuildProvenanceClientCanonicalFallback:
             assert _build_provenance_client_or_none() is None
 
     def test_falls_back_to_canonical_when_network_set(self):
-        """Sprint 146 — operator declared PRSM_NETWORK=mainnet +
-        opted into on-chain provenance → builder pulls canonical
-        ProvenanceRegistry address from networks.py.
-
-        Mainnet `provenance_registry` field still pins V1 for legacy
-        Item 7 callers; V2 is surfaced separately via the
-        `provenance_registry_v2` field. Match networks.py exactly.
+        """Sprint 146 + sp932 — operator declared PRSM_NETWORK=mainnet + opted
+        into on-chain provenance with no explicit address → builder pulls the
+        canonical address from networks.py. The canonical fallback now PREFERS
+        the V2 registry when one is wired (node.py:200-202), building a
+        ProvenanceRegistryV2Client; the V1 `provenance_registry` field is the
+        legacy fallback used only when no V2 address is present. _resolve_endpoints
+        is mocked so the assertion isn't pinned to a live networks.py value.
         """
-        canonical_v1 = "0xdF470BFa9eF310B196801D5105468515d0069915"
+        v2_addr = "0x" + "a2" * 20
         with patch(
-            "prsm.economy.web3.provenance_registry.ProvenanceRegistryClient"
-        ) as MockClient, patch.dict(os.environ, {
+            "prsm.node.node._resolve_endpoints"
+        ) as MockResolve, patch(
+            "prsm.economy.web3.provenance_registry_v2.ProvenanceRegistryV2Client"
+        ) as MockV2, patch.dict(os.environ, {
             "PRSM_ONCHAIN_PROVENANCE": "1",
             "PRSM_NETWORK": "mainnet",
             "FTNS_WALLET_PRIVATE_KEY": "0x" + "01" * 32,
         }, clear=False):
             os.environ.pop("PRSM_PROVENANCE_REGISTRY_ADDRESS", None)
-            MockClient.return_value = MagicMock()
+            MockResolve.return_value = MagicMock(
+                provenance_registry_v2=v2_addr,
+                provenance_registry="0x" + "b1" * 20,
+                rpc_url="https://rpc.example",
+            )
+            MockV2.return_value = MagicMock()
             client = _build_provenance_client_or_none()
             assert client is not None
-            kwargs = MockClient.call_args.kwargs
-            assert kwargs["contract_address"] == canonical_v1
+            kwargs = MockV2.call_args.kwargs
+            assert kwargs["contract_address"] == v2_addr
 
     def test_returns_none_when_opt_in_flag_unset(self):
         """Sprint 146 invariant: even with PRSM_NETWORK + canonical

@@ -356,37 +356,44 @@ class TestBindEndpoint:
         assert r.status_code == 400
         assert r.json()["detail"]["error"] == "binding_signature_invalid"
 
-    def test_bind_conflict_returns_409(self, client, alice, services):
-        # Pre-bind alice's wallet to node_X.
-        existing_node_id = "a" * 32
-        existing_issued = "2026-04-27T00:00:00Z"
-        existing_msg = build_binding_message(
-            alice.address, existing_node_id, existing_issued
-        )
-        existing_sig = _sign_message(existing_msg, alice)
+    def test_bind_conflict_returns_409(self, client, alice, bob, services):
+        # sp932 — refreshed for the Sprint 786 multi-device contract. A wallet
+        # binding to a SECOND node is now allowed (wallet→node is 1:N), so the
+        # still-load-bearing 409 conflict is NODE-side: a different wallet may
+        # not bind a node_id already claimed by another wallet (otherwise an
+        # operator could steal another node's identity).
+        node_a = "a" * 32
+        issued_a = "2026-04-27T00:00:00Z"
         services.binding_service.bind(
             wallet_address=alice.address,
-            node_id_hex=existing_node_id,
-            signature=existing_sig,
-            issued_at_iso=existing_issued,
+            node_id_hex=node_a,
+            signature=_sign_message(build_binding_message(alice.address, node_a, issued_a), alice),
+            issued_at_iso=issued_a,
         )
 
-        # Now attempt to bind alice's wallet to a DIFFERENT node_Y.
-        # We bypass /siwe/verify (which would resolve to the existing
-        # node_id) and POST directly.
-        new_node_id = "b" * 32
-        new_issued = "2026-04-27T00:01:00Z"
-        new_msg = build_binding_message(
-            alice.address, new_node_id, new_issued
-        )
-        new_sig = _sign_message(new_msg, alice)
-        r = client.post(
+        # Sprint 786: alice binding a DIFFERENT node (multi-device) SUCCEEDS.
+        node_b = "b" * 32
+        issued_b = "2026-04-27T00:01:00Z"
+        ok = client.post(
             "/api/v1/auth/wallet/bind",
             json={
                 "wallet_address": alice.address,
-                "node_id_hex": new_node_id,
-                "signature": new_sig,
-                "issued_at": new_issued,
+                "node_id_hex": node_b,
+                "signature": _sign_message(build_binding_message(alice.address, node_b, issued_b), alice),
+                "issued_at": issued_b,
+            },
+        )
+        assert ok.status_code == 200, ok.text
+
+        # But BOB binding alice's node_a is a node-side conflict → 409.
+        issued_c = "2026-04-27T00:02:00Z"
+        r = client.post(
+            "/api/v1/auth/wallet/bind",
+            json={
+                "wallet_address": bob.address,
+                "node_id_hex": node_a,
+                "signature": _sign_message(build_binding_message(bob.address, node_a, issued_c), bob),
+                "issued_at": issued_c,
             },
         )
         assert r.status_code == 409
