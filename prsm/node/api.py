@@ -1180,6 +1180,30 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
     # disables the gate (pre-742 behavior). Non-int safely
     # defaults to 1 MiB.
     from starlette.responses import JSONResponse as _BodyLimitJSON
+    # sp947 — routes that enforce their OWN, larger body cap in-handler. The
+    # generic 1 MiB guard below would SHADOW these (rejecting an over-1-MiB
+    # upload at the middleware with the wrong PRSM_HTTP_MAX_BODY_BYTES message
+    # before the handler's canonical PRSM_MAX_UPLOAD_BYTES / *_SHARD_* 413 — or
+    # a legitimate 200 — can fire). For these paths the ceiling is raised to a
+    # coarse multiple of the route's own configured cap: enough that an over-cap
+    # request still REACHES the handler for its canonical error, while a gross
+    # multi-GB body is still bounded here. Every other route keeps the 1 MiB
+    # DoS guard (sprint 742 F70) unchanged.
+    _UPLOAD_ROUTE_CAP_ENV = {
+        "/content/upload": ("PRSM_MAX_UPLOAD_BYTES", 10 * 1024 * 1024),
+        "/content/upload/shard": ("PRSM_MAX_SHARD_UPLOAD_BYTES", 100 * 1024 * 1024),
+    }
+
+    def _positive_int_env(_os, name, default):
+        raw = _os.environ.get(name, "").strip()
+        if not raw:
+            return default
+        try:
+            v = int(raw)
+        except (TypeError, ValueError):
+            return default
+        return v if v > 0 else default
+
     @app.middleware("http")
     async def http_body_size_limit_middleware(request, call_next):
         import os as _os
@@ -1192,6 +1216,16 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         else:
             _max_bytes = 1024 * 1024
         if _max_bytes > 0:
+            # sp947 — honor an upload route's own (larger) cap so the generic
+            # guard never pre-empts the handler's canonical 413. Keeps the
+            # larger of (operator's global cap, route budget); leaves the
+            # global cap authoritative for all non-upload routes. The "0 =
+            # disabled" semantics are preserved (this block is gated on >0).
+            _route_cap_env = _UPLOAD_ROUTE_CAP_ENV.get(request.url.path)
+            if _route_cap_env is not None:
+                _route_budget = _positive_int_env(_os, *_route_cap_env) * 2 + 1024 * 1024
+                if _route_budget > _max_bytes:
+                    _max_bytes = _route_budget
             cl_header = request.headers.get("content-length", "")
             if cl_header:
                 try:
