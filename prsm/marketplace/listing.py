@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import os
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -28,6 +29,27 @@ from typing import Any, Dict, List, Optional
 from eth_utils import keccak
 
 logger = logging.getLogger(__name__)
+
+# sp926 — implausibility ceiling on a self-reported capacity claim. A single
+# node cannot realistically serve more than this many shards/sec; a claim above
+# it is rejected at ingestion so it can't game the priority-boost ranking.
+# Generous default (env-tunable) — the point is to reject the absurd, not to
+# tightly bound legitimate high-end operators.
+_DEFAULT_MAX_LISTING_CAPACITY = 1_000_000.0
+
+
+def _max_listing_capacity() -> float:
+    """sp926 — upper bound on capacity_shards_per_sec. PRSM_MAX_LISTING_CAPACITY_SHARDS_PER_SEC."""
+    try:
+        return max(
+            1.0,
+            float(os.environ.get(
+                "PRSM_MAX_LISTING_CAPACITY_SHARDS_PER_SEC",
+                _DEFAULT_MAX_LISTING_CAPACITY,
+            )),
+        )
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_LISTING_CAPACITY
 
 
 def build_listing_signing_payload(
@@ -180,6 +202,17 @@ def verify_listing(listing: ProviderListing) -> bool:
     if listing.ttl_seconds < 0 or listing.price_per_shard_ftns < 0:
         logger.warning(
             f"listing {listing.listing_id!r} rejected: negative ttl or price"
+        )
+        return False
+
+    # sp926 — capacity sanity. A negative capacity is nonsensical (and would
+    # make the selection cap_norm negative); an implausibly large one is a
+    # ranking-gaming claim. Bound it at ingestion.
+    cap_max = _max_listing_capacity()
+    if listing.capacity_shards_per_sec < 0 or listing.capacity_shards_per_sec > cap_max:
+        logger.warning(
+            f"listing {listing.listing_id!r} rejected: capacity "
+            f"{listing.capacity_shards_per_sec} out of bounds [0, {cap_max}]"
         )
         return False
 

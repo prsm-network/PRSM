@@ -429,9 +429,14 @@ class MarketplaceOrchestrator:
         requests. The influence is bounded (normalized, scaled by boost).
         """
         tier_score = {"open": 1, "standard": 2, "premium": 3, "critical": 4}
-        max_cap = max(
-            (l.capacity_shards_per_sec for l in listings), default=0.0,
-        )
+        # sp926 — defensively clamp capacity to >= 0 in the boost math so a
+        # negative (or otherwise unvalidated) capacity that slipped past
+        # verify_listing can't produce a negative/scrambled cap_norm. The
+        # upper-bound check lives in verify_listing (ingestion).
+        def _cap(l: "ProviderListing") -> float:
+            return max(float(l.capacity_shards_per_sec), 0.0)
+
+        max_cap = max((_cap(l) for l in listings), default=0.0)
 
         def score(listing: ProviderListing) -> Tuple[float, str]:
             tier = tier_score.get(listing.stake_tier, 0)
@@ -440,7 +445,7 @@ class MarketplaceOrchestrator:
             price = max(listing.price_per_shard_ftns, 1e-9)
             base = tier / price
             if priority_boost > 0 and max_cap > 0:
-                cap_norm = listing.capacity_shards_per_sec / max_cap
+                cap_norm = _cap(listing) / max_cap
                 base = base * (1.0 + priority_boost * cap_norm)
             # Negate because we'll sort ascending by (score, then
             # ascending by provider_id — stable tiebreak).
