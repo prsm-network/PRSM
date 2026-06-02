@@ -369,10 +369,22 @@ class ComputeProvider:
         confirmed_provider = data.get("provider_id", "")
 
         pending = getattr(self, '_pending_confirm', {})
-        job = pending.pop(job_id, None)
+        job = pending.get(job_id)
         if not job:
             return
 
+        # sp935 — only the job's REQUESTER may confirm it. `origin` is the
+        # sp934-authenticated author of the confirm; without this check any peer
+        # could confirm (or, pre-sp934, redirect) another requester's job.
+        # Peek before popping so a forged confirm can't consume a pending job.
+        if origin != job.requester_id:
+            logger.warning(
+                "Job %s: confirm from %s is not the requester %s — ignoring",
+                job_id[:8], str(origin)[:8], str(job.requester_id)[:8],
+            )
+            return
+
+        pending.pop(job_id, None)
         if confirmed_provider == self.identity.node_id:
             # We won — start executing
             self.active_jobs[job_id] = job
@@ -389,8 +401,23 @@ class ComputeProvider:
         """Handle job cancellation from the requester."""
         job_id = data.get("job_id", "")
 
-        # Remove from pending confirm queue
         pending = getattr(self, '_pending_confirm', {})
+        job = pending.get(job_id) or self.active_jobs.get(job_id)
+        if not job:
+            return
+
+        # sp935 — only the job's REQUESTER may cancel it. `origin` is the
+        # sp934-authenticated author of the cancel; without this check any peer
+        # could cancel another requester's in-flight job (free DoS on the
+        # provider's work + payment).
+        if origin != job.requester_id:
+            logger.warning(
+                "Job %s: cancel from %s is not the requester %s — ignoring",
+                job_id[:8], str(origin)[:8], str(job.requester_id)[:8],
+            )
+            return
+
+        # Remove from pending confirm queue
         pending.pop(job_id, None)
 
         # If the job is active, mark it cancelled (can't stop mid-execution
