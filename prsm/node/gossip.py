@@ -8,14 +8,87 @@ and other network-wide announcements with deduplication and TTL.
 """
 
 import asyncio
+import base64
 import collections
+import hashlib
+import json
 import logging
 import time
+import uuid
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
+from prsm.node.identity import verify_signature
 from prsm.node.transport import MSG_GOSSIP, MSG_PEER_CONNECTED, P2PMessage, PeerConnection, WebSocketTransport
 
 logger = logging.getLogger(__name__)
+
+
+# ── sp934: authenticated gossip origin ────────────────────────────────────
+# The transport authenticates the immediate sender_id (sp731 F64), but the
+# `origin` (original author, preserved across multi-hop relay) was an untrusted
+# payload field that application handlers used for authorization. The author now
+# signs an attestation over the message's identifying fields and ships its
+# pubkey; a receiver trusts `origin` ONLY if the pubkey hashes to it (node_id ==
+# sha256(pubkey)[:32]) AND the signature verifies — otherwise it falls back to
+# the authenticated sender_id. Self-verifying (no pubkey registry needed) and
+# relay-safe (payload + nonce are preserved when forwarding).
+
+def _gossip_origin_signing_bytes(
+    subtype: str, data: Any, origin: str, origin_time: Any, nonce: str,
+) -> bytes:
+    """Canonical bytes the origin author signs / the receiver verifies."""
+    return json.dumps(
+        {
+            "subtype": subtype,
+            "data": data,
+            "origin": origin,
+            "origin_time": origin_time,
+            "nonce": nonce,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+
+
+def build_gossip_origin_fields(
+    identity, subtype: str, data: Any, origin_time: float, nonce: str,
+) -> Dict[str, Any]:
+    """Payload fields that let a receiver authenticate `identity` as the origin."""
+    signed = _gossip_origin_signing_bytes(subtype, data, identity.node_id, origin_time, nonce)
+    return {
+        "origin": identity.node_id,
+        "origin_time": origin_time,
+        "origin_pubkey": identity.public_key_b64,
+        "origin_sig": identity.sign(signed),
+    }
+
+
+def _authenticate_origin(payload: Dict[str, Any], nonce: str, fallback_sender_id: str) -> str:
+    """Return the AUTHENTICATED origin for a gossip message.
+
+    Trust `payload['origin']` iff its attestation (pubkey + signature) is present,
+    the pubkey hashes to the claimed node_id, and the signature verifies. Else
+    return the transport-authenticated `fallback_sender_id` — never the bare,
+    unsigned payload origin.
+    """
+    claimed = payload.get("origin")
+    pubkey = payload.get("origin_pubkey", "")
+    sig = payload.get("origin_sig", "")
+    if not (claimed and pubkey and sig):
+        return fallback_sender_id
+    try:
+        derived = hashlib.sha256(base64.b64decode(pubkey)).hexdigest()[:32]
+    except Exception:
+        return fallback_sender_id
+    if derived != claimed:
+        return fallback_sender_id   # pubkey does not bind to the claimed node_id
+    signed = _gossip_origin_signing_bytes(
+        payload.get("subtype", ""), payload.get("data", {}),
+        claimed, payload.get("origin_time"), nonce,
+    )
+    if verify_signature(pubkey, signed, sig):
+        return claimed
+    return fallback_sender_id
 
 _BOUNDED_GOSSIP_LABELS = {
     "heartbeat",
@@ -235,16 +308,24 @@ class GossipProtocol:
         to enable self-compute and other local operations.
         """
         self._record_publish(subtype)
+        # sp934 — sign an origin attestation so receivers can authenticate this
+        # node as the author across multi-hop relay. The nonce is generated here
+        # (rather than letting P2PMessage default it) so it can be bound into the
+        # signed payload.
+        nonce = uuid.uuid4().hex[:16]
+        origin_fields = build_gossip_origin_fields(
+            self.transport.identity, subtype, data, time.time(), nonce,
+        )
         msg = P2PMessage(
             msg_type=MSG_GOSSIP,
             sender_id=self.transport.identity.node_id,
             payload={
                 "subtype": subtype,
                 "data": data,
-                "origin": self.transport.identity.node_id,
-                "origin_time": time.time(),
+                **origin_fields,
             },
             ttl=ttl if ttl is not None else self.default_ttl,
+            nonce=nonce,
         )
         
         # Send to peers
@@ -301,7 +382,10 @@ class GossipProtocol:
         """Process incoming gossip and optionally re-propagate."""
         subtype = msg.payload.get("subtype", "")
         data = msg.payload.get("data", {})
-        origin = msg.payload.get("origin", msg.sender_id)
+        # sp934 — authenticate the origin: trust payload['origin'] only if its
+        # attestation verifies, else use the transport-authenticated sender_id.
+        # A peer can no longer impersonate another node by setting payload origin.
+        origin = _authenticate_origin(msg.payload, msg.nonce, msg.sender_id)
 
         if not subtype:
             self._record_drop("", "missing_subtype")
