@@ -9264,11 +9264,20 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 continue
 
             shard_filename = f"{dataset_id}-shard-{i:04d}"
-            uploaded = await node.content_uploader.upload(
-                content=chunk,
-                filename=shard_filename,
-                royalty_rate=royalty_rate,
-            )
+            try:
+                uploaded = await node.content_uploader.upload(
+                    content=chunk,
+                    filename=shard_filename,
+                    royalty_rate=royalty_rate,
+                )
+            except NotImplementedError as exc:
+                # sp921 (content data-plane review) — a single shard chunk that
+                # still exceeds the uploader's internal sharding threshold makes
+                # upload() raise NotImplementedError (sp491 F29 guard). Surface
+                # as 413 with the actionable detail (mirrors /content/upload at
+                # api.py:8906) instead of a generic 500. Operators should pass a
+                # larger shard_count so each chunk falls under the threshold.
+                raise HTTPException(status_code=413, detail=str(exc))
             if uploaded is None:
                 raise HTTPException(
                     status_code=502,

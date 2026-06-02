@@ -87,3 +87,24 @@ class TestShardSizeCap:
             resp = _post(_node(), b"hello world")
         # Either 200 (passes) or 502 (downstream — accepted past cap)
         assert resp.status_code != 413
+
+
+class TestShardUploadNotImplemented:
+    """Sprint 921 (content data-plane review #3) — a single shard chunk that
+    still exceeds the uploader's internal sharding threshold makes
+    content_uploader.upload() raise NotImplementedError (the sp491 F29 guard).
+    The /content/upload/shard handler must surface that as 413 with the
+    actionable detail (mirroring /content/upload at api.py:8906), NOT a generic
+    500."""
+
+    def test_chunk_over_threshold_returns_413_not_500(self):
+        node = _node()
+        node.content_uploader.upload = AsyncMock(
+            side_effect=NotImplementedError(
+                "content exceeds sharding threshold; split via a larger "
+                "shard_count or /content/upload/shard"
+            ),
+        )
+        resp = _post(node, b"hello world")
+        assert resp.status_code == 413
+        assert "threshold" in resp.json()["detail"].lower()
