@@ -66,7 +66,17 @@ contract StorageSlashing is Ownable2Step, ReentrancyGuard {
     uint256 public constant MIN_HEARTBEAT_GRACE = 1 hours;
     uint256 public constant MAX_HEARTBEAT_GRACE = 30 days;
 
+    // sp940 — a provider must miss `slashGraceMultiplier` whole grace windows
+    // (not one) before a permissionless heartbeat slash applies. This gives an
+    // honest operator a real recovery buffer for a transient RPC/connectivity
+    // blip, instead of being slashable the instant one grace window lapses (the
+    // honest-operator griefing the storage-slashing review surfaced). Bounded +
+    // governance-settable so the Foundation can tune it without another redeploy.
+    uint256 public constant MIN_SLASH_GRACE_MULTIPLIER = 1;
+    uint256 public constant MAX_SLASH_GRACE_MULTIPLIER = 10;
+
     uint256 public heartbeatGraceSeconds;
+    uint256 public slashGraceMultiplier;
     address public authorizedVerifier;
 
     // -------------------------------------------------------------------------
@@ -102,6 +112,7 @@ contract StorageSlashing is Ownable2Step, ReentrancyGuard {
         bytes32 slashId
     );
     event HeartbeatGraceUpdated(uint256 oldGrace, uint256 newGrace);
+    event SlashGraceMultiplierUpdated(uint256 oldMultiplier, uint256 newMultiplier);
     event AuthorizedVerifierUpdated(
         address indexed oldVerifier,
         address indexed newVerifier
@@ -113,6 +124,7 @@ contract StorageSlashing is Ownable2Step, ReentrancyGuard {
 
     error InvalidAddress();
     error GraceOutOfRange(uint256 grace, uint256 minAllowed, uint256 maxAllowed);
+    error MultiplierOutOfRange(uint256 multiplier, uint256 minAllowed, uint256 maxAllowed);
     error NotAuthorizedVerifier();
     error AlreadySlashed(bytes32 slashId);
     error HeartbeatNotRecorded();
@@ -143,6 +155,10 @@ contract StorageSlashing is Ownable2Step, ReentrancyGuard {
         stakeBond = IStakeBondSlasher(_stakeBond);
         authorizedVerifier = _authorizedVerifier;
         heartbeatGraceSeconds = _heartbeatGraceSeconds;
+        // sp940 — default to requiring TWO missed grace windows before a
+        // heartbeat slash (honest-operator recovery buffer). Tunable via
+        // setSlashGraceMultiplier within [MIN, MAX].
+        slashGraceMultiplier = 2;
     }
 
     // -------------------------------------------------------------------------
@@ -210,7 +226,10 @@ contract StorageSlashing is Ownable2Step, ReentrancyGuard {
         uint64 last = lastHeartbeat[provider];
         if (last == 0) revert HeartbeatNotRecorded();
 
-        uint256 expiry = uint256(last) + heartbeatGraceSeconds;
+        // sp940 — slashable only after `slashGraceMultiplier` whole grace
+        // windows have elapsed, so a single missed window (transient RPC /
+        // connectivity blip) does NOT slash an honest operator.
+        uint256 expiry = uint256(last) + heartbeatGraceSeconds * slashGraceMultiplier;
         if (block.timestamp <= expiry) {
             revert HeartbeatNotExpired(block.timestamp, expiry);
         }
@@ -245,5 +264,24 @@ contract StorageSlashing is Ownable2Step, ReentrancyGuard {
         uint256 old = heartbeatGraceSeconds;
         heartbeatGraceSeconds = newGrace;
         emit HeartbeatGraceUpdated(old, newGrace);
+    }
+
+    /// @notice sp940 — set how many whole grace windows a provider must miss
+    ///         before a permissionless heartbeat slash applies. Bounded to
+    ///         [MIN_SLASH_GRACE_MULTIPLIER, MAX_SLASH_GRACE_MULTIPLIER].
+    function setSlashGraceMultiplier(uint256 newMultiplier) external onlyOwner {
+        if (
+            newMultiplier < MIN_SLASH_GRACE_MULTIPLIER ||
+            newMultiplier > MAX_SLASH_GRACE_MULTIPLIER
+        ) {
+            revert MultiplierOutOfRange(
+                newMultiplier,
+                MIN_SLASH_GRACE_MULTIPLIER,
+                MAX_SLASH_GRACE_MULTIPLIER
+            );
+        }
+        uint256 old = slashGraceMultiplier;
+        slashGraceMultiplier = newMultiplier;
+        emit SlashGraceMultiplierUpdated(old, newMultiplier);
     }
 }

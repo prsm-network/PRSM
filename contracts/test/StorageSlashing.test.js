@@ -277,7 +277,7 @@ describe("StorageSlashing — slasher for Phase 7-storage", function () {
     it("succeeds past the grace period — caller is credited as challenger", async function () {
       await deploy();
       await slashing.connect(provider).recordHeartbeat();
-      await time.increase(DEFAULT_GRACE + 100);
+      await time.increase(2 * DEFAULT_GRACE + 100); // sp940 — slashable after 2 grace windows (default multiplier)
 
       await slashing
         .connect(anyone)
@@ -290,7 +290,7 @@ describe("StorageSlashing — slasher for Phase 7-storage", function () {
     it("prevents double-slash for the same heartbeat window", async function () {
       await deploy();
       await slashing.connect(provider).recordHeartbeat();
-      await time.increase(DEFAULT_GRACE + 100);
+      await time.increase(2 * DEFAULT_GRACE + 100); // sp940 — slashable after 2 grace windows (default multiplier)
       await slashing
         .connect(anyone)
         .slashForMissingHeartbeat(provider.address);
@@ -302,10 +302,45 @@ describe("StorageSlashing — slasher for Phase 7-storage", function () {
     it("emits HeartbeatMissingSlashed", async function () {
       await deploy();
       await slashing.connect(provider).recordHeartbeat();
-      await time.increase(DEFAULT_GRACE + 100);
+      await time.increase(2 * DEFAULT_GRACE + 100); // sp940 — slashable after 2 grace windows (default multiplier)
       await expect(
         slashing.connect(anyone).slashForMissingHeartbeat(provider.address)
       ).to.emit(slashing, "HeartbeatMissingSlashed");
+    });
+
+    // sp940 — honest-operator recovery buffer: one missed grace window is NOT
+    // slashable (default multiplier = 2), so a transient blip can't be griefed.
+    it("does NOT slash after only one grace window (sp940 buffer)", async function () {
+      await deploy();
+      expect(await slashing.slashGraceMultiplier()).to.equal(2n);
+      await slashing.connect(provider).recordHeartbeat();
+      await time.increase(DEFAULT_GRACE + 100); // past 1 window, within the 2x threshold
+      await expect(
+        slashing.connect(anyone).slashForMissingHeartbeat(provider.address)
+      ).to.be.revertedWithCustomError(slashing, "HeartbeatNotExpired");
+    });
+
+    it("setSlashGraceMultiplier retunes the threshold (1x → slashable after one window)", async function () {
+      await deploy();
+      await slashing.connect(owner).setSlashGraceMultiplier(1);
+      await slashing.connect(provider).recordHeartbeat();
+      await time.increase(DEFAULT_GRACE + 100);
+      await slashing.connect(anyone).slashForMissingHeartbeat(provider.address);
+      const rec = await mockStake.slashes(0);
+      expect(rec.provider).to.equal(provider.address);
+    });
+
+    it("setSlashGraceMultiplier rejects out-of-range + is onlyOwner", async function () {
+      await deploy();
+      await expect(
+        slashing.connect(owner).setSlashGraceMultiplier(0)
+      ).to.be.revertedWithCustomError(slashing, "MultiplierOutOfRange");
+      await expect(
+        slashing.connect(owner).setSlashGraceMultiplier(11)
+      ).to.be.revertedWithCustomError(slashing, "MultiplierOutOfRange");
+      await expect(
+        slashing.connect(anyone).setSlashGraceMultiplier(3)
+      ).to.be.reverted; // Ownable
     });
   });
 
