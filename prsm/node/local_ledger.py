@@ -7,6 +7,7 @@ Zero-config — no PostgreSQL required. Each node maintains its own ledger
 which is reconciled via gossip when connected to the network.
 """
 
+import asyncio
 import json
 import time
 import uuid
@@ -61,6 +62,15 @@ class LocalLedger:
     def __init__(self, db_path: str = ":memory:") -> None:
         self.db_path = db_path
         self._db: Optional[aiosqlite.Connection] = None
+        # sp929 — serialize balance-DECREASING operations. Balances are derived
+        # from the append-only log, so debit/transfer/agent_debit read the
+        # balance (await) and then insert the debit (await) — asyncio yields at
+        # each await, so two concurrent decreasers on the same wallet would both
+        # read the old balance, both pass the check, and both insert, driving
+        # the balance negative (spend FTNS that doesn't exist). This lock makes
+        # the check+insert atomic. Credits are additive and never overspend, so
+        # they do not take the lock.
+        self._write_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         """Open database and create tables."""
@@ -446,11 +456,28 @@ class LocalLedger:
         description: str = "",
     ) -> Transaction:
         """Debit FTNS from a wallet (payment to system/network)."""
+        # sp929 — hold the write lock across the check+insert so two concurrent
+        # debits on the same wallet can't both pass on a stale balance read.
+        async with self._write_lock:
+            return await self._debit_locked(wallet_id, amount, tx_type, description)
+
+    async def _debit_locked(
+        self,
+        wallet_id: str,
+        amount: float,
+        tx_type: TransactionType,
+        description: str = "",
+    ) -> Transaction:
+        """Balance-checked debit. The caller MUST hold self._write_lock."""
         balance = await self.get_balance(wallet_id)
         if balance < amount:
             raise ValueError(
                 f"Insufficient balance: {balance:.6f} < {amount:.6f}"
             )
+        # The transactions table has FOREIGN KEY(to_wallet) -> wallets, so the
+        # "system" sink must exist or the INSERT fails (transfer() already does
+        # this for its destination via _ensure_wallet).
+        await self._ensure_wallet("system")
         # Record as transfer from wallet to a system sink
         tx = Transaction(
             tx_id=str(uuid.uuid4()),
@@ -475,23 +502,25 @@ class LocalLedger:
     ) -> Transaction:
         """Transfer FTNS between wallets."""
         await self._ensure_wallet(to_wallet)
-        balance = await self.get_balance(from_wallet)
-        if balance < amount:
-            raise ValueError(
-                f"Insufficient balance: {balance:.6f} < {amount:.6f}"
+        # sp929 — atomic check+insert (see debit()).
+        async with self._write_lock:
+            balance = await self.get_balance(from_wallet)
+            if balance < amount:
+                raise ValueError(
+                    f"Insufficient balance: {balance:.6f} < {amount:.6f}"
+                )
+            tx = Transaction(
+                tx_id=str(uuid.uuid4()),
+                tx_type=tx_type,
+                from_wallet=from_wallet,
+                to_wallet=to_wallet,
+                amount=amount,
+                description=description,
+                timestamp=time.time(),
+                signature=signature,
             )
-        tx = Transaction(
-            tx_id=str(uuid.uuid4()),
-            tx_type=tx_type,
-            from_wallet=from_wallet,
-            to_wallet=to_wallet,
-            amount=amount,
-            description=description,
-            timestamp=time.time(),
-            signature=signature,
-        )
-        await self._insert_tx(tx)
-        return tx
+            await self._insert_tx(tx)
+            return tx
 
     async def get_transaction_history(
         self, wallet_id: str, limit: int = 50
@@ -668,33 +697,40 @@ class LocalLedger:
         Checks the agent's remaining allowance and the principal's balance.
         Returns the transaction, or None if rejected.
         """
-        allowance = await self.get_agent_allowance(agent_id)
-        if not allowance or allowance["revoked"]:
-            return None
+        # sp929 — hold the write lock across the WHOLE sequence: the allowance
+        # read, the balance-checked debit, and the spent update. Otherwise two
+        # concurrent agent_debits both read the same remaining-allowance and the
+        # same principal balance, both pass, and both debit + bump spent —
+        # overspending the principal AND over-running the allowance. _debit_locked
+        # is called (not debit) because the lock is not reentrant.
+        async with self._write_lock:
+            allowance = await self.get_agent_allowance(agent_id)
+            if not allowance or allowance["revoked"]:
+                return None
 
-        if amount > allowance["remaining"]:
-            return None  # Exceeds allowance
+            if amount > allowance["remaining"]:
+                return None  # Exceeds allowance
 
-        principal_id = allowance["principal_id"]
-        balance = await self.get_balance(principal_id)
-        if balance < amount:
-            return None  # Insufficient principal balance
+            principal_id = allowance["principal_id"]
 
-        # Debit from principal
-        tx = await self.debit(
-            wallet_id=principal_id,
-            amount=amount,
-            tx_type=tx_type,
-            description=f"[agent:{agent_id[:12]}] {description}",
-        )
+            # Debit from principal (raises ValueError on insufficient balance).
+            try:
+                tx = await self._debit_locked(
+                    wallet_id=principal_id,
+                    amount=amount,
+                    tx_type=tx_type,
+                    description=f"[agent:{agent_id[:12]}] {description}",
+                )
+            except ValueError:
+                return None  # Insufficient principal balance
 
-        # Update spent
-        await self._db.execute(
-            "UPDATE agent_allowances SET spent = spent + ? WHERE agent_id = ?",
-            (amount, agent_id),
-        )
-        await self._db.commit()
-        return tx
+            # Update spent (under the same lock, so the next agent_debit sees it).
+            await self._db.execute(
+                "UPDATE agent_allowances SET spent = spent + ? WHERE agent_id = ?",
+                (amount, agent_id),
+            )
+            await self._db.commit()
+            return tx
 
     async def revoke_agent_allowance(self, principal_id: str, agent_id: str) -> bool:
         """Revoke an agent's spending authority. Returns True if found."""
