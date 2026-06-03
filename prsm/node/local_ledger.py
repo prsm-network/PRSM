@@ -198,7 +198,8 @@ class LocalLedger:
                 embedding_id      TEXT,
                 near_duplicate_of TEXT,
                 metadata          TEXT NOT NULL DEFAULT '{}',
-                registered_at     REAL NOT NULL
+                registered_at     REAL NOT NULL,
+                signed_record     TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_prov_creator ON provenance_chains(creator_id);
             CREATE INDEX IF NOT EXISTS idx_prov_hash ON provenance_chains(content_hash);
@@ -260,6 +261,17 @@ class LocalLedger:
         try:
             await self._db.execute(
                 "ALTER TABLE gossip_log ADD COLUMN attestation TEXT"
+            )
+            await self._db.commit()
+        except Exception:
+            pass
+
+        # sp965 — idempotent migration: add provenance_chains.signed_record (the
+        # verbatim signed record) so the cross-node provenance RESPONSE path can
+        # re-serve a cryptographically verifiable form. NULL for pre-sp965 rows.
+        try:
+            await self._db.execute(
+                "ALTER TABLE provenance_chains ADD COLUMN signed_record TEXT"
             )
             await self._db.commit()
         except Exception:
@@ -773,12 +785,22 @@ class LocalLedger:
         cid = data.get("cid", "")
         if not cid:
             return
+        # sp965 — preserve the VERBATIM received record (the exact dict that was
+        # signed, plus the signature) so the cross-node provenance RESPONSE path
+        # can re-serve a cryptographically verifiable form. The typed columns
+        # below are a lossy view (registered_at != the signed created_at, and
+        # is_sharded/provenance_hash are dropped); the verbatim blob is the
+        # source of truth for re-verification.
+        signed_record = (
+            json.dumps(data) if data.get("signature") else None
+        )
         await self._db.execute(
             """INSERT INTO provenance_chains
                (cid, content_hash, creator_id, creator_pubkey, filename,
                 size_bytes, royalty_rate, parent_cids, signature,
-                embedding_id, near_duplicate_of, metadata, registered_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                embedding_id, near_duplicate_of, metadata, registered_at,
+                signed_record)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(cid) DO UPDATE SET
                    content_hash      = excluded.content_hash,
                    creator_id        = excluded.creator_id,
@@ -790,7 +812,8 @@ class LocalLedger:
                    signature         = excluded.signature,
                    embedding_id      = excluded.embedding_id,
                    near_duplicate_of = excluded.near_duplicate_of,
-                   metadata          = excluded.metadata""",
+                   metadata          = excluded.metadata,
+                   signed_record     = excluded.signed_record""",
             (
                 cid,
                 data.get("content_hash", ""),
@@ -805,9 +828,26 @@ class LocalLedger:
                 data.get("near_duplicate_of"),
                 json.dumps(data.get("metadata", {})),
                 time.time(),
+                signed_record,
             ),
         )
         await self._db.commit()
+
+    async def get_signed_provenance(self, cid: str) -> Optional[Dict[str, Any]]:
+        """sp965 — return the VERBATIM signed provenance record for `cid` (the
+        exact dict that was signed + its signature), or None if no verbatim
+        record was stored (pre-sp965 rows / unsigned writes). Used by the query
+        responder to re-serve a cryptographically verifiable form."""
+        cursor = await self._db.execute(
+            "SELECT signed_record FROM provenance_chains WHERE cid = ?", (cid,)
+        )
+        row = await cursor.fetchone()
+        if not row or row[0] is None:
+            return None
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return None
 
     async def get_provenance(self, cid: str) -> Optional[Dict[str, Any]]:
         """Return the provenance record for a CID, or None if unknown."""

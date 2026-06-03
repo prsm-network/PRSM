@@ -384,7 +384,12 @@ class ContentIndex:
         if not cid or not self.ledger:
             return
         try:
-            record = await self.ledger.get_provenance(cid)
+            # sp965 — prefer the VERBATIM signed record so the requester can
+            # cryptographically verify authorship; fall back to the lossy typed
+            # row only for pre-sp965 rows that have no verbatim form stored.
+            record = await self.ledger.get_signed_provenance(cid)
+            if record is None:
+                record = await self.ledger.get_provenance(cid)
             if record:
                 await self.gossip.publish(GOSSIP_PROVENANCE_RESPONSE, {
                     "cid": cid,
@@ -403,13 +408,24 @@ class ContentIndex:
         provenance = data.get("provenance", {})
         if not cid or not provenance:
             return
-        # Persist to local ledger so future lookups are instant. sp964: the
-        # response carries a lossy re-serialized stored row (signature can't be
-        # reconstructed), so we apply first-writer-wins (never overwrite an
-        # established creator) without requiring a verifiable signature.
+        # sp965 — the responder now re-serves the VERBATIM signed record, so the
+        # response is cryptographically verifiable. Gate BOTH persistence AND the
+        # caller-facing future on authenticity: a forged response is ignored
+        # entirely (never cached, never handed to the get_provenance() caller —
+        # the caller waits for an honest answer or times out to None). An
+        # unverifiable record from a pre-sp965 (lossy) responder is likewise not
+        # trusted; full interop is restored once peers upgrade.
+        authentic = self._provenance_authentic(provenance)
+        if not authentic:
+            logger.debug(
+                "Ignoring unverifiable provenance response for %s "
+                "(no valid signature/creator binding)", str(cid)[:12],
+            )
+            return
+        # Persist (first-writer-wins still applies — can't reassign a creator).
         if self.ledger:
-            await self._verified_upsert(provenance, require_signature=False)
-        # Resolve any pending async get_provenance() call
+            await self._verified_upsert(provenance, require_signature=True)
+        # Resolve any pending async get_provenance() call with the verified record.
         future = self._pending_provenance.get(cid)
         if future and not future.done():
             future.set_result(provenance)
