@@ -254,10 +254,50 @@ class ComputeRequester:
             backend_peer_ids = {p.node_id for p in backend_peers}
             capable_peers = [p for p in capable_peers if p.node_id in backend_peer_ids] or capable_peers
 
+        # sp958 — EXCLUDE confirmed repeat-liars from dispatch (not merely sort
+        # them last). A provider with >= PRSM_DISPATCH_MAX_CONSENSUS_MISMATCHES
+        # confirmed consensus-mismatch events (the sp957 evidence log) caught
+        # fabricating results stops receiving paid jobs from this node. This is
+        # the sampling-immune signal (a reliability ratio is useless: at a 5%
+        # sample rate a 100%-fabricating provider still scores ~0.95) and a
+        # sound, LOCAL, reversible enforcement — it moves no stake.
+        before = len(capable_peers)
+        capable_peers = [p for p in capable_peers if not self._dispatch_excluded(p.node_id)]
+        if len(capable_peers) < before:
+            logger.warning(
+                "sp958: excluded %d confirmed repeat-liar(s) from %s dispatch",
+                before - len(capable_peers), job_type.value,
+            )
+
         # Sort by reliability — unreliable peers fall to the bottom
         capable_peers.sort(key=lambda p: p.reliability_score, reverse=True)
 
         return [p.node_id for p in capable_peers]
+
+    def _dispatch_excluded(self, node_id: str) -> bool:
+        """True if ``node_id`` has accumulated enough confirmed consensus
+        mismatches (sp957 evidence log) to be barred from compute dispatch.
+
+        No log wired (minimal/legacy) → never excluded (current behavior).
+        ``PRSM_DISPATCH_MAX_CONSENSUS_MISMATCHES`` (default 2) is the threshold;
+        ``PRSM_DISPATCH_MISMATCH_WINDOW_SEC`` (default 0 = all-time) optionally
+        decays old evidence so a reformed provider re-enters. Fail-open: any
+        error in the check leaves the provider eligible (never silently starve
+        dispatch on a bookkeeping glitch)."""
+        log = getattr(self, "mismatch_log", None)
+        if log is None:
+            return False
+        try:
+            threshold = int(os.getenv("PRSM_DISPATCH_MAX_CONSENSUS_MISMATCHES", "2"))
+            if threshold <= 0:
+                return False
+            window = float(os.getenv("PRSM_DISPATCH_MISMATCH_WINDOW_SEC", "0") or 0)
+            since = (time.time() - window) if window > 0 else None
+            return log.count_for(node_id, since_timestamp=since) >= threshold
+        except Exception as e:  # never starve dispatch on a check error
+            logger.debug("sp958: dispatch-eligibility check failed for %s: %s",
+                         str(node_id)[:8], e)
+            return False
 
     async def submit_job(
         self,

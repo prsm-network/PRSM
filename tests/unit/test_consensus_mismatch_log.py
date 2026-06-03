@@ -180,3 +180,39 @@ def test_endpoint_invalid_limit_422():
     node = _node()
     resp = _client(node).get("/admin/consensus-mismatch-evidence?limit=0")
     assert resp.status_code == 422
+
+
+# ── count_for: per-provider confirmed-mismatch count (sp958 input) ──────────
+
+
+def test_count_for_counts_per_provider():
+    log = ConsensusMismatchLog()
+    asyncio.run(log.record(_evidence(job="j1", accused="prov-liar")))
+    asyncio.run(log.record(_evidence(job="j2", accused="prov-liar")))
+    asyncio.run(log.record(_evidence(job="j3", accused="prov-honest-once")))
+    assert log.count_for("prov-liar") == 2
+    assert log.count_for("prov-honest-once") == 1
+    assert log.count_for("prov-never") == 0
+
+
+def test_count_for_is_case_insensitive():
+    log = ConsensusMismatchLog()
+    asyncio.run(log.record(_evidence(accused="0xAbC")))
+    assert log.count_for("0xabc") == 1
+
+
+def test_count_for_since_timestamp_window():
+    log = ConsensusMismatchLog()
+    # Two old entries + one new, appended directly to control timestamps.
+    log.append(ConsensusMismatchEntry(
+        timestamp=100.0, job_id="old1", accused_provider_id="p",
+        accused_output_hash="0x1", majority_output_hash="0x2"))
+    log.append(ConsensusMismatchEntry(
+        timestamp=200.0, job_id="old2", accused_provider_id="p",
+        accused_output_hash="0x1", majority_output_hash="0x2"))
+    log.append(ConsensusMismatchEntry(
+        timestamp=5000.0, job_id="new1", accused_provider_id="p",
+        accused_output_hash="0x1", majority_output_hash="0x2"))
+    assert log.count_for("p") == 3
+    # Only entries at/after the cutoff count.
+    assert log.count_for("p", since_timestamp=1000.0) == 1

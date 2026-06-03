@@ -170,6 +170,34 @@ class ConsensusMismatchLog:
     def count(self) -> int:
         return len(self._entries)
 
+    def count_for(
+        self,
+        provider_id: str,
+        *,
+        since_timestamp: Optional[float] = None,
+    ) -> int:
+        """Count confirmed mismatches recorded against ``provider_id``.
+
+        sp958: this is the sampling-immune signal a local dispatch-eligibility
+        gate uses to stop paying a confirmed repeat-liar (a reliability *ratio*
+        is useless here — at a 5% sample rate a 100%-fabricating provider still
+        scores ~0.95 because 95% of its forgeries were never re-executed). Each
+        counted entry survived strict-majority adjudication, so the count is
+        high-confidence. Optional ``since_timestamp`` windows the count so an
+        operator can let old evidence decay; default counts all retained entries.
+        """
+        if not provider_id:
+            return 0
+        p = provider_id.lower()
+        n = 0
+        for e in self._entries:
+            if e.accused_provider_id.lower() != p:
+                continue
+            if since_timestamp is not None and e.timestamp < since_timestamp:
+                continue
+            n += 1
+        return n
+
     # ── challenge_sink adapter (async (evidence: dict) -> None) ──────────
 
     async def record(self, evidence: Any) -> None:
