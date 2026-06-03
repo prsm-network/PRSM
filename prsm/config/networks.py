@@ -56,6 +56,11 @@ class NetworkConfig:
     # Phase 3.x.3 publisher key anchor
     publisher_key_anchor: Optional[str] = None
 
+    # §14 anti-spam creator stake (sp976 CreatorStakeRegistry). None until the
+    # commissioning ceremony deploys it + records the address here (the canonical
+    # home, like every other contract). The Python CreatorStakeClient reads this.
+    creator_stake_registry: Optional[str] = None
+
     # Network-specific operational notes for users
     notes: tuple[str, ...] = field(default_factory=tuple)
 
@@ -106,6 +111,7 @@ MAINNET = NetworkConfig(
     storage_slashing="0x0e9cAfadCCCe0987C773B5FdFF295c2Aa6F03337",
     key_distribution="0x51AF73Aa098E3b12Da78167c25c3d1D98059c8Ff",
     publisher_key_anchor="0xd811ad9986f44f404b0fd992168a7cc76206df03",  # Phase 3.x.3 deployed 2026-05-20 via Foundation Safe + EIP-2470 CREATE2 factory (sprints 619-621); on-chain tx 0x55087635ae9543ae2a844e112d76c04f93f19c72d0e9f7c736eafed7fb3510b0 block 46248175; admin() == Foundation Safe verified
+    creator_stake_registry=None,  # sp976 CreatorStakeRegistry — NOT yet deployed. RECORD the address HERE after the gated Base mainnet ceremony (transferOwnership→Foundation Safe→2-of-3 acceptOwnership); the CreatorStakeClient then reads it. See docs/2026-06-03-creator-stake-registry-sepolia-runbook.md.
     notes=(
         "Mainnet uses the real 2-of-3 Foundation Safe (Ledger + Trezor + OneKey) at 0x91b0...5791.",
         "Audit-bundle ownership-transfer ceremony complete 2026-05-07: all 7 Ownable2Step "
@@ -155,6 +161,7 @@ TESTNET = NetworkConfig(
     storage_slashing="0x2ba1B361d2AD49f15F1131762fA3512d7824EB06",
     key_distribution="0xdB41A471AAC86285cD855bEdC27D7FC810dc3318",
     publisher_key_anchor=None,  # not yet deployed on Base Sepolia; Phase 3.x.3 Sepolia deploy was on Ethereum Sepolia
+    creator_stake_registry=None,  # sp976 CreatorStakeRegistry — record the Base Sepolia rehearsal address here if a testnet gate is wanted (the rehearsal script is self-contained and does not require this).
     notes=(
         "TESTNET — testnet-FTNS has zero monetary value.",
         "Foundation 'Safe' on testnet is a single deployer EOA, NOT the real 2-of-3 mainnet multisig.",
@@ -242,6 +249,7 @@ class ResolvedEndpoints:
     royalty_distributor: Optional[str]
     foundation_safe: Optional[str]
     publisher_key_anchor: Optional[str]
+    creator_stake_registry: Optional[str]
     settlement_registry: Optional[str]
     escrow_pool: Optional[str]
     stake_bond: Optional[str]
@@ -327,6 +335,16 @@ def resolve_endpoints(network: Optional[str] = None) -> ResolvedEndpoints:
         foundation_safe=_override("PRSM_FOUNDATION_SAFE", cfg.foundation_safe),
         publisher_key_anchor=_override(
             "PRSM_PUBLISHER_KEY_ANCHOR_ADDRESS", cfg.publisher_key_anchor
+        ),
+        # sp981 — §14 creator-stake registry. Primary override env is the
+        # non-prefixed CREATOR_STAKE_REGISTRY_ADDRESS (the name from_env + the
+        # deploy script already use); the PRSM_-prefixed alias is accepted for
+        # consistency with the other contracts.
+        creator_stake_registry=_override(
+            "CREATOR_STAKE_REGISTRY_ADDRESS",
+            _override(
+                "PRSM_CREATOR_STAKE_REGISTRY_ADDRESS", cfg.creator_stake_registry
+            ),
         ),
         # Audit-bundle + Phase 8 + Phase 7-storage — pinning individual
         # addresses is rarer in practice but we still expose the override

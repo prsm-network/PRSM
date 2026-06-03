@@ -45,6 +45,8 @@ def clean_env(monkeypatch):
         "PRSM_COMPENSATION_DISTRIBUTOR_ADDRESS",
         "PRSM_STORAGE_SLASHING_ADDRESS",
         "PRSM_KEY_DISTRIBUTION_ADDRESS",
+        "CREATOR_STAKE_REGISTRY_ADDRESS",
+        "PRSM_CREATOR_STAKE_REGISTRY_ADDRESS",
     ]:
         monkeypatch.delenv(k, raising=False)
     return monkeypatch
@@ -146,6 +148,31 @@ def test_unknown_network_raises_keyerror(clean_env):
     clean_env.setenv("PRSM_NETWORK", "purple-frog")
     with pytest.raises(KeyError, match="unknown network"):
         resolve_endpoints()
+
+
+# ── sp981 — creator-stake registry joins the canonical address registry ──────
+
+
+def test_creator_stake_registry_none_by_default(clean_env):
+    """Not yet deployed on any network — the resolver returns None until the
+    commissioning ceremony records the address (the canonical home is networks.py,
+    consistent with every other deployed contract)."""
+    e = resolve_endpoints()
+    assert e.creator_stake_registry is None
+    assert MAINNET.creator_stake_registry is None
+    assert TESTNET.creator_stake_registry is None
+
+
+def test_creator_stake_registry_env_override_flows_through(clean_env):
+    """Post-ceremony an operator may pin the address via the existing
+    CREATOR_STAKE_REGISTRY_ADDRESS env (the name from_env + the deploy script
+    already use), overriding the per-network default."""
+    clean_env.setenv(
+        "CREATOR_STAKE_REGISTRY_ADDRESS",
+        "0x6666666666666666666666666666666666666666",
+    )
+    e = resolve_endpoints()
+    assert e.creator_stake_registry == "0x6666666666666666666666666666666666666666"
 
 
 def test_empty_env_value_treated_as_unset(clean_env):

@@ -93,11 +93,34 @@ class CreatorStakeClient:
     def from_env(
         cls, *, backend: Optional[_StakeBackend] = None,
     ) -> "CreatorStakeClient":
-        addr = (
-            os.environ.get("CREATOR_STAKE_REGISTRY_ADDRESS")
-            or None
-        )
-        rpc = os.environ.get("BASE_RPC_URL") or None
+        # sp981 — resolve the address + RPC through the canonical per-network
+        # registry (prsm.config.networks), the same path every other deployed
+        # contract uses. The operator records the post-ceremony address ONCE in
+        # networks.py (or via the CREATOR_STAKE_REGISTRY_ADDRESS env override) and
+        # the gate goes live against the network's default Base RPC — no separate
+        # RPC env required. Fail-soft to the legacy direct-env read if resolution
+        # raises (e.g. a misconfigured PRSM_NETWORK), so from_env never crashes
+        # the gate at node startup.
+        addr: Optional[str]
+        rpc: Optional[str]
+        try:
+            from prsm.config.networks import resolve_endpoints
+            ep = resolve_endpoints()
+            addr = ep.creator_stake_registry or None
+            # An explicit RPC env still wins; otherwise the resolved network RPC
+            # (which is never None — falls back to the Base default).
+            rpc = (
+                os.environ.get("BASE_RPC_URL")
+                or ep.rpc_url
+                or None
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "CreatorStakeClient.from_env: network resolution failed (%s) — "
+                "falling back to direct env vars.", exc,
+            )
+            addr = os.environ.get("CREATOR_STAKE_REGISTRY_ADDRESS") or None
+            rpc = os.environ.get("BASE_RPC_URL") or None
         # sp978 — when commissioned (registry address + RPC set) and no explicit
         # backend was injected, construct the real on-chain read backend so the
         # stake gate has actual teeth (pre-sp978 from_env never wired a backend →

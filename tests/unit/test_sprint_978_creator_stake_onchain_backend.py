@@ -108,9 +108,31 @@ def test_from_env_wires_onchain_backend_when_addr_and_rpc_set(monkeypatch):
 
 def test_from_env_no_backend_when_unset(monkeypatch):
     monkeypatch.delenv("CREATOR_STAKE_REGISTRY_ADDRESS", raising=False)
+    monkeypatch.delenv("PRSM_CREATOR_STAKE_REGISTRY_ADDRESS", raising=False)
     monkeypatch.delenv("BASE_RPC_URL", raising=False)
+    monkeypatch.delenv("PRSM_NETWORK", raising=False)
     client = CreatorStakeClient.from_env()
     assert client._backend is None  # in-memory dev scaffold
+
+
+# ── sp981 — from_env resolves the address through the canonical registry ─────
+
+
+def test_from_env_uses_networks_default_rpc_when_only_address_set(monkeypatch):
+    """Post-ceremony the operator records ONLY the address (in networks.py, the
+    canonical home, or via the env override). The RPC then resolves to the
+    network default (Base mainnet) through resolve_endpoints — so the gate goes
+    live without ALSO requiring a separate BASE_RPC_URL. This is the unified
+    resolution every other deployed contract already uses."""
+    monkeypatch.setenv("CREATOR_STAKE_REGISTRY_ADDRESS", ADDR)
+    monkeypatch.delenv("BASE_RPC_URL", raising=False)
+    monkeypatch.delenv("PRSM_BASE_RPC_URL", raising=False)
+    monkeypatch.delenv("PRSM_NETWORK", raising=False)
+    client = CreatorStakeClient.from_env()
+    assert isinstance(client._backend, CreatorStakeRegistryBackend)
+    assert client.is_commissioned() is True
+    # The resolved RPC is the Base mainnet default (no explicit RPC env set).
+    assert client._rpc_url == "https://mainnet.base.org"
 
 
 # ── apply_stake_gate keys on the eth address (decision A) ───────────────────
