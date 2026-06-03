@@ -418,7 +418,8 @@ class DAGLedger:
                 origin TEXT NOT NULL,
                 payload TEXT NOT NULL,
                 ttl INTEGER NOT NULL DEFAULT 5,
-                received_at REAL NOT NULL
+                received_at REAL NOT NULL,
+                attestation TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_gossip_received ON gossip_log(received_at);
 
@@ -469,7 +470,18 @@ class DAGLedger:
                 paid_responders TEXT DEFAULT '[]'
             );
         """)
-        
+
+        # sp961 — idempotent migration: add gossip_log.attestation for DBs
+        # created before this column existed (mirrors LocalLedger). SQLite
+        # raises on a duplicate column; caught + ignored so re-init is a no-op.
+        try:
+            await self._db.execute(
+                "ALTER TABLE gossip_log ADD COLUMN attestation TEXT"
+            )
+            await self._db.commit()
+        except Exception:
+            pass
+
     async def _load_state(self) -> None:
         cursor = await self._db.execute("SELECT tx_id, parent_ids, cumulative_weight, confirmation_level FROM dag_transactions")
         async for row in cursor:
@@ -1905,12 +1917,16 @@ class DAGLedgerAdapter:
         origin: str,
         payload: Dict[str, Any],
         ttl: int = 5,
+        attestation: Optional[Dict[str, Any]] = None,
     ) -> None:
         await self._dag._db.execute(
             """INSERT OR IGNORE INTO gossip_log
-               (nonce, subtype, origin, payload, ttl, received_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (nonce, subtype, origin, json.dumps(payload), ttl, time.time()),
+               (nonce, subtype, origin, payload, ttl, received_at, attestation)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                nonce, subtype, origin, json.dumps(payload), ttl, time.time(),
+                json.dumps(attestation) if attestation is not None else None,
+            ),
         )
         await self._dag._db.commit()
 
@@ -1923,7 +1939,7 @@ class DAGLedgerAdapter:
         if subtypes:
             placeholders = ",".join("?" for _ in subtypes)
             cursor = await self._dag._db.execute(
-                f"""SELECT nonce, subtype, origin, payload, ttl, received_at
+                f"""SELECT nonce, subtype, origin, payload, ttl, received_at, attestation
                     FROM gossip_log
                     WHERE received_at > ? AND subtype IN ({placeholders})
                     ORDER BY received_at ASC LIMIT ?""",
@@ -1931,7 +1947,7 @@ class DAGLedgerAdapter:
             )
         else:
             cursor = await self._dag._db.execute(
-                """SELECT nonce, subtype, origin, payload, ttl, received_at
+                """SELECT nonce, subtype, origin, payload, ttl, received_at, attestation
                    FROM gossip_log
                    WHERE received_at > ?
                    ORDER BY received_at ASC LIMIT ?""",
@@ -1942,6 +1958,7 @@ class DAGLedgerAdapter:
             {
                 "nonce": r[0], "subtype": r[1], "origin": r[2],
                 "payload": json.loads(r[3]), "ttl": r[4], "received_at": r[5],
+                "attestation": json.loads(r[6]) if r[6] is not None else None,
             }
             for r in rows
         ]

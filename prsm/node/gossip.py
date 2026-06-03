@@ -90,6 +90,43 @@ def _authenticate_origin(payload: Dict[str, Any], nonce: str, fallback_sender_id
         return claimed
     return fallback_sender_id
 
+
+def _attestation_from_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """sp961 — extract the persistable origin attestation from a live gossip
+    payload (the fields a later catch-up needs to RE-verify authorship). Returns
+    None when the message carries no attestation (legacy/unsigned)."""
+    pubkey = payload.get("origin_pubkey", "")
+    sig = payload.get("origin_sig", "")
+    if not (pubkey and sig):
+        return None
+    return {
+        "origin_time": payload.get("origin_time"),
+        "origin_pubkey": pubkey,
+        "origin_sig": sig,
+    }
+
+
+def _authenticate_catchup_origin(
+    *, subtype: str, data: Any, claimed_origin: str,
+    attestation: Optional[Dict[str, Any]], nonce: str, fallback_sender_id: str,
+) -> str:
+    """sp961 — authenticate the origin of a CAUGHT-UP (digest-replayed) message.
+
+    Reconstructs the attested payload from the stored entry + attestation and
+    reuses :func:`_authenticate_origin`. Without a valid attestation the claimed
+    origin is NOT trusted — a relaying peer cannot forge authorship — so it falls
+    back to the transport-authenticated relaying sender."""
+    att = attestation or {}
+    verify_payload = {
+        "subtype": subtype,
+        "data": data,
+        "origin": claimed_origin,
+        "origin_time": att.get("origin_time"),
+        "origin_pubkey": att.get("origin_pubkey", ""),
+        "origin_sig": att.get("origin_sig", ""),
+    }
+    return _authenticate_origin(verify_payload, nonce, fallback_sender_id)
+
 _BOUNDED_GOSSIP_LABELS = {
     "heartbeat",
     "agent_task_offer",
@@ -417,6 +454,9 @@ class GossipProtocol:
                     origin=origin,
                     payload=data,
                     ttl=msg.ttl,
+                    # sp961 — persist the origin attestation so a later digest
+                    # catch-up can RE-verify authorship relayer-independently.
+                    attestation=_attestation_from_payload(msg.payload),
                 )
             except Exception:
                 pass  # Fire-and-forget; don't break gossip on log failure
@@ -613,16 +653,27 @@ class GossipProtocol:
             try:
                 subtype = message_data.get("subtype", "")
                 payload = message_data.get("payload", {})
-                origin = message_data.get("origin", msg.sender_id)
                 nonce = message_data.get("nonce", "")
-                
+                attestation = message_data.get("attestation")
+                # sp961 — RE-authenticate the origin of the caught-up message
+                # rather than trusting the relaying peer's claim. Without a valid
+                # attestation, attribute it to the transport-authenticated relayer
+                # (never the bare claimed origin) — a relayer cannot forge
+                # authorship of replayed content/job/provenance/agent ads.
+                origin = _authenticate_catchup_origin(
+                    subtype=subtype, data=payload,
+                    claimed_origin=message_data.get("origin", msg.sender_id),
+                    attestation=attestation, nonce=nonce,
+                    fallback_sender_id=msg.sender_id,
+                )
+
                 if not subtype or not payload:
                     continue
-                
+
                 # Skip if we've already seen this message (dedup)
                 if nonce and await self._is_duplicate(nonce):
                     continue
-                
+
                 # Deliver to local subscribers
                 callbacks = self._subscribers.get(subtype, [])
                 for cb in callbacks:
@@ -630,8 +681,9 @@ class GossipProtocol:
                         await cb(subtype, payload, origin)
                     except Exception as e:
                         logger.error(f"Error in catch-up subscriber callback ({subtype}): {e}")
-                
-                # Store in local gossip log
+
+                # Store in local gossip log (origin is the AUTHENTICATED value;
+                # carry the attestation forward so this node can re-serve it).
                 if self.ledger and subtype not in ("heartbeat", GOSSIP_DIGEST_REQUEST, GOSSIP_DIGEST_RESPONSE):
                     try:
                         await self.ledger.log_gossip(
@@ -640,6 +692,7 @@ class GossipProtocol:
                             origin=origin,
                             payload=payload,
                             ttl=1,  # Already propagated, just storing locally
+                            attestation=attestation if origin == message_data.get("origin") else None,
                         )
                     except Exception:
                         pass  # Don't break on log failure

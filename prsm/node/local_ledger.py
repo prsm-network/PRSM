@@ -167,13 +167,19 @@ class LocalLedger:
             );
 
             -- Gossip log for persistence and catch-up
+            -- sp961: `attestation` (nullable JSON) persists the origin's signed
+            -- attestation (origin_time/origin_pubkey/origin_sig) so the digest
+            -- catch-up path can RE-verify authorship relayer-independently. NULL
+            -- for pre-sp961 rows / unsigned messages (→ catch-up falls back to
+            -- the relaying sender). `payload` still stores just `data`.
             CREATE TABLE IF NOT EXISTS gossip_log (
                 nonce       TEXT PRIMARY KEY,
                 subtype     TEXT NOT NULL,
                 origin      TEXT NOT NULL,
                 payload     TEXT NOT NULL,
                 ttl         INTEGER NOT NULL DEFAULT 5,
-                received_at REAL NOT NULL
+                received_at REAL NOT NULL,
+                attestation TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_gossip_log_time ON gossip_log(received_at);
             CREATE INDEX IF NOT EXISTS idx_gossip_log_subtype ON gossip_log(subtype);
@@ -245,6 +251,19 @@ class LocalLedger:
                 paid_responders         TEXT NOT NULL DEFAULT '[]'
             );
         """)
+
+        # sp961 — idempotent migration: add gossip_log.attestation to DBs
+        # created before this column existed. `CREATE TABLE IF NOT EXISTS`
+        # above only covers fresh DBs; existing ones need the ALTER. SQLite
+        # raises OperationalError ("duplicate column name") when the column is
+        # already present — caught + ignored so re-init is a no-op.
+        try:
+            await self._db.execute(
+                "ALTER TABLE gossip_log ADD COLUMN attestation TEXT"
+            )
+            await self._db.commit()
+        except Exception:
+            pass
 
     async def close(self) -> None:
         if self._db:
@@ -852,13 +871,21 @@ class LocalLedger:
         origin: str,
         payload: Dict[str, Any],
         ttl: int = 5,
+        attestation: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Persist a gossip message for catch-up replay."""
+        """Persist a gossip message for catch-up replay.
+
+        sp961: `attestation` (the origin's signed origin_time/origin_pubkey/
+        origin_sig) is stored so the catch-up consumer can RE-verify authorship
+        relayer-independently. None → stored NULL (unsigned / pre-sp961)."""
         await self._db.execute(
             """INSERT OR IGNORE INTO gossip_log
-               (nonce, subtype, origin, payload, ttl, received_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (nonce, subtype, origin, json.dumps(payload), ttl, time.time()),
+               (nonce, subtype, origin, payload, ttl, received_at, attestation)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                nonce, subtype, origin, json.dumps(payload), ttl, time.time(),
+                json.dumps(attestation) if attestation is not None else None,
+            ),
         )
         await self._db.commit()
 
@@ -872,7 +899,7 @@ class LocalLedger:
         if subtypes:
             placeholders = ",".join("?" for _ in subtypes)
             cursor = await self._db.execute(
-                f"""SELECT nonce, subtype, origin, payload, ttl, received_at
+                f"""SELECT nonce, subtype, origin, payload, ttl, received_at, attestation
                     FROM gossip_log
                     WHERE received_at > ? AND subtype IN ({placeholders})
                     ORDER BY received_at ASC LIMIT ?""",
@@ -880,7 +907,7 @@ class LocalLedger:
             )
         else:
             cursor = await self._db.execute(
-                """SELECT nonce, subtype, origin, payload, ttl, received_at
+                """SELECT nonce, subtype, origin, payload, ttl, received_at, attestation
                    FROM gossip_log
                    WHERE received_at > ?
                    ORDER BY received_at ASC LIMIT ?""",
@@ -895,6 +922,7 @@ class LocalLedger:
                 "payload": json.loads(r[3]),
                 "ttl": r[4],
                 "received_at": r[5],
+                "attestation": json.loads(r[6]) if r[6] is not None else None,
             }
             for r in rows
         ]
