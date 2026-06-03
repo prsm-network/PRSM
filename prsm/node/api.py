@@ -9550,8 +9550,14 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                     raw_tier = tracker.tier_for(r.creator_id)
                 except Exception:  # noqa: BLE001
                     raw_tier = TIER_NEW
+                # sp978 (decision A) — the stake gate keys on the creator's ETH
+                # address (the §14 canonical creator identity), not the node_id.
+                # The reputation tier above is still keyed by creator_id; only
+                # the stake check uses the eth address. A record with no eth
+                # address can't have bonded stake → apply_stake_gate demotes
+                # HIGH→MEDIUM (safe default).
                 tier = apply_stake_gate(
-                    raw_tier, r.creator_id, stake_client,
+                    raw_tier, r.creator_eth_address, stake_client,
                 )
             else:
                 tier = TIER_NEW

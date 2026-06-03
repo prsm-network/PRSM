@@ -225,6 +225,10 @@ class _FakeIndex:
             r.size_bytes = 1024
             r.content_hash = "sha"
             r.creator_id = creator
+            # sp978 (decision A) — the stake gate keys on creator_eth_address.
+            # The fixture stakes by this same identity (see the stake() calls),
+            # so a record's stake-identity matches what was bonded.
+            r.creator_eth_address = creator
             r.providers = []
             r.created_at = 0
             r.metadata = {}

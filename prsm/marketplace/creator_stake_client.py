@@ -98,6 +98,23 @@ class CreatorStakeClient:
             or None
         )
         rpc = os.environ.get("BASE_RPC_URL") or None
+        # sp978 — when commissioned (registry address + RPC set) and no explicit
+        # backend was injected, construct the real on-chain read backend so the
+        # stake gate has actual teeth (pre-sp978 from_env never wired a backend →
+        # the gate ran on the in-memory mirror forever). Fail-soft: if the
+        # backend can't be built, fall back to the in-memory dev scaffold.
+        if backend is None and addr and rpc:
+            try:
+                from prsm.economy.web3.creator_stake_registry_backend import (
+                    CreatorStakeRegistryBackend,
+                )
+                backend = CreatorStakeRegistryBackend(addr, rpc)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "CreatorStakeClient.from_env: could not build the on-chain "
+                    "backend (%s) — using the in-memory dev scaffold.", exc,
+                )
+                backend = None
         return cls(
             registry_address=addr, rpc_url=rpc, backend=backend,
         )
@@ -121,16 +138,14 @@ class CreatorStakeClient:
                 f"amount_wei must be a positive integer, "
                 f"got {amount_wei!r}"
             )
+        # sp978 — when a real backend is wired, it is authoritative: do NOT fall
+        # back to the in-memory mirror on error (that fallback was the toothless
+        # free-stake bypass — a backend error or a non-server-action would
+        # silently credit the gate). The in-memory mirror is ONLY the
+        # uncommissioned (backend=None) dev scaffold.
         if self._backend is not None:
-            try:
-                self._backend.stake(creator_id, amount_wei)
-                return
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "CreatorStakeClient: backend.stake "
-                    "raised: %s — falling back to in-memory",
-                    exc,
-                )
+            self._backend.stake(creator_id, amount_wei)
+            return
         self._balances[creator_id] = (
             self._balances.get(creator_id, 0) + amount_wei
         )
@@ -150,18 +165,11 @@ class CreatorStakeClient:
             )
         if not reason:
             raise ValueError("reason must be non-empty")
+        # sp978 — backend authoritative when wired (no in-memory fallback; see
+        # stake()). In-memory only for the uncommissioned dev scaffold.
         if self._backend is not None:
-            try:
-                self._backend.slash(
-                    creator_id, amount_wei, reason,
-                )
-                return
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "CreatorStakeClient: backend.slash "
-                    "raised: %s — falling back to in-memory",
-                    exc,
-                )
+            self._backend.slash(creator_id, amount_wei, reason)
+            return
         current = self._balances.get(creator_id, 0)
         self._balances[creator_id] = max(0, current - amount_wei)
 
@@ -192,7 +200,7 @@ class CreatorStakeClient:
 
 def apply_stake_gate(
     tier: str,
-    creator_id: str,
+    creator_eth_address: Optional[str],
     stake_client: Optional[CreatorStakeClient],
 ) -> str:
     """Layer stake-eligibility on top of a score-based tier.
@@ -202,6 +210,12 @@ def apply_stake_gate(
     (stake doesn't buy you score, and the gate only acts on
     HIGH).
 
+    sp978 (decision A): the stake identity is the creator's ETH
+    ADDRESS (the §14 canonical creator key — fingerprint dedup +
+    content royalty already use it), NOT the node_id. A falsy
+    address (a record with no creator_eth_address) can't have
+    bonded stake → demote to MEDIUM (safe default).
+
     stake_client=None is a no-op passthrough — preserves
     backwards-compat for sprint 287/288/289 callers that
     don't yet thread the stake client.
@@ -210,13 +224,15 @@ def apply_stake_gate(
         return tier
     if tier != TIER_HIGH:
         return tier
+    if not creator_eth_address:
+        return TIER_MEDIUM  # no eth address → no bonded stake → demote
     try:
-        if stake_client.is_high_tier_eligible(creator_id):
+        if stake_client.is_high_tier_eligible(creator_eth_address):
             return TIER_HIGH
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "apply_stake_gate: eligibility check raised "
             "for %s: %s — demoting to MEDIUM (defensive)",
-            creator_id, exc,
+            creator_eth_address, exc,
         )
     return TIER_MEDIUM
