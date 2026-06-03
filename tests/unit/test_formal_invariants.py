@@ -1074,6 +1074,51 @@ def test_creator_stake_registry_paused_readable():
     assert inv.kind == InvariantKind.BOOL_READ
 
 
+# ── sp985 — BatchSettlementRegistry runtime invariants (LIVE on mainnet) ──
+
+
+def test_registry_has_settlement_registry():
+    """The deployed-on-mainnet settlement + consensus-slashing contract
+    (BatchSettlementRegistry, settlement_registry in networks.py) joins the
+    runtime invariant registry — it was previously in NEITHER formal lane
+    despite being live and holding the slash path."""
+    assert "settlement_registry" in INVARIANT_REGISTRY
+    invs = INVARIANT_REGISTRY["settlement_registry"]
+    assert len(invs) >= 6
+
+
+def test_settlement_registry_owner_is_foundation():
+    invs = INVARIANT_REGISTRY["settlement_registry"]
+    inv = next((i for i in invs if i.id == "INV-BSR-1"), None)
+    assert inv is not None
+    assert inv.kind == InvariantKind.ADDRESS_EQ
+    assert inv.severity == InvariantSeverity.CRITICAL
+    assert inv.expected.lower() == _FOUNDATION_SAFE.lower()
+
+
+def test_settlement_registry_challenge_window_floor_pinned():
+    """The dispute-window FLOOR. Drift toward 0 would let a slash finalize
+    before honest providers can dispute a CONSENSUS_MISMATCH challenge — a
+    direct false-slash risk on the live slashing path."""
+    invs = INVARIANT_REGISTRY["settlement_registry"]
+    inv = next((i for i in invs if i.id == "INV-BSR-2"), None)
+    assert inv is not None
+    assert inv.kind == InvariantKind.UINT256_EQ
+    assert inv.severity == InvariantSeverity.CRITICAL
+    assert inv.expected == 3600  # 1 hour
+
+
+def test_settlement_registry_lookback_and_gas_floors_pinned():
+    invs = INVARIANT_REGISTRY["settlement_registry"]
+    lookback = next((i for i in invs if i.id == "INV-BSR-4"), None)
+    slash_gas = next((i for i in invs if i.id == "INV-BSR-6"), None)
+    assert lookback is not None and lookback.expected == 86400  # 1 day
+    # The MIN_SLASH_GAS floor — the L4 audit fix that stops a slash call being
+    # griefed into an out-of-gas revert (which would silently spare a guilty
+    # provider).
+    assert slash_gas is not None and slash_gas.expected == 150000
+
+
 def test_emission_mainnet_chain_id_pinned():
     """INV-EC-2: BASE_MAINNET_CHAIN_ID() == 8453. The
     chainid pin that enforces the 4-year mainnet halving

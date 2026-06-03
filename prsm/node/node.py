@@ -3025,11 +3025,14 @@ class PRSMNode:
                 "creator_stake_registry": (
                     endpoints.creator_stake_registry
                 ),
+                # sp985 — BatchSettlementRegistry (settlement + consensus-slash).
+                # LIVE on mainnet → these runtime pins execute against real state.
+                "settlement_registry": endpoints.settlement_registry,
             }
             logger.info(
                 "Formal-invariant checker wired "
-                "(backend=%s, 8 contracts: rd=%s ftns=%s "
-                "ep=%s ec=%s cd=%s ss=%s sb=%s csr=%s)",
+                "(backend=%s, 9 contracts: rd=%s ftns=%s "
+                "ep=%s ec=%s cd=%s ss=%s sb=%s csr=%s bsr=%s)",
                 bool(backend),
                 self._formal_invariant_addresses.get(
                     "royalty_distributor",
@@ -3054,6 +3057,9 @@ class PRSMNode:
                 ),
                 self._formal_invariant_addresses.get(
                     "creator_stake_registry",
+                ),
+                self._formal_invariant_addresses.get(
+                    "settlement_registry",
                 ),
             )
         except Exception as exc:  # noqa: BLE001

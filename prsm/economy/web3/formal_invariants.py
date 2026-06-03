@@ -199,6 +199,12 @@ _SEL_MAX_UNBOND_DELAY = (
 _SEL_CHALLENGER_BOUNTY_BPS = (
     "0xfc65a392"                       # CHALLENGER_BOUNTY_BPS()
 )
+# sp985 — BatchSettlementRegistry constant getters (selectors via `cast sig`).
+_SEL_MIN_LOOKBACK = "0x763299ca"       # MIN_LOOKBACK_SECONDS()
+_SEL_MAX_LOOKBACK = "0x19bad7ee"       # MAX_LOOKBACK_SECONDS()
+_SEL_MIN_CHALLENGE_WINDOW = "0x62ae4744"  # MIN_CHALLENGE_WINDOW_SECONDS()
+_SEL_MAX_CHALLENGE_WINDOW = "0x035d1c84"  # MAX_CHALLENGE_WINDOW_SECONDS()
+_SEL_MIN_SLASH_GAS = "0x8553927c"      # MIN_SLASH_GAS()
 
 
 # ── OpenZeppelin AccessControl role hashes (bytes32) ──
@@ -899,6 +905,112 @@ INVARIANT_REGISTRY: Dict[str, List[Invariant]] = {
             spec_text="paused() is readable",
             kind=InvariantKind.BOOL_READ,
             selector=_SEL_PAUSED,
+        ),
+    ],
+    # sp985 — BatchSettlementRegistry (settlement_registry in networks.py),
+    # LIVE on Base mainnet (0x48fFab…). Holds the settlement + consensus-slashing
+    # path (challengeReceipt → StakeBond.slash). Previously in NEITHER formal
+    # lane despite being deployed; these runtime pins execute against live state.
+    # The challenge-window + slash-gas floors are load-bearing for the standing
+    # "a single node must NEVER falsely slash an honest provider" invariant.
+    "settlement_registry": [
+        Invariant(
+            id="INV-BSR-1",
+            contract_name="settlement_registry",
+            title="owner() == Foundation Safe",
+            description=(
+                "The settlement + slashing registry is sole-owned by the "
+                "Foundation Safe via Ownable2Step. The owner controls "
+                "setStakeBond / setEscrowPool / setChallengeWindow / pause — "
+                "a non-Safe owner could repoint the slasher or shrink the "
+                "dispute window. Mirrors INV-SB-4 / INV-CSR-3."
+            ),
+            severity=InvariantSeverity.CRITICAL,
+            spec_text=f"owner() == {_FOUNDATION_SAFE_BASE}",
+            kind=InvariantKind.ADDRESS_EQ,
+            selector=_SEL_OWNER,
+            expected=_FOUNDATION_SAFE_BASE,
+        ),
+        Invariant(
+            id="INV-BSR-2",
+            contract_name="settlement_registry",
+            title="MIN_CHALLENGE_WINDOW_SECONDS pinned at 1 hour",
+            description=(
+                "The dispute-window FLOOR. The challenge window is the period "
+                "during which a CONSENSUS_MISMATCH (or other) challenge can be "
+                "filed against a settled batch before it finalizes. Drift toward "
+                "0 would let a settlement finalize before honest providers can "
+                "dispute — a direct false-slash / false-finalize risk on the "
+                "live slashing path."
+            ),
+            severity=InvariantSeverity.CRITICAL,
+            spec_text="MIN_CHALLENGE_WINDOW_SECONDS() == 1 hours",
+            kind=InvariantKind.UINT256_EQ,
+            selector=_SEL_MIN_CHALLENGE_WINDOW,
+            expected=3600,
+        ),
+        Invariant(
+            id="INV-BSR-3",
+            contract_name="settlement_registry",
+            title="MAX_CHALLENGE_WINDOW_SECONDS pinned at 30 days",
+            description=(
+                "Upper bound prevents the challenge window from being set so "
+                "long that legitimate settlements can never finalize (a "
+                "liveness griefing vector against honest providers)."
+            ),
+            severity=InvariantSeverity.HIGH,
+            spec_text="MAX_CHALLENGE_WINDOW_SECONDS() == 30 days",
+            kind=InvariantKind.UINT256_EQ,
+            selector=_SEL_MAX_CHALLENGE_WINDOW,
+            expected=30 * 86400,
+        ),
+        Invariant(
+            id="INV-BSR-4",
+            contract_name="settlement_registry",
+            title="MIN_LOOKBACK_SECONDS pinned at 1 day",
+            description=(
+                "Lower bound on the settlement lookback window. Read by "
+                "StakeBond.requestUnbond to clamp the unbond delay against the "
+                "longest pinned settlement window, so a provider cannot unbond "
+                "and escape a pending settlement/slash. Drift toward 0 weakens "
+                "that escape-prevention guarantee."
+            ),
+            severity=InvariantSeverity.CRITICAL,
+            spec_text="MIN_LOOKBACK_SECONDS() == 1 days",
+            kind=InvariantKind.UINT256_EQ,
+            selector=_SEL_MIN_LOOKBACK,
+            expected=86400,
+        ),
+        Invariant(
+            id="INV-BSR-5",
+            contract_name="settlement_registry",
+            title="MAX_LOOKBACK_SECONDS pinned at 365 days",
+            description=(
+                "Upper bound on the settlement lookback window — caps how far "
+                "back a batch can claim settlement coverage."
+            ),
+            severity=InvariantSeverity.HIGH,
+            spec_text="MAX_LOOKBACK_SECONDS() == 365 days",
+            kind=InvariantKind.UINT256_EQ,
+            selector=_SEL_MAX_LOOKBACK,
+            expected=365 * 86400,
+        ),
+        Invariant(
+            id="INV-BSR-6",
+            contract_name="settlement_registry",
+            title="MIN_SLASH_GAS pinned at 150000",
+            description=(
+                "The L4-self-audit gas floor: challengeReceipt forwards at "
+                "least MIN_SLASH_GAS to the try/catch stakeBond.slash() call so "
+                "a guilty provider cannot grief the slash into an out-of-gas "
+                "revert (which would silently spare them). Drift downward "
+                "re-opens that anti-slash griefing vector."
+            ),
+            severity=InvariantSeverity.HIGH,
+            spec_text="MIN_SLASH_GAS() == 150000",
+            kind=InvariantKind.UINT256_EQ,
+            selector=_SEL_MIN_SLASH_GAS,
+            expected=150_000,
         ),
     ],
     "escrow_pool": [
