@@ -1057,6 +1057,39 @@ def _build_watcher_event_dedup_store_or_none():
         return None
 
 
+_LOOPBACK_BIND_HOSTS = frozenset({
+    "127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1",
+})
+
+
+def assess_public_bind_auth_posture(*, listen_host, api_key_present):
+    """Sprint 960 — classify the API server's network-exposure auth posture.
+
+    The protected money prefixes (/wallet/, /compute/, /transactions/) are only
+    authenticated by NodeAuthMiddleware when PRSM_NODE_API_KEY is set. With the
+    default listen_host of 0.0.0.0 and no key, those endpoints are reachable
+    UNAUTHENTICATED by anyone who can route to the host.
+
+    Returns ``(level, message)`` where level is ``"ok"`` or ``"insecure"``.
+    ``"insecure"`` = bound to a non-loopback interface AND no API key. Loopback
+    binds (local dev / reverse-proxy-fronted) and any bind WITH a key are ``"ok"``.
+    Pure + side-effect-free so the caller decides whether to warn or fail-closed.
+    """
+    host = (listen_host or "").strip().lower()
+    is_loopback = host in _LOOPBACK_BIND_HOSTS
+    if is_loopback or api_key_present:
+        return ("ok", "")
+    msg = (
+        f"SECURITY: node bound to non-loopback host {listen_host!r} with no "
+        f"PRSM_NODE_API_KEY set — the protected money endpoints (/wallet/, "
+        f"/compute/, /transactions/) are UNAUTHENTICATED and reachable by anyone "
+        f"who can route to this host. Set PRSM_NODE_API_KEY=... (or bind 127.0.0.1 "
+        f"behind an authenticating reverse proxy). Set "
+        f"PRSM_REQUIRE_AUTH_ON_PUBLIC_BIND=1 to refuse to start in this posture."
+    )
+    return ("insecure", msg)
+
+
 def _build_key_distribution_watcher_or_none(
     *, client, state_store=None, webhook_deliverer=None,
     webhook_url=None, webhook_secret=None, dedup_store=None,
@@ -4222,6 +4255,29 @@ class PRSMNode:
                         "values only): %s",
                         _nice_increment, exc,
                     )
+
+        # Sprint 960 — network-exposure auth posture check. The protected
+        # money endpoints are only authenticated when PRSM_NODE_API_KEY is set;
+        # binding 0.0.0.0 (the default) without that key exposes them
+        # unauthenticated. Warn loudly by default (a hard fail would break
+        # legitimate local-dev + reverse-proxy deployments); refuse to start
+        # only when the operator opted into PRSM_REQUIRE_AUTH_ON_PUBLIC_BIND.
+        _posture, _posture_msg = assess_public_bind_auth_posture(
+            listen_host=getattr(self.config, "listen_host", None),
+            api_key_present=bool(
+                _os_nice.environ.get("PRSM_NODE_API_KEY", "").strip()
+            ),
+        )
+        if _posture == "insecure":
+            logger.warning(_posture_msg)
+            if _os_nice.environ.get(
+                "PRSM_REQUIRE_AUTH_ON_PUBLIC_BIND", "",
+            ).strip().lower() in {"1", "true", "yes", "on"}:
+                raise RuntimeError(
+                    "Refusing to start: PRSM_REQUIRE_AUTH_ON_PUBLIC_BIND is set "
+                    "and the node is in an insecure public-bind/no-auth posture. "
+                    + _posture_msg
+                )
 
         # Sprint 595 (Phase 2D) — capture the running event loop +
         # initialize the chain-executor pending-requests dict. Used
