@@ -205,6 +205,8 @@ _SEL_MAX_LOOKBACK = "0x19bad7ee"       # MAX_LOOKBACK_SECONDS()
 _SEL_MIN_CHALLENGE_WINDOW = "0x62ae4744"  # MIN_CHALLENGE_WINDOW_SECONDS()
 _SEL_MAX_CHALLENGE_WINDOW = "0x035d1c84"  # MAX_CHALLENGE_WINDOW_SECONDS()
 _SEL_MIN_SLASH_GAS = "0x8553927c"      # MIN_SLASH_GAS()
+# sp987 — ProvenanceRegistry (v1 + v2) royalty-rate ceiling.
+_SEL_MAX_ROYALTY_RATE_BPS = "0xa62dbe61"  # MAX_ROYALTY_RATE_BPS()
 
 
 # ── OpenZeppelin AccessControl role hashes (bytes32) ──
@@ -1011,6 +1013,49 @@ INVARIANT_REGISTRY: Dict[str, List[Invariant]] = {
             kind=InvariantKind.UINT256_EQ,
             selector=_SEL_MIN_SLASH_GAS,
             expected=150_000,
+        ),
+    ],
+    # sp987 — ProvenanceRegistry V2 (active) + V1 (legacy, retained). Both
+    # deployed on Base mainnet and both read by the off-chain RoyaltyDistributor.
+    # Permissionless registries (no owner/pausable) — the one contract-level
+    # invariant is the royalty-rate ceiling, a CROSS-CONTRACT consistency pin.
+    "provenance_registry_v2": [
+        Invariant(
+            id="INV-PRV2-1",
+            contract_name="provenance_registry_v2",
+            title="MAX_ROYALTY_RATE_BPS pinned at 9800",
+            description=(
+                "The royalty-rate ceiling. MUST equal 10000 - "
+                "RoyaltyDistributor.NETWORK_FEE_BPS (200, pinned by INV-RD-1), "
+                "so a registered creator royalty rate + the network fee can "
+                "NEVER exceed gross revenue (an over-allocation / distributor-"
+                "solvency guard). This pin is the provenance half of that "
+                "cross-contract pairing; a v2 redeploy or a network-fee change "
+                "that broke the 9800+200==10000 relationship surfaces here."
+            ),
+            severity=InvariantSeverity.CRITICAL,
+            spec_text="MAX_ROYALTY_RATE_BPS() == 9800",
+            kind=InvariantKind.UINT256_EQ,
+            selector=_SEL_MAX_ROYALTY_RATE_BPS,
+            expected=9800,
+        ),
+    ],
+    "provenance_registry": [
+        Invariant(
+            id="INV-PRV-1",
+            contract_name="provenance_registry",
+            title="MAX_ROYALTY_RATE_BPS pinned at 9800 (legacy v1)",
+            description=(
+                "Same royalty-rate ceiling as INV-PRV2-1, on the legacy v1 "
+                "registry (Base mainnet 0xdF47…9915) still read by the "
+                "RoyaltyDistributor for pre-v2 uploads. 10000 - NETWORK_FEE_BPS "
+                "(200) over-allocation guard."
+            ),
+            severity=InvariantSeverity.CRITICAL,
+            spec_text="MAX_ROYALTY_RATE_BPS() == 9800",
+            kind=InvariantKind.UINT256_EQ,
+            selector=_SEL_MAX_ROYALTY_RATE_BPS,
+            expected=9800,
         ),
     ],
     "escrow_pool": [

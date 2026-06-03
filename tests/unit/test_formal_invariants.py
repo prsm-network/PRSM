@@ -1119,6 +1119,34 @@ def test_settlement_registry_lookback_and_gas_floors_pinned():
     assert slash_gas is not None and slash_gas.expected == 150000
 
 
+# ── sp987 — Provenance registries: royalty-rate ceiling (both deployed) ──
+
+
+def test_registry_has_provenance_registries():
+    """Both deployed provenance registries (v1 + v2, read by the off-chain
+    RoyaltyDistributor) join the runtime registry — neither was covered."""
+    assert "provenance_registry_v2" in INVARIANT_REGISTRY
+    assert "provenance_registry" in INVARIANT_REGISTRY
+
+
+def test_provenance_max_royalty_rate_pinned():
+    """The cross-contract over-allocation guard: MAX_ROYALTY_RATE_BPS (9800)
+    must equal 10000 - RoyaltyDistributor.NETWORK_FEE_BPS (200, pinned by
+    INV-RD-1), so a registered royalty rate + the network fee can NEVER exceed
+    gross revenue. Pinned on BOTH deployed registries — a v2 redeploy or a
+    network-fee change that broke the pairing would surface here."""
+    for name, inv_id in [
+        ("provenance_registry_v2", "INV-PRV2-1"),
+        ("provenance_registry", "INV-PRV-1"),
+    ]:
+        invs = INVARIANT_REGISTRY[name]
+        inv = next((i for i in invs if i.id == inv_id), None)
+        assert inv is not None, name
+        assert inv.kind == InvariantKind.UINT256_EQ
+        assert inv.severity == InvariantSeverity.CRITICAL
+        assert inv.expected == 9800
+
+
 def test_emission_mainnet_chain_id_pinned():
     """INV-EC-2: BASE_MAINNET_CHAIN_ID() == 8453. The
     chainid pin that enforces the 4-year mainnet halving

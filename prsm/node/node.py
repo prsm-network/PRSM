@@ -3028,11 +3028,18 @@ class PRSMNode:
                 # sp985 — BatchSettlementRegistry (settlement + consensus-slash).
                 # LIVE on mainnet → these runtime pins execute against real state.
                 "settlement_registry": endpoints.settlement_registry,
+                # sp987 — ProvenanceRegistry V2 (active) + V1 (legacy); both
+                # deployed + read by the RoyaltyDistributor. Royalty-rate ceiling.
+                "provenance_registry_v2": (
+                    endpoints.provenance_registry_v2
+                ),
+                "provenance_registry": endpoints.provenance_registry,
             }
             logger.info(
                 "Formal-invariant checker wired "
-                "(backend=%s, 9 contracts: rd=%s ftns=%s "
-                "ep=%s ec=%s cd=%s ss=%s sb=%s csr=%s bsr=%s)",
+                "(backend=%s, 11 contracts: rd=%s ftns=%s "
+                "ep=%s ec=%s cd=%s ss=%s sb=%s csr=%s bsr=%s "
+                "prv2=%s prv=%s)",
                 bool(backend),
                 self._formal_invariant_addresses.get(
                     "royalty_distributor",
@@ -3060,6 +3067,12 @@ class PRSMNode:
                 ),
                 self._formal_invariant_addresses.get(
                     "settlement_registry",
+                ),
+                self._formal_invariant_addresses.get(
+                    "provenance_registry_v2",
+                ),
+                self._formal_invariant_addresses.get(
+                    "provenance_registry",
                 ),
             )
         except Exception as exc:  # noqa: BLE001
