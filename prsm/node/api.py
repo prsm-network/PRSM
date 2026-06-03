@@ -1519,6 +1519,47 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             },
         )
 
+    # Sprint 954 — server-side Origin check for the wallet onboarding endpoints
+    # (/api/v1/auth/wallet/*), the last auth-review residual. DNS-rebinding
+    # defense COMPLEMENTING CORS: CORS stops a cross-origin page from READING
+    # wallet responses, but a rebinding attack makes the victim's browser send a
+    # state-changing request to the loopback-bound node that the browser treats
+    # as same-origin to the attacker's page — the Origin header still carries the
+    # attacker's domain. Reject a wallet request whose Origin is present AND not
+    # in the operator's PRSM_ALLOWED_ORIGINS allowlist. No Origin header (CLI /
+    # MCP / server-to-server) is always allowed; an unset/empty allowlist stays
+    # permissive (dev/unconfigured), matching the CORS default + the 127.0.0.1
+    # default bind. Unlike /admin/* (which rejects ALL browser-origin requests),
+    # the wallet endpoints are legitimately browser-facing, so allowlisted
+    # origins pass. CORS (registered later → outermost) handles preflight
+    # OPTIONS before this guard sees them.
+    @app.middleware("http")
+    async def wallet_origin_guard_middleware(request, call_next):
+        if request.url.path.startswith("/api/v1/auth/wallet"):
+            origin = request.headers.get("origin", "").strip()
+            if origin:
+                import os as _os_wog
+                _raw = _os_wog.environ.get("PRSM_ALLOWED_ORIGINS", "").strip()
+                if _raw:
+                    _allowed = {o.strip() for o in _raw.split(",") if o.strip()}
+                    if _allowed and origin not in _allowed:
+                        from starlette.responses import JSONResponse as _WalletOriginJSON
+                        return _WalletOriginJSON(
+                            status_code=403,
+                            content={
+                                "detail": (
+                                    "wallet endpoint rejected a cross-origin "
+                                    "browser request (sprint 954 DNS-rebinding "
+                                    "defense): Origin is not in "
+                                    "PRSM_ALLOWED_ORIGINS. Add the wallet UI's "
+                                    "origin to PRSM_ALLOWED_ORIGINS if it is "
+                                    "legitimate."
+                                ),
+                                "origin": origin,
+                            },
+                        )
+        return await call_next(request)
+
     # Sprint 187 — HEAD-rewriting middleware. The dashboard sub-app
     # mount at `""` (see ~line 6753) catches HEAD requests before
     # FastAPI's auto-HEAD-for-GET path runs, returning 404 for any
