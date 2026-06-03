@@ -13965,6 +13965,61 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             "limit": limit,
         }
 
+    @app.get("/admin/consensus-mismatch-evidence")
+    async def get_consensus_mismatch_evidence(
+        limit: int = 50,
+        offset: int = 0,
+        provider: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Recent CONSENSUS_MISMATCH evidence from the single-provider compute
+        pay path (sp928 optimistic verification / sp957 evidence capture).
+
+        When the ComputeResultSampler catches a provider returning an output
+        that disagreed with a strict majority of independent re-runs, the
+        evidence lands here. Each entry: timestamp, job_id, accused_provider_id,
+        accused_output_hash, majority_output_hash, witness_provider_ids,
+        accused_bonded, accused_stake_wei, accused_operator_address.
+
+        This is NOT an on-chain slash — an autonomous slash from one node's
+        re-execution is unsound (StakeBond.slash is slasher-only; the open
+        challengeReceipt rail re-verifies a Merkle proof the off-chain
+        single-provider path never produces). It is the operator-reviewable
+        corpus a future authority-gated on-chain bridge consumes.
+
+        Optional `provider` filter narrows to one accused provider id.
+
+        Status:
+          503 — evidence log not wired
+          422 — limit out of [1, 1000] OR offset < 0
+          200 — {entries, total, offset, limit}
+        """
+        if limit <= 0 or limit > 1000:
+            raise HTTPException(
+                status_code=422,
+                detail=f"limit must be in [1, 1000], got {limit}",
+            )
+        if offset < 0:
+            raise HTTPException(
+                status_code=422,
+                detail=f"offset must be >= 0, got {offset}",
+            )
+        ring = getattr(node, "_consensus_mismatch_log", None)
+        if ring is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Consensus-mismatch evidence log not initialized "
+                    "(requires the compute requester / sp928 verification wiring)."
+                ),
+            )
+        entries = ring.recent(limit=limit, offset=offset, provider=provider)
+        return {
+            "entries": [e.to_dict() for e in entries],
+            "total": ring.count(),
+            "offset": offset,
+            "limit": limit,
+        }
+
     @app.get("/admin/earnings-summary")
     async def get_earnings_summary() -> Dict[str, Any]:
         """Aggregate operator earnings view.

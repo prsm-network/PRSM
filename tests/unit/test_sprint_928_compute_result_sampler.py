@@ -236,6 +236,67 @@ async def test_bonded_outlier_routes_onchain_challenge():
 
 
 @pytest.mark.asyncio
+async def test_evidence_carries_accused_bonded_stake_and_operator():
+    """sp957: evidence must carry the accused's bonded status, stake_wei, and
+    operator_address so a downstream authority can size/route an on-chain
+    challenge without re-querying chain state. The ORIGINAL provider's stake
+    flows in via verify()'s original_* args."""
+    re_exec = FakeReExecutor([
+        ReExecResult("prov-B", "hash-Y"),
+        ReExecResult("prov-C", "hash-Y"),
+    ])
+    rep, chal = FakeReputationSink(), FakeChallengeSink()
+    out = await _sampler(re_exec, rep=rep, chal=chal).verify(
+        job_id="job-1",
+        job_type=JobType.INFERENCE,
+        payload={"prompt": "hi"},
+        original_provider_id="prov-A",
+        original_output_hash="hash-X",
+        original_bonded=True,
+        original_stake_wei=7_000_000_000_000_000_000,
+        original_operator_address="0xOPERATOR",
+    )
+    assert out.verdict == VerificationVerdict.MISMATCH
+    assert len(chal.evidence) == 1
+    ev = chal.evidence[0]
+    assert ev["accused_bonded"] is True
+    assert ev["accused_stake_wei"] == 7_000_000_000_000_000_000
+    assert ev["accused_operator_address"] == "0xOPERATOR"
+
+
+@pytest.mark.asyncio
+async def test_evidence_carries_lying_reexec_provider_stake():
+    """When the LIAR is an independent re-exec provider (not the original), its
+    own stake_wei/operator_address (carried on the ReExecResult) must appear in
+    the evidence — not the original's."""
+    re_exec = FakeReExecutor([
+        # prov-B is the bonded liar; prov-C + prov-D form the majority with the original.
+        ReExecResult("prov-B", "hash-LIE", bonded=True,
+                     stake_wei=3_000_000_000_000_000_000, operator_address="0xLIAR"),
+        ReExecResult("prov-C", "hash-X"),
+        ReExecResult("prov-D", "hash-X"),
+    ])
+    rep, chal = FakeReputationSink(), FakeChallengeSink()
+    out = await _sampler(re_exec, rep=rep, chal=chal, max_tiebreakers=2).verify(
+        job_id="job-1",
+        job_type=JobType.INFERENCE,
+        payload={"prompt": "hi"},
+        original_provider_id="prov-A",
+        original_output_hash="hash-X",
+        original_bonded=False,
+    )
+    # The original agreed with the majority → VERIFIED; the liar prov-B is penalized.
+    assert out.verdict == VerificationVerdict.VERIFIED
+    assert "prov-B" in out.penalized_provider_ids
+    assert len(chal.evidence) == 1
+    ev = chal.evidence[0]
+    assert ev["accused_provider_id"] == "prov-B"
+    assert ev["accused_bonded"] is True
+    assert ev["accused_stake_wei"] == 3_000_000_000_000_000_000
+    assert ev["accused_operator_address"] == "0xLIAR"
+
+
+@pytest.mark.asyncio
 async def test_unbonded_outlier_reputation_only_no_challenge():
     re_exec = FakeReExecutor([
         ReExecResult("prov-B", "hash-Y"),

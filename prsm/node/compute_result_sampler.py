@@ -62,10 +62,18 @@ DEFAULT_SAMPLE_RATE = 0.05
 
 @dataclass(frozen=True)
 class ReExecResult:
-    """One independent re-execution of a sampled job."""
+    """One independent re-execution of a sampled job.
+
+    sp957: ``bonded``/``stake_wei``/``operator_address`` carry the participant's
+    on-chain stake posture so that, when this participant is the outlier, the
+    routed CONSENSUS_MISMATCH evidence is self-describing — a downstream
+    authority can size/route an on-chain challenge without re-querying chain
+    state. They are *descriptive only*: nothing in this module moves stake."""
     provider_id: str
     output_hash: str
     bonded: bool = False
+    stake_wei: int = 0
+    operator_address: Optional[str] = None
 
 
 class VerificationVerdict(str, Enum):
@@ -145,6 +153,8 @@ class ComputeResultSampler:
         original_provider_id: str,
         original_output_hash: str,
         original_bonded: bool = False,
+        original_stake_wei: int = 0,
+        original_operator_address: Optional[str] = None,
     ) -> VerificationOutcome:
         """Re-execute on independent providers and adjudicate the original."""
         self._stats["sampled"] += 1
@@ -192,17 +202,22 @@ class ComputeResultSampler:
             outcome.samples.append(extra)
             exclude.add(extra.provider_id)
 
-        return await self._adjudicate(outcome, original_bonded)
+        original = ReExecResult(
+            provider_id=outcome.original_provider_id,
+            output_hash=outcome.original_output_hash,
+            bonded=original_bonded,
+            stake_wei=original_stake_wei,
+            operator_address=original_operator_address,
+        )
+        return await self._adjudicate(outcome, original)
 
     async def _adjudicate(
-        self, outcome: VerificationOutcome, original_bonded: bool
+        self, outcome: VerificationOutcome, original: ReExecResult
     ) -> VerificationOutcome:
         """Group all participants by output and penalize outliers vs the majority."""
         # Participants: the original + every re-execution sample. Each carries
-        # (provider_id, output_hash, bonded).
-        participants: List[ReExecResult] = [
-            ReExecResult(outcome.original_provider_id, outcome.original_output_hash, original_bonded)
-        ] + list(outcome.samples)
+        # (provider_id, output_hash, bonded, stake_wei, operator_address).
+        participants: List[ReExecResult] = [original] + list(outcome.samples)
         total = len(participants)
 
         # Group by output hash (first-match grouping so a tolerance comparator
@@ -280,6 +295,11 @@ class ComputeResultSampler:
             "accused_output_hash": accused.output_hash,
             "majority_output_hash": truth_hash,
             "witness_provider_ids": witnesses,
+            # sp957: self-describing stake posture so a downstream authority can
+            # size/route an on-chain challenge without re-querying chain state.
+            "accused_bonded": accused.bonded,
+            "accused_stake_wei": accused.stake_wei,
+            "accused_operator_address": accused.operator_address,
         }
         try:
             await self._challenge_sink(evidence)

@@ -1625,21 +1625,25 @@ def node_earnings(api_port: int, output_format: str):
 def _node_admin_history(
     *, api_port: int, path: str, label: str,
     output_format: str, limit: int = 20,
-    row_renderer=None,
+    row_renderer=None, provider: Optional[str] = None,
 ):
-    """Shared helper for the 4 admin-history CLI commands.
+    """Shared helper for the admin-history CLI commands.
 
     `row_renderer` is a callable(entry: dict) -> str that
     each command supplies for typed rendering. Without it the
-    raw entry dict is printed (debug fallback).
+    raw entry dict is printed (debug fallback). Optional `provider`
+    narrows the server-side query to one provider/address.
     """
     import json
     import datetime
     import httpx
+    from urllib.parse import quote
 
     url = (
         f"http://127.0.0.1:{api_port}{path}?limit={limit}"
     )
+    if provider:
+        url += f"&provider={quote(str(provider), safe='')}"
     try:
         with httpx.Client(timeout=10.0) as client:
             resp = client.get(url)
@@ -3057,6 +3061,18 @@ def _render_heartbeat_row(e: dict) -> str:
     )
 
 
+def _render_consensus_mismatch_row(e: dict) -> str:
+    bonded = "bonded" if e.get("accused_bonded") else "unbonded"
+    stake = (e.get("accused_stake_wei", 0) or 0) / 1e18
+    return (
+        f"job={str(e.get('job_id', '?'))[:18]:<18}  "
+        f"accused={_short_addr(e.get('accused_provider_id', '?'))}  "
+        f"{bonded} stake={stake:.4f}  "
+        f"out={str(e.get('accused_output_hash', '?'))[:10]}.."
+        f" vs majority={str(e.get('majority_output_hash', '?'))[:10]}.."
+    )
+
+
 def _render_distribution_row(e: dict) -> str:
     creator = e.get("to_creator", 0) / 1e18
     operator = e.get("to_operator", 0) / 1e18
@@ -3083,6 +3099,41 @@ def node_slash_history(api_port, output_format, limit):
         output_format=output_format,
         limit=limit,
         row_renderer=_render_slash_row,
+    )
+
+
+@node.group("consensus-mismatch", invoke_without_command=False)
+def node_consensus_mismatch():
+    """sp957 — CONSENSUS_MISMATCH evidence (single-provider compute pay path).
+
+    Read-only operator triage over GET /admin/consensus-mismatch-evidence:
+    the bonded providers a sampled re-execution caught returning an output that
+    disagreed with the re-run majority. This is NOT an on-chain slash — it is
+    the operator-reviewable corpus a future authority-gated bridge consumes.
+    """
+
+
+@node_consensus_mismatch.command("list")
+@click.option("--api-port", default=8000, type=int)
+@click.option(
+    "--format", "output_format",
+    type=click.Choice(["text", "json"]), default="text",
+)
+@click.option("--limit", default=20, type=int)
+@click.option(
+    "--provider", default=None,
+    help="Filter to one accused provider id / address.",
+)
+def node_consensus_mismatch_list(api_port, output_format, limit, provider):
+    """Show recent CONSENSUS_MISMATCH evidence."""
+    _node_admin_history(
+        api_port=api_port,
+        path="/admin/consensus-mismatch-evidence",
+        label="Consensus Mismatch Evidence",
+        output_format=output_format,
+        limit=limit,
+        row_renderer=_render_consensus_mismatch_row,
+        provider=provider,
     )
 
 

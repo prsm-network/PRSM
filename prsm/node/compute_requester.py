@@ -38,6 +38,7 @@ from prsm.node.identity import NodeIdentity, verify_signature
 from prsm.node.local_ledger import LocalLedger, TransactionType
 from prsm.node.transport import WebSocketTransport
 from prsm.node.payment_escrow import PaymentEscrow
+from prsm.node.operator_delegation import verify_operator_delegation_blob
 
 if TYPE_CHECKING:
     from prsm.node.discovery import PeerDiscovery
@@ -125,6 +126,13 @@ class ComputeRequester:
         # Built lazily in start() (or injected by node.py / tests before start).
         self.sampler: Optional[ComputeResultSampler] = None
         self._verify_tasks: Set[asyncio.Task] = set()
+        # sp957 — CONSENSUS_MISMATCH challenge routing. Both injected by node.py
+        # after construction (kept optional so tests / minimal wirings still run):
+        #   stake_reader  → resolves a provider's on-chain bond posture
+        #   mismatch_log  → persistent, operator-reviewable evidence store; its
+        #                   async record() becomes the sampler's challenge_sink.
+        self.stake_reader: Optional[Any] = None
+        self.mismatch_log: Optional[Any] = None
 
     async def start(self) -> None:
         """Register gossip handlers."""
@@ -140,23 +148,68 @@ class ComputeRequester:
 
         Sample rate is env-tunable (``PRSM_COMPUTE_VERIFY_SAMPLE_RATE``).
         Verification re-runs are always free (see ``_reexec_for_verification``).
-        On-chain CONSENSUS_MISMATCH challenge routing for bonded providers is a
-        documented follow-on (challenge_sink left None) that must thread the
-        provider's bonded status + a StakeBond lookup; until then the active
-        deterrent is reputation / eligibility removal — which is strictly more
-        verification than the single-provider pay path had before (none).
+
+        sp957: a caught bonded liar's CONSENSUS_MISMATCH evidence is now routed
+        to ``self.mismatch_log.record`` (a persistent, operator-reviewable store)
+        when a log is injected. This does NOT slash on-chain — an autonomous
+        slash from a single node's re-execution is unsound (StakeBond.slash is
+        slasher-only; the open challengeReceipt rail re-verifies a Merkle proof
+        the off-chain single-provider pay path never produces). The evidence is
+        the corpus a future authority-gated bridge consumes. The always-on
+        deterrent remains reputation / eligibility removal.
         """
         rate = DEFAULT_SAMPLE_RATE
         try:
             rate = float(os.getenv("PRSM_COMPUTE_VERIFY_SAMPLE_RATE", str(DEFAULT_SAMPLE_RATE)))
         except (TypeError, ValueError):
             logger.warning("sp928: bad PRSM_COMPUTE_VERIFY_SAMPLE_RATE — using default")
+        challenge_sink = (
+            self.mismatch_log.record if self.mismatch_log is not None else None
+        )
         return ComputeResultSampler(
             re_executor=self._reexec_for_verification,
             reputation_sink=self._record_verification_failure,
-            challenge_sink=None,
+            challenge_sink=challenge_sink,
             sample_rate=rate,
         )
+
+    def _resolve_stake_posture(self, provider_id: str):
+        """Resolve a provider's on-chain bond posture for evidence routing.
+
+        Returns ``(bonded, stake_wei, operator_address)``. A provider's CLAIMED
+        ``operator_address`` (from its hardware_profile) is trusted ONLY after a
+        valid operator-delegation proof (sprint 788) — a spoofed claim, a missing
+        peer record, or an unavailable stake reader all degrade to the unbonded
+        ``(False, 0, None)`` safe default. This is descriptive metadata for the
+        CONSENSUS_MISMATCH evidence log; it grants no authority and moves no stake.
+        """
+        try:
+            disc = self.discovery
+            known = getattr(disc, "known_peers", None) if disc is not None else None
+            peer = known.get(provider_id) if isinstance(known, dict) else None
+            if peer is None:
+                return (False, 0, None)
+            hw = getattr(peer, "hardware_profile", None) or {}
+            operator_address = (hw.get("operator_address") or "").strip()
+            if not operator_address:
+                return (False, 0, None)
+            # sprint-788 gate: an unverified claim cannot ride another bond.
+            if not verify_operator_delegation_blob(
+                node_id=provider_id,
+                operator_address=operator_address,
+                delegation=hw.get("operator_delegation"),
+            ):
+                return (False, 0, None)
+            if self.stake_reader is None:
+                # Operator is proven, but we can't size the bond → treat as
+                # unbonded (safe degrade) while still surfacing the address.
+                return (False, 0, operator_address)
+            stake_wei = int(self.stake_reader.stake_amount_for(operator_address) or 0)
+            return (stake_wei > 0, stake_wei, operator_address)
+        except Exception as e:  # never let posture resolution break verification
+            logger.debug("sp957: stake-posture resolution failed for %s: %s",
+                         str(provider_id)[:8], e)
+            return (False, 0, None)
 
     async def stop(self) -> None:
         self._running = False
@@ -515,12 +568,16 @@ class ComputeRequester:
     ) -> None:
         """Drive sampler.verify() for a completed job (fire-and-forget safe)."""
         try:
+            bonded, stake_wei, operator_address = self._resolve_stake_posture(provider_id)
             outcome = await self.sampler.verify(
                 job_id=job.job_id,
                 job_type=job.job_type,
                 payload=job.payload,
                 original_provider_id=provider_id,
                 original_output_hash=original_hash,
+                original_bonded=bonded,
+                original_stake_wei=stake_wei,
+                original_operator_address=operator_address,
             )
             if outcome.verdict == VerificationVerdict.MISMATCH:
                 logger.warning(
@@ -573,7 +630,16 @@ class ComputeRequester:
         rerun_job = self.submitted_jobs.get(rerun.job_id)
         rerun_provider = (rerun_job.provider_id if rerun_job else None) or capable[0]
         out_hash = hashlib.sha256(json.dumps(res, sort_keys=True).encode()).hexdigest()
-        return ReExecResult(provider_id=rerun_provider, output_hash=out_hash)
+        # sp957: carry the re-run provider's own bond posture so a lying
+        # re-exec provider's stake is recorded in the routed evidence.
+        bonded, stake_wei, operator_address = self._resolve_stake_posture(rerun_provider)
+        return ReExecResult(
+            provider_id=rerun_provider,
+            output_hash=out_hash,
+            bonded=bonded,
+            stake_wei=stake_wei,
+            operator_address=operator_address,
+        )
 
     def _record_verification_failure(self, provider_id: str, outcome) -> None:
         """Reputation deterrent — drop a caught liar's reliability score."""

@@ -2033,6 +2033,26 @@ class PRSMNode:
         self._slash_event_log = SlashEventRing(
             persist_dir=_slash_persist_dir,
         )
+        # sp957 — CONSENSUS_MISMATCH evidence log for the single-provider
+        # compute pay path (sp928 optimistic verification). When the sampler
+        # catches a bonded provider returning a fabricated result, the evidence
+        # lands here (opt-in persistent, visible at
+        # GET /admin/consensus-mismatch-evidence). NOT an on-chain slash — an
+        # autonomous slash from one node's re-execution is unsound; this is the
+        # corpus a future authority-gated bridge consumes.
+        from prsm.node.consensus_mismatch_log import ConsensusMismatchLog
+        from prsm.node.onchain_stake_reader import OnChainStakeReader
+        _cm_dir_raw = os.environ.get(
+            "PRSM_CONSENSUS_MISMATCH_LOG_DIR", "",
+        ).strip()
+        self._consensus_mismatch_log = ConsensusMismatchLog(
+            persist_dir=(
+                _PathForSlash(_cm_dir_raw) if _cm_dir_raw else None
+            ),
+        )
+        # Shared on-chain stake reader (graceful-degrade to 0 off-chain) used to
+        # resolve a caught provider's bond posture for the evidence record.
+        self._compute_stake_reader = OnChainStakeReader()
         _hb_dir_raw = os.environ.get(
             "PRSM_HEARTBEAT_LOG_DIR", "",
         ).strip()
@@ -4073,6 +4093,13 @@ class PRSMNode:
         self.compute_requester.ledger_sync = self.ledger_sync
         if hasattr(self.compute_requester, 'escrow'):
             self.compute_requester.escrow = self._payment_escrow
+        # sp957 — wire CONSENSUS_MISMATCH evidence routing into the requester's
+        # sampler (built lazily in compute_requester.start(), which runs after
+        # this). stake_reader resolves a caught provider's bond posture; the
+        # mismatch_log.record becomes the sampler's challenge_sink.
+        if hasattr(self.compute_requester, 'stake_reader'):
+            self.compute_requester.stake_reader = self._compute_stake_reader
+            self.compute_requester.mismatch_log = self._consensus_mismatch_log
         if self.storage_provider:
             self.storage_provider.ledger_sync = self.ledger_sync
         self.agent_collaboration.ledger_sync = self.ledger_sync
