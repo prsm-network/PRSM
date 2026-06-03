@@ -182,6 +182,33 @@ def test_endpoint_invalid_limit_422():
     assert resp.status_code == 422
 
 
+# ── GET /admin/consensus-mismatch-evidence/summary (sp959 visibility) ───────
+
+
+def test_summary_endpoint_returns_requester_summary():
+    node = _node()
+    node.compute_requester = MagicMock()
+    node.compute_requester.dispatch_exclusion_summary = MagicMock(return_value={
+        "threshold": 2, "window_sec": 0.0,
+        "providers": [
+            {"provider_id": "prov-liar", "mismatch_count": 3, "excluded": True},
+        ],
+    })
+    resp = _client(node).get("/admin/consensus-mismatch-evidence/summary")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["threshold"] == 2
+    assert body["providers"][0]["provider_id"] == "prov-liar"
+    assert body["providers"][0]["excluded"] is True
+
+
+def test_summary_endpoint_503_without_requester():
+    node = _node()
+    node.compute_requester = None
+    resp = _client(node).get("/admin/consensus-mismatch-evidence/summary")
+    assert resp.status_code == 503
+
+
 # ── count_for: per-provider confirmed-mismatch count (sp958 input) ──────────
 
 
@@ -216,3 +243,11 @@ def test_count_for_since_timestamp_window():
     assert log.count_for("p") == 3
     # Only entries at/after the cutoff count.
     assert log.count_for("p", since_timestamp=1000.0) == 1
+
+
+def test_providers_returns_distinct_accused():
+    log = ConsensusMismatchLog()
+    asyncio.run(log.record(_evidence(job="j1", accused="prov-a")))
+    asyncio.run(log.record(_evidence(job="j2", accused="prov-a")))
+    asyncio.run(log.record(_evidence(job="j3", accused="prov-b")))
+    assert set(log.providers()) == {"prov-a", "prov-b"}

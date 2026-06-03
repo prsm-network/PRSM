@@ -210,3 +210,47 @@ class TestConsensusMismatch:
             runner.invoke(
                 node, ["consensus-mismatch", "list", "--provider", "0xPROV"])
         assert "provider=0xPROV" in captured["url"]
+
+    def test_summary_renders_excluded_providers(self, runner):
+        payload = {
+            "threshold": 2, "window_sec": 0.0,
+            "providers": [
+                {"provider_id": "0xLIAR", "mismatch_count": 3, "excluded": True},
+                {"provider_id": "0xONCE", "mismatch_count": 1, "excluded": False},
+            ],
+        }
+        captured = {}
+
+        def capture_get(url):
+            captured["url"] = url
+            return _ok(payload)
+
+        with patch("httpx.Client") as MockClient:
+            ci = MockClient.return_value.__enter__.return_value
+            ci.get = MagicMock(side_effect=capture_get)
+            result = runner.invoke(node, ["consensus-mismatch", "summary"])
+        assert result.exit_code == 0
+        assert "/admin/consensus-mismatch-evidence/summary" in captured["url"]
+        assert "0xLIAR" in result.output
+        assert "EXCLUDED" in result.output.upper()
+
+    def test_summary_503_friendly_exit_0(self, runner):
+        bad = MagicMock()
+        bad.status_code = 503
+        bad.json = MagicMock(return_value={"detail": "not wired"})
+        with patch("httpx.Client") as MockClient:
+            ci = MockClient.return_value.__enter__.return_value
+            ci.get = MagicMock(return_value=bad)
+            result = runner.invoke(node, ["consensus-mismatch", "summary"])
+        assert result.exit_code == 0
+        assert "not" in result.output.lower()
+
+    def test_summary_json_format(self, runner):
+        payload = {"threshold": 2, "window_sec": 0.0, "providers": []}
+        with patch("httpx.Client") as MockClient:
+            ci = MockClient.return_value.__enter__.return_value
+            ci.get = MagicMock(return_value=_ok(payload))
+            result = runner.invoke(
+                node, ["consensus-mismatch", "summary", "--format", "json"])
+        assert result.exit_code == 0
+        assert json.loads(result.output) == payload

@@ -182,3 +182,35 @@ class TestDispatchEligibilityGate:
         out = req._get_capable_peers(JobType.INFERENCE)
         # now() is far past 100+3600 → old evidence outside window → eligible.
         assert "prov-reformed" in out
+
+
+class TestDispatchExclusionSummary:
+    """sp959 — operator visibility into the sp958 silent enforcement policy:
+    which providers is THIS node currently refusing to pay, and why."""
+
+    def test_summary_reports_counts_and_excluded_flag(self, monkeypatch):
+        monkeypatch.setenv("PRSM_DISPATCH_MAX_CONSENSUS_MISMATCHES", "2")
+        monkeypatch.delenv("PRSM_DISPATCH_MISMATCH_WINDOW_SEC", raising=False)
+        log = ConsensusMismatchLog()
+        for i in range(3):
+            asyncio.run(log.record({
+                "reason": "CONSENSUS_MISMATCH", "job_id": f"a{i}",
+                "accused_provider_id": "prov-liar"}))
+        asyncio.run(log.record({
+            "reason": "CONSENSUS_MISMATCH", "job_id": "b0",
+            "accused_provider_id": "prov-once"}))
+        req = _make_requester()
+        req.mismatch_log = log
+        summary = req.dispatch_exclusion_summary()
+        assert summary["threshold"] == 2
+        by_id = {p["provider_id"]: p for p in summary["providers"]}
+        assert by_id["prov-liar"]["mismatch_count"] == 3
+        assert by_id["prov-liar"]["excluded"] is True
+        assert by_id["prov-once"]["mismatch_count"] == 1
+        assert by_id["prov-once"]["excluded"] is False
+
+    def test_summary_no_log_is_empty(self):
+        req = _make_requester()
+        req.mismatch_log = None
+        summary = req.dispatch_exclusion_summary()
+        assert summary["providers"] == []

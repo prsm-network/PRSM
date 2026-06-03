@@ -198,6 +198,14 @@ class ConsensusMismatchLog:
             n += 1
         return n
 
+    def providers(self) -> List[str]:
+        """Distinct accused provider ids present in the ring (first-seen order).
+        sp959: the enumeration a dispatch-exclusion summary iterates."""
+        seen: Dict[str, None] = {}
+        for e in self._entries:
+            seen.setdefault(e.accused_provider_id, None)
+        return list(seen.keys())
+
     # ── challenge_sink adapter (async (evidence: dict) -> None) ──────────
 
     async def record(self, evidence: Any) -> None:

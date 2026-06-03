@@ -14020,6 +14020,32 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             "limit": limit,
         }
 
+    @app.get("/admin/consensus-mismatch-evidence/summary")
+    async def get_consensus_mismatch_summary() -> Dict[str, Any]:
+        """sp959 — operator visibility into the sp958 dispatch-exclusion policy.
+
+        sp958 makes this node silently stop routing paid jobs to a provider
+        with enough confirmed consensus mismatches. This surfaces that policy:
+        the active threshold + decay window, and a per-provider breakdown of
+        confirmed-mismatch counts with an `excluded` flag — so an operator can
+        answer "which providers am I refusing to pay, and why?" without reading
+        logs.
+
+        Status:
+          503 — compute requester not wired
+          200 — {threshold, window_sec, providers: [{provider_id, mismatch_count, excluded}]}
+        """
+        requester = getattr(node, "compute_requester", None)
+        if requester is None or not hasattr(requester, "dispatch_exclusion_summary"):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Compute requester not initialized "
+                    "(dispatch-exclusion policy unavailable)."
+                ),
+            )
+        return requester.dispatch_exclusion_summary()
+
     @app.get("/admin/earnings-summary")
     async def get_earnings_summary() -> Dict[str, Any]:
         """Aggregate operator earnings view.

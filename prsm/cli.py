@@ -3137,6 +3137,59 @@ def node_consensus_mismatch_list(api_port, output_format, limit, provider):
     )
 
 
+@node_consensus_mismatch.command("summary")
+@click.option("--api-port", default=8000, type=int)
+@click.option(
+    "--format", "output_format",
+    type=click.Choice(["text", "json"]), default="text",
+)
+def node_consensus_mismatch_summary(api_port, output_format):
+    """Show which providers this node is excluding from dispatch + why."""
+    import json as _json
+    import httpx as _httpx
+    url = f"http://127.0.0.1:{api_port}/admin/consensus-mismatch-evidence/summary"
+    try:
+        with _httpx.Client(timeout=10.0) as client:
+            resp = client.get(url)
+    except _httpx.RequestError as exc:
+        console.print(
+            f"[red]Cannot reach PRSM node at {url}[/red]\n"
+            f"[dim]Start with: prsm node start[/dim]\n[dim]Details: {exc}[/dim]"
+        )
+        sys.exit(2)
+    if resp.status_code == 503:
+        console.print(
+            "[yellow]Dispatch-exclusion policy not available.[/yellow]\n"
+            f"[dim]{resp.json().get('detail', 'compute requester not wired')}[/dim]"
+        )
+        sys.exit(0)
+    if resp.status_code != 200:
+        console.print(f"[red]{url} returned {resp.status_code}[/red]: {resp.text}")
+        sys.exit(1)
+    body = resp.json()
+    if output_format == "json":
+        console.print(_json.dumps(body, indent=2))
+        return
+    threshold = body.get("threshold", 0)
+    window = body.get("window_sec", 0)
+    providers = body.get("providers", [])
+    console.print(
+        f"[bold]Dispatch Exclusion Policy[/bold] "
+        f"(threshold={threshold} confirmed mismatches, "
+        f"window={'all-time' if not window else f'{window:.0f}s'}):"
+    )
+    if not providers:
+        console.print("  [dim]No flagged providers[/dim]")
+        return
+    for p in providers:
+        excluded = p.get("excluded")
+        tag = "[red]EXCLUDED[/red]" if excluded else "[green]eligible[/green]"
+        console.print(
+            f"  {tag}  {_short_addr(p.get('provider_id', '?'))}  "
+            f"mismatches={p.get('mismatch_count', 0)}"
+        )
+
+
 @node.command("doctor")
 @click.option(
     "--api-url", "api_url_override", default=None,

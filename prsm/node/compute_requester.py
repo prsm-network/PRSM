@@ -288,16 +288,54 @@ class ComputeRequester:
         if log is None:
             return False
         try:
-            threshold = int(os.getenv("PRSM_DISPATCH_MAX_CONSENSUS_MISMATCHES", "2"))
+            threshold, since = self._dispatch_exclusion_policy()
             if threshold <= 0:
                 return False
-            window = float(os.getenv("PRSM_DISPATCH_MISMATCH_WINDOW_SEC", "0") or 0)
-            since = (time.time() - window) if window > 0 else None
             return log.count_for(node_id, since_timestamp=since) >= threshold
         except Exception as e:  # never starve dispatch on a check error
             logger.debug("sp958: dispatch-eligibility check failed for %s: %s",
                          str(node_id)[:8], e)
             return False
+
+    def _dispatch_exclusion_policy(self):
+        """Resolve (threshold, since_timestamp) from env — the single source of
+        truth shared by the gate and the operator-facing summary (no drift)."""
+        threshold = int(os.getenv("PRSM_DISPATCH_MAX_CONSENSUS_MISMATCHES", "2"))
+        window = float(os.getenv("PRSM_DISPATCH_MISMATCH_WINDOW_SEC", "0") or 0)
+        since = (time.time() - window) if window > 0 else None
+        return threshold, since
+
+    def dispatch_exclusion_summary(self) -> Dict[str, Any]:
+        """sp959 — operator visibility into the sp958 enforcement policy: which
+        providers this node is currently refusing to pay, and the count of
+        confirmed mismatches behind each. Returns the active threshold/window
+        plus a per-provider breakdown (count + excluded bool). Empty when no
+        evidence log is wired."""
+        log = getattr(self, "mismatch_log", None)
+        threshold = int(os.getenv("PRSM_DISPATCH_MAX_CONSENSUS_MISMATCHES", "2"))
+        window = float(os.getenv("PRSM_DISPATCH_MISMATCH_WINDOW_SEC", "0") or 0)
+        out: Dict[str, Any] = {
+            "threshold": threshold,
+            "window_sec": window,
+            "providers": [],
+        }
+        if log is None:
+            return out
+        try:
+            _, since = self._dispatch_exclusion_policy()
+            rows = []
+            for pid in log.providers():
+                count = log.count_for(pid, since_timestamp=since)
+                rows.append({
+                    "provider_id": pid,
+                    "mismatch_count": count,
+                    "excluded": threshold > 0 and count >= threshold,
+                })
+            rows.sort(key=lambda r: r["mismatch_count"], reverse=True)
+            out["providers"] = rows
+        except Exception as e:
+            logger.debug("sp959: dispatch-exclusion summary failed: %s", e)
+        return out
 
     async def submit_job(
         self,
