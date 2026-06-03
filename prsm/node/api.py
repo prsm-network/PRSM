@@ -15837,12 +15837,34 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         else:
             top_status = "healthy"
 
+        # sp963 — surface the sp960 network-exposure auth posture so operators
+        # can re-check it any time (not just at the startup log line). A bind to
+        # a non-loopback interface with no PRSM_NODE_API_KEY leaves the protected
+        # money endpoints unauthenticated.
+        security_posture: Dict[str, Any] = {"level": "ok", "message": ""}
+        try:
+            from prsm.node.node import assess_public_bind_auth_posture
+            listen_host = getattr(getattr(node, "config", None), "listen_host", None)
+            api_key_set = bool(os.environ.get("PRSM_NODE_API_KEY", "").strip())
+            level, message = assess_public_bind_auth_posture(
+                listen_host=listen_host, api_key_present=api_key_set,
+            )
+            security_posture = {
+                "level": level,
+                "listen_host": listen_host,
+                "api_key_set": api_key_set,
+                "message": message,
+            }
+        except Exception as exc:  # noqa: BLE001 — never break health on this
+            logger.debug("security_posture probe failed: %s", exc)
+
         return {
             "status": top_status,
             "node_id": (
                 node.identity.node_id if node.identity else "unknown"
             ),
             "subsystems": subsystems,
+            "security_posture": security_posture,
         }
 
     # ── Batch Settlement Endpoints ─────────────────────────────────
