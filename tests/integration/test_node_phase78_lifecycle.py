@@ -30,7 +30,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from prsm.node.node import PRSMNode as Node
+from prsm.node.node import PRSMNode as Node, _drain_task_bounded
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -81,17 +81,31 @@ class TestStaticWiringIntegrity:
                 f"with timeout in the shutdown loop."
             )
 
-    def test_stop_uses_5s_timeout_and_cancellederror_suppression(self):
+    def test_stop_drains_daemon_tasks_with_bounded_abandon(self):
+        # Sprint 955 — Node.stop must BOUND its daemon-task drains so a
+        # misbehaving/stuck daemon can't hang shutdown. It uses
+        # _drain_task_bounded (a 5.0s bound), which on timeout cancel-requests
+        # and ABANDONS the task — strictly stronger than the prior
+        # asyncio.wait_for(task, 5.0), which cancelled THEN awaited the
+        # cancellation and so could itself hang on a task that resists cancel
+        # (an uncancellable executor RPC / subprocess teardown).
         stop_src = inspect.getsource(Node.stop)
-        assert "timeout=5.0" in stop_src, (
-            "Node.stop daemon shutdown must use timeout=5.0 to "
-            "bound graceful-stop wait. Without it, a misbehaving "
-            "daemon could hang indefinitely."
+        assert "_drain_task_bounded" in stop_src, (
+            "Node.stop daemon-task drain must use _drain_task_bounded to "
+            "bound the wait; without it a stuck daemon hangs shutdown."
         )
-        assert "CancelledError" in stop_src, (
-            "Node.stop must suppress CancelledError when awaiting "
-            "daemon tasks; otherwise stop propagates a benign "
-            "cancellation as an exception."
+        assert "5.0" in stop_src, (
+            "the daemon-task drain bound (5.0s) must be present in Node.stop."
+        )
+        # The primitive must ABANDON (not await) a non-finishing task — that is
+        # the load-bearing difference from wait_for.
+        drain_src = inspect.getsource(_drain_task_bounded)
+        assert "asyncio.wait(" in drain_src, (
+            "_drain_task_bounded must use asyncio.wait (returns at the deadline "
+            "regardless), NOT wait_for (which awaits the cancellation)."
+        )
+        assert "task.cancel()" in drain_src, (
+            "_drain_task_bounded must cancel-request the stuck task on timeout."
         )
 
 

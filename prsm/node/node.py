@@ -1603,6 +1603,44 @@ class _StakingFTNSAdapter:
             return False
 
 
+async def _drain_task_bounded(
+    task: "Optional[asyncio.Task]",
+    timeout: float,
+    name: str = "task",
+) -> bool:
+    """Sprint 955 — bounded drain of a daemon task during node shutdown.
+
+    Awaits ``task`` for up to ``timeout`` seconds via ``asyncio.wait`` (which
+    returns at the deadline regardless of the task's state). If it finishes,
+    its result is reaped (a non-cancel exception is logged + swallowed —
+    shutdown is best-effort) and True is returned. If it does NOT finish in
+    time, the task is cancel-REQUESTED but ABANDONED (we never await the
+    cancellation) and False is returned.
+
+    This is the load-bearing difference from ``asyncio.wait_for(task, timeout)``:
+    wait_for, on timeout, cancels the task AND THEN AWAITS the cancellation —
+    so a task stuck in an uncancellable await (a blocking executor RPC, a
+    subprocess teardown) makes the shutdown itself hang forever. Abandoning the
+    task guarantees node.stop() returns within the bound (the process is
+    stopping; an orphaned task is acceptable). Sibling of sp953's bounded
+    transport shutdown, one layer up in the node's own stop sequence."""
+    if task is None:
+        return True
+    done, _pending = await asyncio.wait({task}, timeout=timeout)
+    if task in done:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001 — best-effort shutdown
+            logger.warning("node.stop: %s raised on stop: %s", name, exc)
+        return True
+    logger.warning(
+        "node.stop: %s did not wind down within %.1fs — cancel-requested and "
+        "abandoned (avoids hanging shutdown).", name, timeout,
+    )
+    task.cancel()  # request only — do NOT await (a stuck task would re-hang us)
+    return False
 
 
 class PRSMNode:
@@ -5236,8 +5274,12 @@ class PRSMNode:
         ):
             task = getattr(self, task_attr, None)
             if task is not None:
-                with suppress(asyncio.CancelledError):
-                    await asyncio.wait_for(task, timeout=5.0)
+                # sp955 — bounded drain. `asyncio.wait_for(task, 5)` cancels then
+                # AWAITS the cancellation on timeout, so a task stuck in an
+                # uncancellable await hangs shutdown forever (observed: node.stop
+                # parked on PendingWithdrawReconciler). `_drain_task_bounded`
+                # abandons a non-finishing task instead, guaranteeing we return.
+                await _drain_task_bounded(task, 5.0, name=task_attr)
                 setattr(self, task_attr, None)
 
         if self.agent_collaboration:
