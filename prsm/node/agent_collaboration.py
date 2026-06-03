@@ -130,6 +130,13 @@ class TaskOffer:
     result: Optional[Dict[str, Any]] = None
     created_at: float = field(default_factory=time.time)
     escrow_tx_id: Optional[str] = None  # Transaction ID for escrowed budget
+    # sp971 — escrow is paid XOR refunded AT MOST ONCE. Mirrors the
+    # ReviewRequest.paid_reviewers / KnowledgeQuery.paid_responders idempotency
+    # guard. Set BEFORE the credit await so a concurrent path (stop() racing the
+    # expiry sweep) no-ops instead of double-crediting (local_ledger.credit() is
+    # NOT write-lock-atomic, unlike sp929's debit() — the app layer is the guard).
+    paid: bool = False
+    refunded: bool = False
 
 
 @dataclass
@@ -853,6 +860,12 @@ class AgentCollaboration:
         """Release escrowed FTNS to the assigned agent's node."""
         if not self.ledger or not task.assigned_agent_id:
             return
+        # sp971 — at-most-once: skip if already paid or refunded; claim the
+        # payment BEFORE the await so a concurrent call no-ops. Roll back on
+        # failure so a legitimate retry can still pay.
+        if task.paid or task.refunded:
+            return
+        task.paid = True
         try:
             # Find the assigned agent's node from the bid
             target_node = None
@@ -887,12 +900,19 @@ class AgentCollaboration:
                     description=f"Task payment (pending sync): {task.title[:30]}",
                 )
         except Exception as e:
+            task.paid = False  # sp971 — roll back so a legitimate retry can pay
             logger.error(f"Task payment failed for {task.task_id[:8]}: {e}")
 
     async def _refund_task_escrow(self, task: TaskOffer) -> None:
         """Refund escrowed FTNS back to the requester's wallet."""
         if not self.ledger or task.ftns_budget <= 0:
             return
+        # sp971 — at-most-once: skip if already refunded or paid; claim the
+        # refund BEFORE the await so the expiry sweep racing stop() no-ops
+        # instead of double-crediting. Roll back on failure to allow retry.
+        if task.refunded or task.paid:
+            return
+        task.refunded = True
         try:
             from prsm.node.local_ledger import TransactionType
             await self.ledger.credit(
@@ -903,6 +923,7 @@ class AgentCollaboration:
             )
             logger.info(f"Refunded {task.ftns_budget} FTNS for task {task.task_id[:8]}")
         except Exception as e:
+            task.refunded = False  # roll back so a later sweep can retry
             logger.error(f"Escrow refund failed for task {task.task_id[:8]}: {e}")
 
     async def _pay_reviewer(self, review: ReviewRequest, reviewer_node_id: str, reviewer_agent_id: str) -> None:
