@@ -74,6 +74,19 @@ def test_catalog_has_creator_stake_registry_proof():
     assert entry["runtime_invariants"] == []
 
 
+def test_catalog_has_batch_settlement_consensus_mismatch_proof():
+    """Sprint 986 ships BatchSettlementConsensusMismatchSpec — the
+    live-on-mainnet settlement registry's false-slash guards are
+    machine-proven (the 'never falsely slash an honest provider' invariant)."""
+    assert (
+        "BatchSettlementConsensusMismatchSpec" in SYMBOLIC_PROOF_CATALOG
+    )
+    entry = SYMBOLIC_PROOF_CATALOG["BatchSettlementConsensusMismatchSpec"]
+    assert (
+        entry["mirrors_runtime_contract"] == "settlement_registry"
+    )
+
+
 def test_catalog_has_three_band_routing_proof():
     """Sprint 374: PRSM-PROV-1 three-band routing (§7.19)."""
     assert "ThreeBandRoutingSpec" in SYMBOLIC_PROOF_CATALOG
@@ -279,6 +292,34 @@ Symbolic test result: 3 passed; 0 failed; time: 0.09s
         if p.name.startswith("check_mint_preserves_cap")
     )
     assert mint_proof.paths_explored == 5
+
+
+def test_parser_handles_tuple_struct_param_signature():
+    """sp986 regression: a check function taking a struct/tuple param renders a
+    NESTED-paren signature, e.g. check_x((bytes32,address,bool)). The original
+    single-level `[^)]*` matcher silently dropped every such proof (suite came
+    back ERROR 'no parseable results' even though halmos PASSed). The parser
+    must capture the full nested signature."""
+    output = """
+Running 2 tests for test/BatchSettlementConsensusMismatch.t.sol:BatchSettlementConsensusMismatchSpec
+[PASS] check_same_provider_never_valid((bytes32,bytes32,address,address,bool,bool)) (paths: 12, time: 0.02s, bounds: [])
+[PASS] check_all_guards_satisfied_accepts((bytes32,bytes32,bytes32,address,address,bool)) (paths: 9, time: 0.02s, bounds: [])
+Symbolic test result: 2 passed; 0 failed; time: 0.04s
+""".strip()
+    suite = _parse_halmos_output("BatchSettlementConsensusMismatchSpec", output)
+    assert suite.status == SymbolicProofStatus.PASSED
+    assert len(suite.proofs) == 2
+    # The full nested signature is captured in the name (substring checks in the
+    # live tests rely on the leading check_ name being present).
+    assert any(
+        p.name.startswith("check_same_provider_never_valid")
+        for p in suite.proofs
+    )
+    same_provider = next(
+        p for p in suite.proofs
+        if p.name.startswith("check_same_provider_never_valid")
+    )
+    assert same_provider.paths_explored == 12
 
 
 def test_parser_handles_mixed_pass_fail():
@@ -646,6 +687,30 @@ def test_live_halmos_creator_stake_registry():
     assert any(
         "check_creatorStakeOf_zero_after_requestUnbond" in n
         for n in proof_names
+    ), proof_names
+
+
+@pytest.mark.requires_halmos
+def test_live_halmos_batch_settlement_consensus_mismatch():
+    """Real halmos invocation against the BatchSettlementRegistry
+    consensus-mismatch false-slash guards (sprint 986). Six proofs.
+    Validated locally at 6 passed / 0 failed."""
+    runner = HalmosRunner(timeout_seconds=120)
+    if not runner.is_available():
+        pytest.skip("halmos or forge not on PATH")
+    suite = runner.run("BatchSettlementConsensusMismatchSpec")
+    assert suite.status == SymbolicProofStatus.PASSED, (
+        f"BatchSettlementConsensusMismatchSpec failed: {suite.to_dict()}"
+    )
+    proof_names = {p.name for p in suite.proofs}
+    assert any(
+        "check_same_provider_never_valid" in n for n in proof_names
+    ), proof_names
+    assert any(
+        "check_cross_group_never_valid" in n for n in proof_names
+    ), proof_names
+    assert any(
+        "check_all_guards_satisfied_accepts" in n for n in proof_names
     ), proof_names
 
 

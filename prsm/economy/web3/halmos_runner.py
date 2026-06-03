@@ -234,6 +234,13 @@ def _parse_halmos_output(
       [FAIL] check_name() (paths: 3, time: 0.01s, bounds: [])
         Counterexample: ...
 
+    The signature can contain NESTED parens when a check function takes a
+    struct/tuple param, e.g.
+      [PASS] check_x((bytes32,address,bool)) (paths: 9, time: 0.02s, bounds: [])
+    so the name+signature is captured lazily up to the " (paths:" marker rather
+    than with a single-level paren matcher (sp986 — the earlier `[^)]*` matcher
+    silently dropped every tuple-param proof).
+
     Footer:
       Symbolic test result: 3 passed; 0 failed; time: 0.09s
 
@@ -245,7 +252,7 @@ def _parse_halmos_output(
     for line in clean.splitlines():
         m = re.match(
             r"^\s*\[(PASS|FAIL|ERROR)\]\s+"
-            r"(\w+(?:\([^)]*\))?)\s+"
+            r"(.+?)\s+"
             r"\(paths:\s*(\d+),\s+"
             r"time:\s*([\d.]+)s",
             line,
@@ -540,6 +547,29 @@ SYMBOLIC_PROOF_CATALOG: Dict[str, Dict[str, Any]] = {
             "bounds) are added to the runtime registry at "
             "commission time, once the contract has an "
             "on-chain address."
+        ),
+    },
+    "BatchSettlementConsensusMismatchSpec": {
+        "mirrors_runtime_contract": "settlement_registry",
+        "runtime_invariants": [],
+        "description": (
+            "Symbolic proof that the LIVE-on-mainnet "
+            "BatchSettlementRegistry's CONSENSUS_MISMATCH "
+            "challenge path can NEVER slash unless a "
+            "genuine cross-provider, same-consensus-group "
+            "disagreement is proven. Each false-slash "
+            "precondition — same provider on both batches, "
+            "mismatched / zero consensus_group_id, no "
+            "actual output disagreement, self-referential "
+            "challenge — is proven to force rejection for "
+            "ALL symbolic inputs; a non-vacuity proof "
+            "confirms the validator accepts when all guards "
+            "hold. The algorithmic backing for the standing "
+            "'a single node must NEVER falsely slash an "
+            "honest provider' invariant, complementing the "
+            "sp985 runtime pins (INV-BSR-*). Source-"
+            "identity-mirrors _handleConsensusMismatch at "
+            "BatchSettlementRegistry.sol:898-944."
         ),
     },
 }
