@@ -423,6 +423,27 @@ class DAGLedger:
             );
             CREATE INDEX IF NOT EXISTS idx_gossip_received ON gossip_log(received_at);
 
+            -- sp966 — durable provenance registry (mirrors LocalLedger so the
+            -- DEFAULT (dag) backend actually persists + serves gossip provenance;
+            -- previously absent → provenance silently dead on default nodes).
+            CREATE TABLE IF NOT EXISTS provenance_chains (
+                cid               TEXT PRIMARY KEY,
+                content_hash      TEXT NOT NULL DEFAULT '',
+                creator_id        TEXT NOT NULL,
+                creator_pubkey    TEXT NOT NULL DEFAULT '',
+                filename          TEXT NOT NULL DEFAULT '',
+                size_bytes        INTEGER NOT NULL DEFAULT 0,
+                royalty_rate      REAL NOT NULL DEFAULT 0.01,
+                parent_cids       TEXT NOT NULL DEFAULT '[]',
+                signature         TEXT NOT NULL DEFAULT '',
+                embedding_id      TEXT,
+                near_duplicate_of TEXT,
+                metadata          TEXT NOT NULL DEFAULT '{}',
+                registered_at     REAL NOT NULL,
+                signed_record     TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_prov_creator ON provenance_chains(creator_id);
+
             CREATE TABLE IF NOT EXISTS collab_tasks (
                 task_id TEXT PRIMARY KEY,
                 requester_agent_id TEXT NOT NULL,
@@ -1713,6 +1734,175 @@ class DAGLedger:
             )
             await self._db.commit()
             return cursor.rowcount == 1
+
+    # ── sp966 — node-services surface (gossip-log + provenance) ──────────
+    # Mirrors LocalLedger so the DEFAULT (dag) backend actually persists +
+    # serves gossip-log/digest-catch-up + provenance. A parity pin test
+    # (test_sprint_966) guards against the two ledgers drifting again. These
+    # operate on self._db (DAGLedger's own connection), NOT the unwired
+    # DAGLedgerAdapter that previously held look-alike copies.
+
+    async def log_gossip(
+        self,
+        nonce: str,
+        subtype: str,
+        origin: str,
+        payload: Dict[str, Any],
+        ttl: int = 5,
+        attestation: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Persist a gossip message for catch-up replay (sp961 attestation)."""
+        await self._db.execute(
+            """INSERT OR IGNORE INTO gossip_log
+               (nonce, subtype, origin, payload, ttl, received_at, attestation)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                nonce, subtype, origin, json.dumps(payload), ttl, time.time(),
+                json.dumps(attestation) if attestation is not None else None,
+            ),
+        )
+        await self._db.commit()
+
+    async def get_recent_gossip(
+        self,
+        since: float,
+        subtypes: Optional[List[str]] = None,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve gossip messages received after *since* timestamp."""
+        if subtypes:
+            placeholders = ",".join("?" for _ in subtypes)
+            cursor = await self._db.execute(
+                f"""SELECT nonce, subtype, origin, payload, ttl, received_at, attestation
+                    FROM gossip_log
+                    WHERE received_at > ? AND subtype IN ({placeholders})
+                    ORDER BY received_at ASC LIMIT ?""",
+                (since, *subtypes, limit),
+            )
+        else:
+            cursor = await self._db.execute(
+                """SELECT nonce, subtype, origin, payload, ttl, received_at, attestation
+                   FROM gossip_log
+                   WHERE received_at > ?
+                   ORDER BY received_at ASC LIMIT ?""",
+                (since, limit),
+            )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "nonce": r[0],
+                "subtype": r[1],
+                "origin": r[2],
+                "payload": json.loads(r[3]),
+                "ttl": r[4],
+                "received_at": r[5],
+                "attestation": json.loads(r[6]) if r[6] is not None else None,
+            }
+            for r in rows
+        ]
+
+    async def prune_gossip_log(self, max_age: float) -> int:
+        """Delete gossip entries older than *max_age* seconds. Returns count deleted."""
+        cutoff = time.time() - max_age
+        cursor = await self._db.execute(
+            "DELETE FROM gossip_log WHERE received_at < ?", (cutoff,)
+        )
+        await self._db.commit()
+        return cursor.rowcount
+
+    async def upsert_provenance(self, data: Dict[str, Any]) -> None:
+        """Persist or update a provenance record received from the network.
+
+        sp966 mirror of LocalLedger.upsert_provenance, incl. the sp965 verbatim
+        signed_record (the exact dict that was signed) so the cross-node
+        provenance RESPONSE path can re-serve a cryptographically verifiable form.
+        """
+        cid = data.get("cid", "")
+        if not cid:
+            return
+        signed_record = json.dumps(data) if data.get("signature") else None
+        await self._db.execute(
+            """INSERT INTO provenance_chains
+               (cid, content_hash, creator_id, creator_pubkey, filename,
+                size_bytes, royalty_rate, parent_cids, signature,
+                embedding_id, near_duplicate_of, metadata, registered_at,
+                signed_record)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(cid) DO UPDATE SET
+                   content_hash      = excluded.content_hash,
+                   creator_id        = excluded.creator_id,
+                   creator_pubkey    = excluded.creator_pubkey,
+                   filename          = excluded.filename,
+                   size_bytes        = excluded.size_bytes,
+                   royalty_rate      = excluded.royalty_rate,
+                   parent_cids       = excluded.parent_cids,
+                   signature         = excluded.signature,
+                   embedding_id      = excluded.embedding_id,
+                   near_duplicate_of = excluded.near_duplicate_of,
+                   metadata          = excluded.metadata,
+                   signed_record     = excluded.signed_record""",
+            (
+                cid,
+                data.get("content_hash", ""),
+                data.get("creator_id", ""),
+                data.get("creator_public_key", ""),
+                data.get("filename", ""),
+                data.get("size_bytes", 0),
+                data.get("royalty_rate", 0.01),
+                json.dumps(data.get("parent_cids", [])),
+                data.get("signature", ""),
+                data.get("embedding_id"),
+                data.get("near_duplicate_of"),
+                json.dumps(data.get("metadata", {})),
+                time.time(),
+                signed_record,
+            ),
+        )
+        await self._db.commit()
+
+    async def get_provenance(self, cid: str) -> Optional[Dict[str, Any]]:
+        """Return the provenance record for a CID, or None if unknown."""
+        cursor = await self._db.execute(
+            """SELECT cid, content_hash, creator_id, creator_pubkey, filename,
+                      size_bytes, royalty_rate, parent_cids, signature,
+                      embedding_id, near_duplicate_of, metadata, registered_at
+               FROM provenance_chains WHERE cid = ?""",
+            (cid,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "cid": row[0],
+            "content_hash": row[1],
+            "creator_id": row[2],
+            "creator_public_key": row[3],
+            "filename": row[4],
+            "size_bytes": row[5],
+            "royalty_rate": row[6],
+            "parent_cids": json.loads(row[7]),
+            "signature": row[8],
+            "embedding_id": row[9],
+            "near_duplicate_of": row[10],
+            "metadata": json.loads(row[11]),
+            "registered_at": row[12],
+        }
+
+    async def get_signed_provenance(self, cid: str) -> Optional[Dict[str, Any]]:
+        """sp965/sp966 — return the VERBATIM signed provenance record for `cid`
+        (the exact dict that was signed + its signature), or None if no verbatim
+        record was stored. Used by the query responder to re-serve a verifiable
+        form."""
+        cursor = await self._db.execute(
+            "SELECT signed_record FROM provenance_chains WHERE cid = ?", (cid,)
+        )
+        row = await cursor.fetchone()
+        if not row or row[0] is None:
+            return None
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return None
 
 
 class DAGLedgerAdapter:
