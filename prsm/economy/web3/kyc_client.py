@@ -225,12 +225,19 @@ class KYCClient:
                 f"got {level!r}"
             )
 
-        # Idempotency: if there's already an active session for
-        # this user (INITIATED / PENDING / VERIFIED), return it.
+        # Idempotency: if there's already an active session for this user
+        # (INITIATED / PENDING / VERIFIED) AT THE SAME LEVEL, return it.
+        # sp967: a level CHANGE must always re-initiate, even from VERIFIED —
+        # otherwise a VERIFIED basic user can never upgrade to enhanced (the
+        # documented upgrade path), permanently capping their AML tier. The
+        # re-initiated session reflects the requested level; the user re-verifies
+        # at the new level via the vendor flow (their prior-level entitlement
+        # does not silently persist under the new in-progress record).
         existing = self._records.get(user_id)
         if (
             existing is not None
             and existing.status not in _REINITIATABLE_STATUSES
+            and existing.level == level
         ):
             return existing
 

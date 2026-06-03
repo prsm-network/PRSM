@@ -136,6 +136,48 @@ def test_initiate_idempotent_for_active_session():
     assert len(fake.initiated) == 1
 
 
+def test_verified_user_can_upgrade_level():
+    """sp967 — a VERIFIED basic user requesting 'enhanced' must START a new
+    enhanced vendor session (the documented upgrade path). Previously the
+    idempotency guard returned the unchanged basic record for ANY
+    non-reinitiatable status, so VERIFIED users could never upgrade — capping
+    their AML tier forever."""
+    fake = FakeVendorBackend()
+    c = KYCClient(vendor="persona", api_key="k", backend=fake)
+    c.initiate(user_id="alice", email="a@x.io", level=KYC_LEVEL_BASIC)
+    c.update_status("alice", KYC_STATUS_VERIFIED)
+    rec = c.initiate(user_id="alice", email="a@x.io", level=KYC_LEVEL_ENHANCED)
+    assert rec.level == KYC_LEVEL_ENHANCED
+    assert rec.status == KYC_STATUS_INITIATED
+    assert len(fake.initiated) == 2
+    assert fake.initiated[-1] == ("alice", "a@x.io", "enhanced")
+
+
+def test_verified_user_same_level_still_idempotent():
+    """A VERIFIED user re-requesting the SAME level stays idempotent (no new
+    vendor session, record unchanged) — only a level change re-initiates."""
+    fake = FakeVendorBackend()
+    c = KYCClient(vendor="persona", api_key="k", backend=fake)
+    c.initiate(user_id="alice", email="a@x.io", level=KYC_LEVEL_BASIC)
+    c.update_status("alice", KYC_STATUS_VERIFIED)
+    rec = c.initiate(user_id="alice", email="a@x.io", level=KYC_LEVEL_BASIC)
+    assert rec.status == KYC_STATUS_VERIFIED  # unchanged
+    assert rec.level == KYC_LEVEL_BASIC
+    assert len(fake.initiated) == 1  # no new session
+
+
+def test_uncommissioned_verified_user_can_upgrade_to_pending_commission():
+    """Even uncommissioned, a level change must re-initiate (→ PENDING_COMMISSION
+    enhanced) rather than returning the stale basic record."""
+    c = KYCClient()  # uncommissioned
+    c.initiate(user_id="alice", email="a@x.io", level=KYC_LEVEL_BASIC)
+    # Force a VERIFIED basic record (simulating a prior commissioned verification).
+    c.update_status("alice", KYC_STATUS_VERIFIED)
+    rec = c.initiate(user_id="alice", email="a@x.io", level=KYC_LEVEL_ENHANCED)
+    assert rec.level == KYC_LEVEL_ENHANCED
+    assert rec.status == KYC_STATUS_PENDING_COMMISSION
+
+
 def test_initiate_re_initiates_after_rejection():
     """REJECTED → re-initiate should start a fresh session."""
     fake = FakeVendorBackend()
