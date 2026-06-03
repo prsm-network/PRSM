@@ -516,4 +516,30 @@ SYMBOLIC_PROOF_CATALOG: Dict[str, Dict[str, Any]] = {
             "inline."
         ),
     },
+    "CreatorStakeRegistrySpec": {
+        "mirrors_runtime_contract": "creator_stake_registry",
+        "runtime_invariants": [],
+        "description": (
+            "Symbolic proofs for the §14 anti-spam "
+            "CreatorStakeRegistry (sp976; pre-deploy-"
+            "audited + hardened sp979). Three families, "
+            "all proven for ALL symbolic inputs across "
+            "stake/requestUnbond/withdraw/slash/drain: "
+            "(1) SOLVENCY — ftns.balanceOf(this) >= "
+            "totalCustodied + foundationReserveBalance "
+            "(sister to INV-EP-1 / INV-RD-4); (2) SLASH "
+            "CONSERVATION — slash moves exactly `amount` "
+            "from bonded stake to the reserve, never "
+            "below zero; (3) ANTI-GAME ELIGIBILITY — "
+            "creatorStakeOf drops to 0 the instant a "
+            "creator begins to unbond, closing the "
+            "stake->get-tier->spam->unstake game. "
+            "Source-identity-mirrors CreatorStakeRegistry"
+            ".sol (line ranges pinned). Runtime state-"
+            "pins (owner == Foundation Safe; unbond-delay "
+            "bounds) are added to the runtime registry at "
+            "commission time, once the contract has an "
+            "on-chain address."
+        ),
+    },
 }

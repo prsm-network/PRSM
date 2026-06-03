@@ -57,6 +57,23 @@ def test_catalog_has_escrow_pool_solvency_proof():
     assert "INV-EP-1" in entry["runtime_invariants"]
 
 
+def test_catalog_has_creator_stake_registry_proof():
+    """Sprint 983 ships CreatorStakeRegistrySpec — the §14
+    anti-spam money-custody contract joins the symbolic lane:
+    solvency + slash-conservation + anti-game eligibility."""
+    assert (
+        "CreatorStakeRegistrySpec" in SYMBOLIC_PROOF_CATALOG
+    )
+    entry = SYMBOLIC_PROOF_CATALOG["CreatorStakeRegistrySpec"]
+    assert (
+        entry["mirrors_runtime_contract"] == "creator_stake_registry"
+    )
+    # Runtime state-pins are added at commission time (no on-chain
+    # address yet) — the proofs here are algorithmic, the symbolic
+    # lane's job.
+    assert entry["runtime_invariants"] == []
+
+
 def test_catalog_has_three_band_routing_proof():
     """Sprint 374: PRSM-PROV-1 three-band routing (§7.19)."""
     assert "ThreeBandRoutingSpec" in SYMBOLIC_PROOF_CATALOG
@@ -602,6 +619,32 @@ def test_live_halmos_royalty_distributor_solvency():
     assert any(
         "check_recoverStranded_does_not_decrease_claimable"
         in n
+        for n in proof_names
+    ), proof_names
+
+
+@pytest.mark.requires_halmos
+def test_live_halmos_creator_stake_registry():
+    """Real halmos invocation against the §14 CreatorStakeRegistry
+    proofs (sprint 983): solvency + slash-conservation + anti-game
+    eligibility. Ten proofs. Validated locally at 10 passed / 0 failed."""
+    runner = HalmosRunner(timeout_seconds=120)
+    if not runner.is_available():
+        pytest.skip("halmos or forge not on PATH")
+    suite = runner.run("CreatorStakeRegistrySpec")
+    assert suite.status == SymbolicProofStatus.PASSED, (
+        f"CreatorStakeRegistrySpec failed: {suite.to_dict()}"
+    )
+    proof_names = {p.name for p in suite.proofs}
+    # The three headline properties must be present + green.
+    assert any(
+        "check_slash_preserves_solvency" in n for n in proof_names
+    ), proof_names
+    assert any(
+        "check_slash_conserves_value" in n for n in proof_names
+    ), proof_names
+    assert any(
+        "check_creatorStakeOf_zero_after_requestUnbond" in n
         for n in proof_names
     ), proof_names
 

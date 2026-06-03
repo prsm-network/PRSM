@@ -1,6 +1,12 @@
 {
   "version": 1,
   "pins": {
+    "contracts/contracts/CreatorStakeRegistry.sol:116-126": "b955f6ab9c865d50ccd6febca69358470dcb2486aec56283b3a49bccbb781ebf",
+    "contracts/contracts/CreatorStakeRegistry.sol:132-145": "86a75117989aa74a8bba0bec6a25c24a87631c8fe63b1b7bdcecb26306997c00",
+    "contracts/contracts/CreatorStakeRegistry.sol:148-161": "4e340e6195eafd0273acc90d43c3a507c9e099f4d4adf73cf821cc6d23beea1a",
+    "contracts/contracts/CreatorStakeRegistry.sol:172-182": "7b36f5ec37bf14083a0567b25cfb5d3de77a0bcbda6641120863855993232024",
+    "contracts/contracts/CreatorStakeRegistry.sol:188-191": "e1d153784eea2cd8ac49ab1f8d8d53741248b99787aecf6a21c4a677f21a698d",
+    "contracts/contracts/CreatorStakeRegistry.sol:217-224": "26c86109441f0441d2bd2200dbf05b2d68a6fc64eabaed2ef04d99fec25ede89",
     "contracts/contracts/FTNSTokenSimple.sol:70-73": "e30adaec5a31e5c57efa6a1e0e8d2c02ad816a960e49af4db22956ed29a30870",
     "contracts/contracts/RoyaltyDistributor.sol:111-155": "e0b6a5d6d44d026dede08c48ae3edf9f442fe702c7d09de640235a4edac5af5f",
     "contracts/contracts/RoyaltyDistributor.sol:161-170": "92f12456027a5de39b27697965a0877296e57c10f55146c6aff60b02b89da20f",
