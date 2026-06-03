@@ -66,14 +66,23 @@ def _make_receipt(
     )
 
 
+_escrow_counter = [0]
+
+
 def _make_batched(
     job_id: str = "job-1",
     shard_index: int = 0,
     requester: str = ADDR_REQUESTER_A,
     provider: str = ADDR_PROVIDER_X,
     value_ftns: int = ONE_FTNS,
-    escrow_id: str = "escrow-1",
+    escrow_id: str = None,
 ) -> BatchedReceipt:
+    # sp973 — each real dispatch has a UNIQUE local_escrow_id; default to a fresh
+    # one per call so a batch of distinct receipts isn't collapsed by the new
+    # per-escrow-id dedup. Tests exercising the dedup pass an explicit id.
+    if escrow_id is None:
+        _escrow_counter[0] += 1
+        escrow_id = f"escrow-{_escrow_counter[0]}"
     return BatchedReceipt(
         receipt=_make_receipt(job_id=job_id, shard_index=shard_index),
         requester_address=requester,
@@ -489,3 +498,37 @@ def test_batched_receipt_rejects_bad_group_id_length():
             value_ftns=1, local_escrow_id="e",
             consensus_group_id=b"\x00" * 31,  # 31 bytes, not 32
         )
+
+
+# ── sp973: per-batch local_escrow_id dedup (defense-in-depth) ──────────────
+
+
+def test_duplicate_escrow_id_counted_once_in_batch():
+    """A receipt with a local_escrow_id already in the batch is a no-op — it must
+    not inflate count or total_value_ftns (guards a future replay into add())."""
+    b = PendingBatch()
+    b.append(_make_batched(escrow_id="e1", value_ftns=ONE_FTNS), 100)
+    b.append(_make_batched(escrow_id="e1", value_ftns=ONE_FTNS), 100)  # duplicate
+    assert b.count == 1
+    assert b.total_value_ftns == ONE_FTNS
+
+
+def test_distinct_escrow_ids_both_counted():
+    b = PendingBatch()
+    b.append(_make_batched(escrow_id="e1", value_ftns=ONE_FTNS), 100)
+    b.append(_make_batched(escrow_id="e2", value_ftns=ONE_FTNS), 100)
+    assert b.count == 2
+    assert b.total_value_ftns == 2 * ONE_FTNS
+
+
+def test_accumulator_add_dedups_duplicate_escrow_id():
+    """End-to-end through the accumulator: a duplicate escrow id does not advance
+    the count threshold."""
+    from prsm.settlement.accumulator import AccumulatorConfig
+    acc = ReceiptAccumulator(AccumulatorConfig(count_threshold=2))
+    t = 1700000000  # fixed clock; evaluate readiness at the same instant so the
+    acc.add(_make_batched(escrow_id="e1"), at_unix=t)  # TIME threshold never fires
+    acc.add(_make_batched(escrow_id="e1"), at_unix=t)  # dup → still 1 → not ready
+    assert acc.ready_batches(at_unix=t) == []
+    acc.add(_make_batched(escrow_id="e2"), at_unix=t)  # distinct → 2 → ready
+    assert len(acc.ready_batches(at_unix=t)) == 1

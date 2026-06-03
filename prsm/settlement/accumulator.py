@@ -24,12 +24,15 @@ PaymentEscrow reconciliation, Task 7).
 """
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from prsm.compute.shard_receipt import ShardExecutionReceipt
+
+logger = logging.getLogger(__name__)
 
 
 class TriggerReason(str, Enum):
@@ -97,6 +100,11 @@ class PendingBatch:
     # Captured from the first receipt; all subsequent receipts must match.
     tier_slash_rate_bps: int = 0
     consensus_group_id: bytes = b"\x00" * 32
+    # sp973 — local_escrow_ids already counted in THIS batch, so a duplicate
+    # add() is a no-op (defense-in-depth against a future replay/double-call into
+    # the accumulator when it is exposed to gossip/API). Resets per batch — a
+    # fresh PendingBatch is created on the next add after pop_batch drains this.
+    seen_escrow_ids: Set[str] = field(default_factory=set)
 
     @property
     def count(self) -> int:
@@ -109,7 +117,17 @@ class PendingBatch:
         """Add a receipt. Sets started_at_unix + batch-level fields on
         the first append. Subsequent appends must agree on
         tier_slash_rate_bps and consensus_group_id — the caller's
-        accumulator keying should guarantee this; we assert defensively."""
+        accumulator keying should guarantee this; we assert defensively.
+
+        sp973 — idempotent on local_escrow_id: a receipt whose escrow id is
+        already counted in this batch is a no-op (never double-counts
+        value/count)."""
+        if br.local_escrow_id and br.local_escrow_id in self.seen_escrow_ids:
+            logger.debug(
+                "PendingBatch.append: duplicate local_escrow_id %s ignored",
+                br.local_escrow_id,
+            )
+            return
         if self.is_empty():
             self.started_at_unix = at_unix
             self.tier_slash_rate_bps = br.tier_slash_rate_bps
@@ -126,6 +144,8 @@ class PendingBatch:
                 )
         self.receipts.append(br)
         self.total_value_ftns += br.value_ftns
+        if br.local_escrow_id:
+            self.seen_escrow_ids.add(br.local_escrow_id)
 
 
 # Phase 7.1x §8.7 + Phase 7: accumulator key extended to separate
