@@ -241,6 +241,55 @@ def test_onfido_replay_same_signature_rejected(monkeypatch):
     assert r2.status_code == 409
 
 
+def _client_no_ring(kyc):
+    """Client whose replay ring is None — simulates WebhookReplayRing
+    construction failure (node.py:2867-2873 swallows it to None)."""
+    node = MagicMock()
+    node.identity.node_id = "test-node"
+    node.ftns_ledger = None
+    node._kyc_client = kyc
+    node._fiat_compliance_ring = None
+    node._coinbase_waas_client = None
+    node._kyc_webhook_replay_ring = None
+    return TestClient(
+        create_api_app(node, enable_security=False),
+        raise_server_exceptions=False,
+    )
+
+
+def test_onfido_valid_webhook_fails_closed_when_replay_ring_none(monkeypatch):
+    """sp969 — replay ring None (construction failed) + a secret configured →
+    a VALID-signed Onfido webhook must FAIL CLOSED (503), not silently skip
+    replay defense. Onfido carries no timestamp, so the ring is its ONLY replay
+    defense; fail-open let a captured valid Onfido webhook be replayed at will."""
+    monkeypatch.setenv("ONFIDO_WEBHOOK_TOKEN", "wh_tok")
+    kyc = _commissioned_kyc("onfido")
+    _seed_alice(kyc)
+    body = json.dumps({"user_id": "alice", "status": "VERIFIED"}).encode("utf-8")
+    header = _onfido_header(body, "wh_tok")
+    r = _client_no_ring(kyc).post(
+        "/wallet/kyc/webhook/onfido", content=body,
+        headers={"Content-Type": "application/json", "X-SHA2-Signature": header},
+    )
+    assert r.status_code == 503
+
+
+def test_forged_webhook_still_401_even_when_replay_ring_none(monkeypatch):
+    """The fail-closed 503 must come AFTER signature verification: a FORGED
+    webhook is still rejected at 401 (the sig check), never reaching the 503 —
+    so a bad actor can't probe the 503 without a valid signature."""
+    monkeypatch.setenv("ONFIDO_WEBHOOK_TOKEN", "wh_tok")
+    kyc = _commissioned_kyc("onfido")
+    _seed_alice(kyc)
+    body = json.dumps({"user_id": "alice", "status": "VERIFIED"}).encode("utf-8")
+    r = _client_no_ring(kyc).post(
+        "/wallet/kyc/webhook/onfido", content=body,
+        headers={"Content-Type": "application/json",
+                 "X-SHA2-Signature": "deadbeef" * 8},  # forged
+    )
+    assert r.status_code == 401
+
+
 def test_distinct_signatures_pass_through(monkeypatch):
     """Two webhooks with different signatures (different
     bodies → different HMACs) must both succeed."""

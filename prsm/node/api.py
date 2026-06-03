@@ -4928,6 +4928,28 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             replay_ring = getattr(
                 node, "_kyc_webhook_replay_ring", None,
             )
+            # sp969 — FAIL CLOSED if the replay ring is unavailable. The ring is
+            # constructed unconditionally at node init (node.py:2858); None here
+            # means construction RAISED (swallowed to None at node.py:2873). The
+            # signature-hash dedup is the vendor-agnostic replay defense — and
+            # for Onfido (no timestamp) the ONLY one — so we cannot guarantee
+            # replay protection on this money-adjacent KYC webhook. Reject (503)
+            # rather than silently accept (mirrors sp888 fail-closed). Reached
+            # only after the signature check, so a forged webhook is already
+            # 401'd above and cannot probe this path.
+            if replay_ring is None:
+                logger.error(
+                    "KYC webhook replay ring unavailable (construction "
+                    "failed) — failing closed with 503 (vendor=%s)",
+                    _vendor_lower,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Webhook replay defense temporarily unavailable; "
+                        "retry later."
+                    ),
+                )
             if replay_ring is not None:
                 # Persona: use the v1=<hex> portion as the
                 # replay token (varies per body+ts).
