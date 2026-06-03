@@ -14636,6 +14636,11 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 "prsm_distribution_log_count", "_distribution_log",
                 "DistributedEventRing entry count (Phase 8 emission rounds)",
             ),
+            (
+                "prsm_consensus_mismatch_log_count", "_consensus_mismatch_log",
+                "ConsensusMismatchLog entry count (sp957 — confirmed compute "
+                "re-execution mismatches; alert on growth)",
+            ),
         ):
             try:
                 ring = getattr(node, ring_attr, None)
@@ -14648,6 +14653,29 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 logger.warning(
                     "metrics %s probe failed: %s", ring_metric, exc,
                 )
+
+        # prsm_dispatch_excluded_providers — sp962: how many providers this node
+        # is currently EXCLUDING from compute dispatch (sp958 enforcement of the
+        # sp957 evidence). Fleet operators alert on this rising. Emitted only
+        # when the compute requester is wired.
+        try:
+            requester = getattr(node, "compute_requester", None)
+            if requester is not None and hasattr(requester, "dispatch_exclusion_summary"):
+                summary = requester.dispatch_exclusion_summary()
+                excluded = sum(
+                    1 for p in summary.get("providers", []) if p.get("excluded")
+                )
+                lines.append(
+                    "# HELP prsm_dispatch_excluded_providers "
+                    "Providers currently barred from compute dispatch "
+                    "(confirmed consensus mismatches >= threshold)"
+                )
+                lines.append("# TYPE prsm_dispatch_excluded_providers gauge")
+                lines.append(f"prsm_dispatch_excluded_providers {excluded}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "metrics prsm_dispatch_excluded_providers probe failed: %s", exc,
+            )
 
         # prsm_arbitration_pending_count
         try:

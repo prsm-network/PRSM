@@ -209,6 +209,50 @@ def test_summary_endpoint_503_without_requester():
     assert resp.status_code == 503
 
 
+# ── /metrics Prometheus exposition (sp962 fleet observability) ──────────────
+
+
+def _metrics_node():
+    """A node with the rings the /metrics loop probes set to None except the
+    consensus-mismatch log, so the new gauge is isolated + deterministic."""
+    node = _node()
+    for attr in ("_webhook_log", "_heartbeat_log", "_distribution_log",
+                 "_arbitration_queue", "_escrow_cleanup_task",
+                 "_heartbeat_scheduler_task", "_compensation_scheduler_task",
+                 "_key_distribution_watcher_task", "_storage_slashing_watcher_task"):
+        setattr(node, attr, None)
+    return node
+
+
+def test_metrics_emits_consensus_mismatch_count():
+    node = _metrics_node()
+    for i in range(3):
+        asyncio.run(node._consensus_mismatch_log.record(_evidence(
+            job=f"j{i}", accused="prov-liar")))
+    node.compute_requester = MagicMock()
+    node.compute_requester.dispatch_exclusion_summary = MagicMock(return_value={
+        "threshold": 2, "window_sec": 0.0,
+        "providers": [
+            {"provider_id": "prov-liar", "mismatch_count": 3, "excluded": True},
+            {"provider_id": "prov-ok", "mismatch_count": 1, "excluded": False},
+        ],
+    })
+    body = _client(node).get("/metrics").text
+    assert "prsm_consensus_mismatch_log_count 3" in body
+    assert "prsm_dispatch_excluded_providers 1" in body
+
+
+def test_metrics_excluded_gauge_zero_when_none_excluded():
+    node = _metrics_node()
+    node.compute_requester = MagicMock()
+    node.compute_requester.dispatch_exclusion_summary = MagicMock(return_value={
+        "threshold": 2, "window_sec": 0.0, "providers": [],
+    })
+    body = _client(node).get("/metrics").text
+    assert "prsm_consensus_mismatch_log_count 0" in body
+    assert "prsm_dispatch_excluded_providers 0" in body
+
+
 # ── count_for: per-provider confirmed-mismatch count (sp958 input) ──────────
 
 
