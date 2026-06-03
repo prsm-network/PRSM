@@ -87,6 +87,16 @@ PROTECTED_PREFIXES = [
     # list (workflow PII + provenance fingerprinting risk).
     "/transactions",
     "/content/mine",
+    # Sprint 970 — the creator-stake MUTATION endpoints
+    # (POST /marketplace/creator-stake/stake | /slash) write the
+    # balance that gates HIGH creator-tier eligibility (search
+    # ranking + tier label). Unprotected, any reachable caller
+    # could grant a creator free HIGH tier or grief a competitor's
+    # tier. Joins /staking/ + /wallet/ in the protected set. (The
+    # deeper gap — the gate is in-memory-only with no on-chain
+    # CreatorStakeRegistry teeth — is a separate creator-stake
+    # commissioning item; this closes the auth vector now.)
+    "/marketplace/creator-stake/",
 ]
 
 

@@ -64,6 +64,24 @@ class TestArbitrationProtected:
         assert _is_protected("/content/arbitration/preview-resolution")
 
 
+class TestCreatorStakeProtected:
+    """sp970 — the creator-stake MUTATION endpoints write the in-memory balance
+    that gates HIGH creator-tier eligibility (search ranking + tier label).
+    Unprotected, any reachable caller could grant a creator free HIGH tier
+    (/stake) or grief a competitor's tier (/slash). They join /staking/ +
+    /wallet/ in the protected set (enforced when PRSM_NODE_API_KEY is configured;
+    dev-mode no-key is unaffected). NOTE: the deeper gap — the gate has no
+    on-chain teeth (in-memory only, no CreatorStakeRegistry backend) — is a
+    separate creator-stake commissioning item; this closes the auth vector now."""
+
+    def test_creator_stake_mutation_protected(self):
+        assert _is_protected("/marketplace/creator-stake/stake")
+        assert _is_protected("/marketplace/creator-stake/slash")
+
+    def test_creator_stake_read_protected_via_prefix(self):
+        assert _is_protected("/marketplace/creator-stake/0xCreator")
+
+
 class TestUnchanged:
     def test_public_endpoints_still_pass(self):
         # Sanity: /health, / etc. not in protected list
