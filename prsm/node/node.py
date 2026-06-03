@@ -3034,12 +3034,18 @@ class PRSMNode:
                     endpoints.provenance_registry_v2
                 ),
                 "provenance_registry": endpoints.provenance_registry,
+                # sp988 — fleet governance sweep: the last deployed contracts
+                # with governance state (immutable admin / Ownable2Step owner).
+                "publisher_key_anchor": (
+                    endpoints.publisher_key_anchor
+                ),
+                "key_distribution": endpoints.key_distribution,
             }
             logger.info(
                 "Formal-invariant checker wired "
-                "(backend=%s, 11 contracts: rd=%s ftns=%s "
+                "(backend=%s, 13 contracts: rd=%s ftns=%s "
                 "ep=%s ec=%s cd=%s ss=%s sb=%s csr=%s bsr=%s "
-                "prv2=%s prv=%s)",
+                "prv2=%s prv=%s pka=%s kd=%s)",
                 bool(backend),
                 self._formal_invariant_addresses.get(
                     "royalty_distributor",
@@ -3073,6 +3079,12 @@ class PRSMNode:
                 ),
                 self._formal_invariant_addresses.get(
                     "provenance_registry",
+                ),
+                self._formal_invariant_addresses.get(
+                    "publisher_key_anchor",
+                ),
+                self._formal_invariant_addresses.get(
+                    "key_distribution",
                 ),
             )
         except Exception as exc:  # noqa: BLE001

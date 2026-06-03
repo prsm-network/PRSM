@@ -207,6 +207,8 @@ _SEL_MAX_CHALLENGE_WINDOW = "0x035d1c84"  # MAX_CHALLENGE_WINDOW_SECONDS()
 _SEL_MIN_SLASH_GAS = "0x8553927c"      # MIN_SLASH_GAS()
 # sp987 — ProvenanceRegistry (v1 + v2) royalty-rate ceiling.
 _SEL_MAX_ROYALTY_RATE_BPS = "0xa62dbe61"  # MAX_ROYALTY_RATE_BPS()
+# sp988 — PublisherKeyAnchor immutable admin getter.
+_SEL_ADMIN = "0xf851a440"              # admin()
 
 
 # ── OpenZeppelin AccessControl role hashes (bytes32) ──
@@ -1056,6 +1058,50 @@ INVARIANT_REGISTRY: Dict[str, List[Invariant]] = {
             kind=InvariantKind.UINT256_EQ,
             selector=_SEL_MAX_ROYALTY_RATE_BPS,
             expected=9800,
+        ),
+    ],
+    # sp988 — fleet governance sweep: the last two deployed contracts with
+    # governance state. The owner/admin == Foundation Safe pin is the
+    # governance-capture detector — it surfaces an ownership compromise or a
+    # wrong-governance deployment on the live probe.
+    "publisher_key_anchor": [
+        Invariant(
+            id="INV-PKA-1",
+            contract_name="publisher_key_anchor",
+            title="admin() == Foundation Safe",
+            description=(
+                "PublisherKeyAnchor's admin is IMMUTABLE (set once at "
+                "construction, no setter). Pinning admin() == Foundation Safe "
+                "confirms the deployed contract is governed by the Safe — a "
+                "wrong-admin deployment would be unrecoverable (no setter), so "
+                "this pin is the only on-chain check that the anchor's governance "
+                "is correct. Phase 3.x.3 deploy (2026-05-20) verified admin == "
+                "Foundation Safe at deploy."
+            ),
+            severity=InvariantSeverity.CRITICAL,
+            spec_text=f"admin() == {_FOUNDATION_SAFE_BASE}",
+            kind=InvariantKind.ADDRESS_EQ,
+            selector=_SEL_ADMIN,
+            expected=_FOUNDATION_SAFE_BASE,
+        ),
+    ],
+    "key_distribution": [
+        Invariant(
+            id="INV-KD-1",
+            contract_name="key_distribution",
+            title="owner() == Foundation Safe",
+            description=(
+                "KeyDistribution (Ownable2Step) is sole-owned by the Foundation "
+                "Safe via the 2026-05-07 audit-bundle acceptOwnership ceremony "
+                "(one of the 7 Ownable2Step contracts transferred in that batch). "
+                "The owner controls key-distribution governance; a non-Safe owner "
+                "would be a governance compromise. Mirrors INV-SB-4."
+            ),
+            severity=InvariantSeverity.CRITICAL,
+            spec_text=f"owner() == {_FOUNDATION_SAFE_BASE}",
+            kind=InvariantKind.ADDRESS_EQ,
+            selector=_SEL_OWNER,
+            expected=_FOUNDATION_SAFE_BASE,
         ),
     ],
     "escrow_pool": [

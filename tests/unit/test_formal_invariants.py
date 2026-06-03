@@ -1119,6 +1119,37 @@ def test_settlement_registry_lookback_and_gas_floors_pinned():
     assert slash_gas is not None and slash_gas.expected == 150000
 
 
+# ── sp988 — Fleet governance sweep: last deployed contracts' owner/admin pins ──
+
+
+def test_registry_has_publisher_key_anchor_and_key_distribution():
+    """The last two deployed contracts with governance state join the registry,
+    completing fleet-wide governance-capture monitoring."""
+    assert "publisher_key_anchor" in INVARIANT_REGISTRY
+    assert "key_distribution" in INVARIANT_REGISTRY
+
+
+def test_publisher_key_anchor_admin_is_foundation():
+    """PublisherKeyAnchor.admin() is immutable; pinning it == Foundation Safe
+    confirms the deployed contract's admin is the Safe (detects a wrong-admin
+    deployment, which is unrecoverable since admin is immutable)."""
+    invs = INVARIANT_REGISTRY["publisher_key_anchor"]
+    inv = next((i for i in invs if i.id == "INV-PKA-1"), None)
+    assert inv is not None
+    assert inv.kind == InvariantKind.ADDRESS_EQ
+    assert inv.severity == InvariantSeverity.CRITICAL
+    assert inv.expected.lower() == _FOUNDATION_SAFE.lower()
+
+
+def test_key_distribution_owner_is_foundation():
+    invs = INVARIANT_REGISTRY["key_distribution"]
+    inv = next((i for i in invs if i.id == "INV-KD-1"), None)
+    assert inv is not None
+    assert inv.kind == InvariantKind.ADDRESS_EQ
+    assert inv.severity == InvariantSeverity.CRITICAL
+    assert inv.expected.lower() == _FOUNDATION_SAFE.lower()
+
+
 # ── sp987 — Provenance registries: royalty-rate ceiling (both deployed) ──
 
 
