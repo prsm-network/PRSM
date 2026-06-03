@@ -1643,6 +1643,23 @@ async def _drain_task_bounded(
     return False
 
 
+# sp956 — generous per-subsystem shutdown bound. Legitimate subsystem stops
+# complete in well under this; it only bites a genuinely-stuck subsystem (an
+# uncancellable external dep — libp2p subprocess teardown, a wedged SQLite
+# close, a libtorrent shutdown, a chain RPC). Generous so a merely-slow stop
+# (e.g. a large SQLite WAL checkpoint) is not abandoned prematurely.
+_STOP_TIMEOUT = 10.0
+
+
+async def _await_bounded(coro: "Awaitable", timeout: float, name: str) -> bool:
+    """Sprint 956 — coroutine form of `_drain_task_bounded` for node.stop()'s
+    subsystem stops. Runs ``coro`` as a task and drains it up to ``timeout``;
+    if it doesn't finish, cancel-REQUESTS and ABANDONS it (never awaits the
+    cancellation), guaranteeing node shutdown can't hang on a stuck subsystem.
+    Returns True if the stop finished within the bound, False if abandoned."""
+    return await _drain_task_bounded(asyncio.ensure_future(coro), timeout, name)
+
+
 class PRSMNode:
     """A fully operational PRSM network node.
 
@@ -5201,7 +5218,7 @@ class PRSMNode:
         # when worker is None or was never started.
         if getattr(self, "_auto_claim_worker", None) is not None:
             try:
-                await self._auto_claim_worker.stop()
+                await _await_bounded(self._auto_claim_worker.stop(), _STOP_TIMEOUT, "auto_claim_worker")
             except Exception as exc:
                 logger.warning(
                     "AutoClaimWorker stop raised: %s", exc,
@@ -5213,7 +5230,7 @@ class PRSMNode:
             self, "_funnel_auto_sweep_worker", None,
         ) is not None:
             try:
-                await self._funnel_auto_sweep_worker.stop()
+                await _await_bounded(self._funnel_auto_sweep_worker.stop(), _STOP_TIMEOUT, "funnel_auto_sweep_worker")
             except Exception as exc:
                 logger.warning(
                     "FunnelAutoSweepWorker stop raised: %s", exc,
@@ -5226,7 +5243,7 @@ class PRSMNode:
         # decision sees a stable flag.
         if getattr(self, "_preemption_detector", None) is not None:
             try:
-                await self._preemption_detector.stop()
+                await _await_bounded(self._preemption_detector.stop(), _STOP_TIMEOUT, "preemption_detector")
             except Exception as exc:
                 logger.warning(
                     "PreemptionDetector stop raised: %s", exc,
@@ -5283,47 +5300,52 @@ class PRSMNode:
                 setattr(self, task_attr, None)
 
         if self.agent_collaboration:
-            await self.agent_collaboration.stop()
+            # sp956 — every awaitable subsystem stop below is bounded via
+            # _await_bounded so a single stuck subsystem (libp2p subprocess
+            # teardown, a wedged SQLite close, a libtorrent shutdown, a chain
+            # RPC) cannot hang node shutdown. Normal stops finish fast and are
+            # reaped immediately; only a genuinely-stuck one is abandoned.
+            await _await_bounded(self.agent_collaboration.stop(), _STOP_TIMEOUT, "agent_collaboration")
         # Stop content economy (Phase 4)
         if self.content_economy:
-            await self.content_economy.stop()
-        # Stop multi-party escrow (Phase 4)
+            await _await_bounded(self.content_economy.stop(), _STOP_TIMEOUT, "content_economy")
+        # Stop multi-party escrow (Phase 4) — synchronous stop (fast flag-set).
         if hasattr(self, '_mp_escrow') and self._mp_escrow:
             self._mp_escrow.stop()
-        # Stop BitTorrent components
+        # Stop BitTorrent components (libtorrent teardown can hang → bounded)
         if self.bt_requester:
-            await self.bt_requester.stop()
+            await _await_bounded(self.bt_requester.stop(), _STOP_TIMEOUT, "bt_requester")
         if self.bt_provider:
-            await self.bt_provider.stop()
+            await _await_bounded(self.bt_provider.stop(), _STOP_TIMEOUT, "bt_provider")
         if self.bt_client:
-            await self.bt_client.shutdown()
+            await _await_bounded(self.bt_client.shutdown(), _STOP_TIMEOUT, "bt_client")
         if self.ledger_sync:
-            await self.ledger_sync.stop()
+            await _await_bounded(self.ledger_sync.stop(), _STOP_TIMEOUT, "ledger_sync")
         if hasattr(self, '_escrow_cleanup_task') and self._escrow_cleanup_task:
             self._escrow_cleanup_task.cancel()
-            try:
-                await self._escrow_cleanup_task
-            except asyncio.CancelledError:
-                pass
+            await _drain_task_bounded(
+                self._escrow_cleanup_task, _STOP_TIMEOUT, "escrow_cleanup_task",
+            )
 
         if self.content_uploader:
-            await self.content_uploader.close()
+            await _await_bounded(self.content_uploader.close(), _STOP_TIMEOUT, "content_uploader")
         if self.storage_provider:
-            await self.storage_provider.stop()
+            await _await_bounded(self.storage_provider.stop(), _STOP_TIMEOUT, "storage_provider")
         if self.compute_provider:
-            await self.compute_provider.stop()
+            await _await_bounded(self.compute_provider.stop(), _STOP_TIMEOUT, "compute_provider")
         if self.compute_requester:
-            await self.compute_requester.stop()
+            await _await_bounded(self.compute_requester.stop(), _STOP_TIMEOUT, "compute_requester")
         if hasattr(self, '_capability_announce_task'):
             self._capability_announce_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._capability_announce_task
+            await _drain_task_bounded(
+                self._capability_announce_task, _STOP_TIMEOUT, "capability_announce_task",
+            )
 
         if self.discovery:
-            await self.discovery.stop()
+            await _await_bounded(self.discovery.stop(), _STOP_TIMEOUT, "discovery")
         # T3b: stop the DHT components before transport so any in-flight
         # outbound DHT RPC has the underlying transport adapter still
-        # available during teardown. Idempotent.
+        # available during teardown. Idempotent. (Synchronous stop — fast.)
         if self.dht_components is not None:
             try:
                 self.dht_components.stop()
@@ -5333,11 +5355,11 @@ class PRSMNode:
                     f"{type(exc).__name__}: {exc}"
                 )
         if self.gossip:
-            await self.gossip.stop()
+            await _await_bounded(self.gossip.stop(), _STOP_TIMEOUT, "gossip")
         if self.transport:
-            await self.transport.stop()
+            await _await_bounded(self.transport.stop(), _STOP_TIMEOUT, "transport")
         if self.ledger:
-            await self.ledger.close()
+            await _await_bounded(self.ledger.close(), _STOP_TIMEOUT, "ledger")
 
         # Close content storage
         try:
