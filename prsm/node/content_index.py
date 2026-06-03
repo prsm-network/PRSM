@@ -12,6 +12,9 @@ which nodes can serve each CID (providers).
 """
 
 import asyncio
+import base64
+import hashlib
+import json
 import logging
 import time
 from collections import OrderedDict
@@ -25,6 +28,7 @@ from prsm.node.gossip import (
     GOSSIP_PROVENANCE_RESPONSE,
     GossipProtocol,
 )
+from prsm.node.identity import verify_signature
 
 logger = logging.getLogger(__name__)
 
@@ -286,13 +290,90 @@ class ContentIndex:
     async def _on_provenance_register(
         self, subtype: str, data: Dict[str, Any], origin: str
     ) -> None:
-        """Persist a provenance registration to the local ledger."""
-        if not self.ledger or not data.get("cid"):
+        """Persist a provenance registration to the local ledger.
+
+        sp964: the broadcast PROVENANCE_REGISTER carries the original signed
+        record, so we fully authenticate it (signature + pubkey↔creator binding)
+        and enforce first-writer-wins before persisting — a peer can no longer
+        forge or hijack the §14 first-creator-wins provenance record.
+        """
+        await self._verified_upsert(data, require_signature=True)
+
+    @staticmethod
+    def _provenance_authentic(record: Dict[str, Any]) -> bool:
+        """True iff `record` carries a valid signature whose pubkey binds to the
+        claimed creator_id. Mirrors gossip._authenticate_origin: node_id ==
+        sha256(pubkey)[:32], and the ed25519 signature verifies over the canonical
+        json of the record WITHOUT its `signature` field (exactly what
+        ContentUploader signs). Returns False on any missing field / parse error."""
+        creator_id = record.get("creator_id") or ""
+        pubkey = record.get("creator_public_key") or ""
+        sig = record.get("signature") or ""
+        if not (creator_id and pubkey and sig):
+            return False
+        try:
+            derived = hashlib.sha256(base64.b64decode(pubkey)).hexdigest()[:32]
+        except Exception:
+            return False
+        if derived != creator_id:
+            return False  # pubkey does not bind to the claimed creator_id
+        try:
+            signed = json.dumps(
+                {k: v for k, v in record.items() if k != "signature"},
+                sort_keys=True,
+            ).encode()
+        except Exception:
+            return False
+        return verify_signature(pubkey, signed, sig)
+
+    async def _verified_upsert(
+        self, record: Dict[str, Any], *, require_signature: bool
+    ) -> None:
+        """Guarded persistence for a gossip-received provenance record.
+
+        - require_signature (REGISTER path): the original signed record is on the
+          wire, so reject anything whose signature/creator-binding fails.
+        - first-writer-wins (BOTH paths): a gossip record can NEVER change an
+          existing cid's creator_id/creator_pubkey/royalty_rate. Same-creator
+          re-registrations and metadata updates are allowed; new cids register
+          normally. The RESPONSE path carries a lossy re-serialized stored row
+          whose signature can't be reconstructed, so it relies on first-writer-
+          wins only (full response-path crypto needs verbatim signed-form
+          storage — a documented follow-on)."""
+        if not self.ledger:
+            return
+        cid = record.get("cid")
+        if not cid:
+            return
+        if require_signature and not self._provenance_authentic(record):
+            logger.warning(
+                "Rejecting provenance register for %s: signature/creator "
+                "binding invalid (sp964)", str(cid)[:12],
+            )
+            return
+        # First-writer-wins: never let a gossip record reassign an established
+        # creator. Use the LEDGER's local-only lookup (NOT self.get_provenance,
+        # which would broadcast a cross-node query and could recurse/hang).
+        try:
+            existing = await self.ledger.get_provenance(cid)
+        except Exception:
+            existing = None
+        if (
+            existing
+            and existing.get("creator_id")
+            and existing.get("creator_id") != record.get("creator_id")
+        ):
+            logger.warning(
+                "Rejecting provenance for %s: first-writer-wins (existing "
+                "creator %s != %s) (sp964)", str(cid)[:12],
+                str(existing.get("creator_id"))[:12],
+                str(record.get("creator_id"))[:12],
+            )
             return
         try:
-            await self.ledger.upsert_provenance(data)
+            await self.ledger.upsert_provenance(record)
         except Exception as exc:
-            logger.warning(f"Failed to persist provenance for {data.get('cid', '?')[:12]}: {exc}")
+            logger.warning(f"Failed to persist provenance for {str(cid)[:12]}: {exc}")
 
     async def _on_provenance_query(
         self, subtype: str, data: Dict[str, Any], origin: str
@@ -322,12 +403,12 @@ class ContentIndex:
         provenance = data.get("provenance", {})
         if not cid or not provenance:
             return
-        # Persist to local ledger so future lookups are instant
+        # Persist to local ledger so future lookups are instant. sp964: the
+        # response carries a lossy re-serialized stored row (signature can't be
+        # reconstructed), so we apply first-writer-wins (never overwrite an
+        # established creator) without requiring a verifiable signature.
         if self.ledger:
-            try:
-                await self.ledger.upsert_provenance(provenance)
-            except Exception as exc:
-                logger.warning(f"Failed to persist provenance response for {cid[:12]}: {exc}")
+            await self._verified_upsert(provenance, require_signature=False)
         # Resolve any pending async get_provenance() call
         future = self._pending_provenance.get(cid)
         if future and not future.done():
