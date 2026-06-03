@@ -112,18 +112,37 @@ describe("CreatorStakeRegistry", function () {
   });
 
   describe("foundation reserve drain", function () {
-    it("owner drains accrued slash proceeds to the reserve wallet", async function () {
+    // sp979 — the reserve wallet must be a CONTRACT (WalletNotContract guard,
+    // mirroring StakeBond), so use a deployed contract address as the Safe stand-in.
+    async function _safeContract() {
+      const S = await ethers.getContractFactory("MockERC20");
+      const safe = await S.deploy();
+      await safe.waitForDeployment();
+      return safe;
+    }
+
+    it("owner drains accrued slash proceeds to the (contract) reserve wallet", async function () {
+      const safe = await _safeContract();
+      const safeAddr = await safe.getAddress();
       await reg.connect(creator).stake(MIN_HIGH);
       await reg.connect(slasher).slash(creator.address, 400n * ONE, "spam");
-      await reg.connect(owner).setFoundationReserveWallet(reserve.address);
-      const before = await token.balanceOf(reserve.address);
+      await reg.connect(owner).setFoundationReserveWallet(safeAddr);
+      const before = await token.balanceOf(safeAddr);
       await reg.connect(owner).drainFoundationReserve();
-      expect(await token.balanceOf(reserve.address)).to.equal(before + 400n * ONE);
+      expect(await token.balanceOf(safeAddr)).to.equal(before + 400n * ONE);
       expect(await reg.foundationReserveBalance()).to.equal(0n);
     });
 
     it("non-owner cannot drain", async function () {
       await expect(reg.connect(other).drainFoundationReserve()).to.be.reverted;
+    });
+
+    it("setFoundationReserveWallet rejects an EOA (WalletNotContract)", async function () {
+      // sp979 — reserve must be a contract (Foundation Safe), not an EOA, so a
+      // typo/compromised-owner can't misroute the drained reserve to an EOA.
+      await expect(
+        reg.connect(owner).setFoundationReserveWallet(reserve.address)
+      ).to.be.reverted;
     });
   });
 
@@ -134,6 +153,54 @@ describe("CreatorStakeRegistry", function () {
       await reg.connect(owner).unpause();
       await reg.connect(creator).stake(MIN_HIGH);
       expect(await reg.creatorStakeOf(creator.address)).to.equal(MIN_HIGH);
+    });
+  });
+
+  // sp979 — pause-invariant (audit HIGH x5): a paused contract must freeze ALL
+  // value movement + state transitions, mirroring StakeBond. Every mutating
+  // function must revert while paused — no value out, no slash, no redirect.
+  describe("pause invariant — all mutating ops frozen when paused", function () {
+    it("withdraw reverts when paused (no creator value-out during a freeze)", async function () {
+      await reg.connect(creator).stake(MIN_HIGH);
+      await reg.connect(creator).requestUnbond();
+      await time.increase(DELAY + 1);
+      await reg.connect(owner).pause();
+      await expect(reg.connect(creator).withdraw()).to.be.reverted;
+    });
+
+    it("requestUnbond reverts when paused", async function () {
+      await reg.connect(creator).stake(MIN_HIGH);
+      await reg.connect(owner).pause();
+      await expect(reg.connect(creator).requestUnbond()).to.be.reverted;
+    });
+
+    it("slash reverts when paused (slasher can't drain stakes during a freeze)", async function () {
+      await reg.connect(creator).stake(MIN_HIGH);
+      await reg.connect(owner).pause();
+      await expect(
+        reg.connect(slasher).slash(creator.address, 100n * ONE, "spam")
+      ).to.be.reverted;
+    });
+
+    it("setFoundationReserveWallet reverts when paused (no redirect-then-drain)", async function () {
+      const S = await ethers.getContractFactory("MockERC20");
+      const safe = await S.deploy();
+      await safe.waitForDeployment();
+      await reg.connect(owner).pause();
+      await expect(
+        reg.connect(owner).setFoundationReserveWallet(await safe.getAddress())
+      ).to.be.reverted;
+    });
+
+    it("drainFoundationReserve reverts when paused (owner can't extract reserve mid-incident)", async function () {
+      const S = await ethers.getContractFactory("MockERC20");
+      const safe = await S.deploy();
+      await safe.waitForDeployment();
+      await reg.connect(creator).stake(MIN_HIGH);
+      await reg.connect(slasher).slash(creator.address, 100n * ONE, "spam");
+      await reg.connect(owner).setFoundationReserveWallet(await safe.getAddress());
+      await reg.connect(owner).pause();
+      await expect(reg.connect(owner).drainFoundationReserve()).to.be.reverted;
     });
   });
 });

@@ -85,6 +85,7 @@ contract CreatorStakeRegistry is Ownable2Step, ReentrancyGuard, Pausable {
     error InsufficientStake(uint256 staked, uint256 requested);
     error TransferFailed();
     error NoReserveWallet();
+    error WalletNotContract(address provided);
 
     constructor(
         address initialOwner,
@@ -128,7 +129,14 @@ contract CreatorStakeRegistry is Ownable2Step, ReentrancyGuard, Pausable {
      * @notice Begin unbonding. Eligibility (creatorStakeOf) drops to 0
      *         immediately so a creator cannot keep HIGH tier while exiting.
      */
-    function requestUnbond() external {
+    function requestUnbond() external whenNotPaused {
+        // sp979 — whenNotPaused: pause freezes ALL state transitions (mirrors
+        // StakeBond). NOTE (audit, discretionary-slasher SLA): unlike StakeBond
+        // (whose slasher is an async-challenge registry needing a window floor),
+        // this slasher is a discretionary governance/Foundation authority and
+        // slash() works throughout the full unbondDelaySeconds window on both
+        // BONDED + UNBONDING. Set unbondDelaySeconds >= the spam-detection SLA so
+        // a creator can't unbond+withdraw before a warranted slash can land.
         CreatorStake storage s = stakes[msg.sender];
         if (s.status != StakeStatus.BONDED || s.amount == 0) revert NotBonded();
         s.status = StakeStatus.UNBONDING;
@@ -137,7 +145,7 @@ contract CreatorStakeRegistry is Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     /// @notice Withdraw bonded FTNS after the unbond delay has elapsed.
-    function withdraw() external nonReentrant {
+    function withdraw() external nonReentrant whenNotPaused {
         CreatorStake storage s = stakes[msg.sender];
         if (s.status != StakeStatus.UNBONDING) revert NotUnbonding();
         if (block.timestamp < s.unbondEligibleAt) {
@@ -163,7 +171,7 @@ contract CreatorStakeRegistry is Ownable2Step, ReentrancyGuard, Pausable {
      */
     function slash(
         address creator, uint256 amount, string calldata reason
-    ) external {
+    ) external whenNotPaused {
         if (msg.sender != slasher) revert NotSlasher();
         if (amount == 0) revert ZeroAmount();
         CreatorStake storage s = stakes[creator];
@@ -193,13 +201,20 @@ contract CreatorStakeRegistry is Ownable2Step, ReentrancyGuard, Pausable {
         unbondDelaySeconds = newDelay;
     }
 
-    function setFoundationReserveWallet(address wallet) external onlyOwner {
+    function setFoundationReserveWallet(address wallet) external onlyOwner whenNotPaused {
         if (wallet == address(0)) revert ZeroAddress();
+        // sp979 (audit MEDIUM, mirrors StakeBond L505): the reserve must be a
+        // CONTRACT (the Foundation Safe), never an EOA. A typo or compromised
+        // owner setting an EOA here would let drainFoundationReserve() misroute
+        // accrued slash proceeds to a key-controlled wallet. code.length > 0
+        // rejects EOAs (note: it cannot catch a not-yet-deployed CREATE2 addr,
+        // but blocks the realistic typo/EOA-misroute case).
+        if (wallet.code.length == 0) revert WalletNotContract(wallet);
         emit FoundationReserveWalletUpdated(foundationReserveWallet, wallet);
         foundationReserveWallet = wallet;
     }
 
-    function drainFoundationReserve() external onlyOwner nonReentrant {
+    function drainFoundationReserve() external onlyOwner nonReentrant whenNotPaused {
         if (foundationReserveWallet == address(0)) revert NoReserveWallet();
         uint256 amount = foundationReserveBalance;
         foundationReserveBalance = 0;
