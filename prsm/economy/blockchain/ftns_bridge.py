@@ -672,8 +672,29 @@ class FTNSBridge:
         amount: int,
         tx_id: str
     ) -> None:
-        """Rollback on-chain lock on failure"""
-        # This would require admin intervention or automated refund
+        """Rollback on-chain lock on failure.
+
+        ⚠️ KNOWN DEFECT — DO NOT COMMISSION THIS BRIDGE WITHOUT FIXING (bridge
+        money-path review, 2026-06-03). This rollback is a NO-OP (logs only).
+        The withdraw lock-leg BURNS source tokens via FTNSBridge.sol burnFrom
+        (FTNSBridge.sol:250-254) and there is NO on-chain un-burn / recover
+        function, so a failed destination mint destroys the source tokens
+        IRRECOVERABLY. This is currently HARMLESS — the whole FTNSBridge client
+        is dead code: every /bridge/* endpoint returns 503 (node.ftns_bridge is
+        never instantiated), and production cross-chain value movement uses
+        Pattern A (daemon-mediated /wallet/deposit + /wallet/withdraw, sprints
+        540/541). These methods target retired polygon-mumbai-era contracts
+        never deployed on Base mainnet.
+
+        BEFORE wiring node.ftns_bridge / commissioning a real cross-chain bridge:
+        (1) Solidity FIRST — adopt lock-in-escrow (hold, don't burn until the
+            destination mint is confirmed) OR add an owner-gated recoverBurned()
+            re-mint guarded by a recorded failed-bridge record; THEN
+        (2) wire this rollback to that recovery + persist a FAILED-with-pending-
+            refund record so any loss is auditable, never silent.
+        The Python fix is MEANINGLESS without the on-chain un-burn path.
+        """
+        # No-op pending the Solidity recovery path above — see the warning.
         logger.error(f"Chain lock rollback required: {chain_address}, {amount}, {tx_id}")
     
     async def _mint_local_ftns(
