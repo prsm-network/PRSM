@@ -7,12 +7,15 @@ round-trip but for the lighter-weight price-handshake protocol.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import logging
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Dict, Optional
 
+from prsm.node.identity import verify_signature
 from prsm.node.transport import MSG_DIRECT, P2PMessage
 
 logger = logging.getLogger(__name__)
@@ -138,15 +141,67 @@ class PriceNegotiator:
                 reason="quote_exceeds_listing",
             )
 
+        # sp972 — verify the provider's signature so an on-path attacker can't
+        # tamper the quote (price / expiry / provider). Reconstruct EXACTLY what
+        # the provider signed (compute_provider.py:1017-1019) from the RAW
+        # response values — do NOT float()-coerce, so str() matches the
+        # provider's f-string byte-for-byte (an int price would mismatch a float).
+        provider_id = response.get("provider_id", "")
+        pubkey = response.get("provider_pubkey_b64", "")
+        signature = response.get("signature", "")
+        raw_price = response.get("quoted_price_ftns", 0)
+        raw_expires = response.get("quote_expires_unix", 0)
+        if not (provider_id and pubkey and signature):
+            logger.warning(
+                f"price quote {request_id}: unsigned/incomplete attestation; "
+                f"rejecting"
+            )
+            return PriceQuoteRejected(
+                request_id=request_id, listing_id=listing.listing_id,
+                reason="quote_unsigned",
+            )
+        # Bind the pubkey to the claimed provider_id (node_id == sha256(pubkey)
+        # prefix) AND require it to be the listing's (signed) provider — a quote
+        # can't be substituted from another provider.
+        try:
+            derived = hashlib.sha256(
+                base64.b64decode(pubkey)
+            ).hexdigest()[:32]
+        except Exception:
+            derived = ""
+        if derived != provider_id or provider_id != listing.provider_id:
+            logger.warning(
+                f"price quote {request_id}: provider mismatch "
+                f"(derived={derived[:12]}…, claimed={provider_id[:12]}…, "
+                f"listing={listing.provider_id[:12]}…); rejecting"
+            )
+            return PriceQuoteRejected(
+                request_id=request_id, listing_id=listing.listing_id,
+                reason="quote_provider_mismatch",
+            )
+        sig_src = (
+            f"{request_id}||{listing.listing_id}||{shard_index}||"
+            f"{raw_price}||{raw_expires}||{provider_id}"
+        ).encode("utf-8")
+        if not verify_signature(pubkey, sig_src, signature):
+            logger.warning(
+                f"price quote {request_id}: signature verification failed; "
+                f"rejecting"
+            )
+            return PriceQuoteRejected(
+                request_id=request_id, listing_id=listing.listing_id,
+                reason="quote_signature_invalid",
+            )
+
         return PriceQuote(
             request_id=request_id,
             listing_id=listing.listing_id,
             shard_index=shard_index,
             quoted_price_ftns=quoted_price,
-            quote_expires_unix=int(response.get("quote_expires_unix", 0)),
-            provider_id=response.get("provider_id", ""),
-            provider_pubkey_b64=response.get("provider_pubkey_b64", ""),
-            signature=response.get("signature", ""),
+            quote_expires_unix=int(raw_expires or 0),
+            provider_id=provider_id,
+            provider_pubkey_b64=pubkey,
+            signature=signature,
         )
 
     async def _on_direct_message(self, msg: P2PMessage, peer) -> None:
