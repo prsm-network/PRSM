@@ -827,6 +827,80 @@ INVARIANT_REGISTRY: Dict[str, List[Invariant]] = {
             expected=_FOUNDATION_SAFE_BASE,
         ),
     ],
+    # sp984 — §14 anti-spam CreatorStakeRegistry (sp976). Runtime lane,
+    # PENDING_COMMISSION: until the contract is deployed + its address recorded
+    # in networks.py, the /admin/formal-verification/check endpoint returns 503
+    # (the invariant LIST below stays PUBLIC). Completes the dual-lane coverage
+    # — the symbolic lane (CreatorStakeRegistrySpec, sp983) proves the
+    # algorithmic safety (solvency / slash-conservation / anti-game eligibility);
+    # these runtime pins guard the STATE properties (owner, bounds) live, exactly
+    # as StakeBond carries both AdminBoundedSettersSpec + INV-SB-1..4. The unbond-
+    # delay constant selectors are shared with StakeBond by identical function name.
+    "creator_stake_registry": [
+        Invariant(
+            id="INV-CSR-1",
+            contract_name="creator_stake_registry",
+            title="MIN_UNBOND_DELAY_SECONDS pinned at 1 day",
+            description=(
+                "Lower bound on the unbond delay. Combined with the slasher-SLA "
+                "note in requestUnbond, this prevents an instant-unbond mode that "
+                "would let a spam creator withdraw their bond the moment a "
+                "warranted slash is about to land. Mirrors StakeBond INV-SB-1."
+            ),
+            severity=InvariantSeverity.CRITICAL,
+            spec_text="MIN_UNBOND_DELAY_SECONDS() == 1 days",
+            kind=InvariantKind.UINT256_EQ,
+            selector=_SEL_MIN_UNBOND_DELAY,
+            expected=86400,
+        ),
+        Invariant(
+            id="INV-CSR-2",
+            contract_name="creator_stake_registry",
+            title="MAX_UNBOND_DELAY_SECONDS pinned at 30 days",
+            description=(
+                "Upper bound prevents the unbond delay from being weaponized to "
+                "permanently lock an honest creator's bond. Mirrors INV-SB-2."
+            ),
+            severity=InvariantSeverity.CRITICAL,
+            spec_text="MAX_UNBOND_DELAY_SECONDS() == 30 days",
+            kind=InvariantKind.UINT256_EQ,
+            selector=_SEL_MAX_UNBOND_DELAY,
+            expected=30 * 86400,
+        ),
+        Invariant(
+            id="INV-CSR-3",
+            contract_name="creator_stake_registry",
+            title="owner() == Foundation Safe",
+            description=(
+                "The critical governance pin. Post-commissioning ceremony "
+                "(transferOwnership → 2-of-3 acceptOwnership), the registry is "
+                "sole-owned by the Foundation Safe via Ownable2Step — no single "
+                "hot key can pause / set the reserve wallet / drain. Mirrors "
+                "INV-SB-4. FAILs (not skips) if a deployed contract has not yet "
+                "completed the ownership handover."
+            ),
+            severity=InvariantSeverity.CRITICAL,
+            spec_text=f"owner() == {_FOUNDATION_SAFE_BASE}",
+            kind=InvariantKind.ADDRESS_EQ,
+            selector=_SEL_OWNER,
+            expected=_FOUNDATION_SAFE_BASE,
+        ),
+        Invariant(
+            id="INV-CSR-4",
+            contract_name="creator_stake_registry",
+            title="paused() readable (Pausable wired)",
+            description=(
+                "Confirms the OZ Pausable surface is live — the emergency-freeze "
+                "that the sp979 audit made load-bearing (whenNotPaused on every "
+                "value/state mutation). A readable paused() is the precondition "
+                "for the multisig emergency-pause response path."
+            ),
+            severity=InvariantSeverity.HIGH,
+            spec_text="paused() is readable",
+            kind=InvariantKind.BOOL_READ,
+            selector=_SEL_PAUSED,
+        ),
+    ],
     "escrow_pool": [
         Invariant(
             id="INV-EP-1",

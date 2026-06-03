@@ -3019,11 +3019,17 @@ class PRSMNode:
                     endpoints.storage_slashing
                 ),
                 "stake_bond": endpoints.stake_bond,
+                # sp984 — §14 CreatorStakeRegistry (PENDING_COMMISSION; None
+                # until the address is recorded in networks.py post-ceremony,
+                # at which point the runtime probe covers it automatically).
+                "creator_stake_registry": (
+                    endpoints.creator_stake_registry
+                ),
             }
             logger.info(
                 "Formal-invariant checker wired "
-                "(backend=%s, 7 contracts: rd=%s ftns=%s "
-                "ep=%s ec=%s cd=%s ss=%s sb=%s)",
+                "(backend=%s, 8 contracts: rd=%s ftns=%s "
+                "ep=%s ec=%s cd=%s ss=%s sb=%s csr=%s)",
                 bool(backend),
                 self._formal_invariant_addresses.get(
                     "royalty_distributor",
@@ -3045,6 +3051,9 @@ class PRSMNode:
                 ),
                 self._formal_invariant_addresses.get(
                     "stake_bond",
+                ),
+                self._formal_invariant_addresses.get(
+                    "creator_stake_registry",
                 ),
             )
         except Exception as exc:  # noqa: BLE001

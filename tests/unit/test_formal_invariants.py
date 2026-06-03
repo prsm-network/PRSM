@@ -1036,6 +1036,44 @@ def test_stake_bond_owner_is_foundation():
     )
 
 
+# ── sp984 — CreatorStakeRegistry runtime invariants (PENDING_COMMISSION) ──
+
+
+def test_registry_has_creator_stake_registry():
+    """The §14 money-custody contract joins the runtime invariant
+    registry (PUBLIC pinned spec), completing the dual-lane coverage
+    every other money contract has (symbolic sp983 + runtime here)."""
+    assert "creator_stake_registry" in INVARIANT_REGISTRY
+    invs = INVARIANT_REGISTRY["creator_stake_registry"]
+    assert len(invs) >= 4
+
+
+def test_creator_stake_registry_unbond_delay_bounds_pinned():
+    invs = INVARIANT_REGISTRY["creator_stake_registry"]
+    min_d = next((i for i in invs if i.id == "INV-CSR-1"), None)
+    max_d = next((i for i in invs if i.id == "INV-CSR-2"), None)
+    assert min_d is not None and min_d.expected == 86400  # 1 day
+    assert max_d is not None and max_d.expected == 30 * 86400  # 30 days
+
+
+def test_creator_stake_registry_owner_is_foundation():
+    """The critical governance pin: post-ceremony the registry is
+    sole-owned by the Foundation Safe (mirrors INV-SB-4)."""
+    invs = INVARIANT_REGISTRY["creator_stake_registry"]
+    inv = next((i for i in invs if i.id == "INV-CSR-3"), None)
+    assert inv is not None
+    assert inv.kind == InvariantKind.ADDRESS_EQ
+    assert inv.severity == InvariantSeverity.CRITICAL
+    assert inv.expected.lower() == _FOUNDATION_SAFE.lower()
+
+
+def test_creator_stake_registry_paused_readable():
+    invs = INVARIANT_REGISTRY["creator_stake_registry"]
+    inv = next((i for i in invs if i.id == "INV-CSR-4"), None)
+    assert inv is not None
+    assert inv.kind == InvariantKind.BOOL_READ
+
+
 def test_emission_mainnet_chain_id_pinned():
     """INV-EC-2: BASE_MAINNET_CHAIN_ID() == 8453. The
     chainid pin that enforces the 4-year mainnet halving
