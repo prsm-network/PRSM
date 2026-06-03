@@ -2886,6 +2886,32 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             session_token=minted["token"],
         )
 
+        # sp968 — record an onramp_execute PENDING reservation NOW (at session
+        # mint), tagged with the intent_id, so the AML rolling total counts this
+        # in-flight onramp immediately. Previously onramp_execute was recorded
+        # only at CONFIRMED (the on-chain sweep, minutes-to-hours later), so
+        # repeated /onramp/execute calls all saw a stale total → tier bypass.
+        # total_usd_for_user dedups by intent_id, so this PENDING + the later
+        # CONFIRMED settle (same intent_id) count once. Fail-soft: a ring error
+        # must not break the session response.
+        _cring = getattr(node, "_fiat_compliance_ring", None)
+        if _cring is not None and body.destination_user_id:
+            try:
+                _cring.record(
+                    kind="onramp_execute",
+                    user_id=body.destination_user_id,
+                    usd_amount=float(body.usd_amount),
+                    ftns_amount=0.0,
+                    status="PENDING",
+                    address=destination_address,
+                    metadata={"intent_id": intent.intent_id},
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "sp968: onramp reservation record failed for intent %s: %s",
+                    intent.intent_id, exc,
+                )
+
         return {
             "status": "SESSION_READY",
             "session_url": minted["session_url"],

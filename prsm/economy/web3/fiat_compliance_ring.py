@@ -279,9 +279,17 @@ class FiatComplianceRing:
         if not user_id:
             return 0.0
         cutoff = time.time() - window_sec
-        total = 0.0
         with self._lock:  # Sp896 — snapshot, then sum lock-free.
             snap = list(self._entries)
+        # sp968 — dedup by intent_id so an onramp's execute-time PENDING
+        # reservation + its later CONFIRMED settle (same intent) count ONCE
+        # (the latest entry by timestamp wins → reflects the settled amount once
+        # confirmed, the reserved amount while in-flight). Entries WITHOUT an
+        # intent_id (offramp / legacy) each count individually. The PENDING
+        # reservation is what closes the rolling-total TOCTOU: an in-flight
+        # onramp is counted immediately, not only minutes later at CONFIRMED.
+        total = 0.0
+        latest_by_intent: Dict[str, Any] = {}  # intent_id -> (timestamp, usd_amount)
         for e in snap:
             if e.user_id != user_id:
                 continue
@@ -289,7 +297,14 @@ class FiatComplianceRing:
                 continue
             if e.timestamp < cutoff:
                 continue
-            total += e.usd_amount
+            intent_id = (e.metadata or {}).get("intent_id")
+            if intent_id:
+                prev = latest_by_intent.get(intent_id)
+                if prev is None or e.timestamp >= prev[0]:
+                    latest_by_intent[intent_id] = (e.timestamp, e.usd_amount)
+            else:
+                total += e.usd_amount
+        total += sum(amount for _ts, amount in latest_by_intent.values())
         return total
 
     def summary_by_kind(self) -> Dict[str, Dict[str, float]]:
