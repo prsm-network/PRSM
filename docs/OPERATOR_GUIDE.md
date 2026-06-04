@@ -493,19 +493,24 @@ This middleware applies to ALL endpoints (the security-hardening middleware ship
 A network-/data-plane security sweep (sprints 1002–1014) added the knobs below. The
 **fail-closed public-bind posture is the one most likely to affect an upgrade** — read it first.
 
-**⚠️ Public-bind authentication (sp1011 — may refuse to start).** The protected money +
-KYC endpoints are authenticated only when `PRSM_NODE_API_KEY` is set. As of sp1011, a node
-bound to a **non-loopback** interface (e.g. `--host 0.0.0.0`) **with no API key REFUSES to
-start** — previously it only warned. The CLI default bind is `127.0.0.1` (loopback), which
-is unaffected. If your node stops booting after upgrade with an "insecure public-bind/no-auth
-posture" error, do ONE of:
+**Management-API authentication (sp1011 + sp1017).** The protected money + KYC endpoints
+are authenticated only when `PRSM_NODE_API_KEY` is set. The management API binds **loopback
+(`127.0.0.1`) by default** (`api_host`, sp1017), so a default `prsm node start` is NOT
+network-exposed and boots fine **with no key** — local dev and reverse-proxy-fronted
+deployments are unaffected. (The `0.0.0.0` you may see in config is the separate **P2P**
+transport bind, which must stay reachable.)
+
+If you **intentionally expose the management API** (set `api_host=0.0.0.0` / `PRSM_API_HOST=0.0.0.0`,
+e.g. Docker port-mapping) you MUST also authenticate it, or the node **refuses to start**
+(sp1011 fail-closed). Do ONE of:
 
 ```bash
-# Recommended — authenticate the money/KYC endpoints
+# Recommended — authenticate the money/KYC endpoints, then expose the API
 export PRSM_NODE_API_KEY="$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
-# OR bind loopback behind an authenticating reverse proxy:  --host 127.0.0.1
-# OR (NOT recommended — only if fronted by a firewall/security group) run unauthenticated:
-export PRSM_ALLOW_INSECURE_PUBLIC_BIND=1
+export PRSM_API_HOST=0.0.0.0
+# OR keep the API on loopback (default) behind an authenticating reverse proxy (no key needed)
+# OR (NOT recommended — only if fronted by a firewall/security group) expose unauthenticated:
+export PRSM_API_HOST=0.0.0.0 && export PRSM_ALLOW_INSECURE_PUBLIC_BIND=1
 ```
 
 **Content-retrieval + gossip data-plane bounds** (all have safe defaults; tune only if needed):
