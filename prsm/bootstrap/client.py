@@ -15,12 +15,51 @@ bridges the two by:
 import asyncio
 import json
 import logging
+import os
 import ssl
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _build_bootstrap_ssl_context(bootstrap_url: str) -> Optional[ssl.SSLContext]:
+    """sp1006 — SSL context for a bootstrap WSS connection.
+
+    SECURE BY DEFAULT: full TLS verification (CERT_REQUIRED + hostname check)
+    via ssl.create_default_context(). The pre-fix code disabled verification
+    unconditionally (CERT_NONE), making the bootstrap connection MITM-able — an
+    on-path attacker could impersonate the bootstrap and feed a joining node an
+    all-attacker peer list (cold-start eclipse). The live fleet uses valid
+    Let's Encrypt certs, so verifying by default is non-breaking.
+
+    Dev / self-signed deployments opt in explicitly:
+      - PRSM_BOOTSTRAP_TLS_CA_FILE=<pem>  pins a custom CA (still verifies).
+      - PRSM_BOOTSTRAP_TLS_INSECURE=1     disables verification (loudly warned).
+
+    Returns None for a non-wss URL (plain ws:// needs no TLS context).
+    """
+    if not bootstrap_url.startswith("wss://"):
+        return None
+    ctx = ssl.create_default_context()  # CERT_REQUIRED + check_hostname=True
+    insecure = os.environ.get("PRSM_BOOTSTRAP_TLS_INSECURE", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    ca_file = os.environ.get("PRSM_BOOTSTRAP_TLS_CA_FILE", "").strip()
+    if insecure:
+        logger.critical(
+            "PRSM_BOOTSTRAP_TLS_INSECURE is set — bootstrap TLS verification is "
+            "DISABLED. The bootstrap connection is MITM-able (cold-start eclipse "
+            "risk); use this in dev only. Prefer PRSM_BOOTSTRAP_TLS_CA_FILE to pin "
+            "a self-signed bootstrap's CA instead."
+        )
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    elif ca_file:
+        # Pin a custom / self-signed CA as the trust anchor — still verifies.
+        ctx.load_verify_locations(cafile=ca_file)
+    return ctx
 
 try:
     import websockets
@@ -152,13 +191,10 @@ class BootstrapClient:
                 "Install with: pip install websockets"
             )
 
-        # Build SSL context for WSS
-        ssl_ctx = None
-        if self.bootstrap_url.startswith("wss://"):
-            ssl_ctx = ssl.create_default_context()
-            # Bootstrap servers may use self-signed certs in dev
-            ssl_ctx.check_hostname = False
-            ssl_ctx.verify_mode = ssl.CERT_NONE
+        # sp1006 — secure-by-default TLS (verify the bootstrap's cert). Dev /
+        # self-signed deployments opt out via PRSM_BOOTSTRAP_TLS_CA_FILE (pin)
+        # or PRSM_BOOTSTRAP_TLS_INSECURE=1 (disable, loudly warned).
+        ssl_ctx = _build_bootstrap_ssl_context(self.bootstrap_url)
 
         try:
             logger.info(
