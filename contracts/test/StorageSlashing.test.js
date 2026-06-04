@@ -398,4 +398,61 @@ describe("StorageSlashing — slasher for Phase 7-storage", function () {
       ).to.be.revertedWithCustomError(slashing, "OwnableUnauthorizedAccount");
     });
   });
+
+  // -------------------------------------------------------------------------
+  // sp1000 — slasher-wiring regression (against the REAL StakeBond).
+  //
+  // The rest of this suite uses MockStakeBondSlasher, whose slash() has NO
+  // caller check, so it never exercises the on-chain reality: StakeBond's
+  // slasher is IMMUTABLE (set once at construction, no setter per HIGH-7), and on
+  // the deployed fleet it is the BatchSettlementRegistry — NOT StorageSlashing.
+  // So every storage proof-failure / missing-heartbeat slash reverts with
+  // CallerNotSlasher and the misbehaving provider is never penalized (the
+  // storage-tier stake deterrent is non-functional). These tests pin that revert
+  // against a real StakeBond + will verify the eventual on-chain fix (a StakeBond
+  // authorized-slasher allowlist, or StorageSlashing-via-BSR-adapter — see
+  // docs/2026-06-04-storage-slashing-slasher-wiring-gap.md).
+  // -------------------------------------------------------------------------
+  describe("slasher-wiring vs REAL StakeBond (sp1000)", function () {
+    async function deployWithRealStakeBond() {
+      const [o, ver, prov, chal, bsrStandin] = await ethers.getSigners();
+      const Token = await ethers.getContractFactory("MockERC20");
+      const token = await Token.deploy();
+      await token.waitForDeployment();
+      const StakeBond = await ethers.getContractFactory("StakeBond");
+      // Immutable slasher = a stand-in for the BatchSettlementRegistry — anything
+      // that is NOT the StorageSlashing we deploy next. 1-day unbond delay (min).
+      const stakeBond = await StakeBond.deploy(
+        o.address, await token.getAddress(), 24 * 60 * 60, bsrStandin.address,
+      );
+      await stakeBond.waitForDeployment();
+      const Slashing = await ethers.getContractFactory("StorageSlashing");
+      const sl = await Slashing.deploy(
+        await stakeBond.getAddress(), ver.address, DEFAULT_GRACE, o.address,
+      );
+      await sl.waitForDeployment();
+      return { sl, stakeBond, ver, prov, chal };
+    }
+
+    it("submitProofFailure reverts CallerNotSlasher (proof-failure slash never lands)", async function () {
+      const { sl, stakeBond, ver, prov, chal } = await deployWithRealStakeBond();
+      await expect(
+        sl.connect(ver).submitProofFailure(
+          prov.address, SHARD_ID, EVIDENCE, chal.address,
+        )
+      ).to.be.revertedWithCustomError(stakeBond, "CallerNotSlasher");
+    });
+
+    it("slashForMissingHeartbeat reverts CallerNotSlasher once the window elapses", async function () {
+      const { sl, stakeBond, ver, prov } = await deployWithRealStakeBond();
+      // Provider records its own heartbeat, then time advances past the slash
+      // window (grace * slashGraceMultiplier(=2)) so the missing-heartbeat slash
+      // is attempted (and reverts on the caller check).
+      await sl.connect(prov).recordHeartbeat();
+      await time.increase(DEFAULT_GRACE * 2 + 10);
+      await expect(
+        sl.connect(prov).slashForMissingHeartbeat(prov.address)
+      ).to.be.revertedWithCustomError(stakeBond, "CallerNotSlasher");
+    });
+  });
 });

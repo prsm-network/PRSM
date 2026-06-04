@@ -346,8 +346,30 @@ class ProofVerifier:
                 evidence_hash=evidence_hash,
                 challenger=self._challenger_id,
             )
-        except Exception:
-            logger.exception(
-                "slash-hook submission failed for challenge %s",
-                challenge.challenge_id,
-            )
+        except Exception as exc:  # noqa: BLE001
+            # sp1000 — make a NON-LANDING slash loud + actionable instead of a
+            # generic swallowed error. In particular the CallerNotSlasher revert
+            # is the known on-chain wiring gap: StorageSlashing is NOT StakeBond's
+            # authorized slasher (StakeBond's immutable slasher is the
+            # BatchSettlementRegistry), so EVERY storage proof-failure slash
+            # reverts and the misbehaving provider is never penalized — the
+            # storage-tier stake deterrent is non-functional until fixed on-chain.
+            _m = str(exc).lower()
+            if "callernotslasher" in _m or "not slasher" in _m or "slasher" in _m:
+                logger.critical(
+                    "Storage-slash for provider %s did NOT land (%s): "
+                    "StorageSlashing is not StakeBond's authorized slasher "
+                    "(on-chain wiring gap — StakeBond's immutable slasher is the "
+                    "BatchSettlementRegistry). The storage-tier stake deterrent is "
+                    "NON-FUNCTIONAL until fixed on-chain (see "
+                    "docs/2026-06-04-storage-slashing-slasher-wiring-gap.md). The "
+                    "misbehaving provider was NOT penalized for challenge %s.",
+                    challenge.provider_id, type(exc).__name__,
+                    challenge.challenge_id,
+                )
+            else:
+                logger.exception(
+                    "slash-hook submission failed for challenge %s — provider %s "
+                    "was NOT penalized (not auto-retried)",
+                    challenge.challenge_id, challenge.provider_id,
+                )
