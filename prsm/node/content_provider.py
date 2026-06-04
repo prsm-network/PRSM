@@ -836,6 +836,44 @@ class ContentProvider:
                 return size
         return None
 
+    @staticmethod
+    def _cid_anchor_rejects(cid: str, content_bytes: bytes) -> bool:
+        """sp1003 — return True iff ``cid`` is an unambiguous ContentHash
+        content-address AND ``content_bytes`` does NOT hash to it (a
+        content-substitution attempt that must be rejected).
+
+        Returns False (no opinion) when ``cid`` is not a recomputable
+        content address — e.g. a 40/64-char BitTorrent infohash, whose
+        integrity cannot be checked from inline bytes (documented residual
+        gap). The caller then falls back to the gossip-supplied-hash check.
+
+        The guard is strict: the CID must round-trip through ``from_hex``
+        (canonical algorithm-prefixed form) AND carry the algorithm's
+        canonical digest length, so a BT infohash whose leading bytes happen
+        to parse as a valid algorithm id still falls through rather than
+        triggering a false reject.
+        """
+        try:
+            from prsm.storage import ContentHash
+        except Exception:  # pragma: no cover - storage always importable
+            return False
+        try:
+            parsed = ContentHash.from_hex(cid)
+        except (ValueError, TypeError):
+            return False
+        try:
+            canonical = parsed.hex() == cid
+            expected_len = len(
+                ContentHash.from_data(b"", parsed.algorithm_id).digest
+            )
+        except (ValueError, TypeError):
+            return False
+        if not canonical or len(parsed.digest) != expected_len:
+            # Not an unambiguous content address (e.g. BT infohash) — defer.
+            return False
+        recomputed = ContentHash.from_data(content_bytes, parsed.algorithm_id)
+        return recomputed.digest != parsed.digest
+
     async def _request_from_provider(
         self,
         cid: str,
@@ -923,7 +961,28 @@ class ContentProvider:
 
         if content_bytes is None:
             return None
-        
+
+        # sp1003 — CID-anchored integrity (content-substitution defense).
+        # For a ContentHash-shaped CID (an algorithm-prefixed content
+        # address) verify the returned bytes against the CID ITSELF. The
+        # requester chose+trusts the CID, whereas `expected_hash` came from
+        # an UNAUTHENTICATED gossip advertise and is attacker-controllable
+        # (a malicious provider can advertise content_hash=sha256(evil),
+        # serve evil, and pass the gossip-hash check below). The ContentStore
+        # is content-addressed, so genuine content always re-hashes to its
+        # CID. A 40/64-char BitTorrent infohash is NOT a recomputable content
+        # address from inline bytes (documented residual gap in
+        # docs/2026-06-04-content-data-plane-trust-anchors.md) — it fails the
+        # round-trip/digest-length guard and falls through to the gossip-hash
+        # check.
+        if self._cid_anchor_rejects(cid, content_bytes):
+            logger.warning(
+                "CID-anchor mismatch for %s... from %s — refusing "
+                "substituted content (bytes do not hash to the requested CID)",
+                cid[:12], provider_id[:8],
+            )
+            return None
+
         # Verify hash if provided
         if expected_hash:
             actual_hash = hashlib.sha256(content_bytes).hexdigest()
