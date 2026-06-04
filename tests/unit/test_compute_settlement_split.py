@@ -209,6 +209,48 @@ class TestSplitValidation:
             ))
 
 
+class TestSplitFloatTolerance:
+    """sp997 — compute_split_amounts normalizes splits to sum to the budget, but
+    float rounding can make sum land a few ULPs OVER the escrow balance (~8% of
+    multi-recipient forge splits). The old guard `escrow_balance < total_split`
+    had no tolerance (unlike the +1e-9 raise guard) so that float noise returned
+    None → zero transfers, escrow stranded PENDING, providers paid 0 — while the
+    forge handler still reported the job COMPLETED + 200."""
+
+    def test_float_overshoot_within_tolerance_settles_not_strands(self):
+        escrow, ledger = _make_escrow(escrow_balance=0.3)
+        entry = _seed_escrow(escrow, amount=0.3)
+        # 0.1+0.1+0.1 == 0.30000000000000004 in float — a real overshoot pattern.
+        splits = [("a", 0.1), ("b", 0.1), ("c", 0.1)]
+        assert sum(a for _, a in splits) > 0.3  # confirm the float overshoot
+        txs = asyncio.run(escrow.release_escrow_split(
+            job_id="job-x", splits=splits,
+        ))
+        assert txs is not None  # SETTLES (pre-sp997 this returned None → strand)
+        assert entry.status == EscrowStatus.RELEASED
+        paid = {
+            t["to"]: t["amount"]
+            for t in ledger.transfers if t["to"] != "prompter-1"
+        }
+        assert set(paid) == {"a", "b", "c"}  # every worker paid
+        # The clamp shaved the float overshoot off the largest leg; the legs sum
+        # to ~the balance (no over-debit, no spurious strand).
+        assert sum(paid.values()) == pytest.approx(0.3, abs=1e-9)
+
+    def test_real_shortfall_beyond_tolerance_still_strands(self):
+        # Nominal escrow amount 10.0 (so splits summing to 10 pass the +1e-9 raise
+        # guard), but the wallet is genuinely underfunded (balance 5.0 << 10).
+        # A real shortfall (>> 1e-9) must still strand — never release more than held.
+        escrow, ledger = _make_escrow(escrow_balance=5.0)
+        entry = _seed_escrow(escrow, amount=10.0)
+        result = asyncio.run(escrow.release_escrow_split(
+            job_id="job-x", splits=[("a", 6.0), ("b", 4.0)],  # sum 10.0 > balance 5.0
+        ))
+        assert result is None  # real shortfall → strands (correct)
+        assert entry.status == EscrowStatus.PENDING
+        assert not ledger.transfers  # released nothing
+
+
 class TestSplitStateMachine:
     def test_double_release_is_no_op(self):
         escrow, _ = _make_escrow()

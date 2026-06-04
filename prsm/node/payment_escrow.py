@@ -450,12 +450,34 @@ class PaymentEscrow:
 
         escrow_wallet = f"escrow-{escrow.escrow_id}"
         escrow_balance = await self.ledger.get_balance(escrow_wallet)
-        if escrow_balance < total_split:
+        # sp997 — a REAL shortfall (beyond float tolerance) must still strand
+        # (never release more than is held). BUT compute_split_amounts normalizes
+        # the split to sum to the budget with float rounding that can land a few
+        # ULPs OVER escrow_balance (~8% of multi-recipient forge splits, e.g.
+        # 10.000000000000002 vs 10.0). The old `escrow_balance < total_split`
+        # had NO tolerance (unlike the +1e-9 raise guard above), so that float
+        # noise returned None → zero transfers, escrow stranded PENDING, every
+        # provider paid 0, the requester refunded at timeout — while the forge
+        # handler still reported the job COMPLETED + 200. Tolerate the same 1e-9
+        # epsilon, and clamp the float overshoot out of the largest leg so the
+        # per-leg transfers sum to exactly the available balance (no over-debit,
+        # no spurious remainder). The clamp is sub-wei (~1e-15 FTNS).
+        if escrow_balance + 1e-9 < total_split:
             logger.warning(
                 f"Escrow wallet has {escrow_balance:.6f}, trying to "
-                f"split-release {total_split:.6f}"
+                f"split-release {total_split:.6f} (shortfall exceeds fp "
+                f"tolerance) — not releasing"
             )
             return None
+        if total_split > escrow_balance:
+            overshoot = total_split - escrow_balance
+            idx_max = max(
+                range(len(splits)), key=lambda i: splits[i][1],
+            )
+            _r, _a = splits[idx_max]
+            splits = list(splits)
+            splits[idx_max] = (_r, _a - overshoot)
+            total_split = sum(amount for _, amount in splits)
 
         # Atomic-from-caller-view: any per-recipient transfer
         # failure triggers compensating reverse-transfers for the

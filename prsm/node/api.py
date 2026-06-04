@@ -6503,10 +6503,31 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                             agg_share_bps, len(wallet_map),
                             job_id[:8],
                         )
-                        await node._payment_escrow.release_escrow_split(
-                            job_id=job_id,
-                            splits=splits,
+                        # sp997 — capture the return: release_escrow_split returns
+                        # None (NOT raise) when it cannot settle (a real shortfall
+                        # beyond float tolerance, an already-finalized escrow, or a
+                        # rolled-back partial release). The float-overshoot strand
+                        # is now fixed at the source (epsilon tolerance + clamp in
+                        # release_escrow_split), but a genuine None must not stay
+                        # SILENT while the job reports COMPLETED — escalate to a
+                        # visible ERROR naming the job so the stranded escrow can be
+                        # reconciled (the inner warning was buried at WARNING and
+                        # the forge handler swallows settlement exceptions).
+                        _split_txs = (
+                            await node._payment_escrow.release_escrow_split(
+                                job_id=job_id,
+                                splits=splits,
+                            )
                         )
+                        if _split_txs is None:
+                            logger.error(
+                                "forge settlement UNSETTLED for job %s: "
+                                "release_escrow_split returned None (escrow "
+                                "not released — providers unpaid). Escrow "
+                                "remains PENDING for reconciliation/refund; "
+                                "do NOT treat the job's COMPLETED status as "
+                                "proof of payment.", job_id[:8],
+                            )
 
                         # Sprint 248 — on-chain content-access
                         # royalty leg. Off by default. Operator
