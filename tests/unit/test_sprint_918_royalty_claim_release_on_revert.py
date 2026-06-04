@@ -40,6 +40,10 @@ from prsm.economy.web3.provenance_registry import (
 def _record(cid, h="ab" * 32):
     r = MagicMock()
     r.content_hash = h
+    # sp996 — on-chain dispatch keys on provenance_hash (the registry key), not
+    # content_hash. Mirror the registered hash (else MagicMock auto-attr →
+    # skipped_unregistered).
+    r.provenance_hash = h
     r.royalty_rate = 0.05
     return r
 

@@ -28,10 +28,19 @@ from prsm.economy.onchain_content_royalty import (
 )
 
 
-def _fake_record(cid, content_hash_hex):
+def _fake_record(cid, content_hash_hex, provenance_hash_hex=None):
     r = MagicMock()
     r.cid = cid
     r.content_hash = content_hash_hex
+    # sp996 — the on-chain dispatch keys on provenance_hash (the ProvenanceRegistry
+    # key = keccak256(creator || sha3_256(bytes))), NOT the raw SHA-256
+    # content_hash. These tests pass the registered hash as content_hash_hex, so
+    # default provenance_hash to it; the dedicated regression test below sets them
+    # to DIFFERENT values to prove the dispatch uses provenance_hash.
+    r.provenance_hash = (
+        provenance_hash_hex if provenance_hash_hex is not None
+        else content_hash_hex
+    )
     return r
 
 
@@ -194,3 +203,47 @@ def test_no_shards_returns_empty():
         gross_per_shard_wei=1,
     )
     assert results == []
+
+
+def test_dispatch_uses_provenance_hash_not_content_hash():
+    """sp996 regression — the on-chain ProvenanceRegistry/RoyaltyDistributor key
+    on the provenance_hash (keccak256(creator || sha3_256(bytes))), NOT the raw
+    SHA-256 content_hash. Dispatching with content_hash made getCreatorAndRate
+    return address(0) → distributeRoyalty reverted 'Not registered' every time, so
+    the creator's on-chain royalty leg never paid. Assert the dispatcher passes the
+    PROVENANCE hash bytes (and explicitly NOT the SHA-256 content_hash)."""
+    sha256_hex = "ab" * 32   # the record's content_hash (raw SHA-256)
+    prov_hex = "cd" * 32     # the registered provenance_hash (keccak) — distinct
+    rec = _fake_record("c1", sha256_hex, provenance_hash_hex=prov_hex)
+    client = _fake_client([("0xtx", "CONFIRMED")])
+    results = dispatch_content_access_royalties(
+        shards=["c1"],
+        content_index=_fake_index({"c1": rec}),
+        royalty_client=client,
+        serving_node_address="0x" + "1" * 40,
+        gross_per_shard_wei=10**18,
+    )
+    assert results[0].status == "sent"
+    args, _ = client.distribute_royalty.call_args_list[0]
+    assert args[0] == bytes.fromhex(prov_hex)        # the registered key
+    assert args[0] != bytes.fromhex(sha256_hex)      # NOT the SHA-256
+
+
+def test_skips_record_with_no_provenance_hash():
+    """A record never registered on-chain (no provenance_hash) is skipped as
+    'skipped_unregistered' — it can't be paid the on-chain leg (would revert
+    'Not registered'). NOT dispatched (avoids a guaranteed revert per shard)."""
+    rec = MagicMock()
+    rec.cid = "c1"
+    rec.content_hash = "ab" * 32  # has a SHA-256 but was never registered on-chain
+    rec.provenance_hash = None
+    client = _fake_client([("0xtx", "CONFIRMED")])
+    results = dispatch_content_access_royalties(
+        shards=["c1"],
+        content_index=_fake_index({"c1": rec}),
+        royalty_client=client,
+        serving_node_address="0x" + "1" * 40,
+        gross_per_shard_wei=10**18,
+    )
+    assert results[0].status == "skipped_unregistered"
+    client.distribute_royalty.assert_not_called()

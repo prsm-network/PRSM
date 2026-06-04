@@ -2,27 +2,36 @@
 
 Settlement-side helper that ships the per-shard access fee to
 the on-chain RoyaltyDistributor via the existing
-``distribute_royalty(content_hash, serving_node, gross)`` call.
+``distribute_royalty(provenance_hash, serving_node, gross)`` call.
 
 Design notes
 ------------
 
 The on-chain contract resolves the *creator* address itself
-(via the ProvenanceRegistry lookup keyed on content_hash) — we
-only need to supply:
+(via the ProvenanceRegistry lookup). CRITICAL (sp996): that lookup
+is keyed on the **provenance_hash** — ``keccak256(creator_address
+|| sha3_256(bytes))`` — NOT the raw SHA-256 ``content_hash``.
+Passing content_hash makes ``getCreatorAndRate()`` return
+``address(0)`` and ``distributeRoyalty`` revert "Not registered"
+on every call. So the dispatcher reads the record's
+``provenance_hash`` field (the registered key), not content_hash.
+We supply:
 
-  - ``content_hash``: 32-byte content hash from ContentRecord
+  - ``provenance_hash``: the 32-byte on-chain registry key from
+    ContentRecord.provenance_hash (NOT content_hash)
   - ``serving_node``: 0x-prefixed eth address of the node that
     fetched + served the shard (typically the operator's own
     address)
   - ``gross``: FTNS amount in wei to distribute
 
 The dispatcher iterates the supplied ``shards`` list, resolves
-each shard's content_hash via the ContentIndex, validates the
-hash is a well-formed 64-hex-char string, and dispatches one
-``distribute_royalty`` tx per shard. Each tx fail-soft so one
-bad shard doesn't crash the batch — operator sees structured
-per-shard ``DispatchResult`` records for telemetry / retries.
+each shard's provenance_hash via the ContentIndex, validates it is
+a well-formed 64-hex-char string (records with no provenance_hash
+were never registered on-chain → skipped_unregistered), and
+dispatches one ``distribute_royalty`` tx per shard. Each tx
+fail-soft so one bad shard doesn't crash the batch — operator sees
+structured per-shard ``DispatchResult`` records for telemetry /
+retries.
 
 This module does NOT decide whether to dispatch — that's an
 opt-in operator decision wired via env var
@@ -342,9 +351,23 @@ def dispatch_content_access_royalties(
                 status="skipped_no_record",
             ))
             continue
-        hash_bytes = _decode_content_hash(
-            getattr(record, "content_hash", ""),
-        )
+        # sp996 — the on-chain ProvenanceRegistry / RoyaltyDistributor key on the
+        # PROVENANCE hash (keccak256(creator_address || sha3_256(bytes))), NOT the
+        # raw SHA-256 content_hash. Dispatching with content_hash made
+        # getCreatorAndRate() return address(0) → distributeRoyalty reverted
+        # "Not registered" on EVERY call, so the creator's on-chain royalty leg
+        # never paid (no fund loss — the revert is before any transfer — but the
+        # creator was stranded). The registered key lives on the record's separate
+        # provenance_hash field; use it. A record with no provenance_hash was never
+        # registered on-chain and can't be paid the on-chain leg → skip.
+        prov_hash = getattr(record, "provenance_hash", None)
+        if not prov_hash or not isinstance(prov_hash, str):
+            results.append(DispatchResult(
+                cid=cid,
+                status="skipped_unregistered",
+            ))
+            continue
+        hash_bytes = _decode_content_hash(prov_hash)
         if hash_bytes is None:
             results.append(DispatchResult(
                 cid=cid,

@@ -20,6 +20,10 @@ def _rec(cid, content_hash="ab" * 32):
     r = MagicMock()
     r.cid = cid
     r.content_hash = content_hash
+    # sp996 — on-chain dispatch keys on provenance_hash (the registry key), not
+    # content_hash. Mirror the registered hash onto provenance_hash (else the
+    # MagicMock auto-attr routes the record to skipped_unregistered).
+    r.provenance_hash = content_hash
     return r
 
 
