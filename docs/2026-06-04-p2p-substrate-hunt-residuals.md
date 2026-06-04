@@ -46,9 +46,11 @@ against.
   caps) before libp2p is ever made live. This is the correct long-term fix but a
   meaningful chunk, best done when libp2p deployment is actually on the roadmap.
 - **Interim, cheap, do-now:** a **startup guard** — refuse to start (or emit a
-  CRITICAL) when `transport_backend=libp2p` in a non-dev environment, until the
-  attestation is ported. This prevents silently shipping the unhardened path.
-  (Tracked as the next autonomous follow-on.)
+  CRITICAL) when `transport_backend=libp2p`, until the attestation is ported.
+  This prevents silently shipping the unhardened path. ✅ **SHIPPED (sp1010):**
+  `_check_libp2p_origin_auth_gap` in `node.py` logs CRITICAL whenever libp2p is
+  selected and hard-refuses startup when `PRSM_FORBID_UNAUTHENTICATED_LIBP2P` is
+  set. The full attestation port to libp2p remains the long-term fix.
 
 ## ★ RESIDUAL B — bootstrap register accepts a caller-chosen peer_id (finding 10)
 
