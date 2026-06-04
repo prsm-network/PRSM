@@ -42,6 +42,10 @@
  */
 const hre = require("hardhat");
 const { assertSignerMatchesOwner } = require("./deploy-guards");
+// sp994 — block-pinned reads so GATE-4 post-deploy invariant checks are immune to
+// load-balanced-RPC read-replica lag (a stale read right after the irreversible
+// deploy could fake a mismatch, or worse a false pass). See rpc-stable-read.js.
+const { readAt } = require("./rpc-stable-read");
 
 const DAY = 24 * 60 * 60;
 
@@ -105,24 +109,18 @@ async function main() {
   const reg = await Reg.deploy(owner, ftnsAddress, unbondDelay, slasher);
   await reg.waitForDeployment();
   const addr = await reg.getAddress();
-  console.log(`   CreatorStakeRegistry: ${addr}`);
+  // Block the deploy tx mined in — all post-deploy reads are pinned to it so a
+  // lagging read-replica cannot fake a mismatch (it errors on the block until
+  // synced; readAt retries) nor return a stale false-pass.
+  const deployBlock = (await reg.deploymentTransaction().wait()).blockNumber;
+  console.log(`   CreatorStakeRegistry: ${addr} (deploy block ${deployBlock})`);
 
-  // ── Post-deploy invariant checks (poll for read-replica lag) ──────
+  // ── Post-deploy invariant checks (block-pinned; immune to read-replica lag) ──
   console.log(`\nPost-deploy invariant checks…`);
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  let code = "0x";
-  for (let i = 0; i < 15; i++) {
-    code = await hre.ethers.provider.getCode(addr);
-    if (code !== "0x") break;
-    await sleep(1000);
-  }
-  if (code === "0x") {
-    throw new Error(`getCode(${addr}) empty after 15s — verify manually.`);
-  }
-  const onOwner = await reg.owner();
-  const onFtns = await reg.ftns();
-  const onSlasher = await reg.slasher();
-  const onDelay = await reg.unbondDelaySeconds();
+  const onOwner = await readAt(deployBlock, (bt) => reg.owner({ blockTag: bt }));
+  const onFtns = await readAt(deployBlock, (bt) => reg.ftns({ blockTag: bt }));
+  const onSlasher = await readAt(deployBlock, (bt) => reg.slasher({ blockTag: bt }));
+  const onDelay = await readAt(deployBlock, (bt) => reg.unbondDelaySeconds({ blockTag: bt }));
   console.log(`   owner:    ${onOwner}`);
   console.log(`   ftns:     ${onFtns}`);
   console.log(`   slasher:  ${onSlasher}`);
@@ -140,7 +138,8 @@ async function main() {
     throw new Error(`delay mismatch: ${onDelay} != ${unbondDelay}`);
   }
   // creatorStakeOf for an unstaked address must be 0 (responsive + correct ABI).
-  const zero = await reg.creatorStakeOf(hre.ethers.ZeroAddress);
+  const zero = await readAt(deployBlock,
+    (bt) => reg.creatorStakeOf(hre.ethers.ZeroAddress, { blockTag: bt }));
   if (zero !== 0n) throw new Error(`fresh creatorStakeOf != 0: ${zero}`);
   console.log(`   ✓ invariants OK`);
 
