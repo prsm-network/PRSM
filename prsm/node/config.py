@@ -68,9 +68,17 @@ class NodeConfig:
     ledger_type: str = "dag"
 
     # Network
-    listen_host: str = "0.0.0.0"
+    listen_host: str = "0.0.0.0"  # P2P transport bind (peers must reach it)
     p2p_port: int = 9001
     api_port: int = 8000
+    # sp1017 — management-API bind. Defaults to loopback (the money/KYC
+    # endpoints are not network-exposed out of the box; the sp1011 fail-closed
+    # posture check assesses THIS host, not listen_host). Operators who front
+    # the API with a reverse proxy keep this loopback; those who intentionally
+    # expose it (e.g. Docker port-mapping) set api_host=0.0.0.0 — and then must
+    # also set PRSM_NODE_API_KEY or the node fail-closes (sp1011). Override via
+    # PRSM_API_HOST.
+    api_host: str = "127.0.0.1"
 
     # DHT transport (PRSM-DHT-TRANSPORT T1-T5; T3b wiring)
     # Off by default — opt in via PRSM_DHT_ENABLED=1 or by setting
@@ -197,6 +205,11 @@ class NodeConfig:
         if os.getenv("PRSM_TRANSPORT_BACKEND"):
             self.transport_backend = os.getenv("PRSM_TRANSPORT_BACKEND")
 
+        # sp1017 — allow override of the management-API bind via PRSM_API_HOST.
+        _api_host = os.environ.get("PRSM_API_HOST", "").strip()
+        if _api_host:
+            self.api_host = _api_host
+
     @property
     def identity_path(self) -> Path:
         return Path(self.data_dir) / "identity.json"
@@ -222,6 +235,7 @@ class NodeConfig:
             "listen_host": self.listen_host,
             "p2p_port": self.p2p_port,
             "api_port": self.api_port,
+            "api_host": self.api_host,
             "bootstrap_nodes": self.bootstrap_nodes,
             "bootstrap_connect_timeout": self.bootstrap_connect_timeout,
             "bootstrap_retry_attempts": self.bootstrap_retry_attempts,
@@ -354,7 +368,7 @@ class NodeConfig:
                 ncfg[dst] = raw[src]
 
         for field_name in (
-            "display_name", "p2p_port", "api_port",
+            "display_name", "p2p_port", "api_port", "api_host",
             "bootstrap_nodes", "storage_gb",
             "max_concurrent_jobs", "upload_mbps_limit",
             "active_hours_start", "active_hours_end", "active_days",

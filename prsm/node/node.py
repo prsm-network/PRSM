@@ -4380,8 +4380,13 @@ class PRSMNode:
         # loopback posture), so only a deliberate non-loopback bind without a
         # key is stopped. The legacy opt-in PRSM_REQUIRE_AUTH_ON_PUBLIC_BIND is
         # now the default and remains honored.
+        # sp1017 — assess the MANAGEMENT-API bind (config.api_host, served by
+        # _run_api), NOT the P2P transport bind (listen_host). The money/KYC
+        # endpoints live on the API server; listen_host=0.0.0.0 is the P2P
+        # listener and was a false-positive signal that refused every default
+        # `prsm node start` even though the API was on loopback.
         _posture, _posture_msg = assess_public_bind_auth_posture(
-            listen_host=getattr(self.config, "listen_host", None),
+            listen_host=getattr(self.config, "api_host", None) or "127.0.0.1",
             api_key_present=bool(
                 _os_nice.environ.get("PRSM_NODE_API_KEY", "").strip()
             ),
@@ -5799,9 +5804,12 @@ class PRSMNode:
             import uvicorn
 
             app = create_api_app(self)
+            # sp1017 — bind the configured management-API host (default
+            # 127.0.0.1 loopback; PRSM_API_HOST / config.api_host to expose).
+            # The sp1011 posture check assesses this same host.
             config = uvicorn.Config(
                 app,
-                host="127.0.0.1",
+                host=getattr(self.config, "api_host", None) or "127.0.0.1",
                 port=self.config.api_port,
                 log_level="warning",
             )
