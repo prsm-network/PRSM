@@ -58,6 +58,36 @@ from prsm.node.bittorrent_requester import BitTorrentRequester, BitTorrentReques
 logger = logging.getLogger(__name__)
 
 
+def _check_libp2p_origin_auth_gap() -> None:
+    """sp1010 — startup guard for the un-authenticated libp2p transport.
+
+    The libp2p gossip/discovery handlers carry none of the origin-authentication
+    the WebSocket stack has (sp934/937/941/1005), so libp2p is vulnerable to
+    peer-exchange eclipse + index poisoning (see
+    docs/2026-06-04-p2p-substrate-hunt-residuals.md, Residual A). The path is
+    latent on the Linux fleet (its native library is absent), but
+    transport_backend defaults to "libp2p", so this guard ensures the unhardened
+    path cannot ship silently: it always logs CRITICAL, and hard-refuses when the
+    operator opts into enforcement via PRSM_FORBID_UNAUTHENTICATED_LIBP2P.
+    """
+    msg = (
+        "transport_backend=libp2p selected, but the libp2p gossip/discovery path "
+        "lacks the origin-authentication the WebSocket stack carries "
+        "(sp934/937/941/1005) — it is vulnerable to peer-exchange eclipse and "
+        "content-index poisoning. Do NOT use libp2p in production until the "
+        "attestation is ported; prefer PRSM_TRANSPORT_BACKEND=websocket. See "
+        "docs/2026-06-04-p2p-substrate-hunt-residuals.md (Residual A)."
+    )
+    logger.critical("SECURITY: %s", msg)
+    if os.environ.get("PRSM_FORBID_UNAUTHENTICATED_LIBP2P", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    ):
+        raise RuntimeError(
+            "Refusing to start the libp2p transport: " + msg
+            + " (PRSM_FORBID_UNAUTHENTICATED_LIBP2P is set)."
+        )
+
+
 def build_persistent_privacy_budget(data_dir, identity, max_epsilon: float = 100.0):
     """Construct a PersistentPrivacyBudgetTracker rooted at <data_dir>/privacy_budget/.
 
@@ -1811,6 +1841,10 @@ class PRSMNode:
             self._local_hardware_profile = None
 
         if self.config.transport_backend == "libp2p":
+            # sp1010 — the libp2p gossip/discovery path carries none of the
+            # WebSocket stack's origin-auth (Residual A). Warn (or refuse, if
+            # enforcement is enabled) before instantiating it.
+            _check_libp2p_origin_auth_gap()
             from prsm.node.libp2p_transport import Libp2pTransport
             from prsm.node.libp2p_gossip import Libp2pGossip
             from prsm.node.libp2p_discovery import Libp2pDiscovery
