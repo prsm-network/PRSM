@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -47,6 +48,26 @@ DEFAULT_ROYALTY_RATE = 0.01
 # Upper bound matches the on-chain ProvenanceRegistry max (9800 bps = 0.98),
 # so no legitimately-registerable rate is rejected.
 MAX_ADVERTISE_ROYALTY_RATE = 0.98
+
+# sp1007 — bound the per-CID provider set. Each GOSSIP_CONTENT_ADVERTISE adds an
+# attacker-chosen provider_id (only the gossip ORIGIN is sp934-authenticated),
+# so an unbounded set is a memory-DoS + availability-eclipse vector (the
+# retriever's provider selection gets dominated by attacker ids). A real CID has
+# a handful of replicas, so this cap never bites legitimate content.
+MAX_PROVIDERS_PER_CID_DEFAULT = 64
+
+
+def _max_providers_per_cid() -> int:
+    """Per-CID provider-set cap. PRSM_MAX_PROVIDERS_PER_CID overrides; falls back
+    to the default on a missing / non-positive / unparseable value."""
+    raw = os.environ.get("PRSM_MAX_PROVIDERS_PER_CID", "").strip()
+    if not raw:
+        return MAX_PROVIDERS_PER_CID_DEFAULT
+    try:
+        val = int(raw)
+    except (ValueError, TypeError):
+        return MAX_PROVIDERS_PER_CID_DEFAULT
+    return val if val > 0 else MAX_PROVIDERS_PER_CID_DEFAULT
 
 
 def _sane_royalty_rate(raw: Any, *, fallback: float) -> float:
@@ -150,7 +171,11 @@ class ContentIndex:
             # empty/default fields from the new advertisement. Never
             # clobber a populated value.
             record = self._records[cid]
-            record.providers.add(provider_id)
+            # sp1007 — bound the provider set. An already-listed provider always
+            # refreshes; a new (attacker-choosable) provider_id beyond the cap is
+            # dropped so the set can't be grown without bound.
+            if provider_id in record.providers or len(record.providers) < _max_providers_per_cid():
+                record.providers.add(provider_id)
             keyword_changed = self._backfill_record_from_advertise(
                 record, data, origin
             )
