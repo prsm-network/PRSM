@@ -82,10 +82,17 @@ async function tryTimeTravel(seconds) {
   }
 }
 
-// stable() — resilient read-after-write for load-balanced RPCs (sp992). Extracted
-// + unit-tested in test/rpc-stable-read.test.js (the lag path can't be reproduced
-// on the in-process hardhat network).
-const { stable } = require("./rpc-stable-read");
+// Resilient reads for load-balanced RPCs (sp992/sp993). stable() = two-agree (for
+// immutable/constant reads); readAt() = block-pinned (deterministic for reads after
+// a specific write, immune to uniform replica lag). Unit-tested in
+// test/rpc-stable-read.test.js (the lag paths can't be reproduced on hardhat).
+const { stable, readAt } = require("./rpc-stable-read");
+
+/** Send a write tx, wait for its receipt, return the block it mined in. */
+async function blockOf(txPromise) {
+  const receipt = await (await txPromise).wait();
+  return receipt.blockNumber;
+}
 
 /**
  * Wait until a freshly-deployed contract's code is visible to the RPC before
@@ -186,14 +193,13 @@ async function main() {
         `(${Number(eligibleAt - now)}s left). Wait, then re-run.`
       );
     }
-    const before = await stable(() => token.balanceOf(creator.address));
-    const tx = await reg.connect(creator).withdraw();
-    await tx.wait();
+    const withdrawBlk = await blockOf(reg.connect(creator).withdraw());
     ok("withdraw after delay returns the remaining bonded FTNS",
-      (await stable(() => token.balanceOf(creator.address))) - before === owed,
+      (await readAt(withdrawBlk, (bt) => token.balanceOf(creator.address, { blockTag: bt })))
+      - (await readAt(withdrawBlk - 1, (bt) => token.balanceOf(creator.address, { blockTag: bt }))) === owed,
       `returned ${hre.ethers.formatEther(owed)} FTNS`);
     ok("status flips to WITHDRAWN",
-      (await stable(() => reg.stakes(creator.address).then((s) => s.status))) === 3n);
+      (await readAt(withdrawBlk, (bt) => reg.stakes(creator.address, { blockTag: bt }).then((s) => s.status))) === 3n);
     return summarize();
   }
 
@@ -239,22 +245,25 @@ async function main() {
   const apprTx = await token.connect(creator).approve(regAddr, need);
   await apprTx.wait();
 
-  // INV-1: stake pulls FTNS and records the bonded balance.
-  const regBalBefore = await stable(() => token.balanceOf(regAddr));
-  await (await reg.connect(creator).stake(need)).wait();
+  // INV-1: stake pulls FTNS and records the bonded balance. Reads are PINNED to the
+  // stake's block (post-write at B, pre-write baseline at B-1) so a lagging replica
+  // can't serve a stale value — it errors on block B until synced, and readAt retries.
+  const stakeBlk = await blockOf(reg.connect(creator).stake(need));
   ok("stake: creatorStakeOf == bonded amount",
-    (await stable(() => reg.creatorStakeOf(creator.address))) === need,
+    (await readAt(stakeBlk, (bt) => reg.creatorStakeOf(creator.address, { blockTag: bt }))) === need,
     `${hre.ethers.formatEther(need)} FTNS`);
   ok("stake: registry token balance increased by the staked amount",
-    (await stable(() => token.balanceOf(regAddr))) - regBalBefore === need);
+    (await readAt(stakeBlk, (bt) => token.balanceOf(regAddr, { blockTag: bt })))
+    - (await readAt(stakeBlk - 1, (bt) => token.balanceOf(regAddr, { blockTag: bt }))) === need);
 
   // INV-4: slash (while BONDED) reduces stake + credits the Foundation reserve.
   if (slasherIsDeployer) {
-    await (await reg.connect(deployer).slash(creator.address, MIN_HIGH, "rehearsal-spam")).wait();
+    const slashBlk = await blockOf(
+      reg.connect(deployer).slash(creator.address, MIN_HIGH, "rehearsal-spam"));
     ok("slash: bonded stake reduced by the slashed amount",
-      (await stable(() => reg.creatorStakeOf(creator.address))) === MIN_HIGH);
+      (await readAt(slashBlk, (bt) => reg.creatorStakeOf(creator.address, { blockTag: bt }))) === MIN_HIGH);
     ok("slash: foundationReserveBalance credited",
-      (await stable(() => reg.foundationReserveBalance())) === MIN_HIGH);
+      (await readAt(slashBlk, (bt) => reg.foundationReserveBalance({ blockTag: bt }))) === MIN_HIGH);
     // Probe non-slasher rejection from a genuine stranger (NOT the creator — in a
     // single-key run creator == slasher, so that probe would actually slash).
     const strangerNonSlasher =
@@ -278,19 +287,21 @@ async function main() {
       await reverts(() => reg.connect(deployer).setFoundationReserveWallet(creator.address)));
     // Use the token contract itself as the contract-address stand-in for the Safe.
     await (await reg.connect(deployer).setFoundationReserveWallet(tokenAddr)).wait();
-    const reserveBefore = await stable(() => token.balanceOf(tokenAddr));
-    const accrued = await stable(() => reg.foundationReserveBalance());
-    await (await reg.connect(deployer).drainFoundationReserve()).wait();
+    const drainBlk = await blockOf(reg.connect(deployer).drainFoundationReserve());
+    // accrued = reserve balance the block BEFORE the drain; received = reserve-wallet
+    // delta across the drain block. Both pinned → deterministic on a lagging RPC.
+    const accrued = await readAt(drainBlk - 1, (bt) => reg.foundationReserveBalance({ blockTag: bt }));
     ok("drain: reserve wallet received the accrued proceeds",
-      (await stable(() => token.balanceOf(tokenAddr))) - reserveBefore === accrued);
+      (await readAt(drainBlk, (bt) => token.balanceOf(tokenAddr, { blockTag: bt })))
+      - (await readAt(drainBlk - 1, (bt) => token.balanceOf(tokenAddr, { blockTag: bt }))) === accrued);
     ok("drain: foundationReserveBalance zeroed",
-      (await stable(() => reg.foundationReserveBalance())) === 0n);
+      (await readAt(drainBlk, (bt) => reg.foundationReserveBalance({ blockTag: bt }))) === 0n);
   }
 
   // INV-2: requestUnbond drops eligibility to 0 immediately.
-  await (await reg.connect(creator).requestUnbond()).wait();
+  const unbondBlk = await blockOf(reg.connect(creator).requestUnbond());
   ok("requestUnbond: creatorStakeOf drops to 0 immediately (no tier while exiting)",
-    (await stable(() => reg.creatorStakeOf(creator.address))) === 0n);
+    (await readAt(unbondBlk, (bt) => reg.creatorStakeOf(creator.address, { blockTag: bt }))) === 0n);
 
   // INV-3: withdraw before the delay reverts.
   ok("withdraw before delay reverts",
@@ -310,14 +321,17 @@ async function main() {
   // INV-7: withdraw after the delay returns the remaining bonded FTNS.
   const traveled = await tryTimeTravel(Number(delay) + 1);
   if (traveled) {
-    const owed = await stable(() => reg.stakes(creator.address).then((s) => s.amount));
-    const before = await stable(() => token.balanceOf(creator.address));
-    await (await reg.connect(creator).withdraw()).wait();
+    const withdrawBlk = await blockOf(reg.connect(creator).withdraw());
+    // owed = remaining bonded amount the block before withdraw; received = creator
+    // balance delta across the withdraw block. Both pinned.
+    const owed = await readAt(withdrawBlk - 1,
+      (bt) => reg.stakes(creator.address, { blockTag: bt }).then((s) => s.amount));
     ok("withdraw after delay returns the remaining bonded FTNS",
-      (await stable(() => token.balanceOf(creator.address))) - before === owed,
+      (await readAt(withdrawBlk, (bt) => token.balanceOf(creator.address, { blockTag: bt })))
+      - (await readAt(withdrawBlk - 1, (bt) => token.balanceOf(creator.address, { blockTag: bt }))) === owed,
       `returned ${hre.ethers.formatEther(owed)} FTNS`);
     ok("status flips to WITHDRAWN",
-      (await stable(() => reg.stakes(creator.address).then((s) => s.status))) === 3n);
+      (await readAt(withdrawBlk, (bt) => reg.stakes(creator.address, { blockTag: bt }).then((s) => s.status))) === 3n);
   } else {
     const s = await reg.stakes(creator.address);
     console.log(`\n   ⏳ Live chain — cannot fast-forward time. The creator is UNBONDING;`);

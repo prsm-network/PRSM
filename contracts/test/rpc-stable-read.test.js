@@ -1,5 +1,5 @@
 const { expect } = require("chai");
-const { stable } = require("../scripts/rpc-stable-read");
+const { stable, readAt } = require("../scripts/rpc-stable-read");
 
 // sp992 — `stable()` defeats load-balanced-RPC read-after-write staleness (a
 // replica a block behind returns the pre-write value, making a correct contract
@@ -70,5 +70,44 @@ describe("stable() — resilient read-after-write (sp992)", function () {
     const addr = "0x" + "a".repeat(40);
     const t = scripted([addr, addr]);
     expect(await stable(t, NO_SLEEP)).to.equal(addr);
+  });
+});
+
+describe("readAt() — block-pinned read, immune to uniform replica lag (sp993)", function () {
+  // makeCall(blockTag) errors `errors` times (replica head < block), then returns.
+  function pinned(errors, value) {
+    let i = 0;
+    return async (_blockTag) => {
+      if (i++ < errors) throw new Error("block not found"); // replica not synced yet
+      return value;
+    };
+  }
+
+  it("returns the value once a replica has synced to the pinned block", async function () {
+    const v = await readAt(100, pinned(0, 1000n), NO_SLEEP);
+    expect(v).to.equal(1000n);
+  });
+
+  it("retries through 'block not found' (replica head < block) until synced", async function () {
+    // Even when EVERY early read errors uniformly (the failure mode stable() can't
+    // catch), readAt waits and retries until a synced replica serves the block.
+    const v = await readAt(100, pinned(3, 1000n), NO_SLEEP);
+    expect(v).to.equal(1000n);
+  });
+
+  it("passes the pinned block to the read (deterministic state-at-block)", async function () {
+    let seen = null;
+    await readAt(12345, async (bt) => { seen = bt; return 1n; }, NO_SLEEP);
+    expect(seen).to.equal(12345);
+  });
+
+  it("throws an actionable error if no replica ever syncs", async function () {
+    let msg = "";
+    try {
+      await readAt(100, async () => { throw new Error("block not found"); },
+        { ...NO_SLEEP, maxTries: 3 });
+    } catch (e) { msg = e.message; }
+    expect(msg).to.contain("no replica synced");
+    expect(msg).to.contain("BASE_SEPOLIA_RPC_URL");
   });
 });

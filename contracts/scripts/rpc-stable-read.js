@@ -56,4 +56,39 @@ async function stable(thunk, opts = {}) {
   );
 }
 
-module.exports = { stable };
+/**
+ * Read on-chain state PINNED to a specific block — the deterministic cure for
+ * load-balanced-RPC read-after-write lag. After a write mined in block B, reading
+ * state at `{ blockTag: B }` always returns the post-write value: state at a fixed
+ * past block is immutable. A replica whose head is still below B cannot serve block
+ * B — a compliant node errors "block not found" — so we retry until a replica has
+ * synced to B. Unlike stable()'s two-agree heuristic, this is immune to UNIFORM lag
+ * (all replicas a block behind right after the write), which is what actually broke
+ * the live rehearsal.
+ *
+ * @param {number} blockNumber           the block a write was mined in (receipt.blockNumber)
+ * @param {(blockTag:number)=>Promise<any>} makeCall  the pinned read, e.g.
+ *        (bt) => reg.creatorStakeOf(addr, { blockTag: bt })
+ * @param {object} [opts] {sleep, maxTries, errorDelayMs}
+ */
+async function readAt(blockNumber, makeCall, opts = {}) {
+  const sleep = opts.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const maxTries = opts.maxTries || 40;
+  const errorDelayMs = opts.errorDelayMs ?? 2000;
+  let lastErr;
+  for (let i = 0; i < maxTries; i++) {
+    try {
+      return await makeCall(blockNumber);
+    } catch (e) {
+      // replica head < blockNumber ("block not found"), or transient — wait + retry.
+      lastErr = e;
+      await sleep(errorDelayMs);
+    }
+  }
+  throw new Error(
+    `readAt(${blockNumber}): no replica synced to that block after ${maxTries} ` +
+    `tries (last: ${lastErr && lastErr.message}). Use a dedicated BASE_SEPOLIA_RPC_URL.`
+  );
+}
+
+module.exports = { stable, readAt };
