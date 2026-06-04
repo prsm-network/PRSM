@@ -9,6 +9,7 @@ Protects settler, content economy, and other sensitive routes.
 import hashlib
 import logging
 import os
+import re
 import secrets
 from typing import Optional, Set
 
@@ -97,7 +98,37 @@ PROTECTED_PREFIXES = [
     # CreatorStakeRegistry teeth — is a separate creator-stake
     # commissioning item; this closes the auth vector now.)
     "/marketplace/creator-stake/",
+    # Sprint 1012 — API-authz hunt (wt1tb4n3q) gaps. These sensitive endpoints
+    # fell through the protected set even with a key set:
+    #  - creator-reputation MUTATION (record_access) writes the §14 reputation
+    #    that gates creator tier — sibling of the sp970 creator-stake gate
+    #    (findings 3/10).
+    #  - /peers/connect forces an attacker-chosen outbound P2P dial (constrained
+    #    SSRF / port-probe) — an operator action (findings 1/4).
+    #  - /billing/{job_id} leaks other users' escrow/billing records; the
+    #    trailing job_id keeps the /billing/ prefix valid (finding 7).
+    "/marketplace/creator-reputation/",
+    "/peers/connect",
+    "/billing/",
 ]
+
+# Sprint 1012 — protected paths with an EMBEDDED parameter that a startswith
+# prefix cannot express (a bare "/content/" prefix would wrongly gate public
+# content reads). POST /content/{cid}/pin is an operator pin action that should
+# respect the API key (finding 11).
+PROTECTED_PATH_PATTERNS = [
+    re.compile(r"^/content/[^/]+/pin/?$"),
+]
+
+
+def is_protected_path(path: str) -> bool:
+    """sp1012 — single-sourced protection decision for NodeAuthMiddleware: True
+    when ``path`` matches a PROTECTED_PREFIXES prefix OR a PROTECTED_PATH_PATTERNS
+    template. Public-endpoint + signature-authenticated carve-outs are handled
+    separately (earlier) in dispatch."""
+    if any(path.startswith(prefix) for prefix in PROTECTED_PREFIXES):
+        return True
+    return any(pat.match(path) for pat in PROTECTED_PATH_PATTERNS)
 
 
 def generate_api_key() -> str:
@@ -144,8 +175,8 @@ class NodeAuthMiddleware(BaseHTTPMiddleware):
         ):
             return await call_next(request)
 
-        # Check if this is a protected endpoint
-        is_protected = any(path.startswith(prefix) for prefix in PROTECTED_PREFIXES)
+        # Check if this is a protected endpoint (sp1012 — prefix OR templated).
+        is_protected = is_protected_path(path)
 
         if is_protected and self.auth_enabled:
             # Extract API key from headers.
