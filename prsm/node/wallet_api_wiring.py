@@ -33,12 +33,45 @@ Honest scope:
 from __future__ import annotations
 
 import logging
+import hashlib
 import os
+import secrets
 from pathlib import Path
 from typing import Any, Iterable, List, Dict, Optional
 
 
 logger = logging.getLogger(__name__)
+
+
+def _wallet_session_config_from_env() -> tuple:
+    """sp1013 — wallet session-token config from env (API-authz Residual A).
+
+    Returns ``(session_secret: bytes, session_required: bool)``.
+
+    Secret: PRSM_WALLET_SESSION_SECRET — a hex string (0x-optional) or, failing
+    hex parse, raw UTF-8 bytes; a short configured value is stretched via
+    SHA-256 to a 32-byte key. Unset → a per-process random 32-byte secret
+    (sessions are invalidated on restart, which is fine for short-lived tokens).
+
+    Enforcement: PRSM_WALLET_SESSION_REQUIRED — when truthy, the wallet-OWNER
+    read endpoints require a session token bound to the requested wallet. Default
+    off so the mint is additive and existing clients keep working until they
+    adopt the token (default-on is a coordinated follow-on with the frontend).
+    """
+    raw = (os.environ.get("PRSM_WALLET_SESSION_SECRET") or "").strip()
+    if raw:
+        try:
+            secret = bytes.fromhex(raw[2:] if raw.lower().startswith("0x") else raw)
+        except ValueError:
+            secret = raw.encode("utf-8")
+        if len(secret) < 16:
+            secret = hashlib.sha256(secret).digest()
+    else:
+        secret = secrets.token_bytes(32)
+    required = (os.environ.get("PRSM_WALLET_SESSION_REQUIRED") or "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    return secret, required
 
 
 def _resolve_wallet_bindings_db_path() -> Optional[Path]:
@@ -145,10 +178,14 @@ def wire_wallet_api_services(node: Any) -> None:
             binding_store = InMemoryWalletBindingStore()
 
         wallet_api.reset_services_for_tests()
+        _sess_secret, _sess_required = _wallet_session_config_from_env()
         services = wallet_api.WalletApiServices(
             settings=wallet_api.WalletApiSettings(
                 expected_domain="prsm-network.com",
                 expected_chain_id=8453,
+                # sp1013 — wallet session token (API-authz Residual A).
+                session_secret=_sess_secret,
+                session_required=_sess_required,
             ),
             nonce_store=wallet_api.InMemoryNonceStore(),
             binding_service=WalletBindingService(binding_store),

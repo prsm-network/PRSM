@@ -38,13 +38,14 @@ on top of these endpoints.
 
 from __future__ import annotations
 
+import secrets
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional, Protocol
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from prsm.interface.display import (
@@ -68,6 +69,11 @@ from prsm.interface.onboarding.siwe import (
 )
 from prsm.interface.onboarding.siwe import (
     verify as siwe_verify,
+)
+from prsm.interface.onboarding.session_token import (
+    SessionTokenError,
+    mint_session_token,
+    verify_session_token,
 )
 from prsm.interface.onboarding.wallet_binding import (
     BindingConflictError,
@@ -94,6 +100,16 @@ class WalletApiSettings:
     expected_domain: str
     expected_chain_id: int
     nonce_ttl_seconds: int = 300
+    # Sprint 1013 — wallet session-token config (API-authz Residual A). A
+    # per-instance random secret by default (sessions invalidated on restart —
+    # fine for short TTLs); production wiring may pass a stable secret. When
+    # ``session_required`` is True, the wallet-OWNER read endpoints require a
+    # valid session token bound to the requested wallet (closes the read-IDOR).
+    # Default False so the mint is additive and existing callers are unaffected
+    # until the frontend adopts the token (default-on is a coordinated follow-on).
+    session_secret: bytes = field(default_factory=lambda: secrets.token_bytes(32))
+    session_ttl_seconds: int = 3600
+    session_required: bool = False
 
 
 class BalanceLookup(Protocol):
@@ -243,6 +259,72 @@ def get_services() -> WalletApiServices:
     return _services
 
 
+def _extract_session_token(request: Request) -> Optional[str]:
+    """Pull the wallet session token from 'X-Wallet-Session' or an
+    'Authorization: Bearer <token>' header. Returns None if absent."""
+    tok = request.headers.get("X-Wallet-Session")
+    if tok:
+        return tok.strip()
+    auth = request.headers.get("Authorization", "")
+    if auth[:7].lower() == "bearer ":
+        return auth[7:].strip() or None
+    return None
+
+
+def _enforce_wallet_session(
+    request: Request,
+    wallet_address: str,
+    services: WalletApiServices,
+) -> None:
+    """sp1013 — wallet-OWNER authorization for a read of ``wallet_address``.
+
+    No-op unless ``settings.session_required`` is enabled (default off, so the
+    mint is additive and existing callers keep working until clients adopt the
+    token). When enabled, the request MUST carry a session token that verifies
+    under the server secret AND is bound to the SAME wallet being read — so a
+    caller can only read the bindings/earnings/balance of a wallet it has proved
+    (via SIWE) it controls. Closes the read-IDOR on /api/v1/auth/wallet/*.
+    """
+    if not services.settings.session_required:
+        return
+    token = _extract_session_token(request)
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "error": "wallet_session_required",
+                "message": (
+                    "this read requires a wallet session token (X-Wallet-Session "
+                    "or Authorization: Bearer) obtained from /siwe/verify"
+                ),
+            },
+        )
+    try:
+        bound_wallet = verify_session_token(
+            token, secret=services.settings.session_secret,
+        )
+    except SessionTokenError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "error": "wallet_session_invalid",
+                "message": f"invalid or expired wallet session token: {exc}",
+            },
+        ) from exc
+    if bound_wallet != (wallet_address or "").strip().lower():
+        # The token is valid but for a DIFFERENT wallet — the IDOR attempt.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "wallet_session_address_mismatch",
+                "message": (
+                    "the session token is bound to a different wallet than the "
+                    "one requested"
+                ),
+            },
+        )
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Pydantic schemas
 # ──────────────────────────────────────────────────────────────────────────
@@ -295,6 +377,16 @@ class SiweVerifyResponse(BaseModel):
             "ISO-8601 UTC timestamp baked into the binding_message. "
             "Pass back unchanged to /wallet/bind so the server can "
             "reconstruct the same canonical message."
+        ),
+    )
+    session_token: str = Field(
+        ...,
+        description=(
+            "sp1013 — a wallet-bound session token proving control of this "
+            "address (established by the SIWE verify just completed). Present "
+            "it as 'X-Wallet-Session: <token>' or 'Authorization: Bearer "
+            "<token>' on wallet-owner read endpoints (/binding, /bindings, "
+            "/devices/earnings, /balance) to read only this wallet's data."
         ),
     )
 
@@ -458,12 +550,22 @@ def verify_siwe(
         verified.address, node_id_hex, issued_at
     )
 
+    # sp1013 — mint a wallet-bound session token from the just-proved control of
+    # ``verified.address`` so the wallet owner can authenticate later reads
+    # without the operator API key.
+    session_token = mint_session_token(
+        verified.address,
+        secret=services.settings.session_secret,
+        ttl_seconds=services.settings.session_ttl_seconds,
+    )
+
     return SiweVerifyResponse(
         address=verified.address,
         node_id_hex=node_id_hex,
         is_new_user=is_new_user,
         binding_message=binding_message,
         binding_issued_at=issued_at,
+        session_token=session_token,
     )
 
 
@@ -499,6 +601,7 @@ def bind_wallet(
 
 @router.get("/binding", response_model=Optional[WalletBindResponse])
 def get_binding(
+    request: Request,
     wallet_address: str,
     services: WalletApiServices = Depends(get_services),
 ) -> Optional[WalletBindResponse]:
@@ -512,6 +615,7 @@ def get_binding(
     should use ``/bindings`` (sprint 790) which returns the full
     list.
     """
+    _enforce_wallet_session(request, wallet_address, services)
     binding = services.binding_service.get_by_wallet(wallet_address)
     if binding is None:
         return None
@@ -525,6 +629,7 @@ def get_binding(
 
 @router.get("/bindings", response_model=list[WalletBindResponse])
 def get_bindings(
+    request: Request,
     wallet_address: str,
     services: WalletApiServices = Depends(get_services),
 ) -> list[WalletBindResponse]:
@@ -536,6 +641,7 @@ def get_bindings(
     Consumed by `prsm wallet devices list` so operators can audit
     their device roster from the command line.
     """
+    _enforce_wallet_session(request, wallet_address, services)
     bindings = services.binding_service.get_all_by_wallet(
         wallet_address,
     )
@@ -552,6 +658,7 @@ def get_bindings(
 
 @router.get("/devices/earnings")
 def get_devices_earnings(
+    request: Request,
     wallet_address: str,
     services: WalletApiServices = Depends(get_services),
 ) -> Dict[str, Any]:
@@ -577,6 +684,7 @@ def get_devices_earnings(
         aggregate_earnings_by_node_id,
     )
 
+    _enforce_wallet_session(request, wallet_address, services)
     bindings = services.binding_service.get_all_by_wallet(
         wallet_address,
     )
@@ -605,6 +713,7 @@ def get_devices_earnings(
 
 @router.get("/balance", response_model=BalanceResponse)
 def get_balance(
+    request: Request,
     wallet_address: str,
     mode: DisplayMode = "usd",
     services: WalletApiServices = Depends(get_services),
@@ -616,6 +725,7 @@ def get_balance(
     source. Returns 404 if the wallet is not bound — frontends should
     drive the user through /siwe/verify + /bind first.
     """
+    _enforce_wallet_session(request, wallet_address, services)
     if mode not in ("usd", "ftns"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
