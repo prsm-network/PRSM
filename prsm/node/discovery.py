@@ -62,6 +62,12 @@ class PeerInfo:
     # the transport nonce-dedup window cannot re-assert a stale address. 0.0
     # means no attested announce seen yet (legacy/no-timestamp announces).
     last_announce_time: float = 0.0
+    # sp1005 — the portable, self-verifying credential from this peer's last
+    # ATTESTED announce ({node_id, signed_payload, nonce, origin_pubkey,
+    # origin_sig}). Stored so it can be RE-EMITTED via authenticated PEX
+    # (_handle_peer_request) and re-verified by the receiver. None for peers
+    # learned via a direct/legacy path with no attestation (not PEX-relayable).
+    announce_credential: Optional[Dict[str, Any]] = None
     # Sprint 680 — opt-in hardware advertisement. Carries serialized
     # HardwareProfile.to_dict() (or a subset). Consumed by the DHT-
     # backed GpuPoolProvider (sprint 681+) to construct ParallaxGPU
@@ -233,6 +239,85 @@ def _announce_is_stale_replay(payload: Dict[str, Any], prev_announce_time: float
         return float(ts) <= float(prev_announce_time)
     except (TypeError, ValueError):
         return False
+
+
+# ── sp1005: authenticated peer-exchange (PEX) ─────────────────────────────
+# sp937/sp941 authenticated the node's OWN announce (_handle_announce /
+# _handle_capability_announce) but the peer-EXCHANGE response
+# (_handle_peer_response) — by which a node relays OTHER peers it knows — was
+# left unauthenticated, so a connected peer could inject attacker-chosen
+# (node_id → address / hardware_profile) entries into known_peers (eclipse +
+# Parallax-pool poisoning + unbounded-memory DoS). The relayer is not the
+# authority for the entries it forwards, so the fix is a PER-ENTRY portable
+# credential: each peer signs a self-verifying record (its node_id derives from
+# its pubkey, and a signature covers the announce content), which any relayer
+# can forward and any receiver re-verifies. This reuses the sp937 announce
+# attestation primitive (_announce_signing_bytes) — a credential is exactly the
+# verbatim signed material of an authenticated announce, made portable.
+
+_DEFAULT_MAX_KNOWN_PEERS = 2048
+
+
+def _max_known_peers() -> int:
+    """Upper bound on the known_peers routing table (memory + eclipse-magnitude
+    defense). PRSM_MAX_KNOWN_PEERS overrides; falls back to the default on a
+    missing / non-positive / unparseable value."""
+    raw = os.environ.get("PRSM_MAX_KNOWN_PEERS", "").strip()
+    if not raw:
+        return _DEFAULT_MAX_KNOWN_PEERS
+    try:
+        val = int(raw)
+    except (ValueError, TypeError):
+        return _DEFAULT_MAX_KNOWN_PEERS
+    return val if val > 0 else _DEFAULT_MAX_KNOWN_PEERS
+
+
+def _build_announce_credential(node_id: str, payload: Dict[str, Any], nonce: str) -> Optional[Dict[str, Any]]:
+    """Capture the portable, self-verifying credential from an ATTESTED announce
+    so it can be re-emitted via PEX. Returns None when the announce carried no
+    attestation (a direct/legacy peer we can't cryptographically vouch for)."""
+    pubkey = payload.get("origin_pubkey")
+    sig = payload.get("origin_sig")
+    if not (pubkey and sig):
+        return None
+    signed_payload = {k: v for k, v in payload.items() if k not in _ANNOUNCE_ATTEST_KEYS}
+    return {
+        "node_id": node_id,
+        "signed_payload": signed_payload,
+        "nonce": nonce,
+        "origin_pubkey": pubkey,
+        "origin_sig": sig,
+    }
+
+
+def _verify_peer_credential(cred: Any) -> Optional[str]:
+    """Verify a portable peer credential relayed via PEX. Returns the
+    authenticated node_id, or None to DROP. Mirrors
+    _authenticated_announce_node_id but for a self-contained relayed record
+    (there is no connection-peer fallback — a PEX entry is never the relaying
+    peer's own identity)."""
+    if not isinstance(cred, dict):
+        return None
+    node_id = cred.get("node_id") or ""
+    pubkey = cred.get("origin_pubkey") or ""
+    sig = cred.get("origin_sig") or ""
+    signed_payload = cred.get("signed_payload")
+    nonce = cred.get("nonce") or ""
+    if not (node_id and pubkey and sig and isinstance(signed_payload, dict)):
+        return None
+    try:
+        derived = hashlib.sha256(base64.b64decode(pubkey)).hexdigest()[:32]
+    except Exception:
+        return None
+    if derived != node_id:
+        return None
+    try:
+        ok = verify_signature(
+            pubkey, _announce_signing_bytes(node_id, signed_payload, nonce), sig
+        )
+    except Exception:
+        return None
+    return node_id if ok else None
 
 
 class PeerDiscovery:
@@ -980,6 +1065,15 @@ class PeerDiscovery:
         _prev = self.known_peers.get(node_id)
         if _prev is not None and _announce_is_stale_replay(msg.payload, _prev.last_announce_time):
             return
+        # sp1005 — bound the routing table (memory + eclipse-magnitude defense).
+        # Only NEW node_ids are subject to the cap; an already-tracked peer is
+        # always allowed to refresh.
+        if _prev is None and len(self.known_peers) >= _max_known_peers():
+            logger.debug(
+                "known_peers at cap (%d) — dropping new announce from %s",
+                _max_known_peers(), node_id[:8],
+            )
+            return
         # Sprint 570 F28 defense-in-depth: ignore 0.0.0.0:* from
         # legacy pre-sprint-570 peers. The bind-to-all listen host
         # is not a routable advertise value — falling back to
@@ -1010,6 +1104,9 @@ class PeerDiscovery:
             hardware_profile=msg.payload.get("hardware_profile"),
             # sp941 — record the accepted announce_time for the next replay check.
             last_announce_time=float(msg.payload.get("announce_time") or 0.0),
+            # sp1005 — capture the portable credential (when attested) so this
+            # peer can be relayed via authenticated PEX.
+            announce_credential=_build_announce_credential(node_id, msg.payload, msg.nonce),
         )
         # Re-gossip if TTL > 0
         if msg.ttl > 1:
@@ -1023,82 +1120,93 @@ class PeerDiscovery:
             await self.transport.gossip(fwd, fanout=2)
 
     async def _handle_peer_request(self, msg: P2PMessage, peer: PeerConnection) -> None:
-        """Respond with our known peer list."""
-        max_peers = msg.payload.get("max_peers", 20)
-        peers_data = []
-        for info in list(self.known_peers.values())[:max_peers]:
-            entry = {
-                "node_id": info.node_id,
-                "address": info.address,
-                "display_name": info.display_name,
-                "roles": info.roles,
-                "capabilities": info.capabilities,
-                "supported_backends": info.supported_backends,
-                "gpu_available": info.gpu_available,
-            }
-            # Sprint 680 — propagate hardware_profile across DHT hops
-            # when present. Absent → key omitted (legacy receivers
-            # unaffected).
-            if info.hardware_profile is not None:
-                entry["hardware_profile"] = info.hardware_profile
-            peers_data.append(entry)
+        """Respond with our known peer list.
 
-        # Also include directly connected peers
-        for pid, pc in list(self.transport.peers.items())[:max_peers]:
-            if pid not in {p["node_id"] for p in peers_data}:
-                peers_data.append({
-                    "node_id": pid,
-                    "address": pc.address,
-                    "display_name": pc.display_name,
-                    "roles": pc.roles,
-                    "capabilities": getattr(pc, "capabilities", []),
-                    "supported_backends": getattr(pc, "supported_backends", []),
-                    "gpu_available": getattr(pc, "gpu_available", False),
-                })
+        sp1005 — every emitted entry carries the peer's own portable,
+        self-verifying credential (captured from its authenticated announce),
+        and the entry's identity/address/profile live INSIDE that signed
+        credential, so a relayer cannot fabricate or tamper an entry. Peers we
+        have no credential for (direct/legacy, never saw an attested announce)
+        are NOT relayed — the receiver would drop them anyway, and relaying
+        them unsigned would just reopen the eclipse vector.
+        """
+        # sp1005 — bound the response size; max_peers is attacker-controllable.
+        try:
+            max_peers = int(msg.payload.get("max_peers", 20))
+        except (TypeError, ValueError):
+            max_peers = 20
+        max_peers = max(1, min(max_peers, 100))
+        peers_data = []
+        for info in self.known_peers.values():
+            if len(peers_data) >= max_peers:
+                break
+            if info.announce_credential is None:
+                continue
+            peers_data.append({"credential": info.announce_credential})
 
         resp = P2PMessage(
             msg_type=MSG_GOSSIP,
             sender_id=self.transport.identity.node_id,
             payload={
                 "subtype": DISCOVERY_PEER_RESPONSE,
-                "peers": peers_data[:max_peers],
+                "peers": peers_data,
             },
         )
         await self.transport.send_to_peer(peer.peer_id, resp)
 
     async def _handle_peer_response(self, msg: P2PMessage, peer: PeerConnection) -> None:
-        """Process a peer list response."""
+        """Process a peer list (PEX) response.
+
+        sp1005 — each entry MUST carry a portable, self-verifying credential
+        (see _verify_peer_credential). Entries that fail verification — forged,
+        tampered, or impersonating — are DROPPED, so a relaying peer can only
+        forward records that the named peer itself legitimately signed (closing
+        the eclipse + Parallax-pool-poisoning + memory-DoS vectors that the
+        pre-fix unauthenticated handler opened). All ingested fields come from
+        the VERIFIED signed payload, never the tamperable top-level entry.
+        """
         peers_data = msg.payload.get("peers", [])
+        ingested = 0
         for p in peers_data:
-            nid = p.get("node_id", "")
-            if nid and nid != self.transport.identity.node_id:
-                # Sprint 700 F46 fix — monotonic hardware_profile.
-                # Gossip from a non-authoritative peer can ADD profile
-                # data but must NOT REMOVE it. When the incoming
-                # entry's hardware_profile is None and we already have
-                # one locally (typically from the peer's own
-                # authoritative DISCOVERY_ANNOUNCE), preserve the
-                # existing value. Otherwise replace (latest-write-wins
-                # for non-None updates, accept new for previously-
-                # unknown peers).
-                incoming_hw = p.get("hardware_profile")
-                if incoming_hw is None:
-                    existing = self.known_peers.get(nid)
-                    if existing is not None and existing.hardware_profile is not None:
-                        incoming_hw = existing.hardware_profile
-                self.known_peers[nid] = PeerInfo(
-                    node_id=nid,
-                    address=p.get("address", ""),
-                    display_name=p.get("display_name", ""),
-                    roles=p.get("roles", []),
-                    capabilities=p.get("capabilities", []),
-                    supported_backends=p.get("supported_backends", []),
-                    gpu_available=p.get("gpu_available", False),
-                    last_seen=time.time(),
-                    last_capability_update=time.time(),
-                    hardware_profile=incoming_hw,
-                )
-        logger.debug(f"Received {len(peers_data)} peers from {peer.peer_id[:8]}")
+            cred = p.get("credential") if isinstance(p, dict) else None
+            nid = _verify_peer_credential(cred)
+            if nid is None or nid == self.transport.identity.node_id:
+                continue
+            signed = cred["signed_payload"]
+            _prev = self.known_peers.get(nid)
+            # sp941 — reject a replayed (stale-timestamp) credential so it can't
+            # re-assert an old address/profile after the dedup window.
+            if _prev is not None and _announce_is_stale_replay(signed, _prev.last_announce_time):
+                continue
+            # sp1005 — cap the routing table (memory + eclipse-magnitude). New
+            # node_ids only; an already-tracked peer always refreshes.
+            if _prev is None and len(self.known_peers) >= _max_known_peers():
+                continue
+            # Sprint 700 F46 — monotonic hardware_profile: a relayed entry may
+            # ADD profile data but must not REMOVE it.
+            incoming_hw = signed.get("hardware_profile")
+            if incoming_hw is None and _prev is not None and _prev.hardware_profile is not None:
+                incoming_hw = _prev.hardware_profile
+            self.known_peers[nid] = PeerInfo(
+                node_id=nid,
+                address=signed.get("address", ""),
+                display_name=signed.get("display_name", ""),
+                roles=signed.get("roles", []),
+                capabilities=signed.get("capabilities", []),
+                supported_backends=signed.get("supported_backends", []),
+                gpu_available=signed.get("gpu_available", False),
+                last_seen=time.time(),
+                last_capability_update=time.time(),
+                hardware_profile=incoming_hw,
+                last_announce_time=float(signed.get("announce_time") or 0.0),
+                # Store the verified credential so this peer can be re-relayed.
+                announce_credential=cred,
+            )
+            ingested += 1
+        logger.debug(
+            "PEX from %s: %d/%d entries authenticated + ingested",
+            peer.peer_id[:8], ingested, len(peers_data),
+        )
 
     async def _handle_capability_announce(self, msg: P2PMessage, peer: PeerConnection) -> None:
         """Handle capability announcement from a peer.

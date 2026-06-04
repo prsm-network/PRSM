@@ -15,12 +15,39 @@ and we ALREADY have one for this peer, preserve the existing value.
 _handle_announce is unchanged: the announcer IS authoritative for its
 own profile, so replacement (including with None) is semantically
 correct there.
+
+sp1005 — the PEX path (_handle_peer_response) now requires a portable,
+self-verifying credential per entry (the sp937 attestation made portable). The
+F46 monotonic-hardware_profile behavior is unchanged; these tests were updated
+from the pre-sp1005 flat (unauthenticated) wire format to the authenticated
+credential format, preserving every behavior assertion. The hardware_profile
+now lives inside the entry's SIGNED payload (a relayer cannot forge or tamper
+it), which is strictly stronger than the original F46 guarantee.
 """
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+from prsm.node.discovery import _announce_signing_bytes
+from prsm.node.identity import generate_node_identity
+
+
+def _pex_credential(identity, address, hardware_profile=None, announce_time=100.0):
+    """Build the portable peer credential a node signs for itself (sp1005)."""
+    signed = {"subtype": "discovery_announce", "address": address, "announce_time": announce_time}
+    if hardware_profile is not None:
+        signed["hardware_profile"] = hardware_profile
+    nonce = "n-" + identity.node_id[:8]
+    sig = identity.sign(_announce_signing_bytes(identity.node_id, signed, nonce))
+    return {
+        "node_id": identity.node_id,
+        "signed_payload": signed,
+        "nonce": nonce,
+        "origin_pubkey": identity.public_key_b64,
+        "origin_sig": sig,
+    }
 
 
 @pytest.mark.asyncio
@@ -38,24 +65,22 @@ async def test_peer_response_preserves_existing_hardware_profile_when_incoming_n
     transport.identity.node_id = "nyc-self"
     transport.port = 9001
     pd = PeerDiscovery(transport=transport)
+    lam = generate_node_identity("lambda")
     # Pre-populate Lambda's PeerInfo with A10 profile (as if from direct announce)
     a10_profile = {"tflops_fp16": 33.9, "gpu_vram_gb": 22.5, "gpu_name": "NVIDIA A10"}
-    pd.known_peers["lambda"] = PeerInfo(
-        node_id="lambda", address="146.235.193.143:9001",
-        hardware_profile=a10_profile,
+    pd.known_peers[lam.node_id] = PeerInfo(
+        node_id=lam.node_id, address="146.235.193.143:9001",
+        hardware_profile=a10_profile, last_announce_time=50.0,
     )
-    # Now SFO gossips a peer-list including Lambda with NO profile
+    # Now SFO relays a credentialed peer-entry for Lambda with NO profile
     msg = P2PMessage(
         msg_type=MSG_GOSSIP,
         sender_id="sfo",
         payload={
             "subtype": DISCOVERY_PEER_RESPONSE,
-            "peers": [{
-                "node_id": "lambda",
-                "address": "146.235.193.143:9001",
-                "capabilities": ["compute"],
-                # hardware_profile omitted (or None) — SFO doesn't have it yet
-            }],
+            "peers": [{"credential": _pex_credential(
+                lam, "146.235.193.143:9001", hardware_profile=None, announce_time=100.0,
+            )}],
         },
         ttl=1,
     )
@@ -63,7 +88,7 @@ async def test_peer_response_preserves_existing_hardware_profile_when_incoming_n
     peer.peer_id = "sfo"
     await pd._handle_peer_response(msg, peer)
     # NYC must STILL have Lambda's A10 profile
-    assert pd.known_peers["lambda"].hardware_profile == a10_profile, (
+    assert pd.known_peers[lam.node_id].hardware_profile == a10_profile, (
         "F46 fix: gossip from a non-authoritative peer must NOT "
         "downgrade hardware_profile to None when we already have one"
     )
@@ -82,10 +107,11 @@ async def test_peer_response_accepts_hardware_profile_when_we_have_none():
     transport.identity.node_id = "nyc-self"
     transport.port = 9001
     pd = PeerDiscovery(transport=transport)
+    lam = generate_node_identity("lambda")
     # Pre-populate with NO profile
-    pd.known_peers["lambda"] = PeerInfo(
-        node_id="lambda", address="146.235.193.143:9001",
-        hardware_profile=None,
+    pd.known_peers[lam.node_id] = PeerInfo(
+        node_id=lam.node_id, address="146.235.193.143:9001",
+        hardware_profile=None, last_announce_time=50.0,
     )
     a10_profile = {"tflops_fp16": 33.9, "gpu_vram_gb": 22.5}
     msg = P2PMessage(
@@ -93,18 +119,16 @@ async def test_peer_response_accepts_hardware_profile_when_we_have_none():
         sender_id="sfo",
         payload={
             "subtype": DISCOVERY_PEER_RESPONSE,
-            "peers": [{
-                "node_id": "lambda",
-                "address": "146.235.193.143:9001",
-                "hardware_profile": a10_profile,
-            }],
+            "peers": [{"credential": _pex_credential(
+                lam, "146.235.193.143:9001", hardware_profile=a10_profile, announce_time=100.0,
+            )}],
         },
         ttl=1,
     )
     peer = MagicMock()
     peer.peer_id = "sfo"
     await pd._handle_peer_response(msg, peer)
-    assert pd.known_peers["lambda"].hardware_profile == a10_profile
+    assert pd.known_peers[lam.node_id].hardware_profile == a10_profile
 
 
 @pytest.mark.asyncio
@@ -120,9 +144,11 @@ async def test_peer_response_replaces_when_both_present():
     transport.identity.node_id = "nyc-self"
     transport.port = 9001
     pd = PeerDiscovery(transport=transport)
+    lam = generate_node_identity("lambda")
     old_profile = {"tflops_fp16": 33.9, "gpu_name": "NVIDIA A10"}
-    pd.known_peers["lambda"] = PeerInfo(
-        node_id="lambda", address="x:1", hardware_profile=old_profile,
+    pd.known_peers[lam.node_id] = PeerInfo(
+        node_id=lam.node_id, address="x:1", hardware_profile=old_profile,
+        last_announce_time=50.0,
     )
     new_profile = {"tflops_fp16": 67.0, "gpu_name": "NVIDIA H100"}
     msg = P2PMessage(
@@ -130,18 +156,16 @@ async def test_peer_response_replaces_when_both_present():
         sender_id="sfo",
         payload={
             "subtype": DISCOVERY_PEER_RESPONSE,
-            "peers": [{
-                "node_id": "lambda",
-                "address": "x:1",
-                "hardware_profile": new_profile,
-            }],
+            "peers": [{"credential": _pex_credential(
+                lam, "x:1", hardware_profile=new_profile, announce_time=100.0,
+            )}],
         },
         ttl=1,
     )
     peer = MagicMock()
     peer.peer_id = "sfo"
     await pd._handle_peer_response(msg, peer)
-    assert pd.known_peers["lambda"].hardware_profile == new_profile
+    assert pd.known_peers[lam.node_id].hardware_profile == new_profile
 
 
 @pytest.mark.asyncio
@@ -157,20 +181,21 @@ async def test_peer_response_new_peer_with_none_stays_none():
     transport.identity.node_id = "nyc-self"
     transport.port = 9001
     pd = PeerDiscovery(transport=transport)
-    # known_peers does NOT contain "newpeer"
+    newpeer = generate_node_identity("newpeer")
+    # known_peers does NOT contain newpeer
     msg = P2PMessage(
         msg_type=MSG_GOSSIP,
         sender_id="sfo",
         payload={
             "subtype": DISCOVERY_PEER_RESPONSE,
-            "peers": [{"node_id": "newpeer", "address": "x:1"}],
+            "peers": [{"credential": _pex_credential(newpeer, "x:1", hardware_profile=None)}],
         },
         ttl=1,
     )
     peer = MagicMock()
     peer.peer_id = "sfo"
     await pd._handle_peer_response(msg, peer)
-    assert pd.known_peers["newpeer"].hardware_profile is None
+    assert pd.known_peers[newpeer.node_id].hardware_profile is None
 
 
 @pytest.mark.asyncio

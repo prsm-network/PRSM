@@ -25,6 +25,28 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from prsm.node.discovery import _announce_signing_bytes, _verify_peer_credential
+from prsm.node.identity import generate_node_identity
+
+
+def _pex_credential(identity, address, hardware_profile=None, capabilities=None, announce_time=100.0):
+    """sp1005 — portable peer credential a node signs for itself (PEX entries
+    must be authenticated; hardware_profile lives in the SIGNED payload)."""
+    signed = {"subtype": "discovery_announce", "address": address, "announce_time": announce_time}
+    if hardware_profile is not None:
+        signed["hardware_profile"] = hardware_profile
+    if capabilities is not None:
+        signed["capabilities"] = capabilities
+    nonce = "n-" + identity.node_id[:8]
+    sig = identity.sign(_announce_signing_bytes(identity.node_id, signed, nonce))
+    return {
+        "node_id": identity.node_id,
+        "signed_payload": signed,
+        "nonce": nonce,
+        "origin_pubkey": identity.public_key_b64,
+        "origin_sig": sig,
+    }
+
 
 def test_peer_info_carries_optional_hardware_profile():
     """The PeerInfo dataclass exposes a hardware_profile field that
@@ -189,24 +211,24 @@ async def test_handle_peer_response_propagates_hardware_profile():
     transport.identity.node_id = "myid"
     transport.port = 9001
     pd = PeerDiscovery(transport=transport)
+    remote_a = generate_node_identity("remoteA")
     msg = P2PMessage(
         msg_type=MSG_GOSSIP,
         sender_id="gossipper",
         payload={
             "subtype": DISCOVERY_PEER_RESPONSE,
-            "peers": [{
-                "node_id": "remoteA",
-                "address": "11.1.1.1:9001",
-                "capabilities": ["inference"],
-                "hardware_profile": {"tflops_fp16": 7.5, "memory_gb": 12.0},
-            }],
+            "peers": [{"credential": _pex_credential(
+                remote_a, "11.1.1.1:9001",
+                hardware_profile={"tflops_fp16": 7.5, "memory_gb": 12.0},
+                capabilities=["inference"],
+            )}],
         },
         ttl=1,
     )
     peer = MagicMock()
     peer.peer_id = "gossipper"
     await pd._handle_peer_response(msg, peer)
-    assert pd.known_peers["remoteA"].hardware_profile == {
+    assert pd.known_peers[remote_a.node_id].hardware_profile == {
         "tflops_fp16": 7.5, "memory_gb": 12.0,
     }
 
@@ -226,9 +248,17 @@ async def test_handle_peer_request_echoes_known_peer_hardware_profiles():
     transport.peers = {}
     transport.send_to_peer = AsyncMock(return_value=True)
     pd = PeerDiscovery(transport=transport)
-    pd.known_peers["other"] = PeerInfo(
-        node_id="other", address="9.9.9.9:9001",
+    other = generate_node_identity("other")
+    # sp1005 — a peer is PEX-relayable only with its stored portable credential
+    # (captured from its authenticated announce); the hardware_profile rides
+    # inside the signed payload.
+    pd.known_peers[other.node_id] = PeerInfo(
+        node_id=other.node_id, address="9.9.9.9:9001",
         hardware_profile={"tflops_fp16": 3.0, "memory_gb": 8.0},
+        announce_credential=_pex_credential(
+            other, "9.9.9.9:9001",
+            hardware_profile={"tflops_fp16": 3.0, "memory_gb": 8.0},
+        ),
     )
     msg = P2PMessage(
         msg_type=MSG_GOSSIP,
@@ -241,7 +271,11 @@ async def test_handle_peer_request_echoes_known_peer_hardware_profiles():
     await pd._handle_peer_request(msg, peer)
     sent = transport.send_to_peer.call_args[0][1]
     peers = sent.payload["peers"]
-    other_entry = next(p for p in peers if p["node_id"] == "other")
-    assert other_entry["hardware_profile"] == {
+    # The emitted entry is an authenticated credential; verify it + read the
+    # propagated hardware_profile from its signed payload.
+    other_entry = next(
+        p for p in peers if _verify_peer_credential(p.get("credential")) == other.node_id
+    )
+    assert other_entry["credential"]["signed_payload"]["hardware_profile"] == {
         "tflops_fp16": 3.0, "memory_gb": 8.0,
     }
