@@ -519,22 +519,8 @@ class PeerDiscovery:
                 if address in self.bootstrap_failed_nodes:
                     self.bootstrap_failed_nodes.remove(address)
 
-                # Feed discovered peers into known_peers.
-                # Sprint 838 — propagate any relayed hardware_profile
-                # from bootstrap into known_peers so cold-start
-                # joiners see real fleet capacity (sp682 pool
-                # provider reads this field).
-                for bp in peers:
-                    if bp.peer_id and bp.peer_id != self.transport.identity.node_id:
-                        bp_hw = getattr(bp, "hardware_profile", None)
-                        self.known_peers[bp.peer_id] = PeerInfo(
-                            node_id=bp.peer_id,
-                            address=f"{bp.address}:{bp.port}",
-                            capabilities=bp.capabilities,
-                            hardware_profile=(
-                                bp_hw if isinstance(bp_hw, dict) else None
-                            ),
-                        )
+                # Feed discovered peers into known_peers (sp1009 — capped).
+                self._ingest_bootstrap_peers(peers)
 
                 logger.info(
                     "Bootstrap client connected to %s — "
@@ -1039,6 +1025,31 @@ class PeerDiscovery:
         return results
 
     # ── Message handlers ─────────────────────────────────────────
+
+    def _ingest_bootstrap_peers(self, peers) -> int:
+        """sp1009 — feed bootstrap-discovered peers into known_peers, bounded by
+        the same PRSM_MAX_KNOWN_PEERS cap that guards the announce + PEX paths.
+        The bootstrap is TLS-verified (sp1006) but still semi-trusted, so a
+        COMPROMISED bootstrap must not be able to flood known_peers without
+        bound (memory DoS on cold start). An already-known peer always refreshes;
+        a new id beyond the cap is dropped. sp838 relayed hardware_profile is
+        preserved. Returns the number ingested."""
+        ingested = 0
+        for bp in peers:
+            pid = getattr(bp, "peer_id", None)
+            if not pid or pid == self.transport.identity.node_id:
+                continue
+            if pid not in self.known_peers and len(self.known_peers) >= _max_known_peers():
+                continue
+            bp_hw = getattr(bp, "hardware_profile", None)
+            self.known_peers[pid] = PeerInfo(
+                node_id=pid,
+                address=f"{bp.address}:{bp.port}",
+                capabilities=getattr(bp, "capabilities", []),
+                hardware_profile=bp_hw if isinstance(bp_hw, dict) else None,
+            )
+            ingested += 1
+        return ingested
 
     async def _handle_gossip(self, msg: P2PMessage, peer: PeerConnection) -> None:
         """Handle discovery-related gossip messages."""
