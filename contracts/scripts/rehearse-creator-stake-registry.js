@@ -82,6 +82,11 @@ async function tryTimeTravel(seconds) {
   }
 }
 
+// stable() — resilient read-after-write for load-balanced RPCs (sp992). Extracted
+// + unit-tested in test/rpc-stable-read.test.js (the lag path can't be reproduced
+// on the in-process hardhat network).
+const { stable } = require("./rpc-stable-read");
+
 /**
  * Wait until a freshly-deployed contract's code is visible to the RPC before
  * reading its state. On a live network, waitForDeployment() can resolve while a
@@ -165,29 +170,30 @@ async function main() {
   if (process.env.REHEARSAL_PHASE === "withdraw") {
     if (!reg) throw new Error("REHEARSAL_PHASE=withdraw requires REGISTRY_ADDRESS");
     console.log(`\n── PHASE 2: post-delay withdraw ──`);
-    const s = await reg.stakes(creator.address);
+    const status = await stable(() => reg.stakes(creator.address).then((s) => s.status));
+    const eligibleAt = await stable(() => reg.stakes(creator.address).then((s) => s.unbondEligibleAt));
+    const owed = await stable(() => reg.stakes(creator.address).then((s) => s.amount));
     const now = BigInt((await hre.ethers.provider.getBlock("latest")).timestamp);
-    if (s.status !== 2n) {
+    if (status !== 2n) {
       throw new Error(
-        `creator is not UNBONDING (status=${s.status}); run phase 1 first (it must ` +
+        `creator is not UNBONDING (status=${status}); run phase 1 first (it must ` +
         `leave the creator in UNBONDING with funds remaining).`
       );
     }
-    if (now < s.unbondEligibleAt) {
+    if (now < eligibleAt) {
       throw new Error(
-        `unbond delay not elapsed: now=${now} < eligibleAt=${s.unbondEligibleAt} ` +
-        `(${Number(s.unbondEligibleAt - now)}s left). Wait, then re-run.`
+        `unbond delay not elapsed: now=${now} < eligibleAt=${eligibleAt} ` +
+        `(${Number(eligibleAt - now)}s left). Wait, then re-run.`
       );
     }
-    const before = await token.balanceOf(creator.address);
-    const owed = s.amount;
+    const before = await stable(() => token.balanceOf(creator.address));
     const tx = await reg.connect(creator).withdraw();
     await tx.wait();
-    const after = await token.balanceOf(creator.address);
     ok("withdraw after delay returns the remaining bonded FTNS",
-      after - before === owed, `returned ${hre.ethers.formatEther(owed)} FTNS`);
-    const sAfter = await reg.stakes(creator.address);
-    ok("status flips to WITHDRAWN", sAfter.status === 3n, `status=${sAfter.status}`);
+      (await stable(() => token.balanceOf(creator.address))) - before === owed,
+      `returned ${hre.ethers.formatEther(owed)} FTNS`);
+    ok("status flips to WITHDRAWN",
+      (await stable(() => reg.stakes(creator.address).then((s) => s.status))) === 3n);
     return summarize();
   }
 
@@ -215,14 +221,16 @@ async function main() {
 
   const regAddr = await reg.getAddress();
   const tokenAddr = await token.getAddress();
-  const delay = await reg.unbondDelaySeconds();
-  const slasher = await reg.slasher();
+  // All reads go through stable() — load-balanced public RPCs serve reads from
+  // replicas that can be a block behind, returning stale post-write state.
+  const delay = await stable(() => reg.unbondDelaySeconds());
+  const slasher = await stable(() => reg.slasher());
   const slasherIsDeployer = slasher.toLowerCase() === deployer.address.toLowerCase();
 
   // Fund + approve the creator for 2× MIN (so we can slash MIN and still withdraw MIN).
   console.log(`\n── PHASE 1: bond / slash / drain / unbond lifecycle ──`);
   const need = 2n * MIN_HIGH;
-  const haveCreator = await token.balanceOf(creator.address);
+  const haveCreator = await stable(() => token.balanceOf(creator.address));
   if (haveCreator < need) {
     // MockERC20.mint is open in tests; on a real custom FTNS this would be a faucet/transfer.
     const mintTx = await token.mint(creator.address, need - haveCreator);
@@ -232,21 +240,21 @@ async function main() {
   await apprTx.wait();
 
   // INV-1: stake pulls FTNS and records the bonded balance.
-  const regBalBefore = await token.balanceOf(regAddr);
+  const regBalBefore = await stable(() => token.balanceOf(regAddr));
   await (await reg.connect(creator).stake(need)).wait();
   ok("stake: creatorStakeOf == bonded amount",
-    (await reg.creatorStakeOf(creator.address)) === need,
+    (await stable(() => reg.creatorStakeOf(creator.address))) === need,
     `${hre.ethers.formatEther(need)} FTNS`);
   ok("stake: registry token balance increased by the staked amount",
-    (await token.balanceOf(regAddr)) - regBalBefore === need);
+    (await stable(() => token.balanceOf(regAddr))) - regBalBefore === need);
 
   // INV-4: slash (while BONDED) reduces stake + credits the Foundation reserve.
   if (slasherIsDeployer) {
     await (await reg.connect(deployer).slash(creator.address, MIN_HIGH, "rehearsal-spam")).wait();
     ok("slash: bonded stake reduced by the slashed amount",
-      (await reg.creatorStakeOf(creator.address)) === MIN_HIGH);
+      (await stable(() => reg.creatorStakeOf(creator.address))) === MIN_HIGH);
     ok("slash: foundationReserveBalance credited",
-      (await reg.foundationReserveBalance()) === MIN_HIGH);
+      (await stable(() => reg.foundationReserveBalance())) === MIN_HIGH);
     // Probe non-slasher rejection from a genuine stranger (NOT the creator — in a
     // single-key run creator == slasher, so that probe would actually slash).
     const strangerNonSlasher =
@@ -270,19 +278,19 @@ async function main() {
       await reverts(() => reg.connect(deployer).setFoundationReserveWallet(creator.address)));
     // Use the token contract itself as the contract-address stand-in for the Safe.
     await (await reg.connect(deployer).setFoundationReserveWallet(tokenAddr)).wait();
-    const reserveBefore = await token.balanceOf(tokenAddr);
-    const accrued = await reg.foundationReserveBalance();
+    const reserveBefore = await stable(() => token.balanceOf(tokenAddr));
+    const accrued = await stable(() => reg.foundationReserveBalance());
     await (await reg.connect(deployer).drainFoundationReserve()).wait();
     ok("drain: reserve wallet received the accrued proceeds",
-      (await token.balanceOf(tokenAddr)) - reserveBefore === accrued);
+      (await stable(() => token.balanceOf(tokenAddr))) - reserveBefore === accrued);
     ok("drain: foundationReserveBalance zeroed",
-      (await reg.foundationReserveBalance()) === 0n);
+      (await stable(() => reg.foundationReserveBalance())) === 0n);
   }
 
   // INV-2: requestUnbond drops eligibility to 0 immediately.
   await (await reg.connect(creator).requestUnbond()).wait();
   ok("requestUnbond: creatorStakeOf drops to 0 immediately (no tier while exiting)",
-    (await reg.creatorStakeOf(creator.address)) === 0n);
+    (await stable(() => reg.creatorStakeOf(creator.address))) === 0n);
 
   // INV-3: withdraw before the delay reverts.
   ok("withdraw before delay reverts",
@@ -302,15 +310,14 @@ async function main() {
   // INV-7: withdraw after the delay returns the remaining bonded FTNS.
   const traveled = await tryTimeTravel(Number(delay) + 1);
   if (traveled) {
-    const s = await reg.stakes(creator.address);
-    const owed = s.amount;
-    const before = await token.balanceOf(creator.address);
+    const owed = await stable(() => reg.stakes(creator.address).then((s) => s.amount));
+    const before = await stable(() => token.balanceOf(creator.address));
     await (await reg.connect(creator).withdraw()).wait();
     ok("withdraw after delay returns the remaining bonded FTNS",
-      (await token.balanceOf(creator.address)) - before === owed,
+      (await stable(() => token.balanceOf(creator.address))) - before === owed,
       `returned ${hre.ethers.formatEther(owed)} FTNS`);
     ok("status flips to WITHDRAWN",
-      (await reg.stakes(creator.address)).status === 3n);
+      (await stable(() => reg.stakes(creator.address).then((s) => s.status))) === 3n);
   } else {
     const s = await reg.stakes(creator.address);
     console.log(`\n   ⏳ Live chain — cannot fast-forward time. The creator is UNBONDING;`);
