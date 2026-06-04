@@ -13,6 +13,7 @@ import collections
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid
 from typing import Any, Callable, Coroutine, Dict, List, Optional
@@ -182,6 +183,39 @@ GOSSIP_KNOWLEDGE_RESPONSE = "agent_knowledge_response"
 GOSSIP_DIGEST_REQUEST = "digest_request"
 GOSSIP_DIGEST_RESPONSE = "digest_response"
 
+
+# sp1008 — gossip-layer replay barrier. The transport dedups nonces only within
+# its ~300s window, but the gossip log retains messages 1h–24h, so a captured
+# signed frame replayed after 300s would be re-delivered to subscribers and
+# re-fanned into the mesh. A gossip-layer seen-nonce set with a TTL >= the
+# retention closes this; an LRU cap bounds its memory. Legit gossip is
+# unaffected (every publish() uses a fresh nonce — only exact-nonce replays,
+# which mesh redundancy already tolerates being dropped, are caught).
+_DEFAULT_GOSSIP_DEDUP_WINDOW_SEC = 86400.0  # 24h — covers the max log retention
+_DEFAULT_GOSSIP_DEDUP_MAX = 100_000
+
+
+def _gossip_dedup_window() -> float:
+    raw = os.environ.get("PRSM_GOSSIP_DEDUP_WINDOW_SEC", "").strip()
+    if not raw:
+        return _DEFAULT_GOSSIP_DEDUP_WINDOW_SEC
+    try:
+        val = float(raw)
+    except (ValueError, TypeError):
+        return _DEFAULT_GOSSIP_DEDUP_WINDOW_SEC
+    return val if val > 0 else _DEFAULT_GOSSIP_DEDUP_WINDOW_SEC
+
+
+def _gossip_dedup_max() -> int:
+    raw = os.environ.get("PRSM_GOSSIP_DEDUP_MAX", "").strip()
+    if not raw:
+        return _DEFAULT_GOSSIP_DEDUP_MAX
+    try:
+        val = int(raw)
+    except (ValueError, TypeError):
+        return _DEFAULT_GOSSIP_DEDUP_MAX
+    return val if val > 0 else _DEFAULT_GOSSIP_DEDUP_MAX
+
 # Gossip subtypes for BitTorrent integration
 GOSSIP_BITTORRENT_ANNOUNCE = "bittorrent_announce"
 GOSSIP_BITTORRENT_WITHDRAW = "bittorrent_withdraw"
@@ -267,6 +301,12 @@ class GossipProtocol:
         self._subscribers: Dict[str, List[GossipCallback]] = {}
         self._running = False
         self._tasks: List[asyncio.Task] = []
+
+        # sp1008 — gossip-layer replay barrier (nonce -> first-seen time).
+        # OrderedDict so the oldest entries evict first (TTL prune + LRU cap).
+        self._seen_gossip_nonces: "collections.OrderedDict[str, float]" = (
+            collections.OrderedDict()
+        )
 
         # Ledger for gossip persistence (set post-construction by node.py)
         self.ledger: Optional[Any] = None
@@ -415,6 +455,29 @@ class GossipProtocol:
 
     # ── Internal ─────────────────────────────────────────────────
 
+    def _is_replayed_gossip(self, nonce: str, now: float) -> bool:
+        """sp1008 — gossip-layer replay barrier. Returns True if ``nonce`` was
+        already seen within the dedup window (a replay to drop); otherwise
+        records it and returns False. Lazily prunes entries older than the
+        window and enforces an LRU cap, so the set is bounded in memory."""
+        window = _gossip_dedup_window()
+        seen = self._seen_gossip_nonces
+        # TTL prune from the oldest (insertion-ordered).
+        while seen:
+            oldest_nonce = next(iter(seen))
+            if now - seen[oldest_nonce] > window:
+                seen.popitem(last=False)
+            else:
+                break
+        if nonce in seen:
+            return True
+        seen[nonce] = now
+        # LRU cap — evict oldest beyond the bound.
+        cap = _gossip_dedup_max()
+        while len(seen) > cap:
+            seen.popitem(last=False)
+        return False
+
     async def _handle_gossip(self, msg: P2PMessage, peer: PeerConnection) -> None:
         """Process incoming gossip and optionally re-propagate."""
         subtype = msg.payload.get("subtype", "")
@@ -435,6 +498,15 @@ class GossipProtocol:
         
         if subtype == GOSSIP_DIGEST_RESPONSE:
             await self._handle_digest_response(msg, peer)
+            return
+
+        # sp1008 — drop gossip-layer replays before delivering or re-fanning.
+        # Placed AFTER the digest special-casing (the catch-up/sync mechanism
+        # must keep working) and BEFORE subscriber delivery + re-propagation, so
+        # a frame replayed past the transport's ~300s window can neither
+        # re-trigger handlers nor re-amplify into the mesh.
+        if msg.nonce and self._is_replayed_gossip(msg.nonce, time.time()):
+            self._record_drop(subtype, "replayed_nonce")
             return
 
         # Deliver to local subscribers
