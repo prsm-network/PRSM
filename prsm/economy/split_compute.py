@@ -38,6 +38,20 @@ from __future__ import annotations
 from typing import Any, Dict, List, Tuple
 
 
+def _worker_recipient(p: Dict[str, Any]) -> str:
+    """Payout recipient for a worker leg.
+
+    sp998 — prefer the worker's node_id (the identity it self-assigns + the key
+    the aggregator leg and the ledger-sync credit path already use), falling back
+    to the raw pubkey hex only for legacy callers that don't supply it. The raw
+    pubkey hex is NOT a payable identity: it is neither a 0x address (so the
+    on-chain bridge's _resolve_address rejects it) nor a node_id (so a remote
+    peer's `to_wallet == self.node_id` ledger-sync credit never matches), which
+    stranded every worker's FTNS on a local-only dead wallet.
+    """
+    return p.get("source_agent_node_id") or p["source_agent_pubkey_hex"]
+
+
 def compute_split_amounts(
     *,
     participants: List[Dict[str, Any]],
@@ -86,7 +100,7 @@ def compute_split_amounts(
     if all(pcu > 0 for pcu in pcus):
         total_pcu = sum(pcus)
         for p, pcu in zip(participants, pcus):
-            recipient = p["source_agent_pubkey_hex"]
+            recipient = _worker_recipient(p)
             amount = compute_share_total * (pcu / total_pcu)
             splits.append((recipient, amount))
         return splits, "pcu_weighted"
@@ -95,5 +109,5 @@ def compute_split_amounts(
     n = len(participants)
     per_participant = compute_share_total / n
     for p in participants:
-        splits.append((p["source_agent_pubkey_hex"], per_participant))
+        splits.append((_worker_recipient(p), per_participant))
     return splits, "uniform"

@@ -19,7 +19,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
+from prsm.economy.split_compute import compute_split_amounts
 from prsm.node.api import create_api_app
+from prsm.node.identity import node_id_for_public_key
 from prsm.node.payment_escrow import (
     EscrowAlreadyFinalizedError,
     EscrowEntry,
@@ -249,6 +251,48 @@ class TestSplitFloatTolerance:
         assert result is None  # real shortfall → strands (correct)
         assert entry.status == EscrowStatus.PENDING
         assert not ledger.transfers  # released nothing
+
+
+class TestWorkerLegKeying:
+    """sp998 — worker payout legs must be keyed by the worker's node_id (a payable
+    identity, matching the aggregator leg + the ledger-sync credit path), NOT the
+    raw pubkey hex (neither a 0x address nor a node_id → unspendable cross-node)."""
+
+    def test_prefers_node_id_over_pubkey_hex(self):
+        participants = [{
+            "source_agent_pubkey_hex": "aa" * 32,
+            "source_agent_node_id": "node-aaa",
+            "pcu_consumed": 0.0,
+        }]
+        splits, _mode = compute_split_amounts(
+            participants=participants, aggregator_node_id="agg",
+            total_budget=10.0, aggregator_share_bps=500,
+        )
+        worker_legs = [r for r, _ in splits if r != "agg"]
+        assert worker_legs == ["node-aaa"]            # node_id, not pubkey hex
+        assert ("aa" * 32) not in worker_legs
+
+    def test_falls_back_to_pubkey_hex_when_node_id_absent(self):
+        # Legacy callers without source_agent_node_id still resolve (back-compat).
+        participants = [{
+            "source_agent_pubkey_hex": "bb" * 32,
+            "pcu_consumed": 0.0,
+        }]
+        splits, _mode = compute_split_amounts(
+            participants=participants, aggregator_node_id="agg",
+            total_budget=10.0, aggregator_share_bps=500,
+        )
+        worker_legs = [r for r, _ in splits if r != "agg"]
+        assert worker_legs == ["bb" * 32]
+
+    def test_derived_node_id_matches_self_assigned(self):
+        # The node_id the prompter derives from a worker's pubkey MUST equal the
+        # node_id that worker self-assigns (identity.py), else the credit can't be
+        # matched on the worker's node.
+        pubkey = bytes(range(32))
+        assert node_id_for_public_key(pubkey) == __import__(
+            "hashlib"
+        ).sha256(pubkey).hexdigest()[:32]
 
 
 class TestSplitStateMachine:
@@ -553,10 +597,14 @@ class TestForgeSplitRouting:
         assert len(non_refund) == 4
         recipients = {t["to"] for t in non_refund}
         assert "agg-node-7" in recipients
-        # source_agent_pubkey is the recipient — hex-encoded in the
-        # /compute/forge marshal step.
+        # sp998 — worker legs are keyed by the worker's DERIVED node_id (a payable
+        # identity, matching the aggregator leg + the ledger-sync credit path), NOT
+        # the raw pubkey hex (which was unspendable cross-node → stranded the
+        # worker's FTNS on a local-only dead wallet).
+        from prsm.node.identity import node_id_for_public_key
         for p in participants:
-            assert p.source_agent_pubkey.hex() in recipients
+            assert node_id_for_public_key(p.source_agent_pubkey) in recipients
+            assert p.source_agent_pubkey.hex() not in recipients
 
     def test_default_aggregator_share_is_5pct(self, monkeypatch):
         # Default PRSM_AGGREGATOR_SHARE_BPS = 500 → 5% of budget.

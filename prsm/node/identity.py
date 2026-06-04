@@ -93,6 +93,18 @@ class NodeIdentity:
         )
 
 
+def node_id_for_public_key(public_bytes: bytes) -> str:
+    """Derive a node_id from a raw Ed25519 public key.
+
+    node_id == hex(sha256(public_key_bytes))[:32]. Single source of truth for the
+    derivation so callers that hold a peer's pubkey (e.g. swarm settlement
+    attribution) can compute the SAME node_id that peer self-assigns — instead of
+    inventing a different identifier (sp998: worker payout legs must be keyed by
+    this node_id, not the raw pubkey hex, to be payable cross-node).
+    """
+    return hashlib.sha256(public_bytes).hexdigest()[:32]
+
+
 def generate_node_identity(display_name: str = "prsm-node") -> NodeIdentity:
     """Generate a new Ed25519 keypair and derive node_id from public key hash."""
     private_key = Ed25519PrivateKey.generate()
@@ -105,7 +117,7 @@ def generate_node_identity(display_name: str = "prsm-node") -> NodeIdentity:
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw,
     )
-    node_id = hashlib.sha256(public_bytes).hexdigest()[:32]
+    node_id = node_id_for_public_key(public_bytes)
 
     return NodeIdentity(
         node_id=node_id,

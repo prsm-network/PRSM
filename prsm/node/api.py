@@ -6397,6 +6397,11 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                     response_text = qo_result.payload.decode("utf-8")
                 except UnicodeDecodeError:
                     response_text = qo_result.payload.hex()
+                # sp998 — derive each worker's node_id from its pubkey so payout
+                # legs are keyed by a payable identity (see participants below).
+                from prsm.node.identity import (
+                    node_id_for_public_key as _node_id_for_pubkey,
+                )
                 result = {
                     "status": "success",
                     "route": "qo_swarm",
@@ -6415,6 +6420,18 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                         {
                             "shard_cid": pa.shard_cid,
                             "source_agent_pubkey_hex": pa.source_agent_pubkey.hex(),
+                            # sp998 — the worker's node_id, derived from its pubkey
+                            # the SAME way the worker self-assigns it. Settlement
+                            # keys worker payout legs by THIS (not the raw pubkey
+                            # hex, which is neither a 0x address nor a node_id →
+                            # unspendable: it can't bridge on-chain and never
+                            # matches a peer's to_wallet==node_id ledger-sync
+                            # credit, so the worker's FTNS was credited to a
+                            # local-only dead wallet). Matches the aggregator leg,
+                            # which already keys by node_id.
+                            "source_agent_node_id": _node_id_for_pubkey(
+                                pa.source_agent_pubkey,
+                            ),
                             "creator_id": pa.creator_id,
                             "pcu_consumed": pa.pcu_consumed,
                         }
