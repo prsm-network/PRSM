@@ -24,6 +24,7 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -67,6 +68,34 @@ logger = logging.getLogger(__name__)
 DEFAULT_REQUEST_TIMEOUT = 30.0
 MAX_INLINE_SIZE = 1_048_576  # 1MB - content larger than this uses gateway transfer
 MAX_CONCURRENT_REQUESTS = 10
+
+# sp1002 — GATEWAY content-fetch DoS bounds. A peer-supplied GATEWAY url is
+# fetched over HTTP by the *retrieving* node; without an upper byte bound a
+# malicious/over-large body OOMs the retriever (finding 7). The per-fetch cap
+# is the advertised content size plus encoding slack (so "advertise tiny,
+# serve huge" is rejected), and is itself bounded by this hard ceiling so an
+# attacker advertising a giant size can never drive the cap unbounded. The
+# default ceiling is generous (large legitimate content exists) but finite;
+# operators can tune it via PRSM_MAX_GATEWAY_FETCH_BYTES.
+_DEFAULT_GATEWAY_FETCH_CEILING_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+GATEWAY_FETCH_CHUNK_BYTES = 262_144  # 256 KiB streaming read granularity
+
+
+def _gateway_fetch_hard_ceiling_bytes() -> int:
+    """Hard upper bound (bytes) for a single GATEWAY HTTP fetch.
+
+    Read from PRSM_MAX_GATEWAY_FETCH_BYTES at call time (so operators can
+    tune without restart-coupling to import order); falls back to the
+    2 GiB default on missing / non-positive / unparseable values.
+    """
+    raw = os.environ.get("PRSM_MAX_GATEWAY_FETCH_BYTES", "").strip()
+    if not raw:
+        return _DEFAULT_GATEWAY_FETCH_CEILING_BYTES
+    try:
+        val = int(raw)
+    except (ValueError, TypeError):
+        return _DEFAULT_GATEWAY_FETCH_CEILING_BYTES
+    return val if val > 0 else _DEFAULT_GATEWAY_FETCH_CEILING_BYTES
 
 
 class ContentStatus(str, Enum):
@@ -782,9 +811,31 @@ class ContentProvider:
         info = self.content_discovery.get_content_info(cid)
         if info:
             return info.content_hash
-        
+
         return None
-    
+
+    def _get_expected_size(self, cid: str) -> Optional[int]:
+        """Get the advertised content size (bytes) for a CID, if known.
+
+        sp1002 — used to bound a GATEWAY fetch: a provider that advertised
+        N bytes must not be able to then serve an unbounded body. Returns
+        None when no positive size is known (caller falls back to the hard
+        ceiling). The value is gossip-supplied (untrusted) but using it only
+        ever TIGHTENS the cap below the hard ceiling, so a lie can shrink the
+        bound (rejecting the lie's oversized body) but never enlarge it.
+        """
+        if self.content_index:
+            record = self.content_index.lookup(cid)
+            size = getattr(record, "size_bytes", None) if record else None
+            if isinstance(size, int) and size > 0:
+                return size
+        info = self.content_discovery.get_content_info(cid)
+        if info is not None:
+            size = getattr(info, "size", None)
+            if isinstance(size, int) and size > 0:
+                return size
+        return None
+
     async def _request_from_provider(
         self,
         cid: str,
@@ -809,7 +860,13 @@ class ContentProvider:
         loop = asyncio.get_event_loop()
         future: asyncio.Future = loop.create_future()
         self._pending_requests[request_id] = future
-        
+
+        # sp1002 (finding 8) — track elapsed so the GATEWAY HTTP fetch below
+        # runs under the caller's REMAINING timeout budget, not a fixed 120s
+        # outside it (a slow-loris gateway otherwise tied up a worker for
+        # 120s regardless of the caller's smaller timeout).
+        _t0 = time.monotonic()
+
         try:
             # Send request
             msg = P2PMessage(
@@ -821,10 +878,10 @@ class ContentProvider:
             if not sent:
                 logger.debug(f"Failed to send request to {provider_id[:8]}")
                 return None
-            
+
             # Wait for response
             response = await asyncio.wait_for(future, timeout=timeout)
-            
+
         except asyncio.TimeoutError:
             self._telemetry["requests_timed_out"] += 1
             logger.debug(f"Request to {provider_id[:8]} timed out for {cid[:12]}...")
@@ -845,10 +902,25 @@ class ContentProvider:
         
         if response.transfer_mode == TransferMode.INLINE and response.data is not None:
             content_bytes = response.data
-        
+
         elif response.transfer_mode == TransferMode.GATEWAY and response.gateway_url:
-            content_bytes = await self._fetch_from_url(response.gateway_url)
-        
+            # sp1002 (findings 7+8) — bound the peer-supplied gateway fetch.
+            # Cap bytes at the advertised size (+ encoding slack) bounded by
+            # the hard ceiling, and give the HTTP fetch only the caller's
+            # remaining timeout budget.
+            expected_size = self._get_expected_size(cid)
+            ceiling = _gateway_fetch_hard_ceiling_bytes()
+            if expected_size:
+                max_bytes = min(expected_size * 2 + 4096, ceiling)
+            else:
+                max_bytes = ceiling
+            remaining = max(0.5, timeout - (time.monotonic() - _t0))
+            content_bytes = await self._fetch_from_url(
+                response.gateway_url,
+                timeout=remaining,
+                max_bytes=max_bytes,
+            )
+
         if content_bytes is None:
             return None
         
@@ -1006,28 +1078,71 @@ class ContentProvider:
             )
             return None
 
-    async def _fetch_from_url(self, gateway_url: str) -> Optional[bytes]:
+    async def _fetch_from_url(
+        self,
+        gateway_url: str,
+        timeout: Optional[float] = None,
+        max_bytes: Optional[int] = None,
+    ) -> Optional[bytes]:
         """Fetch content via HTTP from a peer-supplied gateway URL.
 
         Used when a peer responds with TransferMode.GATEWAY instead of
         inline bytes. The URL scheme is whatever the peer publishes (e.g.
         ``prsm://`` for in-network gateways, ``http(s)://`` for HTTP-fronted
         nodes); only ``http``/``https`` are actually fetchable here.
+
+        sp1002 — the URL and the served body are both attacker-controlled
+        (ContentResponseMessage.gateway_url comes verbatim from the peer's
+        response). Two DoS guards:
+
+          - ``max_bytes`` (finding 7): refuse early when the advertised
+            Content-Length already exceeds the cap, and stream the body in
+            chunks, aborting the moment the accumulated size passes the cap.
+            Prevents an unbounded / much-larger-than-advertised body from
+            OOM-ing the retriever. Falls back to the hard ceiling when not
+            supplied by the caller.
+          - ``timeout`` (finding 8): the HTTP fetch runs under the caller's
+            remaining retrieve budget, not a fixed 120s outside it.
         """
         if not gateway_url.startswith(("http://", "https://")):
             logger.debug(f"Skipping non-HTTP gateway URL: {gateway_url}")
             return None
+        cap = max_bytes if (max_bytes and max_bytes > 0) else _gateway_fetch_hard_ceiling_bytes()
+        eff_timeout = timeout if (timeout and timeout > 0) else self.default_timeout
         try:
             import aiohttp
             session = await self._get_http_session()
             async with session.get(
                 gateway_url,
-                timeout=aiohttp.ClientTimeout(total=120),
+                timeout=aiohttp.ClientTimeout(total=eff_timeout),
             ) as resp:
-                if resp.status == 200:
-                    return await resp.read()
-                else:
+                if resp.status != 200:
                     logger.debug(f"Gateway returned {resp.status} for {gateway_url}")
+                    return None
+                # Fast-fail when the advertised length already exceeds the
+                # cap (untrusted, but a cheap early reject for honest servers
+                # that set it). Don't trust it for sizing — still stream-cap.
+                declared = resp.headers.get("Content-Length")
+                if declared is not None:
+                    try:
+                        if int(declared) > cap:
+                            logger.warning(
+                                "Gateway %s advertises %s bytes > cap %s — refusing fetch",
+                                gateway_url, declared, cap,
+                            )
+                            return None
+                    except (ValueError, TypeError):
+                        pass
+                buf = bytearray()
+                async for chunk in resp.content.iter_chunked(GATEWAY_FETCH_CHUNK_BYTES):
+                    buf.extend(chunk)
+                    if len(buf) > cap:
+                        logger.warning(
+                            "Gateway %s exceeded byte cap %s mid-stream — aborting fetch",
+                            gateway_url, cap,
+                        )
+                        return None
+                return bytes(buf)
         except Exception as e:
             logger.error(f"Gateway fetch failed for {gateway_url}: {e}")
         return None
