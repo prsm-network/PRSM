@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Awaitable, Callable, Optional, Union
 
@@ -104,6 +105,16 @@ class HeartbeatScheduler:
     # an operator can still intervene.
     CRITICAL_CONSECUTIVE_FAILURES = 3
 
+    # sp999 — the loop wakes at LEAST this often to re-read the on-chain heartbeat
+    # grace + (auto-tune mode) shrink the interval, INDEPENDENT of the heartbeat
+    # cadence. The contract's MIN_HEARTBEAT_GRACE is 1 hour, so a tightened slash
+    # window is >= grace*slashGraceMultiplier (default 2) = 2h; re-checking every
+    # 15 min detects a governance grace reduction + re-tunes well inside it, even
+    # when the heartbeat interval itself is hours (a long-running daemon that
+    # auto-tuned to grace/4 = 6h off a 24h grace was otherwise stranded at a
+    # cadence WIDER than the live window after an incident-response grace cut).
+    GRACE_RECHECK_CEILING_SECONDS = 900.0
+
     def __init__(
         self,
         client,
@@ -121,6 +132,11 @@ class HeartbeatScheduler:
         #   - client lacks heartbeat_grace_seconds() method
         #   - method raises (e.g., RPC down at construction)
         #   - method returns non-positive (operator misconfig)
+        # sp999 — remember whether the interval was auto-tuned (None) vs
+        # operator-pinned. Only the auto-tuned path self-corrects (shrinks) when
+        # governance reduces the on-chain grace; a pinned interval is the
+        # operator's choice, so we only warn (loudly) if it falls behind the window.
+        self._auto_tuned = interval_seconds is None
         if interval_seconds is None:
             interval_seconds = self._auto_tune_from_client(client)
         if interval_seconds <= 0:
@@ -205,14 +221,75 @@ class HeartbeatScheduler:
             datetime.now(timezone.utc) - self.last_tick_at
         ).total_seconds()
 
+    def _maybe_retune(self) -> None:
+        """sp999 — re-read the on-chain heartbeat grace and SHRINK the auto-tuned
+        interval if governance reduced it (incident-response setHeartbeatGrace).
+
+        A long-running daemon froze its interval at construction. If grace is later
+        cut (e.g. 24h → 1h), a HEALTHY provider heartbeating on the old cadence can
+        fall OUTSIDE the new slash window and be permissionlessly slashed despite
+        being honest. Re-reading here keeps the auto-tuned cadence inside the live
+        window. Reads grace DIRECTLY (not via the error-masking auto-tune helper)
+        so a transient RPC blip is a NO-OP — it must never spuriously shrink the
+        interval, only a genuine grace reduction does. Only ever shrinks (never
+        grows past the operator/auto value)."""
+        client = self._client
+        if not hasattr(client, "heartbeat_grace_seconds"):
+            return
+        try:
+            grace = client.heartbeat_grace_seconds()
+        except Exception:  # noqa: BLE001 — transient read: keep current interval
+            return
+        if not isinstance(grace, (int, float)) or grace <= 0:
+            return
+        retuned = max(
+            grace / self.AUTO_TUNE_DIVISOR, self.AUTO_TUNE_MIN_INTERVAL_SECONDS,
+        )
+        if retuned >= self._interval:
+            return  # grace unchanged or larger — never grow
+        if self._auto_tuned:
+            logger.warning(
+                "HeartbeatScheduler: on-chain heartbeat grace dropped — shrinking "
+                "auto-tuned interval %.0fs → %.0fs to stay inside the live slash "
+                "window (a healthy provider must keep heartbeating within it).",
+                self._interval, retuned,
+            )
+            self._interval = float(retuned)
+        else:
+            logger.critical(
+                "HeartbeatScheduler: on-chain heartbeat grace dropped — the "
+                "operator-pinned interval %.0fs now likely EXCEEDS the live slash "
+                "window (auto-tune would use %.0fs). A HEALTHY provider may be "
+                "slashed for a missed heartbeat; lower the configured interval or "
+                "switch to auto-tune (unset PRSM_HEARTBEAT_INTERVAL_SECONDS).",
+                self._interval, retuned,
+            )
+
     async def run_forever(self) -> None:
-        """Run the heartbeat loop until ``stop()`` is called."""
+        """Run the heartbeat loop until ``stop()`` is called.
+
+        The heartbeat fires every ``self._interval``, but the loop WAKES at least
+        every ``GRACE_RECHECK_CEILING_SECONDS`` to re-read the on-chain grace and
+        (auto-tune mode) shrink the interval — so a governance grace reduction is
+        detected + reacted to inside the live slash window even when the heartbeat
+        cadence is hours (sp999)."""
         self._stop_event.clear()
+        last_tick_mono: Optional[float] = None
         while not self._stop_event.is_set():
-            await self.tick()
+            self._maybe_retune()
+            now = time.monotonic()
+            if last_tick_mono is None or (now - last_tick_mono) >= self._interval:
+                await self.tick()
+                last_tick_mono = time.monotonic()
+            # Sleep until the next heartbeat is due, capped so we re-check grace
+            # frequently regardless of the (possibly hours-long) heartbeat cadence.
+            due_in = self._interval - (time.monotonic() - last_tick_mono)
+            nap = min(due_in, self.GRACE_RECHECK_CEILING_SECONDS)
+            if nap <= 0:
+                nap = self.GRACE_RECHECK_CEILING_SECONDS
             try:
                 await asyncio.wait_for(
-                    self._stop_event.wait(), timeout=self._interval,
+                    self._stop_event.wait(), timeout=nap,
                 )
             except asyncio.TimeoutError:
                 continue

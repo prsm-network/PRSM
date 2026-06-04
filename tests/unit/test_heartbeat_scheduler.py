@@ -340,3 +340,70 @@ class TestRunForever:
         # 3 successes, 3 failures (broadcast + revert + pending).
         assert scheduler.success_count == 3
         assert scheduler.failure_count == 3
+
+
+# ──────────────────────────────────────────────────────────────────────
+# sp999 — grace re-tune (false-slash defense)
+# ──────────────────────────────────────────────────────────────────────
+
+
+class _GraceClient(_FakeSlashingClient):
+    """Slashing client with a mutable on-chain heartbeat grace, for the re-tune
+    tests. `grace_raises=True` simulates a transient RPC read failure."""
+
+    def __init__(self, grace_seconds, outcomes=None):
+        super().__init__(outcomes)
+        self._grace = grace_seconds
+        self.grace_raises = False
+
+    def heartbeat_grace_seconds(self):
+        if self.grace_raises:
+            raise RuntimeError("rpc down")
+        return self._grace
+
+
+class TestGraceRetune:
+    """sp999 — a HEALTHY daemon must shrink its auto-tuned heartbeat interval when
+    governance reduces the on-chain grace (incident-response setHeartbeatGrace),
+    or it can be falsely slashed for a 'missed' heartbeat despite heartbeating
+    exactly as configured (its frozen cadence falls outside the tightened window)."""
+
+    def test_auto_tuned_interval_shrinks_when_grace_drops(self):
+        client = _GraceClient(grace_seconds=86400)   # 24h grace
+        s = HeartbeatScheduler(client=client)        # auto-tune → 86400/4 = 6h
+        assert s.interval_seconds == 21600.0
+        client._grace = 3600                          # governance cuts grace to 1h
+        s._maybe_retune()
+        # 3600/4 = 900s (15 min) — back inside the tightened (2h) slash window.
+        assert s.interval_seconds == 900.0
+
+    def test_retune_never_grows_interval(self):
+        client = _GraceClient(grace_seconds=3600)    # 1h → 900s
+        s = HeartbeatScheduler(client=client)
+        assert s.interval_seconds == 900.0
+        client._grace = 86400                         # grace GREW
+        s._maybe_retune()
+        assert s.interval_seconds == 900.0            # unchanged — never grow
+
+    def test_retune_noop_on_transient_read_error(self):
+        client = _GraceClient(grace_seconds=86400)
+        s = HeartbeatScheduler(client=client)         # 6h
+        client.grace_raises = True                     # RPC blip during re-tune
+        s._maybe_retune()
+        # A transient read MUST NOT spuriously shrink (else one blip pins the
+        # daemon at a tight cadence forever — only a genuine grace cut shrinks).
+        assert s.interval_seconds == 21600.0
+
+    def test_operator_pinned_interval_warns_but_not_shrunk(self, caplog):
+        import logging as _logging
+        client = _GraceClient(grace_seconds=86400)
+        # Operator-pinned interval (not auto-tuned) — their choice is preserved.
+        s = HeartbeatScheduler(client=client, interval_seconds=21600.0)
+        client._grace = 3600                            # grace cut below the cadence
+        with caplog.at_level(_logging.CRITICAL):
+            s._maybe_retune()
+        assert s.interval_seconds == 21600.0          # preserved
+        assert any(
+            "EXCEEDS the live slash window" in r.message
+            for r in caplog.records
+        )
