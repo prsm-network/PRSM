@@ -330,6 +330,20 @@ def verify_activation_noise_trace(
             )
         return (True, "")
 
+    # sp1001 — a non-NONE tier with a ~0 total ε means NO DP noise was actually
+    # applied. The injector records exactly 0.0 only on its disabled/no-noise path
+    # (activation_dp.py inject path), so a 0.0 total for STANDARD/HIGH/MAXIMUM is
+    # never an honest under-spend — it is a privacy over-claim (the receipt claims
+    # a private tier but the signed trace proves no noise was injected). Reject.
+    # Genuine stronger-privacy under-spend uses a small POSITIVE ε and still passes.
+    if trace.total_epsilon_spent <= _EPSILON_TOLERANCE:
+        return (
+            False,
+            f"tier {expected_tier_str!r} promises DP noise but the trace "
+            f"records total ε={trace.total_epsilon_spent} — no activation "
+            f"noise was applied (privacy over-claim)",
+        )
+
     # For non-NONE tier, total may not EXCEED the tier's
     # promised ceiling. (Under-spending is acceptable —
     # callers can run with smaller per-stage ε; over-spending

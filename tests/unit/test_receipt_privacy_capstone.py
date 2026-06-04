@@ -328,14 +328,20 @@ def test_verify_with_trace_present_default_permissive():
     assert result.activation_noise_trace_valid is True
 
 
-def test_verify_with_invalid_trace_default_still_ok():
-    """An invalid trace with require_activation_dp=False
-    surfaces as activation_noise_trace_valid=False but ok
-    remains True (default permissive)."""
-    # Manufacture a trace claiming STANDARD but with the
-    # wrong sum (defends pure-additive default semantics)
+def test_verify_with_present_invalid_trace_is_not_ok():
+    """sp1001 — a PRESENT but detectably-INVALID activation_noise_trace must make
+    ok=False on EVERY path, including the default (require_activation_dp_trace=
+    False) used by /compute/receipt/verify, the MCP tool, and the SDK.
+
+    This test previously asserted ok=True ("default permissive") — pinning the §7
+    privacy-OVER-CLAIM bug: a receipt whose own signed trace contradicted its
+    privacy claim still verified as VALID. An HONEST trace always validates, so
+    honest receipts are unaffected; only a detectably-broken privacy proof is now
+    rejected. The signature itself is still valid — the CLAIM is what fails."""
+    # Trace claiming STANDARD but with an internally inconsistent sum
+    # (per-stage sums to 2, not the claimed total 8) → detectably invalid.
     bad_trace = ActivationNoiseTrace(
-        per_stage_epsilon=[1.0, 1.0],  # sum=2 != claimed 8
+        per_stage_epsilon=[1.0, 1.0],  # sum=2 != claimed total 8
         total_epsilon_spent=8.0,
         clip_norm=1.0,
         stage_count=2,
@@ -345,8 +351,64 @@ def test_verify_with_invalid_trace_default_still_ok():
     result = verify_receipt_privacy_claim(
         signed, identity=identity,
     )
+    assert result.signature_valid is True   # signature is fine
     assert result.activation_noise_trace_valid is False
+    assert result.ok is False               # sp1001: invalid proof must NOT be ok
+
+
+def test_overclaim_tier_epsilon_desync_with_present_trace_rejected():
+    """sp1001 (over-claim bug #1) — a receipt claiming MAXIMUM tier but charging
+    STANDARD ε (8.0), carrying an honest MAXIMUM trace (total 1.0), must verify
+    ok=False on the default path: the charged ε (8.0) disagrees with the trace
+    total (1.0). Pre-fix this returned ok=True (tier↔ε desync was non-fatal)."""
+    import dataclasses as _dc
+    max_trace = _make_trace(tier=PrivacyLevel.MAXIMUM)  # honest MAXIMUM → total 1.0
+    signed, identity = _build_signed_receipt(
+        trace=max_trace, tier=PrivacyLevel.MAXIMUM,
+    )
+    # The honest builder set epsilon_spent to the MAXIMUM ceiling (1.0); forge the
+    # over-claim by charging the STANDARD ε (8.0) instead, then re-sign so the
+    # signature is valid (operator self-signing a contradictory pair).
+    forged = sign_receipt(_dc.replace(signed, epsilon_spent=8.0), identity)
+    result = verify_receipt_privacy_claim(forged, identity=identity)
+    assert result.signature_valid is True
+    assert result.ok is False
+
+
+def test_overclaim_zero_noise_trace_on_private_tier_rejected():
+    """sp1001 (over-claim bug #2) — a receipt charging full STANDARD ε (8.0) with a
+    signed activation_noise_trace recording ZERO noise must verify ok=False even
+    under the strict flags. Pre-fix this returned ok=True (the trace validator
+    allowed arbitrary under-spend down to 0.0, and dp_noise_applied was derived
+    from epsilon_spent>0, not the trace)."""
+    zero_trace = ActivationNoiseTrace(
+        per_stage_epsilon=[0.0, 0.0],   # NO noise injected
+        total_epsilon_spent=0.0,
+        clip_norm=1.0,
+        stage_count=2,
+        tier="standard",
+    )
+    signed, identity = _build_signed_receipt(trace=zero_trace)  # tier STANDARD, ε=8.0
+    # Default path:
+    result = verify_receipt_privacy_claim(signed, identity=identity)
+    assert result.ok is False
+    # And under the strictest flags:
+    strict = verify_receipt_privacy_claim(
+        signed, identity=identity,
+        require_dp_noise=True, require_activation_dp_trace=True,
+    )
+    assert strict.ok is False
+
+
+def test_honest_receipt_with_matching_trace_still_ok():
+    """sp1001 regression — an HONEST receipt (tier ε == trace total, full noise on
+    every stage) must still verify ok=True. The over-claim gates only reject
+    detectably-inconsistent proofs, never honest ones."""
+    trace = _make_trace(tier=PrivacyLevel.STANDARD)  # total == STANDARD ε (8.0)
+    signed, identity = _build_signed_receipt(trace=trace)  # epsilon_spent=8.0
+    result = verify_receipt_privacy_claim(signed, identity=identity)
     assert result.ok is True
+    assert result.activation_noise_trace_valid is True
 
 
 def test_verify_require_activation_dp_passes_with_valid_trace():

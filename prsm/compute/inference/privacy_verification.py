@@ -369,6 +369,27 @@ def verify_receipt_privacy_claim(
                     f"activation_noise_trace invalid: "
                     f"{trace_reason}"
                 )
+            else:
+                # sp1001 — cross-check the receipt's claimed epsilon_spent against
+                # the trace's recorded total. The honest executor injects the full
+                # tier ε on every stage and sets epsilon_spent to the same tier
+                # ceiling, so epsilon_spent == trace total on an honest receipt. A
+                # divergence means the CHARGED DP budget and the ACTUALLY-INJECTED
+                # noise disagree — a privacy over-claim (e.g. epsilon_spent=8.0
+                # charged while the signed trace records 0.0 noise). Both fields are
+                # signed, so this is the operator self-signing a contradictory pair.
+                _claimed = float(receipt.epsilon_spent)
+                _traced = float(
+                    getattr(trace, "total_epsilon_spent", 0.0) or 0.0
+                )
+                if abs(_claimed - _traced) > 1e-6:
+                    activation_noise_trace_valid = False
+                    reasons.append(
+                        f"epsilon_spent ({_claimed}) disagrees with the "
+                        f"activation_noise_trace total ({_traced}) — the charged "
+                        f"DP budget and the injected activation noise are "
+                        f"inconsistent (privacy over-claim)"
+                    )
         except Exception as exc:  # noqa: BLE001
             activation_noise_trace_valid = False
             reasons.append(
@@ -441,10 +462,18 @@ def verify_receipt_privacy_claim(
         failed_required = True
     if require_dp_noise and not dp_noise_applied:
         failed_required = True
-    if (
-        require_activation_dp_trace
-        and not activation_noise_trace_valid
-    ):
+    # sp1001 — a PRESENT but detectably-INVALID activation_noise_trace is FATAL on
+    # EVERY path, not only when require_activation_dp_trace=True. The /compute/
+    # receipt/verify endpoint, the MCP tool, and the SDK all default that flag
+    # OFF, so previously a receipt whose own signed trace contradicted its
+    # privacy-tier/epsilon claim (an over-claim: tier↔ε desync, charged-ε vs
+    # injected-noise mismatch, or zero-noise on a private tier) still returned
+    # ok=True. An HONEST trace always validates (the executor injects the full
+    # tier ε every stage), so this never false-rejects honest receipts. NOTE:
+    # activation_noise_trace_valid is False ONLY when a trace was present and
+    # failed, OR when it is absent AND require_activation_dp_trace=True — both are
+    # correctly fatal; an absent trace with the flag off keeps it True (no-op).
+    if not activation_noise_trace_valid:
         failed_required = True
     if require_topology_rotation and (
         not topology_structurally_valid
