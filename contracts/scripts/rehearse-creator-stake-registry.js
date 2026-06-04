@@ -82,6 +82,29 @@ async function tryTimeTravel(seconds) {
   }
 }
 
+/**
+ * Wait until a freshly-deployed contract's code is visible to the RPC before
+ * reading its state. On a live network, waitForDeployment() can resolve while a
+ * subsequent eth_call is load-balanced to a node that has not yet synced the
+ * deploy block — eth_getCode returns "0x" and the first state read fails with
+ * BAD_DATA (value="0x"). Poll getCode until non-empty (mirrors the deploy
+ * script's read-replica-lag tolerance). No-op-fast on hardhat (code is instant).
+ */
+async function confirmCode(contract, label) {
+  const addr = await contract.getAddress();
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (let i = 0; i < 30; i++) {
+    const code = await hre.ethers.provider.getCode(addr);
+    if (code && code !== "0x") return;
+    await sleep(2000);
+  }
+  throw new Error(
+    `${label} at ${addr} still has no code after ~60s — the deploy did not ` +
+    `propagate to the RPC. Re-run (the deploy itself likely succeeded; this is ` +
+    `RPC lag), or pass a more reliable BASE_SEPOLIA_RPC_URL.`
+  );
+}
+
 async function main() {
   const network = hre.network.name;
   if (network === "mainnet" || network === "base") {
@@ -130,6 +153,7 @@ async function main() {
   if (process.env.REGISTRY_ADDRESS) {
     reg = Reg.attach(process.env.REGISTRY_ADDRESS);
     console.log(`Registry (attached):    ${process.env.REGISTRY_ADDRESS}`);
+    await confirmCode(reg, "CreatorStakeRegistry (attached)");
     if (!token) {
       const onFtns = await reg.ftns();
       token = MockERC20.attach(onFtns);
@@ -183,6 +207,11 @@ async function main() {
     await reg.waitForDeployment();
     console.log(`   registry: ${await reg.getAddress()}`);
   }
+
+  // Wait for both contracts' code to be visible on the RPC before any state read
+  // (live-network read-replica lag returns "0x" → BAD_DATA on the first call).
+  await confirmCode(token, "MockERC20");
+  await confirmCode(reg, "CreatorStakeRegistry");
 
   const regAddr = await reg.getAddress();
   const tokenAddr = await token.getAddress();
