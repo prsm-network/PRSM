@@ -2615,6 +2615,27 @@ class PRSMNode:
                 "fields. Real production deployments must wire "
                 "their own InferenceExecutor."
             )
+        elif _exec_kind == "mock-streaming":
+            # Sprint 1016 — single-node mock STREAMING executor. Unlike the
+            # plain `mock` (non-streaming MockInferenceExecutor), this builds a
+            # real ParallaxScheduledExecutor from mock components so
+            # /compute/inference/stream works end-to-end on one node (no real
+            # GPUs / model files / swarm). Synthetic tokens flow through the
+            # genuine gates + allocation + receipt-signing path. Honest scope:
+            # zero/software-tier crypto — MUST NOT be trusted by real verifiers.
+            # Streaming requests must use model_id="mock-model".
+            from prsm.compute.inference.mock_streaming import (
+                build_mock_streaming_executor,
+            )
+            self.inference_executor = build_mock_streaming_executor(self.identity)
+            logger.info(
+                "Inference executor: mock-streaming "
+                "ParallaxScheduledExecutor (opt-in via "
+                "PRSM_INFERENCE_EXECUTOR=mock-streaming). Single-node "
+                "synthetic streaming — zero-filled crypto. Use "
+                "model_id='mock-model'. Real deployments must wire their "
+                "own InferenceExecutor."
+            )
         elif _exec_kind == "parallax":
             # Sprint 558 — opt-in production wiring path for the
             # real ParallaxScheduledExecutor. The builder reads
