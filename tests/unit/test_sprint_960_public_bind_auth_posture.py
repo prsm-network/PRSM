@@ -6,10 +6,10 @@ defaults to 0.0.0.0. So the out-of-the-box posture is "bound to every interface
 with no API key" → those money endpoints are reachable UNAUTHENTICATED by anyone
 who can route to the host, silently.
 
-This adds a pure posture classifier used at node startup: it warns loudly in
-that posture by default (a hard fail would break legitimate local-dev and
-reverse-proxy-fronted deployments), and an opt-in env (PRSM_REQUIRE_AUTH_ON_PUBLIC_BIND)
-makes the node refuse to start instead.
+This adds a pure posture classifier used at node startup. sp1011 later flipped
+the startup response to FAIL-CLOSED BY DEFAULT (the node refuses to start in the
+insecure posture unless the operator acks via PRSM_ALLOW_INSECURE_PUBLIC_BIND);
+the classifier itself is unchanged and still pinned here.
 """
 from __future__ import annotations
 
@@ -60,12 +60,14 @@ def test_loopback_case_insensitive_and_whitespace():
     assert level == "ok"
 
 
-def test_start_wires_posture_check_with_optin_failclosed():
-    """Structural pin: node.start() runs the posture check, warns on insecure,
-    and refuses to start when PRSM_REQUIRE_AUTH_ON_PUBLIC_BIND is set."""
+def test_start_wires_posture_check_failclosed_by_default():
+    """Structural pin: node.start() runs the posture check and (sp1011) refuses
+    to start in the insecure posture BY DEFAULT, with the explicit
+    PRSM_ALLOW_INSECURE_PUBLIC_BIND ack as the only escape."""
     src = inspect.getsource(PRSMNode.start)
     assert "assess_public_bind_auth_posture(" in src
-    assert "PRSM_REQUIRE_AUTH_ON_PUBLIC_BIND" in src
+    assert "should_refuse_insecure_public_bind(" in src
+    assert "PRSM_ALLOW_INSECURE_PUBLIC_BIND" in src
     assert "raise RuntimeError(" in src
     # The check must read the configured bind host + the API key presence.
     assert "listen_host=" in src

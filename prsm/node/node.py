@@ -1120,6 +1120,24 @@ def assess_public_bind_auth_posture(*, listen_host, api_key_present):
     return ("insecure", msg)
 
 
+def should_refuse_insecure_public_bind(posture_level, *, allow_insecure):
+    """sp1011 — fail-closed-by-default decision for the public-bind posture.
+
+    Returns True (refuse to start) when ``posture_level`` is ``"insecure"`` (a
+    non-loopback bind with no API key — money + KYC endpoints unauthenticated)
+    AND the operator has NOT explicitly acknowledged the risk. The ack
+    (PRSM_ALLOW_INSECURE_PUBLIC_BIND) is the single escape hatch for genuinely
+    firewall-fronted deployments that intentionally run unauthenticated.
+
+    Secure-by-default: the common case (CLI loopback bind, or any bind with a
+    key) is ``"ok"`` and never refuses; only a deliberate non-loopback bind
+    without a key is stopped.
+    """
+    if posture_level != "insecure":
+        return False
+    return not allow_insecure
+
+
 def _build_key_distribution_watcher_or_none(
     *, client, state_store=None, webhook_deliverer=None,
     webhook_url=None, webhook_secret=None, dedup_store=None,
@@ -4330,12 +4348,17 @@ class PRSMNode:
                         _nice_increment, exc,
                     )
 
-        # Sprint 960 — network-exposure auth posture check. The protected
-        # money endpoints are only authenticated when PRSM_NODE_API_KEY is set;
-        # binding 0.0.0.0 (the default) without that key exposes them
-        # unauthenticated. Warn loudly by default (a hard fail would break
-        # legitimate local-dev + reverse-proxy deployments); refuse to start
-        # only when the operator opted into PRSM_REQUIRE_AUTH_ON_PUBLIC_BIND.
+        # Sprint 960/1011 — network-exposure auth posture check. The protected
+        # money + KYC endpoints are only authenticated when PRSM_NODE_API_KEY is
+        # set; binding a non-loopback interface without that key exposes them
+        # unauthenticated. sp1011 makes this FAIL-CLOSED BY DEFAULT (was
+        # warn-only): the node refuses to start in the insecure posture unless
+        # the operator explicitly acknowledges running unauthenticated via
+        # PRSM_ALLOW_INSECURE_PUBLIC_BIND (e.g. a firewall-fronted deployment).
+        # Non-disruptive to the common case — the CLI binds 127.0.0.1 (an "ok"
+        # loopback posture), so only a deliberate non-loopback bind without a
+        # key is stopped. The legacy opt-in PRSM_REQUIRE_AUTH_ON_PUBLIC_BIND is
+        # now the default and remains honored.
         _posture, _posture_msg = assess_public_bind_auth_posture(
             listen_host=getattr(self.config, "listen_host", None),
             api_key_present=bool(
@@ -4344,13 +4367,18 @@ class PRSMNode:
         )
         if _posture == "insecure":
             logger.warning(_posture_msg)
-            if _os_nice.environ.get(
-                "PRSM_REQUIRE_AUTH_ON_PUBLIC_BIND", "",
-            ).strip().lower() in {"1", "true", "yes", "on"}:
+            _allow_insecure = _os_nice.environ.get(
+                "PRSM_ALLOW_INSECURE_PUBLIC_BIND", "",
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if should_refuse_insecure_public_bind(
+                _posture, allow_insecure=_allow_insecure,
+            ):
                 raise RuntimeError(
-                    "Refusing to start: PRSM_REQUIRE_AUTH_ON_PUBLIC_BIND is set "
-                    "and the node is in an insecure public-bind/no-auth posture. "
-                    + _posture_msg
+                    "Refusing to start: insecure public-bind/no-auth posture — "
+                    "the money + KYC endpoints would be UNAUTHENTICATED. Set "
+                    "PRSM_NODE_API_KEY, bind 127.0.0.1 behind an authenticating "
+                    "reverse proxy, or set PRSM_ALLOW_INSECURE_PUBLIC_BIND=1 to "
+                    "run unauthenticated (NOT recommended). " + _posture_msg
                 )
 
         # Sprint 595 (Phase 2D) — capture the running event loop +
