@@ -16,6 +16,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -33,6 +34,44 @@ from prsm.node.identity import verify_signature
 logger = logging.getLogger(__name__)
 
 MAX_INDEXED_CIDS = 10_000
+
+# sp1004 — the GOSSIP_CONTENT_ADVERTISE lane is UNAUTHENTICATED (any peer can
+# advertise any CID; sp934 authenticates the sender, not the claim). The
+# in-memory royalty_rate weights off-chain multi-shard pool splits and
+# size_bytes feeds the sp1002 gateway-fetch cap, so a non-finite / negative /
+# absurd value entering the index is a real off-chain poisoning / DoS vector.
+# These bounds reject absolute insanity on ingest; the residual within-bounds
+# relative-skew + creator-binding gap is documented in
+# docs/2026-06-04-content-data-plane-trust-anchors.md (Gap B).
+DEFAULT_ROYALTY_RATE = 0.01
+# Upper bound matches the on-chain ProvenanceRegistry max (9800 bps = 0.98),
+# so no legitimately-registerable rate is rejected.
+MAX_ADVERTISE_ROYALTY_RATE = 0.98
+
+
+def _sane_royalty_rate(raw: Any, *, fallback: float) -> float:
+    """Coerce an advertise-supplied royalty_rate to a safe finite value in
+    [0, MAX_ADVERTISE_ROYALTY_RATE], or return ``fallback`` when it is
+    non-numeric / non-finite / out of range."""
+    try:
+        rate = float(raw)
+    except (TypeError, ValueError):
+        return fallback
+    if not math.isfinite(rate) or rate < 0.0 or rate > MAX_ADVERTISE_ROYALTY_RATE:
+        return fallback
+    return rate
+
+
+def _sane_size_bytes(raw: Any) -> int:
+    """Coerce an advertise-supplied size_bytes to a non-negative int, or 0
+    ("unknown") when it is non-integer / non-finite / negative."""
+    try:
+        if isinstance(raw, float) and not math.isfinite(raw):
+            return 0
+        n = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return n if n >= 0 else 0
 
 
 @dataclass
@@ -131,7 +170,8 @@ class ContentIndex:
             record = ContentRecord(
                 cid=cid,
                 filename=data.get("filename", ""),
-                size_bytes=data.get("size_bytes", 0),
+                # sp1004 — sanitize unauthenticated advertise numerics.
+                size_bytes=_sane_size_bytes(data.get("size_bytes", 0)),
                 content_hash=data.get("content_hash", ""),
                 # Phase 1.3 Task 3g pass-5: empty string signals
                 # "unknown creator" so backfill can repair without
@@ -146,7 +186,11 @@ class ContentIndex:
                 providers={provider_id},
                 created_at=data.get("created_at", time.time()),
                 metadata=data.get("metadata", {}),
-                royalty_rate=data.get("royalty_rate", 0.01),
+                # sp1004 — reject non-finite / negative / absurd rate.
+                royalty_rate=_sane_royalty_rate(
+                    data.get("royalty_rate", DEFAULT_ROYALTY_RATE),
+                    fallback=DEFAULT_ROYALTY_RATE,
+                ),
                 parent_cids=data.get("parent_cids", []),
                 embedding_id=data.get("embedding_id"),
                 near_duplicate_of=data.get("near_duplicate_of"),
@@ -258,8 +302,8 @@ class ContentIndex:
         # means "unknown / not in the incoming ad". Not
         # keyword-affecting.
         if record.size_bytes == 0:
-            incoming_size = data.get("size_bytes")
-            if incoming_size:  # non-zero truthy
+            incoming_size = _sane_size_bytes(data.get("size_bytes"))
+            if incoming_size:  # non-zero (and now guaranteed non-negative int)
                 record.size_bytes = incoming_size
 
         # royalty_rate: backfill default 0.01 when the new payload
@@ -269,10 +313,17 @@ class ContentIndex:
         # later non-default ad will overwrite it. That is safer than
         # the alternative (replica minimal ads permanently pinning
         # royalty_rate to the 0.01 default).
-        if record.royalty_rate == 0.01:
+        if record.royalty_rate == DEFAULT_ROYALTY_RATE:
             incoming_rate = data.get("royalty_rate")
-            if incoming_rate is not None and incoming_rate != 0.01:
-                record.royalty_rate = incoming_rate
+            if incoming_rate is not None:
+                # sp1004 — sanitize before clobbering the default. An
+                # out-of-range / non-finite advertise leaves the default
+                # intact rather than poisoning the rate.
+                sane = _sane_royalty_rate(
+                    incoming_rate, fallback=DEFAULT_ROYALTY_RATE,
+                )
+                if sane != DEFAULT_ROYALTY_RATE:
+                    record.royalty_rate = sane
 
         # Optional fields that are None by default.
         for field_name in (
