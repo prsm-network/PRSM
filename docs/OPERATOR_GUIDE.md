@@ -47,6 +47,10 @@ nano .env
 ```bash
 # Security (REQUIRED - generate your own!)
 SECRET_KEY=<generate with: openssl rand -hex 32>
+# Management-API key — REQUIRED whenever the API is network-exposed (Docker
+# port-mapping / api_host=0.0.0.0). The node fail-closes a public API bind
+# without it (sp1011). Not needed for a default loopback API.
+PRSM_NODE_API_KEY=<generate with: python3 -c 'import secrets;print(secrets.token_urlsafe(32))'>
 
 # Database
 DATABASE_URL=sqlite:///./prsm_node.db
@@ -129,6 +133,12 @@ services:
       - SECRET_KEY=${SECRET_KEY}
       - DATABASE_URL=postgresql://prsm:${POSTGRES_PASSWORD}@db:5432/prsm
       - REDIS_URL=redis://redis:6379
+      # sp1017/sp1018 — the management API binds api_host (default 127.0.0.1 =
+      # container-loopback, UNREACHABLE via the 8000:8000 port-map). Expose it
+      # on the container interface AND authenticate it (a public API bind
+      # without a key fail-closes at startup, sp1011).
+      - PRSM_API_HOST=0.0.0.0
+      - PRSM_NODE_API_KEY=${PRSM_NODE_API_KEY}
     volumes:
       - prsm-data:/data
       - ./config:/app/config
