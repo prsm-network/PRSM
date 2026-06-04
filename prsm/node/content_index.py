@@ -279,6 +279,14 @@ class ContentIndex:
             "embedding_id",
             "near_duplicate_of",
             "provenance_hash",
+            # sp995 (fix B) — a record first created from a minimal replica/
+            # announce advertise (which omits creator_eth_address) had no way to
+            # learn it when the uploader's full advertise arrived later, so the
+            # §14 stake gate keyed on None → wrongly demoted a stake-eligible
+            # HIGH creator. Backfilling it here repairs the record on the full ad
+            # regardless of advertise ordering. (First-non-None-wins, like the
+            # other optional fields — a later minimal ad can't clobber it.)
+            "creator_eth_address",
         ):
             if getattr(record, field_name) is None:
                 incoming = data.get(field_name)

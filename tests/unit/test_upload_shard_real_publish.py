@@ -226,6 +226,61 @@ class TestBackendFailures:
 # ──────────────────────────────────────────────────────────────────────
 
 
+class TestCreatorEthAddressThreading:
+    """sp995 (fix A) — the shard endpoint must thread creator_eth_address into
+    every shard's upload() call, so each shard carries the REAL creator's on-chain
+    identity (which the §14 stake gate + on-chain royalty routing key on), not the
+    hosting operator's wallet. Pre-fix the field was dropped entirely."""
+
+    def test_creator_eth_address_threaded_to_every_shard(self):
+        eth = "0x" + "a" * 40
+        uploader = MagicMock()
+        uploader.upload = AsyncMock(side_effect=[
+            _make_uploaded(cid=f"cid-{i}", size_bytes=100) for i in range(2)
+        ])
+        client = _make_client(_make_node(content_uploader=uploader))
+        r = client.post("/content/upload/shard", json={
+            "dataset_id": "ds-eth",
+            "content_b64": base64.b64encode(b"x" * 5000).decode(),
+            "shard_count": 2,
+            "creator_eth_address": eth,
+        })
+        assert r.status_code == 200, r.text
+        calls = uploader.upload.await_args_list
+        assert len(calls) >= 1
+        for c in calls:
+            assert c.kwargs["creator_eth_address"] == eth
+
+    def test_omitted_creator_eth_address_passes_none(self):
+        """Backward-compat: omitting it passes None → upload() falls back to the
+        operator address (operator self-upload), unchanged behavior."""
+        uploader = MagicMock()
+        uploader.upload = AsyncMock(side_effect=[
+            _make_uploaded(cid="cid-0", size_bytes=100),
+        ])
+        client = _make_client(_make_node(content_uploader=uploader))
+        r = client.post("/content/upload/shard", json={
+            "dataset_id": "ds-no-eth",
+            "content_b64": base64.b64encode(b"x" * 3000).decode(),
+            "shard_count": 1,
+        })
+        assert r.status_code == 200, r.text
+        assert uploader.upload.await_args_list[0].kwargs["creator_eth_address"] is None
+
+    def test_malformed_creator_eth_address_422(self):
+        uploader = MagicMock()
+        uploader.upload = AsyncMock(return_value=_make_uploaded("c", 1))
+        client = _make_client(_make_node(content_uploader=uploader))
+        r = client.post("/content/upload/shard", json={
+            "dataset_id": "ds-bad-eth",
+            "content_b64": base64.b64encode(b"x" * 3000).decode(),
+            "creator_eth_address": "0xnot-a-valid-address",
+        })
+        assert r.status_code == 422
+        assert "creator_eth_address" in r.json()["detail"]
+        uploader.upload.assert_not_awaited()
+
+
 class TestShardSlicing:
     def test_trailing_empty_shards_skipped(self):
         """When shard_count exceeds what 1024-byte minimum chunking

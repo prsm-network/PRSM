@@ -9219,6 +9219,7 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         }
         """
         import base64
+        import re
         from prsm.data.shard_models import SemanticShard, SemanticShardManifest
 
         dataset_id = body.get("dataset_id", "")
@@ -9254,6 +9255,24 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 detail=(
                     f"royalty_rate must be in [0.001, 0.1]; "
                     f"got {royalty_rate}."
+                ),
+            )
+        # sp995 (fix A) — capture the creator's on-chain ETH address per shard,
+        # mirroring /content/upload (ContentUploadRequest.creator_eth_address).
+        # Without this, every shard fell back to the OPERATOR's wallet (or None),
+        # so the §14 stake gate + on-chain royalty routing keyed on the hosting
+        # operator, not the creator who earned HIGH. Optional + same 0x-40-hex
+        # validation; omitted → unchanged (upload() falls back to the operator
+        # address, preserving operator self-upload behavior).
+        creator_eth_address = body.get("creator_eth_address") or None
+        if creator_eth_address is not None and not re.fullmatch(
+            r"0x[0-9a-fA-F]{40}", creator_eth_address,
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "creator_eth_address must be a 0x-prefixed 40-hex-char "
+                    f"address; got {creator_eth_address!r}."
                 ),
             )
 
@@ -9402,6 +9421,7 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                     content=chunk,
                     filename=shard_filename,
                     royalty_rate=royalty_rate,
+                    creator_eth_address=creator_eth_address,
                 )
             except NotImplementedError as exc:
                 # sp921 (content data-plane review) — a single shard chunk that
@@ -9544,21 +9564,35 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         )
 
         rendered = []
+        # sp995 — per-request memo of the gated tier, keyed by the SAME identity
+        # reputation is accumulated + gated under (the creator ETH address). A
+        # prolific creator's many CIDs in one response share one lookup, so the
+        # on-chain stake read fires at most once per distinct creator per request.
+        _tier_memo = {}
         for r in results:
-            if tracker is not None and r.creator_id:
-                try:
-                    raw_tier = tracker.tier_for(r.creator_id)
-                except Exception:  # noqa: BLE001
-                    raw_tier = TIER_NEW
-                # sp978 (decision A) — the stake gate keys on the creator's ETH
-                # address (the §14 canonical creator identity), not the node_id.
-                # The reputation tier above is still keyed by creator_id; only
-                # the stake check uses the eth address. A record with no eth
-                # address can't have bonded stake → apply_stake_gate demotes
-                # HIGH→MEDIUM (safe default).
-                tier = apply_stake_gate(
-                    raw_tier, r.creator_eth_address, stake_client,
-                )
+            # sp995 (fix C) — reputation is RECORDED under the creator ETH address
+            # (auto-record keys on creator_eth_address), and the stake gate keys on
+            # it too, so the tier must be READ under the same identity. Reading
+            # under r.creator_id (the node_id) returned TIER_NEW for every creator
+            # whose reputation was earned via the retrieve flow → legit HIGH
+            # creators were wrongly surfaced as `new` and dropped by min_tier/
+            # exclude_new. Fall back to creator_id only for legacy/no-eth records.
+            tier_key = r.creator_eth_address or r.creator_id
+            if tracker is not None and tier_key:
+                if tier_key in _tier_memo:
+                    tier = _tier_memo[tier_key]
+                else:
+                    try:
+                        raw_tier = tracker.tier_for(tier_key)
+                    except Exception:  # noqa: BLE001
+                        raw_tier = TIER_NEW
+                    # The stake gate keys on the creator ETH address; a record
+                    # with no eth address can't have bonded stake → demote
+                    # HIGH→MEDIUM (safe default).
+                    tier = apply_stake_gate(
+                        raw_tier, r.creator_eth_address, stake_client,
+                    )
+                    _tier_memo[tier_key] = tier
             else:
                 tier = TIER_NEW
             if exclude_new and tier == TIER_NEW:

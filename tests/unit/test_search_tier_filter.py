@@ -90,6 +90,11 @@ class _FakeIndex:
             r.size_bytes = 1024
             r.content_hash = "sha256-deadbeef"
             r.creator_id = creator
+            # sp995 (decision A) — the search tier-read keys on the creator ETH
+            # address (the identity reputation is accumulated + stake-gated
+            # under), so the record must carry it. This test seeds reputation
+            # under `creator`, so the record's eth-address identity is `creator`.
+            r.creator_eth_address = creator
             r.providers = []
             r.created_at = 0
             r.metadata = {}
@@ -151,6 +156,48 @@ def test_results_carry_tier_when_tracker_unwired():
     )
     body = resp.json()
     assert body["results"][0]["creator_tier"] == TIER_NEW
+
+
+def test_search_tier_reads_eth_address_not_node_id():
+    """sp995 (fix C) regression — reputation is RECORDED and stake-gated under the
+    creator ETH address, so the search tier-read must use it, NOT the node_id
+    (creator_id). A record whose creator_id (node_id) differs from its
+    creator_eth_address must still surface the HIGH tier earned under the eth
+    address. Under the old `tracker.tier_for(r.creator_id)` read this returned
+    TIER_NEW → the creator was wrongly excluded by min_tier=high."""
+    eth = "0x" + "a" * 40
+    t = CreatorReputationTracker()
+    _seed_tier(t, eth, TIER_HIGH)  # reputation earned under the ETH address
+
+    node = MagicMock()
+    node.identity.node_id = "test-node"
+    node.ftns_ledger = None
+    node._creator_reputation_tracker = t
+    node._creator_stake_client = None  # uncommissioned → gate passes through
+    rec = MagicMock()
+    rec.cid = "cid_h"
+    rec.filename = "f.bin"
+    rec.size_bytes = 1
+    rec.content_hash = "sha"
+    rec.creator_id = "node-id-distinct-from-eth"  # node_id != eth address
+    rec.creator_eth_address = eth
+    rec.providers = []
+    rec.created_at = 0
+    rec.metadata = {}
+    rec.royalty_rate = 0.1
+    rec.parent_cids = []
+    idx = MagicMock()
+    idx.search = lambda q, limit=20: [rec]
+    node.content_index = idx
+    client = TestClient(
+        create_api_app(node, enable_security=False),
+        raise_server_exceptions=False,
+    )
+
+    resp = client.get("/content/search?q=foo&min_tier=high")
+    body = resp.json()
+    assert [r["cid"] for r in body["results"]] == ["cid_h"]
+    assert body["results"][0]["creator_tier"] == TIER_HIGH
 
 
 # ── min_tier filter ──────────────────────────────────────

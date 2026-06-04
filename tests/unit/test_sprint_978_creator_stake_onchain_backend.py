@@ -70,6 +70,101 @@ def test_backend_stake_and_slash_reject_as_server_actions():
         b.slash(ADDR, 100, "spam")
 
 
+# ── sp995 (fix D): blip-tolerant caching / retry / last-known-good ──────────
+
+
+def _toggle_backend(seq, clock):
+    """Backend whose creatorStakeOf().call() yields outcomes from `seq` (an int
+    returns it; the sentinel RAISE raises) and counts calls. `clock` is injected."""
+    state = {"i": 0, "calls": 0}
+
+    class _Call:
+        def call(self):
+            state["calls"] += 1
+            v = seq[min(state["i"], len(seq) - 1)]
+            state["i"] += 1
+            if v == "RAISE":
+                raise RuntimeError("rpc down")
+            return v
+
+    class _Fns:
+        def creatorStakeOf(self, addr):
+            return _Call()
+
+    class _Contract:
+        functions = _Fns()
+
+    b = CreatorStakeRegistryBackend(
+        ADDR, "https://rpc.example",
+        web3_factory=lambda: _Contract(), clock=lambda: clock["t"],
+    )
+    return b, state
+
+
+def test_balance_of_caches_within_ttl(monkeypatch):
+    monkeypatch.setenv("PRSM_CREATOR_STAKE_CACHE_TTL_S", "60")
+    monkeypatch.setenv("PRSM_CREATOR_STAKE_READ_ATTEMPTS", "3")
+    clock = {"t": 1000.0}
+    b, state = _toggle_backend([5 * 10**18], clock)
+    assert b.balance_of(ADDR) == 5 * 10**18
+    assert b.balance_of(ADDR) == 5 * 10**18  # within TTL → served from cache
+    assert state["calls"] == 1  # only ONE chain call (per-request/cross-request dedup)
+
+
+def test_balance_of_serves_last_known_good_on_blip(monkeypatch):
+    """A transient RPC failure AFTER a good read serves the last-known-good
+    value (within stale-grace), NOT a false 0 that would demote a staked creator."""
+    monkeypatch.setenv("PRSM_CREATOR_STAKE_CACHE_TTL_S", "60")
+    monkeypatch.setenv("PRSM_CREATOR_STAKE_STALE_GRACE_S", "600")
+    monkeypatch.setenv("PRSM_CREATOR_STAKE_READ_ATTEMPTS", "2")
+    clock = {"t": 1000.0}
+    b, state = _toggle_backend([5 * 10**18, "RAISE", "RAISE"], clock)
+    assert b.balance_of(ADDR) == 5 * 10**18  # first read: cached
+    clock["t"] = 1100.0  # past TTL (60s) but within stale-grace (600s)
+    # read now fails (RAISE x2 = exhausts 2 attempts) → last-known-good, NOT 0
+    assert b.balance_of(ADDR) == 5 * 10**18
+
+
+def test_balance_of_fail_closed_when_no_cache(monkeypatch):
+    monkeypatch.setenv("PRSM_CREATOR_STAKE_READ_ATTEMPTS", "2")
+    clock = {"t": 1000.0}
+    b, _ = _toggle_backend(["RAISE"], clock)
+    assert b.balance_of(ADDR) == 0  # no prior good read → fail-closed to 0
+
+
+def test_balance_of_fail_closed_after_stale_grace(monkeypatch):
+    """A SUSTAINED outage (cache older than stale-grace) fail-closes to 0 —
+    preserving the documented fail-closed contract."""
+    monkeypatch.setenv("PRSM_CREATOR_STAKE_CACHE_TTL_S", "60")
+    monkeypatch.setenv("PRSM_CREATOR_STAKE_STALE_GRACE_S", "600")
+    monkeypatch.setenv("PRSM_CREATOR_STAKE_READ_ATTEMPTS", "1")
+    clock = {"t": 1000.0}
+    b, _ = _toggle_backend([5 * 10**18, "RAISE"], clock)
+    assert b.balance_of(ADDR) == 5 * 10**18
+    clock["t"] = 2000.0  # 1000s later → beyond the 600s stale-grace
+    assert b.balance_of(ADDR) == 0  # sustained outage → fail-closed
+
+
+def test_balance_of_retries_transient_then_succeeds(monkeypatch):
+    """A single dropped request self-heals via retry (no false 0 on a cold cache)."""
+    monkeypatch.setenv("PRSM_CREATOR_STAKE_READ_ATTEMPTS", "3")
+    clock = {"t": 1000.0}
+    b, state = _toggle_backend(["RAISE", "RAISE", 7 * 10**18], clock)
+    assert b.balance_of(ADDR) == 7 * 10**18
+    assert state["calls"] == 3  # retried through the two transient failures
+
+
+def test_balance_of_genuine_zero_is_cached_not_treated_as_failure(monkeypatch):
+    """An on-chain 0 (creator never bonded) is a real value, cached + returned —
+    NOT confused with a read failure."""
+    monkeypatch.setenv("PRSM_CREATOR_STAKE_CACHE_TTL_S", "60")
+    clock = {"t": 1000.0}
+    b, state = _toggle_backend([0, 0], clock)
+    assert b.balance_of(ADDR) == 0
+    assert b.balance_of(ADDR) == 0  # served from cache (genuine 0)
+    assert state["calls"] == 1
+
+
 # ── client: no in-memory fallback when a real backend is wired ──────────────
 
 
