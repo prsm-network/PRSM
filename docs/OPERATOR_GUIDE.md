@@ -488,6 +488,66 @@ Behavior:
 
 This middleware applies to ALL endpoints (the security-hardening middleware shipped earlier sits behind it); CORS rejection happens before any other middleware runs.
 
+### Security hardening configuration (ships 2026-06-04)
+
+A network-/data-plane security sweep (sprints 1002–1014) added the knobs below. The
+**fail-closed public-bind posture is the one most likely to affect an upgrade** — read it first.
+
+**⚠️ Public-bind authentication (sp1011 — may refuse to start).** The protected money +
+KYC endpoints are authenticated only when `PRSM_NODE_API_KEY` is set. As of sp1011, a node
+bound to a **non-loopback** interface (e.g. `--host 0.0.0.0`) **with no API key REFUSES to
+start** — previously it only warned. The CLI default bind is `127.0.0.1` (loopback), which
+is unaffected. If your node stops booting after upgrade with an "insecure public-bind/no-auth
+posture" error, do ONE of:
+
+```bash
+# Recommended — authenticate the money/KYC endpoints
+export PRSM_NODE_API_KEY="$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
+# OR bind loopback behind an authenticating reverse proxy:  --host 127.0.0.1
+# OR (NOT recommended — only if fronted by a firewall/security group) run unauthenticated:
+export PRSM_ALLOW_INSECURE_PUBLIC_BIND=1
+```
+
+**Content-retrieval + gossip data-plane bounds** (all have safe defaults; tune only if needed):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PRSM_MAX_GATEWAY_FETCH_BYTES` | `2147483648` (2 GiB) | Hard ceiling on a single peer-supplied GATEWAY HTTP fetch (sp1002 — caps OOM/over-large bodies; the per-fetch bound is the advertised size). |
+| `PRSM_MAX_KNOWN_PEERS` | `2048` | Cap on the peer routing table (sp1005/1009 — bounds memory + eclipse magnitude). |
+| `PRSM_MAX_PROVIDERS_PER_CID` | `64` | Cap on providers tracked per content id (sp1007 — bounds advertise-flood/eclipse). A real CID has a handful of replicas. |
+| `PRSM_GOSSIP_DEDUP_WINDOW_SEC` | `86400` (24 h) | Gossip-layer replay-barrier window (sp1008 — drops a signed frame replayed past the transport's ~300 s nonce window). |
+| `PRSM_GOSSIP_DEDUP_MAX` | `100000` | LRU cap on the gossip replay-barrier set. |
+
+**Bootstrap TLS (sp1006).** The bootstrap WSS client now **verifies the server certificate by
+default** (the live `bootstrap-*.prsm-network.com` fleet uses valid public certs, so no action
+is needed). For a **self-signed dev bootstrap**, pin its CA or disable verification explicitly:
+
+```bash
+export PRSM_BOOTSTRAP_TLS_CA_FILE=/path/to/bootstrap-ca.pem   # pin a custom CA (still verifies)
+export PRSM_BOOTSTRAP_TLS_INSECURE=1                          # disable verification (dev only; MITM-able)
+```
+
+**libp2p transport guard (sp1010).** The default WebSocket transport carries full
+origin-authentication. The alternative libp2p transport does **not** yet, so selecting
+`PRSM_TRANSPORT_BACKEND=libp2p` logs a CRITICAL warning; set
+`PRSM_FORBID_UNAUTHENTICATED_LIBP2P=1` to make the node refuse to start on that backend until
+the auth is ported. Production should use `PRSM_TRANSPORT_BACKEND=websocket`.
+
+**Wallet session tokens (sp1013/1014 — opt-in).** `/siwe/verify` now returns a wallet-bound
+`session_token`. To require it on the wallet-owner read endpoints
+(`/api/v1/auth/wallet/{binding,bindings,devices/earnings,balance}`) so a caller can only read
+the wallet it proved control of:
+
+```bash
+export PRSM_WALLET_SESSION_REQUIRED=1
+export PRSM_WALLET_SESSION_SECRET="0x$(python3 -c 'import secrets;print(secrets.token_hex(32))')"  # stable 32-byte hex; random per-process if unset
+```
+
+Enforcement defaults **off** so existing clients keep working until they send the token
+(default-on is a coordinated frontend/CLI follow-on). Do **not** set the secret to an empty
+`0x` placeholder — a configured-but-empty value is treated as unset (random fallback) rather
+than collapsing to a guessable constant (sp1014).
+
 ### `GET /audit/recent` — operator audit log (ships 2026-05-09)
 
 In-memory ring buffer of state-changing API requests (non-GET). Each entry: `{timestamp, method, path, requester, status_code, request_id}`. Default 1024-entry capacity (older entries auto-evicted). Returns most-recent-first; pagination via `?limit=50&offset=0`.
