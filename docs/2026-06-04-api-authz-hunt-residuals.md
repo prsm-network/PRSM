@@ -51,9 +51,19 @@ binding/earnings metadata leaks).
 the read path — a SIWE-session token or a fresh EIP-191 signature — mirroring the
 existing onboarding signature model (the mutations `/siwe/*`, `/bind` are already
 EIP-191/4361-gated). A caller could then read only bindings/earnings for a wallet
-it controls. This is a per-endpoint auth-model addition (a SIWE-session
-dependency), best done as a focused follow-on rather than mis-gated behind the
-operator key.
+it controls.
+
+✅ **PRIMITIVE SHIPPED (sp1013):** `prsm/interface/onboarding/session_token.py`
+mints a stateless, HMAC-signed, wallet-bound, TTL'd session token on a successful
+`/siwe/verify` (additive — new `session_token` response field). The four
+wallet-owner reads now route through `_enforce_wallet_session`, which (when
+`PRSM_WALLET_SESSION_REQUIRED` is enabled) requires a token bound to the SAME
+wallet being read — no token → 401, wrong wallet → 403, forged/expired → 401.
+**Enforcement defaults OFF** so the mint is additive and existing clients keep
+working; flipping it default-on is a **coordinated follow-on** once the frontend
++ CLI send the token on the read path. Until then, operators who want the closure
+set `PRSM_WALLET_SESSION_REQUIRED=1` (+ optionally a stable
+`PRSM_WALLET_SESSION_SECRET`).
 
 ## ★ RESIDUAL B — per-resource authorization (IDOR) on keyed endpoints (findings 6, 7, 9 IDOR aspect)
 
