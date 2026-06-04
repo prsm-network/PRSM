@@ -59,15 +59,25 @@ def _wallet_session_config_from_env() -> tuple:
     adopt the token (default-on is a coordinated follow-on with the frontend).
     """
     raw = (os.environ.get("PRSM_WALLET_SESSION_SECRET") or "").strip()
+    secret = b""
     if raw:
         try:
             secret = bytes.fromhex(raw[2:] if raw.lower().startswith("0x") else raw)
         except ValueError:
             secret = raw.encode("utf-8")
-        if len(secret) < 16:
-            secret = hashlib.sha256(secret).digest()
-    else:
+    # sp1014 — a DEGENERATE configured value ("0x", "0X", "  0x  ", "") parses to
+    # b"" which, SHA-256-stretched, becomes the WORLD-KNOWN constant sha256(b"")
+    # — a universally-forgeable signing key. Treat an empty parse exactly like
+    # the unset case: take the safe per-process random fallback. Only a genuinely
+    # short-but-NONEMPTY operator secret is stretched (with a loud warning).
+    if not secret:
         secret = secrets.token_bytes(32)
+    elif len(secret) < 16:
+        logger.warning(
+            "PRSM_WALLET_SESSION_SECRET is short (<16 bytes); SHA-256-stretching, "
+            "but configure a 32-byte random hex secret in production"
+        )
+        secret = hashlib.sha256(secret).digest()
     required = (os.environ.get("PRSM_WALLET_SESSION_REQUIRED") or "").strip().lower() in (
         "1", "true", "yes", "on",
     )

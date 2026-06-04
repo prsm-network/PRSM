@@ -140,8 +140,12 @@ def verify_session_token(
     if not isinstance(wallet, str) or not wallet:
         raise SessionTokenMalformed("missing wallet binding")
     try:
+        # OverflowError (e.g. exp=inf) is an ArithmeticError, NOT a
+        # TypeError/ValueError — sp1014: catch it too so a degenerate exp
+        # surfaces as the documented Malformed error (clean 401), never an
+        # uncaught 500 escaping the handler.
         exp_i = int(exp)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise SessionTokenMalformed("missing/invalid exp") from exc
 
     now_i = int(now if now is not None else time.time())

@@ -259,6 +259,29 @@ def get_services() -> WalletApiServices:
     return _services
 
 
+def _normalized_wallet_or_400(wallet_address: str) -> str:
+    """sp1014 — normalize + validate the wallet_address query param ONCE at the
+    endpoint boundary. Strips surrounding whitespace and checksums; a non-address
+    (or whitespace-corrupted) value returns a clean 400 instead of letting
+    ``to_checksum_address`` raise an uncaught 500 deeper in the store (an
+    unauthenticated DoS on the default-off path + a legit-owner false-reject).
+    """
+    from eth_utils import to_checksum_address
+
+    try:
+        return to_checksum_address((wallet_address or "").strip())
+    except Exception as exc:  # noqa: BLE001 — any parse failure is a client error
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "invalid_wallet_address",
+                "message": (
+                    "wallet_address must be a 0x-prefixed 40-hex EVM address"
+                ),
+            },
+        ) from exc
+
+
 def _extract_session_token(request: Request) -> Optional[str]:
     """Pull the wallet session token from 'X-Wallet-Session' or an
     'Authorization: Bearer <token>' header. Returns None if absent."""
@@ -615,6 +638,7 @@ def get_binding(
     should use ``/bindings`` (sprint 790) which returns the full
     list.
     """
+    wallet_address = _normalized_wallet_or_400(wallet_address)
     _enforce_wallet_session(request, wallet_address, services)
     binding = services.binding_service.get_by_wallet(wallet_address)
     if binding is None:
@@ -641,6 +665,7 @@ def get_bindings(
     Consumed by `prsm wallet devices list` so operators can audit
     their device roster from the command line.
     """
+    wallet_address = _normalized_wallet_or_400(wallet_address)
     _enforce_wallet_session(request, wallet_address, services)
     bindings = services.binding_service.get_all_by_wallet(
         wallet_address,
@@ -684,6 +709,7 @@ def get_devices_earnings(
         aggregate_earnings_by_node_id,
     )
 
+    wallet_address = _normalized_wallet_or_400(wallet_address)
     _enforce_wallet_session(request, wallet_address, services)
     bindings = services.binding_service.get_all_by_wallet(
         wallet_address,
@@ -725,6 +751,7 @@ def get_balance(
     source. Returns 404 if the wallet is not bound — frontends should
     drive the user through /siwe/verify + /bind first.
     """
+    wallet_address = _normalized_wallet_or_400(wallet_address)
     _enforce_wallet_session(request, wallet_address, services)
     if mode not in ("usd", "ftns"):
         raise HTTPException(
