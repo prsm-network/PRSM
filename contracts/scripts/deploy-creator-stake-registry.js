@@ -41,6 +41,7 @@
  * base/mainnet guards below without a ratified resolution.
  */
 const hre = require("hardhat");
+const { assertSignerMatchesOwner } = require("./deploy-guards");
 
 const DAY = 24 * 60 * 60;
 
@@ -86,6 +87,18 @@ async function main() {
   if (balance === 0n && network !== "hardhat") {
     throw new Error("Deployer has zero balance");
   }
+
+  // sp990 (readiness-audit ceremony-breaker fix): on a LIVE network the actual
+  // signer MUST equal the intended owner — else the WRONG KEY is about to sign an
+  // irreversible mainnet deploy (e.g. a stale MAINNET_PRIVATE_KEY in contracts/.env
+  // winning over an inline PRIVATE_KEY, since base signs via
+  // MAINNET_PRIVATE_KEY || PRIVATE_KEY). Fail LOUD before the deploy. Tested in
+  // test/deploy-guards.test.js. ALLOW_OWNER_DEPLOYER_MISMATCH=1 opts out.
+  assertSignerMatchesOwner({
+    network,
+    deployerAddress: deployer.address,
+    owner,
+  });
 
   console.log(`\n[1/1] Deploying CreatorStakeRegistry…`);
   const Reg = await hre.ethers.getContractFactory("CreatorStakeRegistry");
@@ -144,11 +157,16 @@ async function main() {
     }
   }
 
+  const cfgName = network === "base" ? "MAINNET" : network;
   console.log(`\n=== DEPLOY COMPLETE ===`);
   console.log(`CreatorStakeRegistry @ ${addr} on ${network} (chain ${chainId})`);
-  console.log(`Next: copy into prsm/deployments/contract_addresses.json under`);
-  console.log(`  ${network}.creator_stake_registry, set CREATOR_STAKE_REGISTRY_ADDRESS.`);
-  console.log(`For mainnet: transferOwnership(FoundationSafe) → Safe acceptOwnership.`);
+  console.log(`For mainnet: FIRST transferOwnership(FoundationSafe) → 2-of-3 Safe acceptOwnership.`);
+  console.log(`Activation (the RUNTIME source of truth — sp981/sp990):`);
+  console.log(`  Record this address in prsm/config/networks.py under the ${cfgName}`);
+  console.log(`  config's creator_stake_registry field; CreatorStakeClient.from_env`);
+  console.log(`  reads it via resolve_endpoints (no separate env var needed).`);
+  console.log(`  NOTE: prsm/deployments/contract_addresses.json is informational ONLY —`);
+  console.log(`  no runtime code reads it for the creator-stake gate.`);
 }
 
 main().catch((e) => {

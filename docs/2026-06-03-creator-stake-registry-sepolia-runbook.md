@@ -50,9 +50,11 @@ funds). The audit-first gate is the reason these never reached mainnet.
 
 ## 2. Prerequisites for the Sepolia rehearsal
 
-- Sepolia (or Base Sepolia) ETH in the deployer EOA.
-- `SEPOLIA_RPC_URL` (or the network your hardhat config names), `PRIVATE_KEY`,
-  and — for explorer verification — `ETHERSCAN_API_KEY`.
+- **Base Sepolia** ETH in the deployer EOA (recommended — it's the same OP-stack L2
+  as Base mainnet, so the closest bytecode/opcode/gas analog. Ethereum Sepolia also
+  works since the Solidity is identical; just swap the network + RPC var below).
+- `BASE_SEPOLIA_RPC_URL` (defaults to `https://sepolia.base.org` if unset),
+  `PRIVATE_KEY`, and — for explorer verification — `ETHERSCAN_API_KEY`.
 - **Nothing else.** The rehearsal driver is self-contained: it deploys a
   `MockERC20` (testnet FTNS stand-in) + a fresh 1-day-delay registry (deployer =
   owner = slasher) and mints/approves itself. To rehearse against an
@@ -66,24 +68,24 @@ lifecycle and **asserts every economic invariant with an explicit PASS/FAIL line
 aborting with "do NOT proceed to the mainnet ceremony" on any failure. It proves the
 **deployed bytecode** behaves as the audited source claims, against a real RPC.
 
+Each command below is a SINGLE line (copy-paste whole). Fill in the `<...>`.
+
+3.1 — Local dry-run (one shot, full lifecycle incl. post-delay withdraw via time-travel). Expect `REHEARSAL RESULT: 14 passed, 0 failed`:
 ```
-# 3.1 Local dry-run (one shot, full lifecycle incl. post-delay withdraw via time-travel):
 npx hardhat run scripts/rehearse-creator-stake-registry.js --network hardhat
-#   → expect: "REHEARSAL RESULT: 14 passed, 0 failed"
-
-# 3.2 Live testnet, PHASE 1 (bond / slash / drain / unbond + all reverts):
-PRIVATE_KEY=0x... SEPOLIA_RPC_URL=https://... \
-  npx hardhat run scripts/rehearse-creator-stake-registry.js --network sepolia
-#   → prints the registry + token addresses and the PHASE-2 command + eligible-at unix.
-
-# 3.3 Live testnet, PHASE 2 (after the unbond delay elapses — ~24h with the 1-day min):
-PRIVATE_KEY=0x... SEPOLIA_RPC_URL=https://... \
-REGISTRY_ADDRESS=0x<from phase 1> FTNS_TOKEN_ADDRESS=0x<from phase 1> \
-REHEARSAL_PHASE=withdraw \
-  npx hardhat run scripts/rehearse-creator-stake-registry.js --network sepolia
-#   → expect: withdraw returns the remaining bonded FTNS + status flips to WITHDRAWN.
 ```
 
+3.2 — Live testnet, PHASE 1 (bond / slash / drain / unbond + all reverts). Prints the registry + token addresses and the exact PHASE-2 command + the eligible-at unix:
+```
+PRIVATE_KEY=0x<deployer> BASE_SEPOLIA_RPC_URL=https://sepolia.base.org npx hardhat run scripts/rehearse-creator-stake-registry.js --network base-sepolia
+```
+
+3.3 — Live testnet, PHASE 2 (after the unbond delay elapses — ~24h with the 1-day min). Expect `withdraw returns the remaining bonded FTNS` + status flips to WITHDRAWN:
+```
+PRIVATE_KEY=0x<deployer> BASE_SEPOLIA_RPC_URL=https://sepolia.base.org REGISTRY_ADDRESS=0x<from phase 1> FTNS_TOKEN_ADDRESS=0x<from phase 1> REHEARSAL_PHASE=withdraw npx hardhat run scripts/rehearse-creator-stake-registry.js --network base-sepolia
+```
+
+(On Ethereum Sepolia instead: use `SEPOLIA_RPC_URL=...` and `--network sepolia`.)
 A live chain cannot fast-forward time, so the time-gated `withdraw` is the only step
 split into a second phase. Record the testnet registry address + the phase-1/phase-2
 tx hashes — this is the "live exercise" evidence the mainnet resolution (§8) cites,
@@ -149,40 +151,67 @@ constructor parameters (owner, FTNS, slasher, unbond delay).
 
 **Step 3 — unblock the deploy script in a ratified PR.** The deploy + rehearsal
 scripts hard-block `base`/`mainnet` by design. In a PR that cites the GATE-2
-resolution id, remove the `base` guard in
-`contracts/scripts/deploy-creator-stake-registry.js`. This PR is the auditable
-record that the block was lifted deliberately.
+resolution id, make this EXACT one-clause edit in
+`contracts/scripts/deploy-creator-stake-registry.js` (the `if (network === "mainnet" || network === "base")` block, ~line 55):
+
+> change `if (network === "mainnet" || network === "base") {`
+> to&nbsp;&nbsp;&nbsp;`if (network === "mainnet") {`
+
+i.e. delete ONLY the ` || network === "base"` substring. Leave the throw body and
+the Ethereum-`mainnet` clause intact (Ethereum mainnet is never a target). Do NOT
+edit `rehearse-creator-stake-registry.js` — the rehearsal must stay blocked on base.
+This PR is the auditable record that the block was lifted deliberately.
 - **GATE 3:** PR merged; the deploy params exactly match the ratified resolution
   (`CREATOR_STAKE_OWNER`, `FTNS_TOKEN_ADDRESS` = canonical Base FTNS
   `0x5276a3756C85f2E9e46f6D34386167a209aa16e5`, `CREATOR_STAKE_SLASHER` = the
   governance/Foundation slash authority, `CREATOR_STAKE_UNBOND_DELAY`).
 
 **Step 4 — deploy to Base mainnet. [OPERATOR SIGNS]**
-```
-PRIVATE_KEY=0x<deployer> BASE_RPC_URL=https://mainnet.base.org \
-CREATOR_STAKE_OWNER=0x<deployer-for-now> \
-FTNS_TOKEN_ADDRESS=0x5276a3756C85f2E9e46f6D34386167a209aa16e5 \
-CREATOR_STAKE_SLASHER=0x<slash-authority per resolution> \
-CREATOR_STAKE_UNBOND_DELAY=<seconds per resolution> \
-AUTO_VERIFY=1 ETHERSCAN_API_KEY=... \
-  npx hardhat run scripts/deploy-creator-stake-registry.js --network base
-```
-The script runs post-deploy invariant checks (owner / ftns / slasher / delay /
-fresh `creatorStakeOf == 0`) and verifies on Basescan. Deploy as the deployer EOA
-first (owner = deployer); ownership transfers to the Safe in steps 5–6.
-- **GATE 4:** contract verified on Basescan; post-deploy invariants printed OK.
 
-**Step 5 — transfer ownership to the Foundation Safe. [OPERATOR SIGNS]** Call
-`transferOwnership(<Foundation Safe 0x91b0e6F85A371D82De94eD13A3812d9f5A4E5791>)`
-from the deployer. (Ownable2Step: this only *nominates*; the Safe must accept.)
+⚠ **SIGNING KEY — read first.** The `base` hardhat network signs via
+`MAINNET_PRIVATE_KEY || PRIVATE_KEY` (hardhat.config.js). `contracts/.env` may carry
+a stale `MAINNET_PRIVATE_KEY` that would silently WIN over an inline `PRIVATE_KEY` —
+deploying this money-custody contract from the wrong EOA. So set
+**`MAINNET_PRIVATE_KEY`** (the var `base` actually reads) to your deployer key, and
+make sure `CREATOR_STAKE_OWNER` equals that same EOA. (sp990 added a guard that
+ABORTS the deploy if the resolved signer ≠ `CREATOR_STAKE_OWNER`, so a mismatch
+fails loud before any tx — but set the right key anyway.)
+
+Single-line command (fill in the `<...>`; `MAINNET_PRIVATE_KEY` and
+`CREATOR_STAKE_OWNER` are the SAME deployer EOA):
+
+```
+MAINNET_PRIVATE_KEY=0x<deployer> CREATOR_STAKE_OWNER=0x<deployer> BASE_RPC_URL=https://mainnet.base.org FTNS_TOKEN_ADDRESS=0x5276a3756C85f2E9e46f6D34386167a209aa16e5 CREATOR_STAKE_SLASHER=0x<slash-authority per resolution> CREATOR_STAKE_UNBOND_DELAY=<seconds per resolution> AUTO_VERIFY=1 ETHERSCAN_API_KEY=<key> npx hardhat run scripts/deploy-creator-stake-registry.js --network base
+```
+
+The script prints `Deployer: 0x...`, runs post-deploy invariant checks (owner /
+ftns / slasher / delay / fresh `creatorStakeOf == 0`), and verifies on Basescan.
+Deploy as the deployer EOA first (owner = deployer); ownership transfers to the
+Safe in steps 5–6.
+- **GATE 4:** BEFORE relying on it, confirm on Basescan that the deploy tx `from`
+  address == the printed `Deployer:` == `CREATOR_STAKE_OWNER` == `owner()` on the
+  deployed contract (the post-deploy invariant checks do NOT catch a wrong signer).
+  Then: contract verified on Basescan; post-deploy invariants printed OK.
+
+**Step 5 — transfer ownership to the Foundation Safe. [OPERATOR SIGNS]** From the
+deployer EOA, call `transferOwnership(<Foundation Safe>)`. Ownable2Step: this only
+*nominates* (sets `pendingOwner`); authority does NOT move until the Safe accepts,
+so a fat-finger here is recoverable (re-call `transferOwnership`, or the wrong
+nominee would have to actively accept). Two ways:
+- Basescan (simplest): on the verified contract's **Write Contract** tab, connect
+  the deployer wallet → `transferOwnership` → `newOwner` = `0x91b0e6F85A371D82De94eD13A3812d9f5A4E5791`. (selector `0xf2fde38b`)
+- Or cast: `cast send <registry> "transferOwnership(address)" 0x91b0e6F85A371D82De94eD13A3812d9f5A4E5791 --rpc-url https://mainnet.base.org --private-key 0x<deployer>`
 
 **Step 6 — Foundation Safe accepts ownership (2-of-3 multisig). [OPERATOR SIGNS]**
-The Safe calls `acceptOwnership()` via the 2-of-3 hardware multisig
-(Ledger + Trezor + OneKey), exactly as the audit-bundle + publisher-key-anchor
-ceremonies did.
-- **GATE 5:** `owner()` on-chain == the Foundation Safe; the deployer EOA retains
-  zero authority. This is the irreversibility line — the contract is now
-  Foundation-governed.
+In the Safe UI **Transaction Builder**, queue one tx against the deployed registry
+and collect 2-of-3 signatures (Ledger + Trezor + OneKey), as the audit-bundle +
+publisher-key-anchor ceremonies did:
+- **To:** `<deployed registry address>`
+- **Method:** `acceptOwnership()` — **Data:** `0x79ba5097` — **Value:** `0`
+
+- **GATE 5:** `owner()` on-chain == the Foundation Safe (NOT `pendingOwner()` — that
+  is pre-acceptance state); the deployer EOA retains zero authority. This is the
+  irreversibility line — the contract is now Foundation-governed.
 
 **Step 7 — record the address + go live (autonomous, one-line edit).** Set
 `creator_stake_registry="0x<deployed>"` in the `MAINNET` config in
@@ -191,9 +220,15 @@ this runbook), with a comment citing the GATE-2 resolution id + deploy tx + bloc
 in the style of the existing `publisher_key_anchor` line. `CreatorStakeClient.from_env`
 then resolves it automatically and the gate goes live against the Base default RPC —
 no extra env var. (Optionally also pin via `CREATOR_STAKE_REGISTRY_ADDRESS` env.)
-- **GATE 6:** on a node, `CreatorStakeClient.from_env().is_commissioned()` is True
-  and `creatorStakeOf` reads the live contract; the §14 HIGH-tier gate now requires
-  a real on-chain bond.
+- **GATE 6:** `is_commissioned()` returning True is **necessary but NOT sufficient**
+  — it is True from address+RPC alone even if the on-chain read backend never built
+  (e.g. web3 missing), in which case the gate silently falls back to the in-memory
+  scaffold with no teeth. Confirm a real LIVE READ: on a node,
+  `GET /admin/formal-verification/check?contract=creator_stake_registry` must return
+  non-503 with **INV-CSR-3 (owner() == Foundation Safe) = PASS** (this executes
+  against live chain state via the wired checker). That proves both that the address
+  resolved AND that the backend reads the real contract — the §14 HIGH-tier gate now
+  requires a real on-chain bond.
 
 **Step 8 — set the Foundation reserve wallet (optional, [OPERATOR SIGNS]).** When
 slash proceeds need to be drainable, the Safe calls
@@ -224,16 +259,27 @@ do it before the first `drainFoundationReserve`.
 >    contract already governed by the Foundation Safe since 2026-05-07.
 >
 > **Resolution.** The council authorizes a single deployment of
-> `CreatorStakeRegistry` to Base mainnet (chainId 8453) with constructor parameters:
-> - `initialOwner` = the deployer EOA, to be transferred to the Foundation Safe
->   `0x91b0e6F85A371D82De94eD13A3812d9f5A4E5791` via Ownable2Step within the same
->   ceremony;
-> - `ftnsAddress` = the canonical Base FTNS `0x5276a3756C85f2E9e46f6D34386167a209aa16e5`;
-> - `initialSlasher` = `0x____` (the governance/Foundation slash authority — RECOMMEND
->   the Foundation Safe or a council-controlled slasher, never a single hot EOA);
-> - `initialUnbondDelay` = `____` seconds (1–30 days; RECOMMEND ≥ the spam-detection
->   SLA so a creator cannot unbond + withdraw before a warranted slash lands — see
->   the slasher-SLA note in `requestUnbond`).
+> `CreatorStakeRegistry` to Base mainnet (chainId 8453) with constructor parameters
+> (listed in the contract's positional order — `initialOwner, ftnsAddress,
+> initialUnbondDelay, initialSlasher` — so this is a 1:1 cross-check against the
+> Solidity signature at GATE 3):
+> 1. `initialOwner` = the deployer EOA, to be transferred to the Foundation Safe
+>    `0x91b0e6F85A371D82De94eD13A3812d9f5A4E5791` via Ownable2Step within the same
+>    ceremony;
+> 2. `ftnsAddress` = the canonical Base FTNS `0x5276a3756C85f2E9e46f6D34386167a209aa16e5`;
+> 3. `initialUnbondDelay` = `____` seconds (1–30 days; RECOMMEND ≥ the spam-detection
+>    SLA so a creator cannot unbond + withdraw before a warranted slash lands — see
+>    the slasher-SLA note in `requestUnbond`). **Correctable in place** post-deploy
+>    via `setUnbondDelay` (owner-only, same 1–30d bounds) — a wrong value here is a
+>    one-tx fix.
+> 4. `initialSlasher` = `0x____` (the governance/Foundation slash authority — RECOMMEND
+>    the Foundation Safe or a council-controlled slasher, never a single hot EOA).
+>    ⚠ **CONSTRUCTOR-IMMUTABLE — choose deliberately.** There is NO `setSlasher()`.
+>    Unlike `initialUnbondDelay` (re-settable above), a wrong `initialSlasher` can
+>    ONLY be corrected by REDEPLOYING the contract and migrating every staked
+>    creator's collateral. This parameter is fixed FOREVER at deploy and controls
+>    who can confiscate creator collateral — treat it with the same care as the
+>    ownership-accept (GATE 5). address(0) is rejected at construction.
 >
 > **Conditions.** (a) The deploy is performed only after this resolution is recorded;
 > (b) the `base` guard in the deploy script is removed in a PR citing this
