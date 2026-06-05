@@ -162,10 +162,20 @@ class BootstrapClient:
         # socket during typed request/response cycles. Buffered
         # here for tests + future async-peer-update consumers.
         self._observed_announcements: List[Dict[str, Any]] = []
+        # sp1023 — the server-observed "<ip>:<port>" reported in register_ack.
+        # Lets the node learn its externally-visible address without a manual
+        # PRSM_ADVERTISE_ADDRESS. None until registered (or if the server omits it).
+        self._observed_address: Optional[str] = None
 
     @property
     def is_connected(self) -> bool:
         return self._connected and self._ws is not None
+
+    @property
+    def observed_address(self) -> Optional[str]:
+        """The "<ip>:<port>" the bootstrap server observed for this node in
+        register_ack, or None if not yet registered / server omitted it."""
+        return self._observed_address
 
     @property
     def is_registered(self) -> bool:
@@ -250,6 +260,11 @@ class BootstrapClient:
             if data.get("type") == "register_ack":
                 self._registered = True
                 self._server_time = data.get("server_time")
+                # sp1023 — capture the server-observed address (tolerates pre-1023
+                # servers that omit the key → stays None).
+                observed = data.get("observed_address")
+                if isinstance(observed, str) and observed.strip():
+                    self._observed_address = observed.strip()
 
                 # Update heartbeat interval from server
                 server_hb = data.get("heartbeat_interval")

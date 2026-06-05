@@ -528,6 +528,11 @@ class BootstrapServer:
             "peers": peer_list[:self.config.peer_list_size],
             "heartbeat_interval": self.config.heartbeat_interval,
             "server_time": datetime.now(timezone.utc).isoformat(),
+            # sp1023 — tell the node how the world sees it: the server-observed
+            # source IP joined to its DECLARED listen port (a routable dial target,
+            # not the ephemeral WS source port). Lets a co-located / NAT'd node
+            # learn its advertise address without a manual PRSM_ADVERTISE_ADDRESS.
+            "observed_address": f"{client_ip}:{port}",
         }
         await websocket.send(json.dumps(response))
         
