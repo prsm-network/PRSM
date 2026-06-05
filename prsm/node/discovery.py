@@ -384,6 +384,11 @@ class PeerDiscovery:
         self.bootstrap_attempted_nodes: List[str] = []
         self.bootstrap_success_node: Optional[str] = None
         self.bootstrap_failed_nodes: List[str] = []
+        # sp1024 — the server-observed advertise address (from the sp1023
+        # register_ack). Used as the own-advertise FALLBACK when
+        # PRSM_ADVERTISE_ADDRESS is unset, so the F14 co-location rewrite + the
+        # gossip announce get a routable value with zero manual config.
+        self._observed_advertise: Optional[str] = None
         # Sprint 653 — separate tracking for the BootstrapClient WS
         # protocol probes (sprint 568+ fallback path). Pre-653 only
         # the P2P-handshake probe failures were tracked; bootstrap
@@ -507,6 +512,10 @@ class PeerDiscovery:
                 )
 
                 self._bootstrap_client = client
+                # sp1024 — capture how the server saw us as the own-advertise
+                # fallback (the env var still wins in _own_advertise()).
+                if getattr(client, "observed_address", None):
+                    self._observed_advertise = client.observed_address
                 self.bootstrap_success_node = address
                 # Sprint 653 — F26 fix: the address is reachable via
                 # the WS protocol even if it failed P2P-handshake.
@@ -787,6 +796,15 @@ class PeerDiscovery:
             "source_policy": str(self._bootstrap_telemetry.get("source_policy", "primary_only")),
         }
 
+    def _own_advertise(self) -> "str | None":
+        """The node's own externally-visible advertise value, the single source
+        for the gossip announce + the F14 co-location dial rewrite. Precedence:
+        PRSM_ADVERTISE_ADDRESS (sp566) → the bootstrap-server-observed address
+        (sp1023/sp1024) → None. May carry a ':port' suffix; the co-location
+        rewrite strips it, and the announce builder takes the host part only."""
+        from prsm.node.libp2p_discovery import _resolve_advertise_address
+        return _resolve_advertise_address() or self._observed_advertise
+
     async def announce_self(self) -> int:
         """Broadcast our presence to the network."""
         # Sprint 756 — operator-controlled active-window scheduling.
@@ -816,8 +834,7 @@ class PeerDiscovery:
         # (sprint-566 env var); otherwise omit so _handle_announce's
         # fallback to peer.address (the WS source-connection IP) kicks
         # in — which IS routable for any inbound connection.
-        from prsm.node.libp2p_discovery import _resolve_advertise_address
-        advertise = _resolve_advertise_address()
+        advertise = self._own_advertise()
         payload = {
             "subtype": DISCOVERY_ANNOUNCE,
             "display_name": getattr(self.transport.identity, "display_name", ""),
@@ -828,7 +845,9 @@ class PeerDiscovery:
             "peer_count": self.transport.peer_count,
         }
         if advertise:
-            payload["address"] = f"{advertise}:{self.transport.port}"
+            # Host-only + our local listen port — observed_address may already
+            # carry a ':port' suffix, so strip it to avoid "ip:port:port".
+            payload["address"] = f"{advertise.split(':', 1)[0]}:{self.transport.port}"
         # Sprint 680 — include hardware_profile only when locally
         # configured. Absent key preserves the pre-680 wire format
         # for peers that don't parse this field yet.
@@ -892,11 +911,8 @@ class PeerDiscovery:
             # Sprint 781 — F14 fix: rewrite to loopback when the
             # peer's announced host matches our own (co-located
             # daemons can't NAT-hairpin to their shared external IP).
-            from prsm.node.libp2p_discovery import (
-                _resolve_advertise_address,
-            )
             dial_addr = _rewrite_co_located_address(
-                addr, _resolve_advertise_address(),
+                addr, self._own_advertise(),
             )
             try:
                 peer = await self.transport.connect_to_peer(dial_addr)
@@ -936,10 +952,7 @@ class PeerDiscovery:
         # Sprint 781 — F14 fix: same loopback-rewrite as
         # _auto_dial_sweep so periodic maintain doesn't keep
         # failing on co-located peers.
-        from prsm.node.libp2p_discovery import (
-            _resolve_advertise_address,
-        )
-        own_advertise = _resolve_advertise_address()
+        own_advertise = self._own_advertise()
         for info in candidates[:needed]:
             dial_addr = _rewrite_co_located_address(
                 info.address, own_advertise,
