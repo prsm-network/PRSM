@@ -2636,6 +2636,44 @@ class PRSMNode:
                 "model_id='mock-model'. Real deployments must wire their "
                 "own InferenceExecutor."
             )
+        elif _exec_kind == "local":
+            # Sprint 1019 (Tier 2) — REAL single-node inference. Runs a real
+            # HuggingFace causal-LM (gpt2/distilgpt2) in-process via transformers
+            # model.generate, wired into a real ParallaxScheduledExecutor — no
+            # RPC, no swarm, no ~8-env-var PRSM_PARALLAX_* ceremony, no Base
+            # anchor. One opt-in env var. Optional overrides:
+            #   PRSM_LOCAL_INFERENCE_MODEL   (default distilgpt2)
+            #   PRSM_LOCAL_INFERENCE_MAX_TOKENS (default 32)
+            # Honest scope: the MODEL output is real, but trust is software-tier
+            # (TEEType.SOFTWARE, vendor_verified=false) — real hardware TEE is
+            # a separate (Tier 3) item. Not for confidential Tier B/C content.
+            from prsm.compute.inference.local_inference import (
+                DEFAULT_LOCAL_MODEL,
+                build_local_inference_executor,
+            )
+            _local_model = (
+                os.environ.get("PRSM_LOCAL_INFERENCE_MODEL", "").strip()
+                or DEFAULT_LOCAL_MODEL
+            )
+            _local_max_raw = os.environ.get(
+                "PRSM_LOCAL_INFERENCE_MAX_TOKENS", "",
+            ).strip()
+            try:
+                _local_max = int(_local_max_raw) if _local_max_raw else 32
+            except ValueError:
+                _local_max = 32
+            self.inference_executor = build_local_inference_executor(
+                self.identity, model_id=_local_model, max_tokens=_local_max,
+            )
+            logger.info(
+                "Inference executor: LOCAL real inference "
+                "(PRSM_INFERENCE_EXECUTOR=local, model=%s). Runs a real "
+                "HuggingFace model in-process, single-node — no GPU swarm / "
+                "no PRSM_PARALLAX_* ceremony. Trust is SOFTWARE-tier "
+                "(vendor_verified=false): real model output, but NOT "
+                "hardware-confidential — do not use for Tier B/C secrets.",
+                _local_model,
+            )
         elif _exec_kind == "parallax":
             # Sprint 558 — opt-in production wiring path for the
             # real ParallaxScheduledExecutor. The builder reads
