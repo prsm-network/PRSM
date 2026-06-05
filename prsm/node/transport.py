@@ -142,6 +142,22 @@ class P2PMessage:
         self.signature = identity.sign(self.to_bytes())
 
 
+def _peer_address_from_handshake(remote_address, payload) -> str:
+    """sp1025 — build a DIALABLE address for an inbound peer.
+
+    Host: ALWAYS the observed TCP source host (never a peer-asserted host —
+    NAT-safe). Port: the peer's DECLARED listen_port from its signed handshake when
+    a valid 1..65535 int, else the observed (ephemeral) source port. The fallback
+    keeps pre-sp1025 / mixed-version peers working (sp570 fallback discipline); the
+    declared-port path is what makes a later fresh OUTBOUND dial succeed (gap-b)."""
+    host, source_port = remote_address[0], remote_address[1]
+    lp = payload.get("listen_port") if isinstance(payload, dict) else None
+    # bool is an int subclass — exclude it explicitly.
+    if isinstance(lp, int) and not isinstance(lp, bool) and 0 < lp < 65536:
+        return f"{host}:{lp}"
+    return f"{host}:{source_port}"
+
+
 @dataclass
 class PeerConnection:
     """Wraps a WebSocket connection with peer metadata."""
@@ -520,7 +536,10 @@ class WebSocketTransport:
 
             peer = PeerConnection(
                 peer_id=peer_id,
-                address=f"{websocket.remote_address[0]}:{websocket.remote_address[1]}",
+                # sp1025 — observed source host + the peer's DECLARED listen port
+                # (gap-b): the raw remote_address port is the ephemeral source
+                # port, undialable for a later fresh outbound dial.
+                address=_peer_address_from_handshake(websocket.remote_address, msg.payload),
                 websocket=websocket,
                 public_key_b64=pub_key_b64,
                 display_name=msg.payload.get("display_name", ""),
@@ -650,6 +669,9 @@ class WebSocketTransport:
                     "public_key": self.identity.public_key_b64,
                     "display_name": self.identity.display_name if hasattr(self.identity, 'display_name') else "",
                     "roles": [],
+                    # sp1025 — advertise our LISTEN port so the listener stores a
+                    # dialable address for us (gap-b). Covered by hs.sign() below.
+                    "listen_port": self.port,
                 },
             )
             hs.sign(self.identity)
