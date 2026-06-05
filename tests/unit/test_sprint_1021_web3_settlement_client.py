@@ -129,8 +129,16 @@ class _FakeEth:
     def wait_for_transaction_receipt(self, tx_hash, timeout=120):
         return _FakeReceipt(status=self._receipt_status)
 
+    def get_transaction_receipt(self, tx_hash):
+        mode = _CFG.get("receipt_lookup", "landed")
+        if mode == "notfound":
+            raise Exception("TransactionNotFound")
+        if mode == "reverted":
+            return _FakeReceipt(status=0)
+        return _FakeReceipt(status=1)  # landed
 
-_CFG = {"send_ok": True, "receipt_status": 1, "contract": None}
+
+_CFG = {"send_ok": True, "receipt_status": 1, "contract": None, "receipt_lookup": "landed"}
 
 
 class _FakeWeb3:
@@ -150,9 +158,10 @@ class _FakeWeb3:
         return object()
 
 
-def _make_client(*, send_ok=True, receipt_status=1, with_key=True):
+def _make_client(*, send_ok=True, receipt_status=1, with_key=True, receipt_lookup="landed"):
     contract = _FakeContract()
-    _CFG.update(send_ok=send_ok, receipt_status=receipt_status, contract=contract)
+    _CFG.update(send_ok=send_ok, receipt_status=receipt_status, contract=contract,
+                receipt_lookup=receipt_lookup)
     with patch(
         "prsm.economy.web3.batch_settlement_contract_client.Web3", _FakeWeb3,
     ), patch(
@@ -285,6 +294,31 @@ async def test_finalize_batch_without_key_raises():
     client, _ = _make_client(with_key=False)
     with pytest.raises(RuntimeError, match="private_key"):
         await client.finalize_batch(b"\xaa" * 32)
+
+
+# ── get_committed_batch_for_tx (reconcile support, sp1022) ────────────────────
+
+@pytest.mark.asyncio
+async def test_get_committed_batch_for_tx_landed():
+    """A mined commit tx that emitted BatchCommitted → recover (batch_id, ts)."""
+    client, _ = _make_client(with_key=False, receipt_lookup="landed")
+    result = await client.get_committed_batch_for_tx("0xLANDED")
+    assert result == (_EXPECTED_BATCH_ID, _EXPECTED_COMMIT_TS)
+
+
+@pytest.mark.asyncio
+async def test_get_committed_batch_for_tx_not_found_returns_none():
+    """Unknown / not-yet-mined tx (get_transaction_receipt raises) → None
+    (the reconcile caller leaves it quarantined, never re-commits)."""
+    client, _ = _make_client(with_key=False, receipt_lookup="notfound")
+    assert await client.get_committed_batch_for_tx("0xUNKNOWN") is None
+
+
+@pytest.mark.asyncio
+async def test_get_committed_batch_for_tx_reverted_returns_none():
+    """A reverted commit tx (receipt status != 1) → None."""
+    client, _ = _make_client(with_key=False, receipt_lookup="reverted")
+    assert await client.get_committed_batch_for_tx("0xREVERTED") is None
 
 
 if __name__ == "__main__":

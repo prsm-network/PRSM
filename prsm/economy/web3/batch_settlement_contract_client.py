@@ -182,6 +182,29 @@ class Web3SettlementContractClient:
             lambda: int(self.contract.functions.batches(batch_id).call()[_BATCH_STATUS_FIELD_INDEX])
         )
 
+    async def get_committed_batch_for_tx(
+        self, tx_hash: str
+    ) -> Optional[Tuple[bytes, int]]:
+        return await asyncio.to_thread(self._get_committed_batch_for_tx_sync, tx_hash)
+
+    def _get_committed_batch_for_tx_sync(self, tx_hash: str) -> Optional[Tuple[bytes, int]]:
+        """Recover (batch_id, commit_timestamp) from a commitBatch tx by parsing the
+        BatchCommitted log in its receipt. Returns None when the tx is unknown / not
+        yet mined (get_transaction_receipt raises or returns None), reverted
+        (status != 1), or emitted no BatchCommitted — i.e. anything other than a
+        confirmed landed commit. The reconcile caller leaves those quarantined."""
+        try:
+            receipt = self.web3.eth.get_transaction_receipt(tx_hash)
+        except Exception:  # noqa: BLE001 - TransactionNotFound etc. → not landed
+            return None
+        if receipt is None or getattr(receipt, "status", 0) != 1:
+            return None
+        logs = self.contract.events.BatchCommitted().process_receipt(receipt)
+        if not logs:
+            return None
+        args = logs[0]["args"]
+        return bytes(args["batchId"]), int(args["commitTimestamp"])
+
     # ── Sync implementations ─────────────────────────────────────────────────
 
     def _commit_batch_sync(

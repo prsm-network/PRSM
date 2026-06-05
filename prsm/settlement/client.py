@@ -89,6 +89,19 @@ class SettlementContractClient(Protocol):
            0=NONEXISTENT, 1=PENDING, 2=FINALIZED, 3=VOIDED."""
         ...
 
+    async def get_committed_batch_for_tx(
+        self, tx_hash: str
+    ) -> Optional[Tuple[bytes, int]]:
+        """Recover (batch_id, commit_timestamp) from a commitBatch tx that was
+        broadcast but whose receipt was lost (the broadcast-but-unconfirmed
+        case). Returns the BatchCommitted (batch_id, commit_timestamp) iff that tx
+        mined and emitted the event, else None (still pending / dropped / reverted).
+
+        Used by ``reconcile_pending_commits`` to ADOPT a batch that actually
+        landed rather than re-committing the same receipts (which mints a distinct
+        on-chain batchId and double-settles)."""
+        ...
+
 
 @dataclass(frozen=True)
 class CommittedBatch:
@@ -118,6 +131,25 @@ class FinalizedBatch:
     tx_submitted: bool                      # False if already finalized etc.
 
 
+@dataclass(frozen=True)
+class PendingCommit:
+    """A commit whose tx was broadcast but whose receipt was lost (the
+    broadcast-but-unconfirmed case). The receipts have been REMOVED from the
+    accumulator (so they can never be re-committed → no double settlement) and are
+    retained here for ``reconcile_pending_commits``: if the original tx actually
+    landed it is adopted into the tracked set; otherwise it stays quarantined for
+    operator attention (never auto-re-committed)."""
+    accumulator_key: Tuple                  # the AccumulatorKey of the popped batch
+    tx_hash: str
+    merkle_root: bytes
+    leaf_hashes: Tuple[bytes, ...]
+    receipt_count: int
+    total_value_ftns: int
+    provider_address: str
+    requester_address: str
+    trigger_reason: TriggerReason
+
+
 class BatchSettlementClient:
     """Drives the Phase 3.1 commit → finalize lifecycle for one provider.
 
@@ -138,6 +170,10 @@ class BatchSettlementClient:
         self._provider = provider_address
         self._tracked: Dict[bytes, CommittedBatch] = {}
         self._finalized_ids: set = set()
+        # sp1022 — commits broadcast but unconfirmed, keyed by tx_hash. Quarantined
+        # (removed from the accumulator) so they can't be re-committed; resolved by
+        # reconcile_pending_commits.
+        self._pending_commits: Dict[str, PendingCommit] = {}
 
     # ── Accumulation ─────────────────────────────────────────────
 
@@ -183,11 +219,29 @@ class BatchSettlementClient:
             try:
                 record = await self._commit_one(ready)
             except Exception as exc:
-                logger.warning(
-                    f"batch commit failed for key {ready.key}: "
-                    f"{type(exc).__name__}: {exc} — receipts retained "
-                    f"in accumulator for retry"
-                )
+                tx_hash = getattr(exc, "tx_hash", None)
+                if tx_hash is not None:
+                    # Broadcast-but-unconfirmed (OnChainPendingError carries
+                    # tx_hash): the tx MAY still mine. Retrying would re-commit the
+                    # same receipts as a DISTINCT on-chain batchId (the registry
+                    # has no content dedup) → double settlement. Quarantine
+                    # instead: remove from the accumulator so it can NEVER be
+                    # re-committed, and record it for reconcile_pending_commits.
+                    self._quarantine_pending(ready, tx_hash)
+                    logger.error(
+                        f"batch commit for key {ready.key} broadcast but "
+                        f"UNCONFIRMED (tx {tx_hash}); quarantined to avoid "
+                        f"double settlement — will reconcile, not retry"
+                    )
+                else:
+                    # BroadcastFailedError (chain saw nothing) / OnChainRevertedError
+                    # (atomic rollback) — safe to retry; receipts stay in the
+                    # accumulator (popped only on success below).
+                    logger.warning(
+                        f"batch commit failed for key {ready.key}: "
+                        f"{type(exc).__name__}: {exc} — receipts retained "
+                        f"in accumulator for retry"
+                    )
                 continue
 
             # Pop only on success so failed commits naturally retry.
@@ -196,6 +250,33 @@ class BatchSettlementClient:
             committed.append(record)
 
         return committed
+
+    def _build_leaves_root(self, ready: ReadyBatch) -> Tuple[List[bytes], bytes]:
+        """Canonical leaf hashes + Merkle root for a ready batch (deterministic).
+        Shared by _commit_one and the pending-quarantine path."""
+        leaf_hashes = [
+            hash_leaf(batched_receipt_to_leaf(br)) for br in ready.batch.receipts
+        ]
+        tree = build_tree_and_proofs(leaf_hashes)
+        return leaf_hashes, tree.root
+
+    def _quarantine_pending(self, ready: ReadyBatch, tx_hash: str) -> None:
+        """Remove a broadcast-but-unconfirmed batch from the accumulator and stash
+        it for reconciliation. Popping is what guarantees no double-commit."""
+        requester_address, provider_address, _group_id, _slash_bps = ready.key
+        leaf_hashes, root = self._build_leaves_root(ready)
+        self._accumulator.pop_batch(ready.key)
+        self._pending_commits[tx_hash] = PendingCommit(
+            accumulator_key=ready.key,
+            tx_hash=tx_hash,
+            merkle_root=root,
+            leaf_hashes=tuple(leaf_hashes),
+            receipt_count=len(leaf_hashes),
+            total_value_ftns=ready.batch.total_value_ftns,
+            provider_address=provider_address,
+            requester_address=requester_address,
+            trigger_reason=ready.trigger,
+        )
 
     async def _commit_one(self, ready: ReadyBatch) -> CommittedBatch:
         """Convert receipts to canonical leaves, build tree, submit
@@ -209,17 +290,13 @@ class BatchSettlementClient:
         # AccumulatorKey is (requester, provider, group_id, slash_rate_bps).
         requester_address, provider_address, group_id, slash_rate_bps = ready.key
 
-        leaves = [
-            batched_receipt_to_leaf(br) for br in ready.batch.receipts
-        ]
-        leaf_hashes = [hash_leaf(leaf) for leaf in leaves]
-        tree = build_tree_and_proofs(leaf_hashes)
+        leaf_hashes, root = self._build_leaves_root(ready)
 
         batch_id, commit_ts = await self._contract.commit_batch(
             provider_address=provider_address,
             requester_address=requester_address,
-            merkle_root=tree.root,
-            receipt_count=len(leaves),
+            merkle_root=root,
+            receipt_count=len(leaf_hashes),
             total_value_ftns=ready.batch.total_value_ftns,
             tier_slash_rate_bps=slash_rate_bps,
             consensus_group_id=group_id,
@@ -231,8 +308,8 @@ class BatchSettlementClient:
             tx_hash="",  # contract client populates if needed; not used by logic
             provider_address=provider_address,
             requester_address=requester_address,
-            merkle_root=tree.root,
-            receipt_count=len(leaves),
+            merkle_root=root,
+            receipt_count=len(leaf_hashes),
             total_value_ftns=ready.batch.total_value_ftns,
             commit_timestamp=commit_ts,
             leaf_hashes=tuple(leaf_hashes),
@@ -290,6 +367,50 @@ class BatchSettlementClient:
 
     def get_tracked(self, batch_id: bytes) -> Optional[CommittedBatch]:
         return self._tracked.get(batch_id)
+
+    def pending_commits(self) -> List[PendingCommit]:
+        """Snapshot of broadcast-but-unconfirmed commits awaiting reconciliation.
+        Non-empty here means operator attention may be warranted: these receipts
+        are NOT settled and NOT in the accumulator (they will not be re-committed)
+        until reconcile_pending_commits resolves their tx's fate."""
+        return list(self._pending_commits.values())
+
+    async def reconcile_pending_commits(self) -> int:
+        """Resolve quarantined broadcast-but-unconfirmed commits. For each, ask the
+        contract whether its tx actually landed (get_committed_batch_for_tx). If it
+        did, ADOPT the batch into the tracked set using the on-chain batch_id +
+        commit_timestamp (so finalize/reconcile flows pick it up) and clear it from
+        quarantine. If it did not land (still pending, dropped, or reverted) leave
+        it quarantined — we never auto-re-commit, since a re-commit of a tx that is
+        merely slow would double-settle. Returns the count newly adopted."""
+        adopted = 0
+        for tx_hash, pc in list(self._pending_commits.items()):
+            try:
+                result = await self._contract.get_committed_batch_for_tx(tx_hash)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"reconcile lookup failed for pending tx {tx_hash}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
+            if not result:
+                continue  # not landed yet — stay quarantined (conservative)
+            batch_id, commit_ts = result
+            self._tracked[batch_id] = CommittedBatch(
+                batch_id=batch_id,
+                tx_hash=tx_hash,
+                provider_address=pc.provider_address,
+                requester_address=pc.requester_address,
+                merkle_root=pc.merkle_root,
+                receipt_count=pc.receipt_count,
+                total_value_ftns=pc.total_value_ftns,
+                commit_timestamp=commit_ts,
+                leaf_hashes=pc.leaf_hashes,
+                trigger_reason=pc.trigger_reason,
+            )
+            del self._pending_commits[tx_hash]
+            adopted += 1
+        return adopted
 
     def is_finalized_locally(self, batch_id: bytes) -> bool:
         """True if this client has seen finalizeBatch succeed. Does NOT
