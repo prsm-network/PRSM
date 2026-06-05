@@ -66,8 +66,17 @@ logger = logging.getLogger(__name__)
 
 # Default timeouts and limits
 DEFAULT_REQUEST_TIMEOUT = 30.0
-MAX_INLINE_SIZE = 1_048_576  # 1MB - content larger than this uses gateway transfer
+MAX_INLINE_SIZE = 1_048_576  # 1MB - content at/under this transfers INLINE (one frame)
 MAX_CONCURRENT_REQUESTS = 10
+
+# sp1020 — CHUNKED P2P transfer ceiling. Content between MAX_INLINE_SIZE and this
+# bound is split into GATEWAY_FETCH_CHUNK_BYTES frames sent over the same P2P
+# WebSocket substrate as INLINE (no libtorrent, no HTTP gateway). Above this bound
+# the dead GATEWAY path still applies (a libtorrent swarm / real HTTP gateway is the
+# right answer for truly huge content). The default is generous but finite — the
+# whole body is buffered in memory on both ends, so this bounds peak memory; tune
+# via PRSM_MAX_CHUNKED_TRANSFER_BYTES.
+_DEFAULT_MAX_CHUNKED_TRANSFER_BYTES = 64 * 1024 * 1024  # 64 MiB
 
 # sp1002 — GATEWAY content-fetch DoS bounds. A peer-supplied GATEWAY url is
 # fetched over HTTP by the *retrieving* node; without an upper byte bound a
@@ -98,6 +107,23 @@ def _gateway_fetch_hard_ceiling_bytes() -> int:
     return val if val > 0 else _DEFAULT_GATEWAY_FETCH_CEILING_BYTES
 
 
+def _max_chunked_transfer_bytes() -> int:
+    """sp1020 — upper bound (bytes) for CHUNKED P2P transfer, read at call time.
+
+    Content above MAX_INLINE_SIZE and at/under this bound is chunked over the P2P
+    substrate; above it the GATEWAY path applies. Falls back to the 64 MiB default
+    on missing / non-positive / unparseable values.
+    """
+    raw = os.environ.get("PRSM_MAX_CHUNKED_TRANSFER_BYTES", "").strip()
+    if not raw:
+        return _DEFAULT_MAX_CHUNKED_TRANSFER_BYTES
+    try:
+        val = int(raw)
+    except (ValueError, TypeError):
+        return _DEFAULT_MAX_CHUNKED_TRANSFER_BYTES
+    return val if val > 0 else _DEFAULT_MAX_CHUNKED_TRANSFER_BYTES
+
+
 class ContentStatus(str, Enum):
     """Status of content retrieval."""
     FOUND = "found"
@@ -108,7 +134,8 @@ class ContentStatus(str, Enum):
 
 class TransferMode(str, Enum):
     """How content is transferred."""
-    INLINE = "inline"  # Base64 encoded in response
+    INLINE = "inline"  # Base64 encoded in a single response
+    CHUNKED = "chunked"  # sp1020: split into ordered base64 frames over the P2P substrate
     GATEWAY = "gateway"  # Gateway URL provided (peer-supplied, may be PRSM-native or HTTP)
 
 
@@ -164,7 +191,11 @@ class ContentResponseMessage:
     gateway_url: Optional[str] = None  # Gateway URL for large files (peer-supplied)
     content_hash: Optional[str] = None  # SHA-256 hash for verification
     filename: Optional[str] = None
-    
+    # sp1020 — CHUNKED transfer: this frame's index + the total frame count for
+    # the content. None for INLINE/GATEWAY (single-frame) responses.
+    chunk_index: Optional[int] = None
+    total_chunks: Optional[int] = None
+
     def to_payload(self) -> Dict[str, Any]:
         """Convert to P2PMessage payload."""
         payload: Dict[str, Any] = {
@@ -174,16 +205,24 @@ class ContentResponseMessage:
             "status": self.status.value,
             "size": self.size,
         }
-        
+
         if self.error:
             payload["error"] = self.error
-        
+
         if self.transfer_mode:
             payload["transfer_mode"] = self.transfer_mode.value
-        
-        if self.data is not None and self.transfer_mode == TransferMode.INLINE:
+
+        # INLINE carries the whole body; CHUNKED carries this frame's slice. Both
+        # ride the same base64-over-WebSocket path.
+        if self.data is not None and self.transfer_mode in (TransferMode.INLINE, TransferMode.CHUNKED):
             payload["data_b64"] = base64.b64encode(self.data).decode()
-        
+
+        if self.transfer_mode == TransferMode.CHUNKED:
+            if self.chunk_index is not None:
+                payload["chunk_index"] = self.chunk_index
+            if self.total_chunks is not None:
+                payload["total_chunks"] = self.total_chunks
+
         if self.gateway_url:
             payload["gateway_url"] = self.gateway_url
         
@@ -214,12 +253,15 @@ class ContentResponseMessage:
         
         data = None
         data_b64 = payload.get("data_b64")
-        if data_b64 and transfer_mode == TransferMode.INLINE:
+        if data_b64 and transfer_mode in (TransferMode.INLINE, TransferMode.CHUNKED):
             try:
                 data = base64.b64decode(data_b64)
             except Exception:
                 pass
-        
+
+        chunk_index = payload.get("chunk_index")
+        total_chunks = payload.get("total_chunks")
+
         return cls(
             request_id=payload.get("request_id", ""),
             cid=payload.get("cid", ""),
@@ -231,6 +273,8 @@ class ContentResponseMessage:
             gateway_url=payload.get("gateway_url"),
             content_hash=payload.get("content_hash"),
             filename=payload.get("filename"),
+            chunk_index=chunk_index if isinstance(chunk_index, int) else None,
+            total_chunks=total_chunks if isinstance(total_chunks, int) else None,
         )
     
     @classmethod
@@ -431,7 +475,13 @@ class ContentProvider:
         
         # Pending requests: request_id -> asyncio.Future
         self._pending_requests: Dict[str, asyncio.Future] = {}
-        
+
+        # sp1020 — CHUNKED reassembly buffers, keyed by request_id. Only ever
+        # populated for OUR outstanding requests (a chunk for an unknown
+        # request_id is dropped), so an attacker cannot drive unbounded growth.
+        # Cleaned up alongside _pending_requests when the request completes.
+        self._pending_chunks: Dict[str, Dict[str, Any]] = {}
+
         # Semaphore to limit concurrent requests
         self._request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
@@ -481,6 +531,7 @@ class ContentProvider:
             if not future.done():
                 future.cancel()
         self._pending_requests.clear()
+        self._pending_chunks.clear()  # sp1020 — drop any in-flight reassembly buffers
     
     # ── Local Content Registration ─────────────────────────────────────
     
@@ -597,7 +648,7 @@ class ContentProvider:
             
             # Determine transfer mode
             if size <= MAX_INLINE_SIZE:
-                # Send inline (base64 encoded)
+                # Send inline (base64 encoded) — single frame.
                 response = ContentResponseMessage(
                     request_id=request_id,
                     cid=cid,
@@ -608,8 +659,17 @@ class ContentProvider:
                     content_hash=content_info.get("content_hash"),
                     filename=content_info.get("filename"),
                 )
+                await self._send_response(peer.peer_id, response)
+            elif size <= _max_chunked_transfer_bytes():
+                # sp1020 — CHUNKED: split into ordered 256 KiB frames over the
+                # same P2P substrate (no libtorrent, no HTTP gateway). The
+                # requester reassembles + re-verifies against the CID/hash.
+                await self._send_chunked_response(
+                    peer.peer_id, request_id, cid, content_bytes, content_info,
+                )
             else:
-                # Provide gateway URL for large files
+                # Beyond the chunked ceiling — provide a gateway URL (a real HTTP
+                # gateway / libtorrent swarm is the right path for huge content).
                 gateway_url = f"prsm://content/{cid}"
                 response = ContentResponseMessage(
                     request_id=request_id,
@@ -621,8 +681,7 @@ class ContentProvider:
                     content_hash=content_info.get("content_hash"),
                     filename=content_info.get("filename"),
                 )
-            
-            await self._send_response(peer.peer_id, response)
+                await self._send_response(peer.peer_id, response)
             
             # Process payment for content access (Phase 4)
             if self.content_economy:
@@ -697,6 +756,40 @@ class ContentProvider:
             payload=response.to_payload(),
         )
         await self.transport.send_to_peer(peer_id, msg)
+
+    async def _send_chunked_response(
+        self,
+        peer_id: str,
+        request_id: str,
+        cid: str,
+        content_bytes: bytes,
+        content_info: Dict[str, Any],
+    ) -> None:
+        """sp1020 — serve content above MAX_INLINE_SIZE as ordered CHUNKED frames
+        over the P2P substrate. Each frame carries its 256 KiB slice + chunk_index
+        + the total_chunks count + the full content size/hash, so the requester
+        reassembles in index order and re-verifies the result against the CID/hash.
+        The whole body was already bandwidth-throttled once by the caller."""
+        size = len(content_bytes)
+        chunk_size = GATEWAY_FETCH_CHUNK_BYTES
+        total_chunks = (size + chunk_size - 1) // chunk_size
+        content_hash = content_info.get("content_hash")
+        filename = content_info.get("filename")
+        for index in range(total_chunks):
+            start = index * chunk_size
+            response = ContentResponseMessage(
+                request_id=request_id,
+                cid=cid,
+                status=ContentStatus.FOUND,
+                data=content_bytes[start:start + chunk_size],
+                size=size,
+                transfer_mode=TransferMode.CHUNKED,
+                content_hash=content_hash,
+                filename=filename,
+                chunk_index=index,
+                total_chunks=total_chunks,
+            )
+            await self._send_response(peer_id, response)
     
     # ── Content Request (Client Side) ───────────────────────────────────
     
@@ -929,16 +1022,19 @@ class ContentProvider:
             return None
         finally:
             self._pending_requests.pop(request_id, None)
-        
+            self._pending_chunks.pop(request_id, None)  # sp1020 — drop any partial reassembly
+
         # Process response
         if response.status != ContentStatus.FOUND:
             logger.debug(f"Provider {provider_id[:8]} returned {response.status}")
             return None
-        
+
         # Get content bytes
         content_bytes: Optional[bytes] = None
-        
-        if response.transfer_mode == TransferMode.INLINE and response.data is not None:
+
+        # INLINE carries the body directly; CHUNKED arrives reassembled (see
+        # _handle_content_response). Both then pass the same CID/hash verification.
+        if response.transfer_mode in (TransferMode.INLINE, TransferMode.CHUNKED) and response.data is not None:
             content_bytes = response.data
 
         elif response.transfer_mode == TransferMode.GATEWAY and response.gateway_url:
@@ -1002,10 +1098,111 @@ class ContentProvider:
         """Handle incoming content response (client side)."""
         response = ContentResponseMessage.from_payload(msg.payload)
         request_id = response.request_id
-        
+
         future = self._pending_requests.get(request_id)
-        if future and not future.done():
-            future.set_result(response)
+        if future is None or future.done():
+            # Unknown / already-resolved request — drop. This also prevents an
+            # attacker from buffering CHUNKED frames under a request_id we never
+            # issued (unbounded-memory defense).
+            self._pending_chunks.pop(request_id, None)
+            return
+
+        if response.transfer_mode == TransferMode.CHUNKED:
+            assembled = self._accumulate_chunk(request_id, response)
+            if assembled is None:
+                return  # more frames pending (or a malformed frame discarded it)
+            # Resolve with one synthetic response carrying the full reassembled
+            # body; _request_from_provider then re-verifies it against the CID/hash.
+            self._pending_chunks.pop(request_id, None)
+            if not future.done():
+                future.set_result(ContentResponseMessage(
+                    request_id=request_id,
+                    cid=response.cid,
+                    status=ContentStatus.FOUND,
+                    data=assembled,
+                    size=len(assembled),
+                    transfer_mode=TransferMode.CHUNKED,
+                    content_hash=response.content_hash,
+                    filename=response.filename,
+                ))
+            return
+
+        # Single-frame response (INLINE / GATEWAY / not-found / error).
+        future.set_result(response)
+
+    def _accumulate_chunk(
+        self, request_id: str, response: ContentResponseMessage,
+    ) -> Optional[bytes]:
+        """sp1020 — buffer one CHUNKED frame; return the reassembled bytes once
+        every frame has arrived, else None. Returns None and discards the
+        in-flight transfer on any malformed or over-bound frame, so a misbehaving
+        provider fails the request safely (future times out → None) rather than
+        corrupting or OOMing the requester. Content integrity of a well-formed-but-
+        wrong reassembly is caught downstream by the CID/hash check."""
+        total = response.total_chunks
+        index = response.chunk_index
+        data = response.data
+        if (not isinstance(total, int) or total <= 0
+                or not isinstance(index, int) or not (0 <= index < total)
+                or data is None):
+            self._pending_chunks.pop(request_id, None)
+            return None
+
+        # Per-frame size cap: a legitimate frame never exceeds the protocol chunk
+        # size. Without this a malicious provider declares a SMALL total_chunks
+        # (passing the count guard below) then sends giant frames (the transport
+        # permits multi-MiB messages), buffering many times the ceiling before the
+        # post-reassembly integrity check can run — a memory-amplification OOM.
+        if len(data) > GATEWAY_FETCH_CHUNK_BYTES:
+            logger.warning(
+                "CHUNKED frame for %s is %d bytes > the %d-byte chunk size — "
+                "refusing (memory-amplification defense)",
+                request_id, len(data), GATEWAY_FETCH_CHUNK_BYTES,
+            )
+            self._pending_chunks.pop(request_id, None)
+            return None
+
+        # The declared frame COUNT must not imply a body over the chunked ceiling.
+        ceiling = _max_chunked_transfer_bytes()
+        if total * GATEWAY_FETCH_CHUNK_BYTES > ceiling + GATEWAY_FETCH_CHUNK_BYTES:
+            logger.warning(
+                "CHUNKED transfer %s declares %d frames exceeding the ceiling "
+                "— refusing", request_id, total,
+            )
+            self._pending_chunks.pop(request_id, None)
+            return None
+
+        buf = self._pending_chunks.get(request_id)
+        if buf is None:
+            buf = {"total": total, "chunks": {}, "bytes": 0}
+            self._pending_chunks[request_id] = buf
+        elif buf["total"] != total:
+            # total_chunks is pinned by the first frame; a disagreeing total is a
+            # malformed/inconsistent transfer — fail fast rather than re-keying the
+            # buffer (which would stall the request to its full timeout).
+            logger.warning(
+                "CHUNKED transfer %s sent inconsistent total_chunks (%d != %d) "
+                "— refusing", request_id, total, buf["total"],
+            )
+            self._pending_chunks.pop(request_id, None)
+            return None
+
+        if index not in buf["chunks"]:
+            buf["bytes"] += len(data)
+            # Running buffered-byte guard (defense-in-depth alongside the per-frame
+            # + count caps): never hold more than one ceiling's worth per request.
+            if buf["bytes"] > ceiling + GATEWAY_FETCH_CHUNK_BYTES:
+                logger.warning(
+                    "CHUNKED transfer %s exceeded the %d-byte buffer ceiling "
+                    "— refusing", request_id, ceiling,
+                )
+                self._pending_chunks.pop(request_id, None)
+                return None
+        buf["chunks"][index] = data
+
+        if len(buf["chunks"]) < total:
+            return None
+        return b"".join(buf["chunks"][i] for i in range(total))
     
     # ── Gossip Handlers ─────────────────────────────────────────────────
     

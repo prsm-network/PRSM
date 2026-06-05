@@ -628,11 +628,12 @@ class TestContentProvider:
             assert response.data == test_data
     
     @pytest.mark.asyncio
-    async def test_handle_content_request_gateway(self, content_provider, mock_transport):
-        """Test handling request for large content (gateway transfer)."""
+    async def test_handle_content_request_chunked(self, content_provider, mock_transport):
+        """sp1020 — content above MAX_INLINE_SIZE (within the chunked ceiling) is
+        served as multiple ordered CHUNKED frames over the P2P substrate (was
+        previously a single dead GATEWAY prsm:// URL)."""
         content_provider.start()
-        
-        # Register local content (larger than MAX_INLINE_SIZE)
+
         large_size = MAX_INLINE_SIZE + 1
         content_provider.register_local_content(
             cid="QmLargeCID",
@@ -640,34 +641,67 @@ class TestContentProvider:
             content_hash="abc123",
             filename="large.bin",
         )
-        
-        # Mock content fetch
+
         with patch.object(content_provider, '_fetch_local', new_callable=AsyncMock) as mock_cat:
             mock_cat.return_value = b"x" * large_size
-            
-            # Create mock peer
+
             peer = MagicMock()
             peer.peer_id = "requester_node"
-            
-            # Create request message
             msg = P2PMessage(
                 msg_type=MSG_DIRECT,
                 sender_id="requester_node",
-                payload=ContentRequestMessage(
-                    cid="QmLargeCID",
-                    request_id="req123",
-                ).to_payload(),
+                payload=ContentRequestMessage(cid="QmLargeCID", request_id="req123").to_payload(),
             )
-            
-            # Handle the request
+
             await content_provider._handle_content_request(msg, peer)
-            
-            # Should have sent a found response with gateway URL
+
+            # Multiple CHUNKED frames, not a single inline/gateway frame.
+            assert mock_transport.send_to_peer.call_count >= 2
+            responses = [
+                ContentResponseMessage.from_payload(c[0][1].payload)
+                for c in mock_transport.send_to_peer.call_args_list
+            ]
+            assert all(r.status == ContentStatus.FOUND for r in responses)
+            assert all(r.transfer_mode == TransferMode.CHUNKED for r in responses)
+            ordered = sorted(responses, key=lambda r: r.chunk_index)
+            assert b"".join(r.data for r in ordered) == b"x" * large_size
+
+    @pytest.mark.asyncio
+    async def test_handle_content_request_gateway_above_chunked_ceiling(
+        self, content_provider, mock_transport, monkeypatch,
+    ):
+        """sp1020 — content above the chunked ceiling falls back to the GATEWAY
+        URL (a real HTTP gateway / libtorrent swarm is the right path there)."""
+        # Force the ceiling down to MAX_INLINE_SIZE so a just-over-inline payload
+        # exceeds it (avoids allocating tens of MiB in the test).
+        monkeypatch.setenv("PRSM_MAX_CHUNKED_TRANSFER_BYTES", str(MAX_INLINE_SIZE))
+        content_provider.start()
+
+        large_size = MAX_INLINE_SIZE + 1
+        content_provider.register_local_content(
+            cid="QmHugeCID",
+            size_bytes=large_size,
+            content_hash="abc123",
+            filename="huge.bin",
+        )
+
+        with patch.object(content_provider, '_fetch_local', new_callable=AsyncMock) as mock_cat:
+            mock_cat.return_value = b"x" * large_size
+
+            peer = MagicMock()
+            peer.peer_id = "requester_node"
+            msg = P2PMessage(
+                msg_type=MSG_DIRECT,
+                sender_id="requester_node",
+                payload=ContentRequestMessage(cid="QmHugeCID", request_id="req123").to_payload(),
+            )
+
+            await content_provider._handle_content_request(msg, peer)
+
             mock_transport.send_to_peer.assert_called_once()
-            call_args = mock_transport.send_to_peer.call_args
-            response_msg = call_args[0][1]
-            response = ContentResponseMessage.from_payload(response_msg.payload)
-            
+            response = ContentResponseMessage.from_payload(
+                mock_transport.send_to_peer.call_args[0][1].payload
+            )
             assert response.status == ContentStatus.FOUND
             assert response.transfer_mode == TransferMode.GATEWAY
             assert "gateway_url" in response.to_payload()
