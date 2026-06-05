@@ -41,11 +41,17 @@ def test_script_uses_set_uo_pipefail():
 def test_canonical_hosts_pinned():
     text = SCRIPT.read_text()
     for host in (
-        "bootstrap1.prsm-network.com",
+        # bootstrap1 was renamed to bootstrap-us in sprint 575 (dead DNS).
+        "bootstrap-us.prsm-network.com",
         "bootstrap-eu.prsm-network.com",
         "bootstrap-apac.prsm-network.com",
     ):
         assert host in text, f"canonical host {host} missing"
+    # The legacy hostname no longer resolves — the probe must not target it.
+    assert "bootstrap1.prsm-network.com" not in text, (
+        "smoke-test script still probes dead bootstrap1; renamed to "
+        "bootstrap-us in sprint 575"
+    )
 
 
 def test_default_ports_pinned():

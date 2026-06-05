@@ -100,6 +100,50 @@ def test_legacy_bootstrap1_in_stored_config_auto_migrates(tmp_path):
     assert cfg.bootstrap_nodes[1] == "wss://bootstrap-eu.prsm-network.com:8765"
 
 
+def test_operator_cloud_init_default_uses_live_bootstrap_host():
+    """sp575 follow-on (Tier-1 audit gap 4): the turnkey operator cloud-init
+    script feeds its BOOTSTRAP_URL to `prsm node start --bootstrap`, which
+    BYPASSES the config-file bootstrap1->bootstrap-us auto-migration. So a
+    stale default here strands every first-boot turnkey node on dead DNS —
+    the single most important first-boot promise (fleet connectivity).
+    """
+    from pathlib import Path
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "scripts" / "operator-node-cloud-init.sh"
+    )
+    assert script.is_file(), f"cloud-init script missing at {script}"
+    text = script.read_text(encoding="utf-8")
+    assert "bootstrap1.prsm-network.com" not in text, (
+        "operator-node-cloud-init.sh still references dead bootstrap1; its "
+        "--bootstrap override bypasses the config auto-migration, so "
+        "first-boot turnkey nodes hit dead DNS"
+    )
+    assert "bootstrap-us.prsm-network.com" in text, (
+        "operator-node-cloud-init.sh must default to the live bootstrap-us host"
+    )
+
+
+def test_smoke_test_fleet_script_uses_live_bootstrap_host():
+    """sp575 follow-on (Tier-1 audit gap 4): the fleet smoke-test probes a
+    hardcoded canonical host list; it must probe the live bootstrap-us, not
+    the dead bootstrap1.
+    """
+    from pathlib import Path
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "scripts" / "smoke-test-bootstrap-fleet.sh"
+    )
+    assert script.is_file(), f"smoke-test script missing at {script}"
+    text = script.read_text(encoding="utf-8")
+    assert "bootstrap1.prsm-network.com" not in text, (
+        "smoke-test-bootstrap-fleet.sh still probes dead bootstrap1"
+    )
+    assert "bootstrap-us.prsm-network.com" in text, (
+        "smoke-test-bootstrap-fleet.sh must probe the live bootstrap-us host"
+    )
+
+
 def test_onboarding_template_placeholder_uses_live_hostname():
     """The network.html placeholder operators see in the UI must
     not be the dead URL either.

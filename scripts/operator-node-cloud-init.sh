@@ -12,7 +12,7 @@
 #
 # CUSTOMIZE BEFORE PASTING:
 #   - NODE_DISPLAY_NAME (optional, defaults to "prsm-op-<random>")
-#   - BOOTSTRAP_URL (defaults to canonical wss://bootstrap1.prsm-network.com:8765)
+#   - BOOTSTRAP_URL (defaults to canonical wss://bootstrap-us.prsm-network.com:8765)
 #
 # WATCH PROGRESS:
 #   ssh -i <your_key> ubuntu@<PUBLIC_IP>
@@ -31,7 +31,7 @@ set -euxo pipefail
 
 # ────── CUSTOMIZE (optional) ──────
 NODE_DISPLAY_NAME="prsm-op-cloud"
-BOOTSTRAP_URL="wss://bootstrap1.prsm-network.com:8765"
+BOOTSTRAP_URL="wss://bootstrap-us.prsm-network.com:8765"
 # ──────────────────────────────────
 
 PRSM_REPO="https://github.com/prsm-network/PRSM.git"

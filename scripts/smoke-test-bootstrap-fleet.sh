@@ -37,7 +37,7 @@ set -uo pipefail
 
 # ── Canonical fleet ──────────────────────────────────────
 DEFAULT_HOSTS=(
-    "bootstrap1.prsm-network.com"
+    "bootstrap-us.prsm-network.com"
     "bootstrap-eu.prsm-network.com"
     "bootstrap-apac.prsm-network.com"
 )
