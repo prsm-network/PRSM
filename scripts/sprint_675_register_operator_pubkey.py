@@ -48,6 +48,29 @@ RPC = os.environ.get("PRSM_BASE_RPC_URL", "https://mainnet.base.org")
 CHAIN_ID = 8453
 
 
+def _fresh_anchor_lookup(anchor, node_id, attempts=3, sleep_s=2.0):
+    """Force a fresh on-chain read of ``node_id``, bypassing the client cache.
+
+    Sprint 1032 fix: the pre-tx idempotency check (``anchor.lookup``) negative-
+    caches the 'not registered' miss for the client's TTL (~1h). Reusing the
+    SAME client for the post-tx verify would read that stale miss and report a
+    SUCCESSFUL registration as failed (the false negative hit live during the
+    Tier-1 bench: tx confirmed status=1, yet the verify printed '✗ empty after
+    confirmation'). ``invalidate()`` drops the cache entry so the next lookup
+    re-fetches from chain; a short retry also rides out RPC read-replica lag
+    between tx confirmation and the pubkey being visible to a fresh read.
+    """
+    result = None
+    for attempt in range(max(1, attempts)):
+        anchor.invalidate(node_id)
+        result = anchor.lookup(node_id)
+        if result:
+            return result
+        if attempt + 1 < attempts:
+            time.sleep(sleep_s)
+    return result
+
+
 def main() -> int:
     pk = (os.environ.get("PRSM_DEPLOYER_PRIVATE_KEY", "") or "").strip()
     if not pk:
@@ -193,12 +216,16 @@ def main() -> int:
         f"(gas used: {receipt.gasUsed})"
     )
 
-    time.sleep(2)
-    looked_up = anchor.lookup(node_id)
+    # Sprint 1032 — verify against a FRESH read. anchor.lookup at the top of
+    # main() negative-cached this node_id's pre-tx miss; without invalidating,
+    # this re-read would return that stale miss and report a confirmed
+    # registration as failed.
+    looked_up = _fresh_anchor_lookup(anchor, node_id)
     if not looked_up:
         print(
-            "✗ anchor.lookup returned empty after confirmation — "
-            "RPC indexing delay?",
+            "✗ anchor.lookup still empty after confirmation + cache "
+            "invalidation + retry — investigate (tx confirmed, so the "
+            "registration likely landed; re-check with a fresh client).",
             file=sys.stderr,
         )
         return 1
