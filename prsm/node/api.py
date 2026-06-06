@@ -7962,11 +7962,17 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             )
 
         if not hasattr(node, 'inference_executor') or node.inference_executor is None:
+            # Sprint 1033 — surface the SPECIFIC actionable cause (web3 missing,
+            # catalog unset, executor not opted in, ...) instead of a generic
+            # "not initialized" that forces operators to grep the daemon log.
+            from prsm.node.inference_wiring import (
+                diagnose_inference_executor_unavailable,
+            )
             raise HTTPException(
                 status_code=503,
                 detail=(
                     "Inference executor not initialized. "
-                    "This node does not currently serve inference requests."
+                    + diagnose_inference_executor_unavailable()
                 ),
             )
 
@@ -8527,11 +8533,15 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             )
 
         if not hasattr(node, 'inference_executor') or node.inference_executor is None:
+            # Sprint 1033 — actionable cause (parity with the unary path).
+            from prsm.node.inference_wiring import (
+                diagnose_inference_executor_unavailable,
+            )
             raise HTTPException(
                 status_code=503,
                 detail=(
                     "Inference executor not initialized. "
-                    "This node does not currently serve inference requests."
+                    + diagnose_inference_executor_unavailable()
                 ),
             )
         # Streaming requires execute_streaming on the wired executor.

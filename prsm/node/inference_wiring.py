@@ -905,6 +905,102 @@ class _StubChainExecutor:
         )
 
 
+def _module_available(name: str) -> bool:
+    """True if a module can be imported, without importing it."""
+    import importlib.util
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def diagnose_inference_executor_unavailable(
+    env=None,
+    module_check=None,
+    path_check=None,
+) -> str:
+    """Sprint 1033 — the actionable reason the inference executor is unavailable.
+
+    Returned in the /compute/inference 503 detail so an operator gets a FIX
+    instead of grepping the daemon log. The executor build
+    (build_parallax_executor_or_none) already logs the real reason at startup;
+    this reconstructs the actionable hint at request time from the env + import
+    availability + catalog file. Live-motivated by the Tier-1 bench, where a
+    GPU operator who installed only `.[ml]` (not `.[blockchain]`) hit a generic
+    503 that hid the real cause (web3/eth_account missing → anchor build failed).
+
+    ``env`` / ``module_check`` / ``path_check`` are injectable for testing;
+    defaults read os.environ / importlib / os.path. Always returns a non-empty
+    string and never raises — it sits on the 503 path.
+    """
+    env = env if env is not None else os.environ
+    module_check = module_check or _module_available
+    path_check = path_check or os.path.exists
+
+    executor = (env.get("PRSM_INFERENCE_EXECUTOR", "") or "").strip().lower()
+    if not executor:
+        return (
+            "PRSM_INFERENCE_EXECUTOR is unset — set it to 'local' (single-node "
+            "real HuggingFace inference) or 'parallax' (the verifiable GPU "
+            "pool). A bare default node serves no inference by design."
+        )
+    if executor == "parallax":
+        if not (module_check("web3") and module_check("eth_account")):
+            return (
+                "PRSM_INFERENCE_EXECUTOR=parallax needs the on-chain anchor "
+                "client, but web3/eth_account are not installed — run "
+                "`pip install -e '.[blockchain]'` (they are NOT in the [ml] "
+                "extra)."
+            )
+        catalog = (
+            env.get("PRSM_PARALLAX_MODEL_CATALOG_FILE", "") or ""
+        ).strip()
+        if not catalog:
+            return (
+                "PRSM_PARALLAX_MODEL_CATALOG_FILE is unset — point it at "
+                "config/parallax/model_catalog.json."
+            )
+        if not path_check(catalog):
+            return (
+                f"PRSM_PARALLAX_MODEL_CATALOG_FILE={catalog!r} does not exist "
+                "— point it at a valid catalog "
+                "(config/parallax/model_catalog.json)."
+            )
+        for var in (
+            "PRSM_PARALLAX_TRUST_STACK_KIND",
+            "PRSM_PARALLAX_GPU_POOL_KIND",
+        ):
+            if not (env.get(var, "") or "").strip():
+                return (
+                    f"{var} is unset — required for the parallax executor "
+                    "(see docs/operations/parallax-inference-deploy.md)."
+                )
+        return (
+            "Parallax env looks set but the executor failed to build — check "
+            "the daemon log for the build_parallax_executor_or_none WARNING "
+            "naming the missing piece (e.g. the anchor RPC was unreachable)."
+        )
+    if executor == "local":
+        if not (module_check("torch") and module_check("transformers")):
+            return (
+                "PRSM_INFERENCE_EXECUTOR=local needs torch + transformers — "
+                "run `pip install -e '.[ml]'`."
+            )
+        return (
+            "PRSM_INFERENCE_EXECUTOR=local is set but the executor failed to "
+            "build — check the daemon log for the specific reason."
+        )
+    if executor in ("mock", "mock-streaming"):
+        return (
+            f"PRSM_INFERENCE_EXECUTOR={executor} is set but the mock executor "
+            "failed to build — check the daemon log."
+        )
+    return (
+        f"PRSM_INFERENCE_EXECUTOR={executor!r} is not a recognized value "
+        "(expected one of: local, parallax, mock, mock-streaming)."
+    )
+
+
 def build_parallax_executor_or_none(node: Any) -> Optional[Any]:
     """Construct a ParallaxScheduledExecutor if every required
     operator-supplied component is present + valid.
