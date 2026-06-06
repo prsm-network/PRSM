@@ -320,6 +320,26 @@ def _verify_peer_credential(cred: Any) -> Optional[str]:
     return node_id if ok else None
 
 
+def _join_bootstrap_address(address: str, port: int) -> str:
+    """sp1026 — combine a bootstrap-peer's stored address + port into a dial
+    target WITHOUT double-appending the port when ``address`` already carries one.
+
+    An operator's ``PRSM_ADVERTISE_ADDRESS`` may be ``host:port`` (the documented
+    sp566 format); the bootstrap server stores it verbatim, so the prior naive
+    ``f"{address}:{port}"`` produced ``host:port:port`` — an undialable address that
+    broke cross-host discovery (surfaced live at the Tier-1 bench). Handles bare
+    IPv4/hostname and bracketed IPv6; bare unbracketed IPv6 is out of scope (the
+    transport uses host:port / bracketed forms)."""
+    if not address:
+        return f"{address}:{port}"
+    if address.startswith("["):  # bracketed IPv6: "[::1]" or "[::1]:9001"
+        return address if "]:" in address else f"{address}:{port}"
+    _host, sep, tail = address.rpartition(":")
+    if sep and tail.isdigit():  # already "host:port"
+        return address
+    return f"{address}:{port}"
+
+
 class PeerDiscovery:
     """Discovers and maintains connections to network peers.
 
@@ -1057,7 +1077,9 @@ class PeerDiscovery:
             bp_hw = getattr(bp, "hardware_profile", None)
             self.known_peers[pid] = PeerInfo(
                 node_id=pid,
-                address=f"{bp.address}:{bp.port}",
+                # sp1026 — do NOT double-append the port: bp.address may already
+                # be "host:port" (the operator's PRSM_ADVERTISE_ADDRESS).
+                address=_join_bootstrap_address(bp.address, bp.port),
                 capabilities=getattr(bp, "capabilities", []),
                 hardware_profile=bp_hw if isinstance(bp_hw, dict) else None,
             )
