@@ -8453,6 +8453,19 @@ def storage():
     pass
 
 
+def _server_detail_or(response, fallback: str) -> str:
+    """Return the server's error ``detail`` (a FastAPI HTTPException body) when
+    present, else ``fallback``. sp1027 — CLI error messages must surface the
+    actionable server reason (e.g. "ContentPublisher … libtorrent not installed")
+    instead of a generic guess; a hard-coded message buried the real cause at the
+    Tier-1 live bench."""
+    try:
+        detail = (response.json() or {}).get("detail")
+    except Exception:  # noqa: BLE001 - non-JSON / empty body
+        detail = None
+    return detail if isinstance(detail, str) and detail.strip() else fallback
+
+
 @storage.command()
 @click.argument("file-path", type=click.Path(exists=True, readable=True))
 @click.option("--description",   default="",    help="Content description")
@@ -8636,10 +8649,14 @@ def upload(
         console.print("❌ Session expired. Run: prsm login", style="red")
         raise SystemExit(1)
     elif response.status_code == 503:
+        # sp1027 — surface the server's actual detail (e.g. the libtorrent hint)
+        # rather than a generic guess that buries the real cause.
         console.print(
             "[red]FAIL[/red] /content/upload returned 503 — "
-            "Content uploader not initialized. Run [bold]prsm "
-            "node start[/bold] to bring the daemon up.",
+            + _server_detail_or(
+                response,
+                "Content uploader not available. Is the daemon up? Run prsm node start.",
+            )
         )
         raise SystemExit(1)
     elif response.status_code == 413:
