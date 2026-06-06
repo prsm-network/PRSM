@@ -165,6 +165,79 @@ def compute_settlement_for_receipt(
     )
 
 
+def split_release_across_stages(
+    receipt: InferenceReceipt,
+    release: Decimal,
+) -> Optional[list]:
+    """Sprint 1031 — distribute ``release`` equally across the distinct stage
+    node_ids carried in ``receipt.topology_assignment``.
+
+    The Tier-1 cross-host bench proved a signed receipt naming each stage's
+    node_id (stage0→head, stage1→worker, ...). Settlement previously credited
+    only the single head/settler node, so a worker that ran half the model was
+    paid nothing. This fans the release out across the nodes that actually ran
+    a slice, reusing PaymentEscrow.release_escrow_split.
+
+    Returns ``None`` — caller keeps the unchanged single-payee path — when the
+    receipt carries no usable topology: topology_assignment absent, malformed
+    (``positions`` not a non-empty dict), or naming fewer than 2 distinct
+    node_ids (e.g. the single-node default path, where topology_assignment is
+    None at runtime).
+
+    Otherwise returns a list of ``(node_id, Decimal amount)`` splits whose
+    amounts sum to ``release`` to within one Decimal ULP — no FTNS is created
+    or lost; only the distribution changes, and the total stays bounded by
+    ``release`` regardless of the topology contents (so a wrong/forged topology
+    can mis-distribute but never over-pay), with any sub-ULP residual refunded
+    to the payer by the escrow's remainder math. Equal-weight policy:
+    layer-balanced stages do comparable work, so the release splits evenly; the
+    non-terminating-division residual (e.g. 1/3) is folded into the first
+    stage's node. Per-node FLOP/priced weighting + on-chain cross-node
+    settlement are explicit follow-ons (this is the off-chain crediting half of
+    the Tier-1 loop-closer).
+
+    Known latent limit (not reachable at realistic inference pricing, fail-safe
+    if it ever is): the caller float()-converts these Decimal shares and
+    PaymentEscrow.release_escrow_split re-sums them against an absolute 1e-9
+    tolerance, so at implausibly large single-job escrows (~1e6+ FTNS) the
+    accumulated float error could exceed tolerance and strand the job (surfaced
+    error, never an over-pay). The proper fix is a magnitude-relative tolerance
+    in release_escrow_split — deferred to its own payment-escrow sprint.
+    """
+    topology = getattr(receipt, "topology_assignment", None)
+    if topology is None:
+        return None
+    positions = getattr(topology, "positions", None)
+    if not isinstance(positions, dict) or not positions:
+        return None
+
+    # Distinct node_ids in deterministic (stage, slot) order so the drift
+    # remainder lands deterministically on the first stage's node.
+    distinct: list = []
+    try:
+        ordered_keys = sorted(positions.keys())
+    except TypeError:
+        ordered_keys = list(positions.keys())
+    for key in ordered_keys:
+        node_id = positions[key]
+        if isinstance(node_id, str) and node_id and node_id not in distinct:
+            distinct.append(node_id)
+    if len(distinct) < 2:
+        return None
+
+    n = len(distinct)
+    per = release / Decimal(n)
+    splits = [(node_id, per) for node_id in distinct]
+    # Fold the Decimal-division residual (e.g. 1/3) into the first node so the
+    # sum equals release to within one Decimal ULP; any sub-ULP residual is an
+    # undershoot the escrow refunds to the payer (never an over-pay).
+    drift = release - sum((amt for _, amt in splits), Decimal("0"))
+    if drift != 0:
+        first_id, first_amt = splits[0]
+        splits[0] = (first_id, first_amt + drift)
+    return splits
+
+
 async def settle_inference_receipt(
     *,
     payment_escrow: "object",
@@ -197,14 +270,48 @@ async def settle_inference_receipt(
     release = decision.release_to_operator
     refund = decision.refund_to_payer
 
-    if release > 0 and refund > 0:
-        # Partial: split-API handles remainder refund automatically.
+    # Sprint 1031 — on a cross-host inference the receipt's signed
+    # topology_assignment names every stage's node_id. Fan the release out
+    # across the distinct stage nodes (each ran a slice) instead of paying only
+    # the local settler. Gated on the receipt having been settled by THIS
+    # operator (settler_node_id == operator_id, i.e. locally built + signed) so
+    # the topology-driven split cannot be repurposed to credit a remote-supplied
+    # topology if a future caller ever feeds a remote receipt into settlement.
+    # None on the single-node default path (no topology) → unchanged.
+    stage_splits = None
+    if release > 0 and getattr(receipt, "settler_node_id", "") == operator_id:
+        stage_splits = split_release_across_stages(receipt, release)
+
+    if stage_splits is not None:
+        # Multi-stage: split sums to `release`; release_escrow_split
+        # auto-refunds the remainder (escrow_amount - release) to the payer.
+        float_splits = [
+            (node_id, float(amount)) for node_id, amount in stage_splits
+        ]
+        # Parity with the swarm/forge split path (api.py:6510): resolve each
+        # stage node_id to the operator's registered FTNS wallet so a
+        # multi-agent operator's per-stage credits consolidate onto one wallet.
+        # Empty map (default) is a no-op — recipients fall through to
+        # themselves; never let wallet-map resolution block payment.
+        try:
+            from prsm.node.compute_wallet_map import (
+                ComputeWalletMap,
+                resolve_splits,
+            )
+            float_splits = resolve_splits(
+                float_splits, ComputeWalletMap.from_env(),
+            )
+        except Exception:
+            pass
+        await payment_escrow.release_escrow_split(job_id, float_splits)
+    elif release > 0 and refund > 0:
+        # Partial (single payee): split-API handles remainder refund.
         await payment_escrow.release_escrow_split(
             job_id,
             [(operator_id, float(release))],
         )
     elif release > 0:
-        # Full payout — existing escrow-flow path.
+        # Full payout (single payee) — existing escrow-flow path.
         await payment_escrow.release_escrow(job_id, operator_id)
     elif refund > 0:
         # No work credited.
