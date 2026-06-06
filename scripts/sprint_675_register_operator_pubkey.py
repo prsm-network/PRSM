@@ -33,6 +33,15 @@ import os
 import sys
 import time
 
+# Sprint 1029 — make the script importable however it is invoked. Running it as
+# a file (`python scripts/sprint_675_...py`) puts scripts/ on sys.path[0], not
+# the repo root, and the editable install does not resolve `prsm` in script-mode
+# on every interpreter (observed on CPython 3.14). Prepend the repo root so the
+# deferred `from prsm.security...` import in main() always resolves.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 
 ANCHOR = "0xd811ad9986f44f404b0fd992168a7cc76206df03"
 RPC = os.environ.get("PRSM_BASE_RPC_URL", "https://mainnet.base.org")
