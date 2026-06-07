@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -999,6 +1000,161 @@ def diagnose_inference_executor_unavailable(
         f"PRSM_INFERENCE_EXECUTOR={executor!r} is not a recognized value "
         "(expected one of: local, parallax, mock, mock-streaming)."
     )
+
+
+# Sentinel-safe model_id allowlist — same pattern FilesystemModelRegistry
+# enforces (^[A-Za-z0-9._-]+$). Validate BEFORE any filesystem Path-join so a
+# traversal model_id can't even stat/read outside the registry root.
+_SAFE_FS_MODEL_ID = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _manifest_layer_count(manifest_dict):
+    """The staged layer count (layer_range hi) from a manifest dict, or None if
+    it can't be determined (so we never false-positive a stale warning)."""
+    try:
+        shards = manifest_dict.get("shards") or []
+        layer_range = shards[0].get("layer_range")
+        if layer_range and len(layer_range) >= 2:
+            return int(layer_range[1])
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return None
+    return None
+
+
+def _resolve_num_layers_from_catalog(model_id: str, catalog_path: str):
+    """num_layers for model_id from the parallax catalog, or None if absent /
+    unreadable / invalid. Never raises (mirrors stage_hf_model._resolve_num_layers
+    but returns None instead of raising — the daemon caller skips on None rather
+    than guessing a layer count)."""
+    try:
+        catalog = json.loads(Path(catalog_path).read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    entry = (catalog.get("models") or {}).get(model_id)
+    if not isinstance(entry, dict):
+        return None
+    n = entry.get("num_layers")
+    # bool is an int subclass in Python — exclude True/False explicitly so a
+    # JSON boolean can't masquerade as a layer count (would yield (0,1)).
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        return None
+    return n
+
+
+def ensure_hf_model_staged(identity, env=None) -> str:
+    """Sprint 1034 — auto-stage the configured HF model into the local
+    FilesystemModelRegistry at daemon startup so an operator no longer has to run
+    scripts/stage_hf_model.py by hand on every node (the last manual step the
+    Tier-1 cross-host bench exposed: an unstaged model → the layer_stage chain
+    server returns MODEL_NOT_FOUND at inference time).
+
+    No-op unless PRSM_INFERENCE_EXECUTOR=parallax AND PRSM_PARALLAX_HF_MODEL_ID
+    + PRSM_MODEL_REGISTRY_ROOT are set AND ``identity`` is present. num_layers is
+    resolved from the parallax catalog (PRSM_PARALLAX_MODEL_CATALOG_FILE, else
+    the bundled config/parallax/model_catalog.json) and NEVER defaulted — a model
+    absent from the catalog is skipped, not registered with a wrong layer count.
+
+    Idempotent + publisher-aware: skips if THIS node already staged the model;
+    REFUSES to clobber a manifest signed by a different publisher (mirrors
+    stage_hf_model.py). The sentinel manifest matches the script byte-for-byte
+    (single shard, 32 zero bytes, layer_range=(0,num_layers)); the HF runner
+    loads real weights from the HF cache at inference, so the registry only needs
+    the model "known" with the right layer_range.
+
+    NEVER raises — it runs on the daemon-start path (the parallax branch in
+    node.initialize() is not otherwise try/except-wrapped). Returns a short
+    status for the caller to log:
+      'registered' | 'already' | 'refused:different-publisher' |
+      'skipped:<reason>' | 'error:<detail>'.
+    """
+    try:
+        environ = env if env is not None else os.environ
+        executor = (
+            environ.get("PRSM_INFERENCE_EXECUTOR", "") or ""
+        ).strip().lower()
+        if executor != "parallax":
+            return "skipped:not-parallax"
+        if identity is None or not getattr(identity, "node_id", ""):
+            return "skipped:no-identity"
+        model_id = (environ.get("PRSM_PARALLAX_HF_MODEL_ID", "") or "").strip()
+        if not model_id:
+            return "skipped:no-model-id"
+        # Reject traversal / unsafe ids BEFORE any Path-join (defense-in-depth;
+        # FilesystemModelRegistry.register would also reject at write time).
+        if model_id in (".", "..") or not _SAFE_FS_MODEL_ID.match(model_id):
+            return "skipped:invalid-model-id"
+        root_str = (environ.get("PRSM_MODEL_REGISTRY_ROOT", "") or "").strip()
+        if not root_str:
+            return "skipped:no-registry-root"
+        catalog_path = (
+            environ.get("PRSM_PARALLAX_MODEL_CATALOG_FILE", "") or ""
+        ).strip()
+        if not catalog_path:
+            # Fall back to the catalog bundled in the repo (config/parallax/).
+            catalog_path = str(
+                Path(__file__).resolve().parents[2]
+                / "config" / "parallax" / "model_catalog.json"
+            )
+        num_layers = _resolve_num_layers_from_catalog(model_id, catalog_path)
+        if num_layers is None:
+            return f"skipped:no-num-layers:{model_id}"
+
+        registry_root = Path(root_str)
+        # Publisher-aware idempotency: FilesystemModelRegistry.register() raises
+        # on ANY pre-existing manifest with no publisher comparison, so check the
+        # manifest ourselves first (mirrors stage_hf_model.py:169-194).
+        manifest_path = registry_root / model_id / "manifest.json"
+        if manifest_path.exists():
+            try:
+                existing = json.loads(manifest_path.read_text())
+                if existing.get("publisher_node_id", "") == identity.node_id:
+                    staged = _manifest_layer_count(existing)
+                    if staged is not None and staged != num_layers:
+                        # The catalog's layer count changed after this model was
+                        # staged. Surface the drift (operator should re-stage)
+                        # rather than silently trusting a stale manifest; we
+                        # don't auto-clobber our own manifest at startup.
+                        return (
+                            f"already:stale-layer-range:{staged}!={num_layers}"
+                        )
+                    return "already"
+                return "refused:different-publisher"
+            except (OSError, json.JSONDecodeError, ValueError):
+                pass  # unreadable manifest → fall through and (re)register
+
+        # Lazy imports — keep the heavy registry/sharding modules off the
+        # module-import path (default operators never trigger them).
+        from prsm.compute.model_registry.registry import (
+            FilesystemModelRegistry,
+            ModelAlreadyRegisteredError,
+        )
+        from prsm.compute.model_sharding.models import ShardedModel, ModelShard
+
+        registry_root.mkdir(parents=True, exist_ok=True)
+        registry = FilesystemModelRegistry(root=registry_root)
+        shard = ModelShard(
+            shard_id=f"{model_id}-shard-0",
+            model_id=model_id,
+            shard_index=0,
+            total_shards=1,
+            tensor_data=b"\x00" * 32,
+            tensor_shape=(32,),
+            layer_range=(0, num_layers),
+            size_bytes=32,
+        )
+        model = ShardedModel(
+            model_id=model_id,
+            model_name=f"HF runner sentinel for {model_id}",
+            total_shards=1,
+            shards=[shard],
+        )
+        try:
+            registry.register(model, identity=identity)
+        except ModelAlreadyRegisteredError:
+            return "already"  # race between the pre-check and register()
+        return "registered"
+    except Exception as exc:  # noqa: BLE001 — must never crash daemon start
+        return f"error:{type(exc).__name__}: {exc}"
 
 
 def build_parallax_executor_or_none(node: Any) -> Optional[Any]:

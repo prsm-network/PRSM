@@ -2706,6 +2706,26 @@ class PRSMNode:
                     "/compute/inference will surface 503 until the "
                     "wiring is complete."
                 )
+            # Sprint 1034 — auto-stage the configured HF model into the local
+            # model registry so the layer_stage chain server can serve it
+            # WITHOUT the operator running scripts/stage_hf_model.py by hand on
+            # every node (the last manual step the Tier-1 bench exposed: an
+            # unstaged model → MODEL_NOT_FOUND at inference). Idempotent +
+            # publisher-aware (won't clobber another publisher). FAIL-OPEN: this
+            # branch is not otherwise try/except-wrapped, so a staging failure
+            # must log + continue, never crash daemon initialize().
+            try:
+                from prsm.node.inference_wiring import ensure_hf_model_staged
+                _stage_status = ensure_hf_model_staged(self.identity)
+                logger.info(
+                    "Sprint 1034 auto-stage HF model: %s", _stage_status,
+                )
+            except Exception as _stage_exc:  # noqa: BLE001
+                logger.warning(
+                    "Sprint 1034 auto-stage failed (non-fatal; run "
+                    "scripts/stage_hf_model.py manually if needed): %s",
+                    _stage_exc,
+                )
         else:
             self.inference_executor = None
 
