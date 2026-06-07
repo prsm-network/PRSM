@@ -74,6 +74,11 @@ BATCH_SETTLEMENT_REGISTRY_ABI = [
         "outputs": [{"name": "", "type": "bool"}],
     },
     {
+        "type": "function", "name": "secondsUntilFinalizable", "stateMutability": "view",
+        "inputs": [{"name": "batchId", "type": "bytes32"}],
+        "outputs": [{"name": "", "type": "uint256"}],
+    },
+    {
         "type": "function", "name": "batches", "stateMutability": "view",
         "inputs": [{"name": "batchId", "type": "bytes32"}],
         "outputs": [
@@ -175,6 +180,14 @@ class Web3SettlementContractClient:
     async def is_finalizable(self, batch_id: bytes) -> bool:
         return await asyncio.to_thread(
             lambda: bool(self.contract.functions.isFinalizable(batch_id).call())
+        )
+
+    async def seconds_until_finalizable(self, batch_id: bytes) -> int:
+        """Seconds remaining in the challenge window (0 if already finalizable).
+        sp1042 — gives the operator a real countdown between the two proof phases
+        instead of a bare 'not finalizable yet'."""
+        return await asyncio.to_thread(
+            lambda: int(self.contract.functions.secondsUntilFinalizable(batch_id).call())
         )
 
     async def finalize_batch(self, batch_id: bytes) -> None:

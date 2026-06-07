@@ -105,9 +105,19 @@ class EscrowPoolClient:
     # ── Async surface ────────────────────────────────────────────────────────
 
     async def balance_of(self, requester: str) -> int:
+        """The requester's ESCROW balance held inside the pool."""
         addr = Web3.to_checksum_address(requester)
         return await asyncio.to_thread(
             lambda: int(self.pool.functions.balanceOf(addr).call())
+        )
+
+    async def ftns_balance_of(self, account: str) -> int:
+        """The account's WALLET FTNS balance (the token's balanceOf, distinct from
+        the in-pool escrow balance). After a settlement, the provider's wallet
+        balance is what rises — the e2e proof asserts on this (sp1042)."""
+        addr = Web3.to_checksum_address(account)
+        return await asyncio.to_thread(
+            lambda: int(self.ftns.functions.balanceOf(addr).call())
         )
 
     async def deposit(self, amount: int) -> str:

@@ -95,6 +95,7 @@ class _FakeContract:
         self._calls = []
         self._views = {
             "isFinalizable": True,
+            "secondsUntilFinalizable": 4242,
             # batches() struct getter — status is field index 7 (uint8).
             "batches": (
                 "0xprovider", "0xrequester", b"\x00" * 32, 3, 100, 0,
@@ -286,6 +287,13 @@ async def test_is_finalizable_reads_view():
     assert await client.is_finalizable(b"\xaa" * 32) is True
     contract._views["isFinalizable"] = False
     assert await client.is_finalizable(b"\xaa" * 32) is False
+
+
+@pytest.mark.asyncio
+async def test_seconds_until_finalizable_reads_view():
+    """sp1042 — the countdown wired for the two-phase e2e proof."""
+    client, _ = _make_client(with_key=False)
+    assert await client.seconds_until_finalizable(b"\xaa" * 32) == 4242
 
 
 @pytest.mark.asyncio
