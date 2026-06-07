@@ -37,8 +37,14 @@ from prsm.settlement.merkle import (
     build_tree_and_proofs,
     hash_leaf,
 )
+from prsm.settlement.state_store import (
+    SettlementStateCorruptError,
+    SettlementStateStore,
+)
 
 logger = logging.getLogger(__name__)
+
+_STATE_VERSION = 1
 
 
 class SettlementContractClient(Protocol):
@@ -164,6 +170,7 @@ class BatchSettlementClient:
         accumulator: ReceiptAccumulator,
         contract_client: SettlementContractClient,
         provider_address: str,
+        state_store: Optional[SettlementStateStore] = None,
     ):
         self._accumulator = accumulator
         self._contract = contract_client
@@ -174,6 +181,16 @@ class BatchSettlementClient:
         # (removed from the accumulator) so they can't be re-committed; resolved by
         # reconcile_pending_commits.
         self._pending_commits: Dict[str, PendingCommit] = {}
+        # sp1039 (brick 2.5) — durable post-commit state. None => in-memory only
+        # (pre-1039 behavior, no filesystem touch). When set, the three dicts
+        # above are rehydrated here and re-persisted after every mutation, so a
+        # restart never strands an already-committed-on-chain batch. A corrupt
+        # state file raises out of load() (loud, not silent-empty).
+        self._store = state_store
+        if self._store is not None:
+            persisted = self._store.load()
+            if persisted is not None:
+                self._apply_state(persisted)
 
     # ── Accumulation ─────────────────────────────────────────────
 
@@ -247,6 +264,7 @@ class BatchSettlementClient:
             # Pop only on success so failed commits naturally retry.
             self._accumulator.pop_batch(ready.key)
             self._tracked[record.batch_id] = record
+            self._persist()  # per-batch: a later loop error can't lose this one
             committed.append(record)
 
         return committed
@@ -277,6 +295,7 @@ class BatchSettlementClient:
             requester_address=requester_address,
             trigger_reason=ready.trigger,
         )
+        self._persist()  # quarantine must survive a restart to be reconciled
 
     async def _commit_one(self, ready: ReadyBatch) -> CommittedBatch:
         """Convert receipts to canonical leaves, build tree, submit
@@ -353,6 +372,7 @@ class BatchSettlementClient:
                 continue
 
             self._finalized_ids.add(batch_id)
+            self._persist()
             finalized.append(FinalizedBatch(
                 batch_id=batch_id, tx_submitted=True
             ))
@@ -409,6 +429,7 @@ class BatchSettlementClient:
                 trigger_reason=pc.trigger_reason,
             )
             del self._pending_commits[tx_hash]
+            self._persist()  # adoption (tracked+ / pending-) must be durable
             adopted += 1
         return adopted
 
@@ -434,5 +455,143 @@ class BatchSettlementClient:
                 continue
             if status == 2:  # FINALIZED per Solidity BatchStatus enum
                 self._finalized_ids.add(batch_id)
+                self._persist()
                 count += 1
         return count
+
+    # ── Durable state (sp1039, brick 2.5) ────────────────────────
+
+    def _persist(self) -> None:
+        """Atomically persist the three post-commit state dicts. No-op when no
+        store is configured (preserves pre-1039 in-memory behavior).
+
+        sp1039 review #6 — a persist failure (disk full / IO error) happens
+        AFTER the in-memory (and possibly on-chain) state already changed, so the
+        in-memory state is now ahead of disk. Log LOUDLY and re-raise rather than
+        swallow: a silent divergence would strand on the next restart, and
+        re-raising bounds the divergence (the caller / poll cycle stops piling up
+        more in-memory-only committed batches and surfaces the failure)."""
+        if self._store is None:
+            return
+        try:
+            self._store.save(self._serialize_state())
+        except Exception as exc:  # noqa: BLE001 — re-raised below after logging
+            logger.error(
+                "settlement state persist FAILED (%s: %s) — in-memory state is "
+                "ahead of disk; a restart before the next successful persist "
+                "would lose the un-persisted change. Check disk/permissions.",
+                type(exc).__name__, exc,
+            )
+            raise
+
+    def _serialize_state(self) -> dict:
+        """JSON-able snapshot. bytes->hex, TriggerReason->value, tuple->list so
+        the round-trip is byte/enum exact (finalize + challenge proofs depend on
+        merkle_root / leaf_hashes / batch_id surviving unchanged)."""
+        return {
+            "version": _STATE_VERSION,
+            "tracked": {
+                bid.hex(): self._committed_to_dict(cb)
+                for bid, cb in self._tracked.items()
+            },
+            "finalized_ids": sorted(b.hex() for b in self._finalized_ids),
+            "pending_commits": {
+                tx: self._pending_to_dict(pc)
+                for tx, pc in self._pending_commits.items()
+            },
+        }
+
+    def _apply_state(self, state: dict) -> None:
+        """Rehydrate the three dicts from a serialized snapshot.
+
+        sp1039 review #1/#4 — a valid-JSON but schema-incompatible file (a future
+        version, a hand-edited/partially-restored file, a renamed/dropped key)
+        must be as LOUD as syntactic corruption. Validate the version and wrap the
+        per-record decode so any mismatch raises SettlementStateCorruptError —
+        which the daemon wiring turns into "settlement OFF + ERROR log" instead of
+        a silent empty rehydrate that would strand every committed batch."""
+        version = state.get("version")
+        if version != _STATE_VERSION:
+            raise SettlementStateCorruptError(
+                f"settlement state version {version!r} != expected "
+                f"{_STATE_VERSION} — refusing to start with a mismatched schema "
+                f"(would risk forgetting committed batches)"
+            )
+        try:
+            self._tracked = {
+                bytes.fromhex(bid): self._committed_from_dict(d)
+                for bid, d in (state.get("tracked") or {}).items()
+            }
+            self._finalized_ids = {
+                bytes.fromhex(h) for h in (state.get("finalized_ids") or [])
+            }
+            self._pending_commits = {
+                tx: self._pending_from_dict(d)
+                for tx, d in (state.get("pending_commits") or {}).items()
+            }
+        except (KeyError, ValueError, TypeError, AttributeError) as exc:
+            raise SettlementStateCorruptError(
+                f"settlement state schema is unreadable: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _committed_to_dict(cb: CommittedBatch) -> dict:
+        return {
+            "batch_id": cb.batch_id.hex(),
+            "tx_hash": cb.tx_hash,
+            "provider_address": cb.provider_address,
+            "requester_address": cb.requester_address,
+            "merkle_root": cb.merkle_root.hex(),
+            "receipt_count": cb.receipt_count,
+            "total_value_ftns": cb.total_value_ftns,
+            "commit_timestamp": cb.commit_timestamp,
+            "leaf_hashes": [h.hex() for h in cb.leaf_hashes],
+            "trigger_reason": cb.trigger_reason.value,
+        }
+
+    @staticmethod
+    def _committed_from_dict(d: dict) -> CommittedBatch:
+        return CommittedBatch(
+            batch_id=bytes.fromhex(d["batch_id"]),
+            tx_hash=d["tx_hash"],
+            provider_address=d["provider_address"],
+            requester_address=d["requester_address"],
+            merkle_root=bytes.fromhex(d["merkle_root"]),
+            receipt_count=d["receipt_count"],
+            total_value_ftns=d["total_value_ftns"],
+            commit_timestamp=d["commit_timestamp"],
+            leaf_hashes=tuple(bytes.fromhex(h) for h in d["leaf_hashes"]),
+            trigger_reason=TriggerReason(d["trigger_reason"]),
+        )
+
+    @staticmethod
+    def _pending_to_dict(pc: PendingCommit) -> dict:
+        requester, provider, group_id, slash_bps = pc.accumulator_key
+        return {
+            "accumulator_key": [requester, provider, group_id.hex(), slash_bps],
+            "tx_hash": pc.tx_hash,
+            "merkle_root": pc.merkle_root.hex(),
+            "leaf_hashes": [h.hex() for h in pc.leaf_hashes],
+            "receipt_count": pc.receipt_count,
+            "total_value_ftns": pc.total_value_ftns,
+            "provider_address": pc.provider_address,
+            "requester_address": pc.requester_address,
+            "trigger_reason": pc.trigger_reason.value,
+        }
+
+    @staticmethod
+    def _pending_from_dict(d: dict) -> PendingCommit:
+        requester, provider, group_hex, slash_bps = d["accumulator_key"]
+        return PendingCommit(
+            accumulator_key=(requester, provider, bytes.fromhex(group_hex),
+                             slash_bps),
+            tx_hash=d["tx_hash"],
+            merkle_root=bytes.fromhex(d["merkle_root"]),
+            leaf_hashes=tuple(bytes.fromhex(h) for h in d["leaf_hashes"]),
+            receipt_count=d["receipt_count"],
+            total_value_ftns=d["total_value_ftns"],
+            provider_address=d["provider_address"],
+            requester_address=d["requester_address"],
+            trigger_reason=TriggerReason(d["trigger_reason"]),
+        )

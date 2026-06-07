@@ -33,7 +33,26 @@ import logging
 import os
 from typing import Any, Optional
 
+from prsm.settlement.state_store import (
+    SettlementStateCorruptError,
+    SettlementStateStore,
+)
+
 logger = logging.getLogger(__name__)
+
+
+def _resolve_state_store(environ) -> Optional[SettlementStateStore]:
+    """Durable-state store for the settlement client, ON by default when
+    settlement is opted in. ``PRSM_SETTLEMENT_STATE_FILE`` overrides the path;
+    the literal ``:memory:`` disables durability (in-memory only)."""
+    from pathlib import Path
+    configured = (environ.get("PRSM_SETTLEMENT_STATE_FILE", "") or "").strip()
+    if configured == ":memory:":
+        return None
+    path = Path(configured) if configured else (
+        Path.home() / ".prsm" / "settlement_state.json"
+    )
+    return SettlementStateStore(path)
 
 
 def build_onchain_settlement_client_or_none(
@@ -99,11 +118,28 @@ def build_onchain_settlement_client_or_none(
             contract_address=registry,
             private_key=key or None,   # None → view-only (commit/finalize defer)
         )
+        # sp1039 (brick 2.5) — durable post-commit state, ON by default whenever
+        # settlement is opted in: committed batches + the broadcast-but-unconfirmed
+        # quarantine represent escrow already locked on chain, so they MUST survive
+        # a restart or the money strands. PRSM_SETTLEMENT_STATE_FILE overrides the
+        # path; ":memory:" disables durability (in-memory only — for tests/diagnostics).
+        state_store = _resolve_state_store(environ)
         return BatchSettlementClient(
             accumulator=ReceiptAccumulator(),
             contract_client=contract_client,
             provider_address=provider_address,
+            state_store=state_store,
         )
+    except SettlementStateCorruptError as exc:
+        # A corrupt money-state file: refuse to start settlement with empty state
+        # (that would silently forget — and strand — every committed batch). Loud
+        # so an operator restores/inspects the file. Settlement stays OFF.
+        logger.error(
+            "on-chain settlement OFF: settlement state file is corrupt (%s). "
+            "Restore it from backup or inspect before re-enabling — starting with "
+            "empty state would strand committed escrow.", exc,
+        )
+        return None
     except Exception as exc:  # never crash daemon start on a wiring problem
         # Log so an operator can tell "off by config" from "off due to error".
         logger.debug(
