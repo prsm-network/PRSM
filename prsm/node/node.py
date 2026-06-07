@@ -2240,6 +2240,7 @@ class PRSMNode:
         self._operator_address = resolve_operator_address()
         # Tasks created on start() — None until then.
         self._compensation_scheduler_task = None
+        self._settlement_poll_task = None  # sp1038 brick 2
         self._heartbeat_scheduler_task = None
         self._key_distribution_watcher_task = None
         self._storage_slashing_watcher_task = None
@@ -4960,6 +4961,18 @@ class PRSMNode:
             )
             logger.info("CompensationDistributorWatcher launched")
 
+        # Sprint 1038 (brick 2) — on-chain settlement commit/finalize/reconcile
+        # poll loop. Only when settlement is opted in; inert (commit/finalize
+        # raise) until a funded settler key is provisioned.
+        if getattr(self, "_onchain_settlement_client", None) is not None:
+            self._settlement_poll_task = asyncio.create_task(
+                self._settlement_poll_loop(),
+            )
+            logger.info(
+                "Sprint 1038 settlement poll loop launched (commit/finalize "
+                "inert until a funded settler key is provisioned)."
+            )
+
         # Start management API in background
         self._api_task = asyncio.create_task(self._run_api())
 
@@ -5513,6 +5526,36 @@ class PRSMNode:
             )
             return None
 
+    async def _settlement_poll_loop(self) -> None:
+        """Sprint 1038 (brick 2) — periodically drive the on-chain settlement
+        commit/finalize/reconcile cycle. Runs only when settlement is opted in
+        (self._onchain_settlement_client is not None); inert (commit/finalize
+        raise 'private_key required') until a funded settler key is provisioned.
+        Each cycle is isolated + never raises; the loop survives iteration errors
+        and exits cleanly on cancellation."""
+        import os as _os
+        from prsm.settlement.client_wiring import run_settlement_poll_cycle
+        try:
+            interval = float(
+                _os.environ.get("PRSM_SETTLEMENT_POLL_INTERVAL_S", "600"),
+            )
+        except (TypeError, ValueError):
+            interval = 600.0
+        interval = max(5.0, interval)
+        while True:
+            try:
+                results = await run_settlement_poll_cycle(
+                    self._onchain_settlement_client,
+                )
+                logger.debug("Sprint 1038 settlement poll cycle: %s", results)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — keep the loop alive
+                logger.warning(
+                    "Sprint 1038 settlement poll iteration error: %s", exc,
+                )
+            await asyncio.sleep(interval)
+
     async def stop(self) -> None:
         """Gracefully shut down all subsystems."""
         if not self._started:
@@ -5595,6 +5638,7 @@ class PRSMNode:
             "_storage_slashing_watcher_task",
             "_compensation_distributor_watcher_task",
             "_pending_withdraw_reconciler_task",  # sp916
+            "_settlement_poll_task",  # sp1038
         ):
             task = getattr(self, task_attr, None)
             if task is not None:

@@ -189,3 +189,42 @@ async def accumulate_settled_inference_receipt(
             "settlement already stands): %s: %s", type(exc).__name__, exc,
         )
         return f"error:{type(exc).__name__}"
+
+
+# Phase order: adopt broadcast-but-unconfirmed commits that landed (so a
+# restart-or-blip doesn't re-commit and double-settle) -> commit ready batches
+# -> finalize those past the challenge window -> mark on-chain-finalized.
+_POLL_PHASES = (
+    ("reconcile_pending", "reconcile_pending_commits"),
+    ("commit", "commit_ready_batches"),
+    ("finalize", "finalize_ready_batches"),
+    ("reconcile_finalized", "reconcile_finalized"),
+)
+
+
+async def run_settlement_poll_cycle(client: Any) -> dict:
+    """Sprint 1038 (brick 2) — drive ONE commit/finalize/reconcile cycle of the
+    on-chain settlement client.
+
+    Each phase is ISOLATED (one failing does not block the others) and the cycle
+    NEVER raises — it runs on a detached background task (see the node poll
+    loop). Returns a per-phase status dict {'reconcile_pending'|'commit'|
+    'finalize'|'reconcile_finalized': 'ok'|<repr>|'error:<Type>'} for logging.
+
+    With the default VIEW-ONLY client (no funded settler key) the commit/finalize
+    phases raise (private_key required) and are recorded as errors — the cycle is
+    inert until the funded-key ceremony. DURABLE batch state (brick 2.5) is
+    required BEFORE that ceremony: today's in-memory _tracked/_pending_commits do
+    not survive a restart, so a crash mid-quarantine could strand a
+    broadcast-but-unconfirmed commit (the sp1022 double-settle guard relies on
+    that quarantine surviving).
+    """
+    results: dict = {}
+    for status_key, method_name in _POLL_PHASES:
+        try:
+            method = getattr(client, method_name)
+            res = await method()
+            results[status_key] = "ok" if res is None else str(res)
+        except Exception as exc:  # noqa: BLE001 — phase isolation; never raise
+            results[status_key] = f"error:{type(exc).__name__}"
+    return results
