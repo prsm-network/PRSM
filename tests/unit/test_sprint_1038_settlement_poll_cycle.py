@@ -22,6 +22,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 def _client(**over):
     c = MagicMock()
+    c.recover_committing_intents = over.get(
+        "recover_committing_intents", AsyncMock(return_value=None))
     c.reconcile_pending_commits = over.get(
         "reconcile_pending_commits", AsyncMock(return_value=None))
     c.commit_ready_batches = over.get(
@@ -38,22 +40,25 @@ def _run(client):
     return asyncio.run(run_settlement_poll_cycle(client))
 
 
-def test_runs_all_four_phases():
+def test_runs_all_phases():
     c = _client()
     res = _run(c)
+    c.recover_committing_intents.assert_awaited_once()
     c.reconcile_pending_commits.assert_awaited_once()
     c.commit_ready_batches.assert_awaited_once()
     c.finalize_ready_batches.assert_awaited_once()
     c.reconcile_finalized.assert_awaited_once()
     assert set(res.keys()) == {
-        "reconcile_pending", "commit", "finalize", "reconcile_finalized",
+        "recover", "reconcile_pending", "commit", "finalize", "reconcile_finalized",
     }
     assert all(v == "ok" for v in res.values())
 
 
-def test_phase_order_is_reconcile_commit_finalize_reconcile():
+def test_phase_order_is_recover_reconcile_commit_finalize_reconcile():
     order = []
     c = _client(
+        recover_committing_intents=AsyncMock(
+            side_effect=lambda: order.append("recover")),
         reconcile_pending_commits=AsyncMock(
             side_effect=lambda: order.append("reconcile_pending")),
         commit_ready_batches=AsyncMock(
@@ -64,7 +69,9 @@ def test_phase_order_is_reconcile_commit_finalize_reconcile():
             side_effect=lambda: order.append("reconcile_finalized")),
     )
     _run(c)
-    assert order == ["reconcile_pending", "commit", "finalize", "reconcile_finalized"]
+    assert order == [
+        "recover", "reconcile_pending", "commit", "finalize", "reconcile_finalized",
+    ]
 
 
 def test_one_phase_error_does_not_block_others():
@@ -80,6 +87,7 @@ def test_one_phase_error_does_not_block_others():
 
 def test_never_raises_when_all_phases_fail():
     c = _client(
+        recover_committing_intents=AsyncMock(side_effect=RuntimeError("r")),
         reconcile_pending_commits=AsyncMock(side_effect=RuntimeError("a")),
         commit_ready_batches=AsyncMock(side_effect=RuntimeError("b")),
         finalize_ready_batches=AsyncMock(side_effect=RuntimeError("c")),

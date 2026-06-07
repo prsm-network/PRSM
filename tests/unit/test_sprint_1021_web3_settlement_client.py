@@ -58,12 +58,28 @@ class _Functions:
         return lambda *args: _Fn(name, args, self._p)
 
 
+class _FakeLogFilter:
+    def __init__(self, entries, raises):
+        self._entries, self._raises = entries, raises
+
+    def get_all_entries(self):
+        if self._raises:
+            raise RuntimeError("eth_getLogs window too wide (413)")
+        return self._entries
+
+
 class _BatchCommittedEvent:
     def __init__(self, parent):
         self._p = parent
 
     def process_receipt(self, receipt):
         return self._p._committed_logs
+
+    def create_filter(self, *, from_block, to_block=None, argument_filters=None):
+        # sp1040 — the chunked recovery scan. Return all configured filter entries
+        # (the test sets them); a single window suffices for these fakes.
+        return _FakeLogFilter(_CFG.get("filter_entries", []),
+                              _CFG.get("filter_raises", False))
 
 
 class _Events:
@@ -107,6 +123,7 @@ class _FakeEth:
     def __init__(self, *, chain_id=8453, send_ok=True, receipt_status=1, contract=None):
         self.chain_id = chain_id
         self.gas_price = 10 ** 9
+        self.block_number = 1_000_000
         self._send_ok = send_ok
         self._receipt_status = receipt_status
         self._contract = contract
@@ -138,7 +155,8 @@ class _FakeEth:
         return _FakeReceipt(status=1)  # landed
 
 
-_CFG = {"send_ok": True, "receipt_status": 1, "contract": None, "receipt_lookup": "landed"}
+_CFG = {"send_ok": True, "receipt_status": 1, "contract": None, "receipt_lookup": "landed",
+        "filter_entries": [], "filter_raises": False}
 
 
 class _FakeWeb3:
@@ -319,6 +337,59 @@ async def test_get_committed_batch_for_tx_reverted_returns_none():
     """A reverted commit tx (receipt status != 1) → None."""
     client, _ = _make_client(with_key=False, receipt_lookup="reverted")
     assert await client.get_committed_batch_for_tx("0xREVERTED") is None
+
+
+# ── find_committed_batch_by_root — sp1040 brick 2.6 chain-scan recovery ────────
+
+_ROOT = b"\xcd" * 32
+
+
+@pytest.mark.asyncio
+async def test_find_committed_batch_by_root_single_match(tmp_path):
+    """One BatchCommitted with the target root → adopt (batch_id, ts)."""
+    client, _ = _make_client(with_key=False)
+    _CFG["filter_raises"] = False
+    _CFG["filter_entries"] = [
+        {"args": {"batchId": _EXPECTED_BATCH_ID, "merkleRoot": _ROOT,
+                  "commitTimestamp": _EXPECTED_COMMIT_TS}},
+    ]
+    result = await client.find_committed_batch_by_root("0x" + "11" * 20, _ROOT)
+    assert result == (_EXPECTED_BATCH_ID, _EXPECTED_COMMIT_TS)
+
+
+@pytest.mark.asyncio
+async def test_find_committed_batch_by_root_no_match_returns_none(tmp_path):
+    client, _ = _make_client(with_key=False)
+    _CFG["filter_raises"] = False
+    _CFG["filter_entries"] = [
+        {"args": {"batchId": _EXPECTED_BATCH_ID, "merkleRoot": b"\x99" * 32,
+                  "commitTimestamp": 1}},  # different root
+    ]
+    assert await client.find_committed_batch_by_root("0x" + "11" * 20, _ROOT) is None
+
+
+@pytest.mark.asyncio
+async def test_find_committed_batch_by_root_refuses_ambiguous(tmp_path):
+    """sp1040 review #2/#5/#11 — two distinct batchIds sharing the root must NOT
+    be auto-adopted (root doesn't bind requester); return None, keep the intent."""
+    client, _ = _make_client(with_key=False)
+    _CFG["filter_raises"] = False
+    _CFG["filter_entries"] = [
+        {"args": {"batchId": b"\x01" * 32, "merkleRoot": _ROOT, "commitTimestamp": 1}},
+        {"args": {"batchId": b"\x02" * 32, "merkleRoot": _ROOT, "commitTimestamp": 2}},
+    ]
+    assert await client.find_committed_batch_by_root("0x" + "11" * 20, _ROOT) is None
+
+
+@pytest.mark.asyncio
+async def test_find_committed_batch_by_root_window_failure_returns_none(tmp_path):
+    """sp1040 review #1 — a getLogs window that 413s is inconclusive: return None
+    (keep the intent + retry) rather than silently report not-landed."""
+    client, _ = _make_client(with_key=False)
+    _CFG["filter_raises"] = True
+    _CFG["filter_entries"] = []
+    assert await client.find_committed_batch_by_root("0x" + "11" * 20, _ROOT) is None
+    _CFG["filter_raises"] = False  # reset for other tests
 
 
 if __name__ == "__main__":

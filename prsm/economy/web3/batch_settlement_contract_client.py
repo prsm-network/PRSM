@@ -112,6 +112,9 @@ BATCH_SETTLEMENT_REGISTRY_ABI = [
 
 _BATCH_STATUS_FIELD_INDEX = 7  # uint8 status within the batches() struct getter
 _RECEIPT_TIMEOUT_SECONDS = 120
+# sp1040 — keep each recovery getLogs window under Base public RPC's ~10k cap
+# (the same ceiling sprint 542 hit; see ftns_onchain.scan_inbound_transfers_chunked).
+_SCAN_MAX_WINDOW = 9_000
 
 
 class Web3SettlementContractClient:
@@ -186,6 +189,92 @@ class Web3SettlementContractClient:
         self, tx_hash: str
     ) -> Optional[Tuple[bytes, int]]:
         return await asyncio.to_thread(self._get_committed_batch_for_tx_sync, tx_hash)
+
+    async def find_committed_batch_by_root(
+        self, provider_address: str, merkle_root: bytes,
+    ) -> Optional[Tuple[bytes, int]]:
+        return await asyncio.to_thread(
+            self._find_committed_batch_by_root_sync, provider_address, merkle_root,
+        )
+
+    def _find_committed_batch_by_root_sync(
+        self, provider_address: str, merkle_root: bytes,
+    ) -> Optional[Tuple[bytes, int]]:
+        """sp1040 (brick 2.6) — recover a commit that LANDED on chain but whose
+        local post-commit persist was lost to a crash. Scans BatchCommitted logs
+        (``provider`` is an indexed topic) for one whose ``merkleRoot`` matches,
+        returning that batch's (batch_id, commit_timestamp) or None.
+
+        sp1040 review fixes:
+        - #1/#6/#12 — the scan is CHUNKED into ``_SCAN_MAX_WINDOW``-block windows
+          (Base public RPC caps getLogs around 10k blocks; an unbounded
+          genesis-to-head request 413s and was silently swallowed, defeating the
+          whole recovery mechanism). The range is bounded: from
+          ``PRSM_SETTLEMENT_SCAN_FROM_BLOCK`` if set, else ``head -
+          PRSM_SETTLEMENT_SCAN_LOOKBACK_BLOCKS`` (default 300k ≈ days on Base,
+          comfortably longer than the challenge window — a freshly-orphaned commit
+          is recovered on the first post-restart poll while it is minutes old).
+        - On ANY scan error we LOG (not silently swallow) and return None so the
+          caller keeps the intent and retries — distinguishable from not-landed.
+        - #2/#5/#11 — if MORE THAN ONE distinct batchId matches (provider, root)
+          we REFUSE to adopt (return None + warn): the root does not bind the
+          requester, so an ambiguous match could adopt the wrong batch. A single
+          unambiguous match is safe (the event is authoritative for what this
+          provider committed)."""
+        import os
+        provider = Web3.to_checksum_address(provider_address)
+        target = bytes(merkle_root)
+        try:
+            head = self.web3.eth.block_number
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("settlement recovery scan: block_number failed (%s) "
+                           "— keeping intent", exc)
+            return None
+        env_from = (os.environ.get("PRSM_SETTLEMENT_SCAN_FROM_BLOCK", "") or "").strip()
+        if env_from:
+            from_block = int(env_from)
+        else:
+            lookback = int(
+                os.environ.get("PRSM_SETTLEMENT_SCAN_LOOKBACK_BLOCKS", "") or 300_000
+            )
+            from_block = max(0, head - lookback)
+
+        matches: dict = {}  # batch_id -> commit_ts (dedup distinct batchIds)
+        event = self.contract.events.BatchCommitted()
+        start = from_block
+        while start <= head:
+            end = min(start + _SCAN_MAX_WINDOW - 1, head)
+            try:
+                flt = event.create_filter(
+                    from_block=start, to_block=end,
+                    argument_filters={"provider": provider},
+                )
+                entries = flt.get_all_entries()
+            except Exception as exc:  # noqa: BLE001 - a capped/failed window is inconclusive
+                logger.warning(
+                    "settlement recovery scan failed on window %d-%d (%s) — "
+                    "keeping intent, will retry", start, end, exc,
+                )
+                return None
+            for e in entries:
+                if bytes(e["args"]["merkleRoot"]) == target:
+                    matches[bytes(e["args"]["batchId"])] = int(
+                        e["args"]["commitTimestamp"])
+            if end == head:
+                break
+            start = end + 1
+
+        if not matches:
+            return None
+        if len(matches) > 1:
+            logger.warning(
+                "settlement recovery: %d distinct batchIds share root %s for "
+                "provider %s — refusing ambiguous adoption (keeping intent for "
+                "operator review)", len(matches), target.hex()[:12], provider,
+            )
+            return None
+        (batch_id, commit_ts), = matches.items()
+        return batch_id, commit_ts
 
     def _get_committed_batch_for_tx_sync(self, tx_hash: str) -> Optional[Tuple[bytes, int]]:
         """Recover (batch_id, commit_timestamp) from a commitBatch tx by parsing the

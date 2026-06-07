@@ -227,10 +227,14 @@ async def accumulate_settled_inference_receipt(
         return f"error:{type(exc).__name__}"
 
 
-# Phase order: adopt broadcast-but-unconfirmed commits that landed (so a
-# restart-or-blip doesn't re-commit and double-settle) -> commit ready batches
-# -> finalize those past the challenge window -> mark on-chain-finalized.
+# Phase order: FIRST recover commit-intents orphaned by a crash in the
+# commit→persist window (sp1040 — adopt any that landed so they get finalized,
+# before we commit anything new); then adopt broadcast-but-unconfirmed commits
+# that landed (so a restart-or-blip doesn't re-commit and double-settle) ->
+# commit ready batches -> finalize those past the challenge window -> mark
+# on-chain-finalized.
 _POLL_PHASES = (
+    ("recover", "recover_committing_intents"),
     ("reconcile_pending", "reconcile_pending_commits"),
     ("commit", "commit_ready_batches"),
     ("finalize", "finalize_ready_batches"),

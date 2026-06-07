@@ -108,6 +108,17 @@ class SettlementContractClient(Protocol):
         on-chain batchId and double-settles)."""
         ...
 
+    async def find_committed_batch_by_root(
+        self, provider_address: str, merkle_root: bytes,
+    ) -> Optional[Tuple[bytes, int]]:
+        """Recover (batch_id, commit_timestamp) for a commit that landed on chain
+        by scanning BatchCommitted logs (provider indexed) for a matching
+        merkle_root. Returns None if none is found / the scan is inconclusive.
+
+        Optional in the Protocol: ``recover_committing_intents`` calls it via
+        getattr and no-ops if a contract client doesn't implement it (sp1040)."""
+        ...
+
 
 @dataclass(frozen=True)
 class CommittedBatch:
@@ -135,6 +146,27 @@ class FinalizedBatch:
     """Return shape of finalize_ready_batches."""
     batch_id: bytes
     tx_submitted: bool                      # False if already finalized etc.
+
+
+@dataclass(frozen=True)
+class CommitIntent:
+    """sp1040 (brick 2.6) — a write-ahead record of a batch this client is ABOUT
+    to commit, written durably BEFORE the irreversible on-chain broadcast.
+
+    If the process crashes after commitBatch confirms on chain (escrow locked)
+    but before the post-commit persist records the batch in _tracked, this intent
+    is what survives the restart. recover_committing_intents() scans the chain for
+    a BatchCommitted with this merkle_root and adopts the landed batch into
+    _tracked — without the intent there is NO way to learn the commit happened
+    (a clean confirm leaves no quarantined tx_hash), and the escrow strands."""
+    accumulator_key: Tuple
+    merkle_root: bytes
+    leaf_hashes: Tuple[bytes, ...]
+    receipt_count: int
+    total_value_ftns: int
+    provider_address: str
+    requester_address: str
+    trigger_reason: TriggerReason
 
 
 @dataclass(frozen=True)
@@ -181,6 +213,12 @@ class BatchSettlementClient:
         # (removed from the accumulator) so they can't be re-committed; resolved by
         # reconcile_pending_commits.
         self._pending_commits: Dict[str, PendingCommit] = {}
+        # sp1040 (brick 2.6) — commit-intent write-ahead log, keyed by merkle_root
+        # hex. An entry means "a commit for this batch was broadcast (or about to
+        # be) and may have landed". Written BEFORE the irreversible broadcast and
+        # cleared once the batch is promoted to _tracked; leftovers on restart are
+        # resolved by recover_committing_intents (chain scan by root).
+        self._committing: Dict[str, CommitIntent] = {}
         # sp1039 (brick 2.5) — durable post-commit state. None => in-memory only
         # (pre-1039 behavior, no filesystem touch). When set, the three dicts
         # above are rehydrated here and re-persisted after every mutation, so a
@@ -233,8 +271,17 @@ class BatchSettlementClient:
         """
         committed: List[CommittedBatch] = []
         for ready in self._accumulator.ready_batches():
+            leaf_hashes, root = self._build_leaves_root(ready)
+            # sp1040 review #10 — key the WAL by (accumulator_key, root), NOT root
+            # alone: two distinct ready batches that happen to share a merkle_root
+            # would otherwise overwrite each other's intent and strand the first.
+            intent_key = self._intent_key(ready.key, root)
+            # sp1040 — WAL: record the intent durably BEFORE the irreversible
+            # broadcast so a crash in the commit→persist window is recoverable.
+            self._committing[intent_key] = self._build_intent(ready, leaf_hashes, root)
+            self._persist()
             try:
-                record = await self._commit_one(ready)
+                record = await self._commit_one(ready, leaf_hashes, root)
             except Exception as exc:
                 tx_hash = getattr(exc, "tx_hash", None)
                 if tx_hash is not None:
@@ -244,7 +291,10 @@ class BatchSettlementClient:
                     # has no content dedup) → double settlement. Quarantine
                     # instead: remove from the accumulator so it can NEVER be
                     # re-committed, and record it for reconcile_pending_commits.
-                    self._quarantine_pending(ready, tx_hash)
+                    # The intent is cleared because the durable _pending_commits
+                    # record (by tx_hash) now owns recovery for this commit.
+                    self._committing.pop(intent_key, None)
+                    self._quarantine_pending(ready, tx_hash, leaf_hashes, root)
                     logger.error(
                         f"batch commit for key {ready.key} broadcast but "
                         f"UNCONFIRMED (tx {tx_hash}); quarantined to avoid "
@@ -252,8 +302,11 @@ class BatchSettlementClient:
                     )
                 else:
                     # BroadcastFailedError (chain saw nothing) / OnChainRevertedError
-                    # (atomic rollback) — safe to retry; receipts stay in the
-                    # accumulator (popped only on success below).
+                    # (atomic rollback) — the commit did NOT land, so drop the
+                    # intent; receipts stay in the accumulator (popped only on
+                    # success below) and are safe to retry next poll.
+                    self._committing.pop(intent_key, None)
+                    self._persist()
                     logger.warning(
                         f"batch commit failed for key {ready.key}: "
                         f"{type(exc).__name__}: {exc} — receipts retained "
@@ -261,10 +314,14 @@ class BatchSettlementClient:
                     )
                 continue
 
-            # Pop only on success so failed commits naturally retry.
+            # Pop only on success so failed commits naturally retry. Promote the
+            # batch and clear its intent together (one persist) — a later loop
+            # error can't lose this one, and a crash before this persist leaves
+            # the intent for chain-scan recovery.
             self._accumulator.pop_batch(ready.key)
             self._tracked[record.batch_id] = record
-            self._persist()  # per-batch: a later loop error can't lose this one
+            self._committing.pop(intent_key, None)
+            self._persist()
             committed.append(record)
 
         return committed
@@ -278,11 +335,38 @@ class BatchSettlementClient:
         tree = build_tree_and_proofs(leaf_hashes)
         return leaf_hashes, tree.root
 
-    def _quarantine_pending(self, ready: ReadyBatch, tx_hash: str) -> None:
+    @staticmethod
+    def _intent_key(accumulator_key: Tuple, root: bytes) -> str:
+        """sp1040 #10 — a string WAL key unique per ready batch (root alone is
+        not: identical content under two accumulator keys shares a root)."""
+        requester, provider, group_id, slash_bps = accumulator_key
+        return f"{root.hex()}|{requester}|{provider}|{group_id.hex()}|{slash_bps}"
+
+    def _build_intent(
+        self, ready: ReadyBatch, leaf_hashes: List[bytes], root: bytes,
+    ) -> CommitIntent:
+        """sp1040 — the write-ahead record for a batch about to be committed."""
+        requester_address, provider_address, _group_id, _slash_bps = ready.key
+        return CommitIntent(
+            accumulator_key=ready.key,
+            merkle_root=root,
+            leaf_hashes=tuple(leaf_hashes),
+            receipt_count=len(leaf_hashes),
+            total_value_ftns=ready.batch.total_value_ftns,
+            provider_address=provider_address,
+            requester_address=requester_address,
+            trigger_reason=ready.trigger,
+        )
+
+    def _quarantine_pending(
+        self, ready: ReadyBatch, tx_hash: str,
+        leaf_hashes: Optional[List[bytes]] = None, root: Optional[bytes] = None,
+    ) -> None:
         """Remove a broadcast-but-unconfirmed batch from the accumulator and stash
         it for reconciliation. Popping is what guarantees no double-commit."""
         requester_address, provider_address, _group_id, _slash_bps = ready.key
-        leaf_hashes, root = self._build_leaves_root(ready)
+        if leaf_hashes is None or root is None:
+            leaf_hashes, root = self._build_leaves_root(ready)
         self._accumulator.pop_batch(ready.key)
         self._pending_commits[tx_hash] = PendingCommit(
             accumulator_key=ready.key,
@@ -297,7 +381,10 @@ class BatchSettlementClient:
         )
         self._persist()  # quarantine must survive a restart to be reconciled
 
-    async def _commit_one(self, ready: ReadyBatch) -> CommittedBatch:
+    async def _commit_one(
+        self, ready: ReadyBatch,
+        leaf_hashes: Optional[List[bytes]] = None, root: Optional[bytes] = None,
+    ) -> CommittedBatch:
         """Convert receipts to canonical leaves, build tree, submit
         commitBatch. On success, returns the CommittedBatch record.
 
@@ -309,7 +396,8 @@ class BatchSettlementClient:
         # AccumulatorKey is (requester, provider, group_id, slash_rate_bps).
         requester_address, provider_address, group_id, slash_rate_bps = ready.key
 
-        leaf_hashes, root = self._build_leaves_root(ready)
+        if leaf_hashes is None or root is None:
+            leaf_hashes, root = self._build_leaves_root(ready)
 
         batch_id, commit_ts = await self._contract.commit_batch(
             provider_address=provider_address,
@@ -394,6 +482,68 @@ class BatchSettlementClient:
         are NOT settled and NOT in the accumulator (they will not be re-committed)
         until reconcile_pending_commits resolves their tx's fate."""
         return list(self._pending_commits.values())
+
+    def committing_intents(self) -> List[CommitIntent]:
+        """Snapshot of write-ahead commit intents not yet promoted/resolved
+        (sp1040). A non-empty list after a clean run means a commit may have
+        landed on chain but its local promote was lost to a crash — resolved by
+        recover_committing_intents (chain scan)."""
+        return list(self._committing.values())
+
+    async def recover_committing_intents(self) -> int:
+        """sp1040 (brick 2.6) — resolve write-ahead commit intents left over from
+        a crash in the commit→persist window. For each intent, scan the chain for
+        a BatchCommitted with this provider + merkle_root: if the commit ACTUALLY
+        LANDED, adopt the batch into _tracked (so finalize proceeds) and clear the
+        intent; if it did not land (or the scan is inconclusive) leave the intent
+        for a later cycle — never assume-failed, since a re-commit of a slow tx
+        would double-settle. Returns the count newly adopted.
+
+        No-op (returns 0) if the contract client cannot scan by root — the backfill
+        simply isn't available, but recovery never crashes."""
+        scan = getattr(self._contract, "find_committed_batch_by_root", None)
+        if scan is None:
+            return 0
+        # sp1040 #9 — scan by the address that actually sent commitBatch
+        # (msg.sender == the settler key) when known; the BatchCommitted.provider
+        # topic is msg.sender. The sp1036 funds-safety check already pins
+        # key.address == provider_address, so these agree today, but using the
+        # contract's own address is correct even if that ever decouples.
+        msg_sender = getattr(self._contract, "address", None)
+        adopted = 0
+        for intent_key, intent in list(self._committing.items()):
+            scan_provider = msg_sender or intent.provider_address
+            try:
+                result = await scan(scan_provider, intent.merkle_root)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"commit-intent recovery scan failed for {intent_key[:12]}…:"
+                    f" {type(exc).__name__}: {exc}"
+                )
+                continue
+            if not result:
+                continue  # not landed / inconclusive — keep the intent (conservative)
+            batch_id, commit_ts = result
+            self._tracked[batch_id] = CommittedBatch(
+                batch_id=batch_id,
+                tx_hash="",
+                provider_address=intent.provider_address,
+                requester_address=intent.requester_address,
+                merkle_root=intent.merkle_root,
+                receipt_count=intent.receipt_count,
+                total_value_ftns=intent.total_value_ftns,
+                commit_timestamp=commit_ts,
+                leaf_hashes=intent.leaf_hashes,
+                trigger_reason=intent.trigger_reason,
+            )
+            del self._committing[intent_key]
+            self._persist()
+            logger.info(
+                f"recovered orphaned commit (root {intent.merkle_root.hex()[:12]}…) "
+                f"as batch {batch_id.hex()[:12]}… — strand avoided"
+            )
+            adopted += 1
+        return adopted
 
     async def reconcile_pending_commits(self) -> int:
         """Resolve quarantined broadcast-but-unconfirmed commits. For each, ask the
@@ -499,6 +649,10 @@ class BatchSettlementClient:
                 tx: self._pending_to_dict(pc)
                 for tx, pc in self._pending_commits.items()
             },
+            "committing": {
+                rh: self._intent_to_dict(ci)
+                for rh, ci in self._committing.items()
+            },
         }
 
     def _apply_state(self, state: dict) -> None:
@@ -528,6 +682,10 @@ class BatchSettlementClient:
             self._pending_commits = {
                 tx: self._pending_from_dict(d)
                 for tx, d in (state.get("pending_commits") or {}).items()
+            }
+            self._committing = {
+                rh: self._intent_from_dict(d)
+                for rh, d in (state.get("committing") or {}).items()
             }
         except (KeyError, ValueError, TypeError, AttributeError) as exc:
             raise SettlementStateCorruptError(
@@ -587,6 +745,35 @@ class BatchSettlementClient:
             accumulator_key=(requester, provider, bytes.fromhex(group_hex),
                              slash_bps),
             tx_hash=d["tx_hash"],
+            merkle_root=bytes.fromhex(d["merkle_root"]),
+            leaf_hashes=tuple(bytes.fromhex(h) for h in d["leaf_hashes"]),
+            receipt_count=d["receipt_count"],
+            total_value_ftns=d["total_value_ftns"],
+            provider_address=d["provider_address"],
+            requester_address=d["requester_address"],
+            trigger_reason=TriggerReason(d["trigger_reason"]),
+        )
+
+    @staticmethod
+    def _intent_to_dict(ci: CommitIntent) -> dict:
+        requester, provider, group_id, slash_bps = ci.accumulator_key
+        return {
+            "accumulator_key": [requester, provider, group_id.hex(), slash_bps],
+            "merkle_root": ci.merkle_root.hex(),
+            "leaf_hashes": [h.hex() for h in ci.leaf_hashes],
+            "receipt_count": ci.receipt_count,
+            "total_value_ftns": ci.total_value_ftns,
+            "provider_address": ci.provider_address,
+            "requester_address": ci.requester_address,
+            "trigger_reason": ci.trigger_reason.value,
+        }
+
+    @staticmethod
+    def _intent_from_dict(d: dict) -> CommitIntent:
+        requester, provider, group_hex, slash_bps = d["accumulator_key"]
+        return CommitIntent(
+            accumulator_key=(requester, provider, bytes.fromhex(group_hex),
+                             slash_bps),
             merkle_root=bytes.fromhex(d["merkle_root"]),
             leaf_hashes=tuple(bytes.fromhex(h) for h in d["leaf_hashes"]),
             receipt_count=d["receipt_count"],
