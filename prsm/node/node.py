@@ -4068,6 +4068,44 @@ class PRSMNode:
             flush_threshold=1.0,      # or when pending ≥ 1.0 FTNS
         )
         
+        # ── On-chain cross-node settlement client (sprint 1036, opt-in) ──
+        # OFF by default. PRSM_ONCHAIN_SETTLEMENT=1 + a provider address opt in
+        # to LOCAL accumulation (the receipt->BatchedReceipt adapter feeds it,
+        # sprint 1035); commit/finalize additionally need a funded
+        # FTNS_WALLET_PRIVATE_KEY (brick 2 + the key ceremony). Fail-open: a
+        # settlement-wiring problem must never crash daemon initialize().
+        self._onchain_settlement_client = None
+        try:
+            from prsm.settlement.client_wiring import (
+                build_onchain_settlement_client_or_none,
+            )
+            self._onchain_settlement_client = (
+                build_onchain_settlement_client_or_none(
+                    provider_address=self._operator_address,
+                )
+            )
+            if self._onchain_settlement_client is not None:
+                logger.info(
+                    "On-chain settlement client wired (provider=%s, "
+                    "write_capable=%s). Accumulation is local; commit/finalize "
+                    "need a funded settler key.",
+                    self._operator_address,
+                    bool(
+                        (os.getenv("FTNS_WALLET_PRIVATE_KEY", "") or "").strip()
+                    ),
+                )
+            else:
+                logger.info(
+                    "On-chain settlement client OFF (opt in with "
+                    "PRSM_ONCHAIN_SETTLEMENT=1 + PRSM_OPERATOR_ADDRESS; add "
+                    "FTNS_WALLET_PRIVATE_KEY for on-chain commit)."
+                )
+        except Exception as _settle_exc:  # noqa: BLE001
+            logger.warning(
+                "On-chain settlement client build failed (non-fatal): %s",
+                _settle_exc,
+            )
+
         # ── Settler Registry (Phase 6: L2-style staking for batch security) ──
         from prsm.node.settler_registry import SettlerRegistry
         self._settler_registry = SettlerRegistry(
