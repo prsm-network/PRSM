@@ -332,6 +332,29 @@ async def _settle_streaming_escrow(
                 job_id=job_id,
                 escrow_amount=escrow_amount,
             )
+            # Sprint 1037 (brick 1.5) — on-chain settlement accumulate
+            # (opt-in; no-op when off). Fail-open (parity with the unary path).
+            try:
+                from prsm.settlement.client_wiring import (
+                    accumulate_settled_inference_receipt,
+                )
+                _acc = await accumulate_settled_inference_receipt(
+                    client=getattr(node, "_onchain_settlement_client", None),
+                    identity=node.identity,
+                    provider_address=getattr(node, "_operator_address", None),
+                    receipt=result.receipt,
+                    release_ftns=decision.release_to_operator,
+                    job_id=job_id,
+                )
+                if _acc != "skipped:no-client":
+                    logger.info(
+                        "Sprint 1037 on-chain settlement accumulate "
+                        "(stream job=%s): %s", job_id, _acc,
+                    )
+            except Exception as _acc_exc:  # noqa: BLE001
+                logger.debug(
+                    "Sprint 1037 accumulate hook error: %s", _acc_exc,
+                )
             if decision.should_slash:
                 logger.warning(
                     "Sprint 784 — slash signal for job_id=%s: "
@@ -8166,6 +8189,37 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                             job_id=job_id,
                             escrow_amount=escrow_amount,
                         )
+                        # Sprint 1037 (brick 1.5) — feed the settled receipt
+                        # into the on-chain settlement accumulator (opt-in;
+                        # no-op when node._onchain_settlement_client is None).
+                        # Fail-open: must never unwind the completed off-chain
+                        # settlement above.
+                        try:
+                            from prsm.settlement.client_wiring import (
+                                accumulate_settled_inference_receipt,
+                            )
+                            _acc = await accumulate_settled_inference_receipt(
+                                client=getattr(
+                                    node, "_onchain_settlement_client", None,
+                                ),
+                                identity=node.identity,
+                                provider_address=getattr(
+                                    node, "_operator_address", None,
+                                ),
+                                receipt=receipt,
+                                release_ftns=decision.release_to_operator,
+                                job_id=job_id,
+                            )
+                            if _acc != "skipped:no-client":
+                                logger.info(
+                                    "Sprint 1037 on-chain settlement "
+                                    "accumulate (job=%s): %s", job_id, _acc,
+                                )
+                        except Exception as _acc_exc:  # noqa: BLE001
+                            logger.debug(
+                                "Sprint 1037 accumulate hook error: %s",
+                                _acc_exc,
+                            )
                         if decision.should_slash:
                             logger.warning(
                                 "Sprint 785 — slash signal for "

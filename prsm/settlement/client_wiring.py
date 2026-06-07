@@ -111,3 +111,81 @@ def build_onchain_settlement_client_or_none(
             type(exc).__name__, exc,
         )
         return None
+
+
+async def accumulate_settled_inference_receipt(
+    *,
+    client: Any,
+    identity: Any,
+    provider_address: Optional[str],
+    receipt: Any,
+    release_ftns: Any,
+    job_id: str,
+    requester_address: Optional[str] = None,
+    executed_at_unix: Optional[int] = None,
+) -> str:
+    """Sprint 1037 (brick 1.5) — feed a just-settled InferenceReceipt into the
+    on-chain settlement accumulator.
+
+    Called from the /compute/inference settle path AFTER the off-chain escrow
+    release: adapts the receipt (sprint 1035) to a BatchedReceipt and calls
+    ``client.accumulate``. No-op when settlement is off (``client`` is None).
+
+    FAIL-OPEN: never raises and never unwinds the completed off-chain
+    settlement — an accumulation problem must not fail the inference response.
+    Returns a status string for the caller to log: 'accumulated' |
+    'skipped:<reason>' | 'error:<Type>'.
+
+    Self-escrow note: today's /compute/inference escrows the requester as the
+    local node, so ``requester_address`` defaults to ``provider_address`` (a
+    self-settlement). Pass a distinct ``requester_address`` once a paying
+    requester supplies its eth address (a future API change).
+    """
+    try:
+        if client is None:
+            return "skipped:no-client"
+        if not provider_address:
+            return "skipped:no-provider-address"
+        from decimal import Decimal
+        rel = (
+            release_ftns if isinstance(release_ftns, Decimal)
+            else Decimal(str(release_ftns))
+        )
+        if rel <= 0:
+            return "skipped:zero-release"
+        # Cross-host multi-stage: the off-chain settle split `release_ftns`
+        # across N stage nodes (sprint 1031). Booking the FULL amount to one
+        # provider on-chain would over-attribute (a conservation mismatch once
+        # the commit path goes live). Skip until per-stage on-chain accumulation
+        # (brick 2). Uses the SAME split helper the off-chain path uses, so the
+        # two ledgers stay consistent.
+        from prsm.economy.credit_policy import split_release_across_stages
+        if split_release_across_stages(receipt, rel) is not None:
+            return "skipped:multi-stage-deferred"
+        value_wei = int(rel * (Decimal(10) ** 18))   # FTNS -> wei (18 dec)
+        if value_wei <= 0:
+            return "skipped:sub-wei"   # release below 1 wei rounds to 0
+        if executed_at_unix is None:
+            import time as _time
+            executed_at_unix = int(_time.time())
+
+        from prsm.settlement.inference_adapter import (
+            inference_receipt_to_batched_receipt,
+        )
+        batched = inference_receipt_to_batched_receipt(
+            receipt=receipt,
+            identity=identity,
+            requester_address=requester_address or provider_address,
+            provider_address=provider_address,
+            value_ftns=value_wei,
+            local_escrow_id=job_id,
+            executed_at_unix=executed_at_unix,
+        )
+        await client.accumulate(batched)
+        return "accumulated"
+    except Exception as exc:  # noqa: BLE001 — never unwind the off-chain settle
+        logger.warning(
+            "on-chain settlement accumulate failed (non-fatal; off-chain "
+            "settlement already stands): %s: %s", type(exc).__name__, exc,
+        )
+        return f"error:{type(exc).__name__}"
