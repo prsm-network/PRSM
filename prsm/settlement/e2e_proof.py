@@ -209,6 +209,64 @@ async def run_finalize_and_verify(
     return report
 
 
+async def run_finalize_by_batch_id(
+    *,
+    contract_client: Any,
+    escrow_client: Any,
+    batch_id: bytes,
+) -> dict:
+    """sp1043 — STATE-FILE-INDEPENDENT finalize: recover + finalize a committed
+    batch straight from chain state, for when the local durable state was lost
+    between the two phases (the committed escrow would otherwise be un-finalizable
+    via the harness). Reads the batch (provider/requester/status), finalizes it
+    directly via the contract, and verifies it reached FINALIZED.
+
+    Idempotent + safe: an already-FINALIZED batch is success (no re-finalize); an
+    absent (NONEXISTENT) / VOIDED / not-yet-finalizable batch is never finalized.
+    Success is keyed on the authoritative on-chain status, not a wallet delta."""
+    batch = await contract_client.get_batch(batch_id)
+    status = int(batch["status"])
+    if status == 0:
+        return {"exists": False, "success": False, "error": "batch not found on chain"}
+    requester = batch["requester"]
+    recipient = batch["provider"]   # settleFromRequester pays the provider
+    if status == 3:
+        return {"exists": True, "finalized": False, "success": False,
+                "error": "batch is VOIDED"}
+    if status == 2:
+        recipient_now = int(await escrow_client.ftns_balance_of(recipient))
+        escrow_now = int(await escrow_client.balance_of(requester))
+        return {"exists": True, "finalizable": True, "finalized": True,
+                "recipient_ftns_after": recipient_now, "recipient_ftns_delta": 0,
+                "requester_escrow_after": escrow_now, "success": True,
+                "note": "already finalized"}
+
+    # status == 1 PENDING
+    finalizable = bool(await contract_client.is_finalizable(batch_id))
+    if not finalizable:
+        seconds_left = await _seconds_until_finalizable(contract_client, batch_id)
+        return {"exists": True, "finalizable": False, "finalized": False,
+                "success": False, "seconds_until_finalizable": seconds_left}
+
+    recipient_before = int(await escrow_client.ftns_balance_of(recipient))
+    await contract_client.finalize_batch(batch_id)   # raises OnChainRevertedError on revert
+    final_status = int(await contract_client.get_batch_status(batch_id))
+    finalized = (final_status == 2)
+    recipient_after = int(await escrow_client.ftns_balance_of(recipient))
+    requester_escrow_after = int(await escrow_client.balance_of(requester))
+    report = {
+        "exists": True, "finalizable": True, "finalized": finalized,
+        "recipient_ftns_before": recipient_before,
+        "recipient_ftns_after": recipient_after,
+        "recipient_ftns_delta": recipient_after - recipient_before,
+        "requester_escrow_after": requester_escrow_after,
+        "success": bool(finalized),
+    }
+    logger.info("finalize-by-id: batch %s success=%s escrow_after=%s",
+                batch_id.hex()[:12], finalized, requester_escrow_after)
+    return report
+
+
 async def _is_finalized(settlement_client: Any, contract_client: Any,
                         batch_id: bytes) -> bool:
     """True if this batch is FINALIZED — locally recorded OR on-chain status==2

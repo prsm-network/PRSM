@@ -304,6 +304,18 @@ async def test_get_batch_status_reads_struct_field_7():
 
 
 @pytest.mark.asyncio
+async def test_get_batch_reads_struct_fields():
+    """sp1043 — the batch struct read used by state-file-independent finalize."""
+    client, _ = _make_client(with_key=False)
+    b = await client.get_batch(b"\xaa" * 32)
+    assert b["provider"] == "0xprovider"
+    assert b["requester"] == "0xrequester"
+    assert b["status"] == 2                 # FINALIZED at index 7
+    assert b["total_value_ftns"] == 100     # index 4
+    assert b["escrow_pool_at_commit"] == "0x0"  # index 13
+
+
+@pytest.mark.asyncio
 async def test_finalize_batch_happy_and_revert():
     client, contract = _make_client()
     await client.finalize_batch(b"\xaa" * 32)  # status 1 → no raise

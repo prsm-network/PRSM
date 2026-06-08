@@ -198,6 +198,25 @@ class Web3SettlementContractClient:
             lambda: int(self.contract.functions.batches(batch_id).call()[_BATCH_STATUS_FIELD_INDEX])
         )
 
+    async def get_batch(self, batch_id: bytes) -> dict:
+        """sp1043 — the batch struct fields the state-file-independent finalize
+        needs (provider/requester/status/value/escrow-pool snapshot). Lets a
+        committed batch be recovered + finalized from chain alone."""
+        return await asyncio.to_thread(self._get_batch_sync, batch_id)
+
+    def _get_batch_sync(self, batch_id: bytes) -> dict:
+        b = self.contract.functions.batches(batch_id).call()
+        return {
+            "provider": b[0],
+            "requester": b[1],
+            "merkle_root": bytes(b[2]),
+            "receipt_count": int(b[3]),
+            "total_value_ftns": int(b[4]),
+            "commit_timestamp": int(b[6]),
+            "status": int(b[7]),               # 0=NONEXISTENT 1=PENDING 2=FINALIZED 3=VOIDED
+            "escrow_pool_at_commit": b[13],
+        }
+
     async def get_committed_batch_for_tx(
         self, tx_hash: str
     ) -> Optional[Tuple[bytes, int]]:

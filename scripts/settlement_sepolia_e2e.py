@@ -69,6 +69,7 @@ async def _amain(args) -> int:
         build_signed_batched_receipt,
         run_deposit_and_commit,
         run_finalize_and_verify,
+        run_finalize_by_batch_id,
     )
     from prsm.node.identity import generate_node_identity
     from eth_account import Account
@@ -146,8 +147,16 @@ async def _amain(args) -> int:
         print(f"  escrow_balance={report['escrow_balance']} wei")
         batch_id = bytes.fromhex(report["batch_id"])
         if args.phase == "deposit-commit":
-            print("PHASE 1 done. Re-run with --phase finalize after the challenge "
-                  "window (~3 days, or sooner if you lowered it before committing).")
+            # sp1043 — print the REAL countdown read from chain (the window is
+            # snapshotted per-batch; don't hardcode a guess).
+            try:
+                secs = await contract.seconds_until_finalizable(batch_id)
+                eta = "now" if secs <= 0 else f"~{secs/3600:.1f}h (at {secs}s)"
+            except Exception:  # noqa: BLE001
+                eta = "the challenge window"
+            print(f"PHASE 1 done. Batch finalizable in {eta}. Re-run with "
+                  f"--phase finalize then (same machine / --state-file), or "
+                  f"--phase finalize --batch-id {report['batch_id']} from anywhere.")
             return 0
 
     if args.phase == "full":
@@ -157,6 +166,22 @@ async def _amain(args) -> int:
             if await contract.is_finalizable(batch_id):
                 break
             await asyncio.sleep(args.poll_interval_s)
+
+    # sp1043 — state-file-independent recovery: finalize a known batch_id straight
+    # from chain state (no dependency on the local durable state file surviving
+    # the multi-day gap).
+    if args.batch_id:
+        bid = bytes.fromhex(args.batch_id[2:] if args.batch_id.startswith("0x")
+                            else args.batch_id)
+        report = await run_finalize_by_batch_id(
+            contract_client=contract, escrow_client=escrow, batch_id=bid)
+        print(f"batch {bid.hex()[:12]}…: {report}")
+        if report.get("success"):
+            return 0
+        secs = report.get("seconds_until_finalizable")
+        if report.get("finalizable") is False and secs is not None:
+            print(f"  not finalizable yet (~{secs/3600:.1f}h remaining)")
+        return 1
 
     # sp1042 review #7 — adopt any commit that landed on-chain but isn't in
     # _tracked: a quarantined broadcast-but-unconfirmed commit (reconcile) or a
@@ -210,6 +235,10 @@ def main(argv=None) -> int:
                         help="FTNS to deposit + settle (default 1.0)")
     parser.add_argument("--state-file", default=_default_state_file(),
                         help="durable settlement state file bridging the two phases")
+    parser.add_argument("--batch-id", default=None,
+                        help="[finalize] finalize this specific batch straight from "
+                             "chain state, no state file needed (recovery path if the "
+                             "state file was lost between the two phases)")
     parser.add_argument("--poll-timeout-s", type=int, default=600,
                         help="[full] max seconds to poll isFinalizable")
     parser.add_argument("--poll-interval-s", type=int, default=15,
