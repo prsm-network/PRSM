@@ -155,6 +155,8 @@ async def run_finalize_and_verify(
     batch_id: bytes,
     requester_address: str,
     recipient_address: str,
+    settle_confirm_attempts: int = 6,
+    settle_confirm_delay_s: float = 2.0,
 ) -> dict:
     """Phase 2: finalize this batch (if the challenge window elapsed) and verify it
     SETTLED. ``success`` is keyed on the AUTHORITATIVE on-chain batch status
@@ -191,8 +193,25 @@ async def run_finalize_and_verify(
     # persists _finalized_ids; idempotent across this per-batch loop.
     await settlement_client.finalize_ready_batches()
     finalized = await _is_finalized(settlement_client, contract_client, batch_id)
+
+    # sp1045 — settlement-confirmation poll. A fresh finalize tx mines, but RPC
+    # read REPLICAS lag, so an immediate balance read can show the PRE-settle state
+    # (escrow not yet drained / wallet unchanged) even though settleFromRequester
+    # landed. The success verdict already follows the on-chain FINALIZED status, so
+    # this only SHARPENS the advisory balances — avoiding alarming-but-wrong
+    # "delta 0 / escrow not drained" output (which would be terrifying mid mainnet
+    # ceremony). Poll until the recipient wallet reflects the settlement, bounded.
     recipient_after = int(await escrow_client.ftns_balance_of(recipient_address))
     requester_escrow_after = int(await escrow_client.balance_of(requester_address))
+    if finalized:
+        import asyncio as _asyncio
+        for attempt in range(max(1, settle_confirm_attempts)):
+            if recipient_after > recipient_before:
+                break   # settlement reflected on the read replica
+            if attempt < settle_confirm_attempts - 1 and settle_confirm_delay_s > 0:
+                await _asyncio.sleep(settle_confirm_delay_s)
+            recipient_after = int(await escrow_client.ftns_balance_of(recipient_address))
+            requester_escrow_after = int(await escrow_client.balance_of(requester_address))
 
     report = {
         "finalizable": True,

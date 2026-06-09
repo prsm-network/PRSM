@@ -153,11 +153,12 @@ def test_run_finalize_and_verify_happy_value_transfer():
         FinalizedBatch(batch_id=bid, tx_submitted=True)]
     escrow = AsyncMock()
     # recipient WALLET FTNS rises by the settled amount; requester escrow drains
-    escrow.ftns_balance_of.side_effect = [0, ONE_FTNS]      # before, after
+    escrow.ftns_balance_of.side_effect = [0, ONE_FTNS]      # before, after (rose)
     escrow.balance_of.return_value = 0                       # requester escrow drained
     report = _run(run_finalize_and_verify(
         settlement_client=settlement, contract_client=contract, escrow_client=escrow,
         batch_id=bid, requester_address=REQ, recipient_address=PROV,
+        settle_confirm_delay_s=0,
     ))
     assert report["finalizable"] is True
     assert report["finalized"] is True
@@ -181,11 +182,12 @@ def test_run_finalize_and_verify_success_keyed_on_chain_status_not_wallet_delta(
     settlement.finalize_ready_batches.return_value = [
         FinalizedBatch(batch_id=bid, tx_submitted=True)]
     escrow = AsyncMock()
-    escrow.ftns_balance_of.side_effect = [0, 0]   # wallet delta 0 (self-pay-ish)
+    escrow.ftns_balance_of.return_value = 0   # wallet never rises (delta 0)
     escrow.balance_of.return_value = 0
     report = _run(run_finalize_and_verify(
         settlement_client=settlement, contract_client=contract, escrow_client=escrow,
         batch_id=bid, requester_address=REQ, recipient_address=PROV,
+        settle_confirm_attempts=2, settle_confirm_delay_s=0,
     ))
     assert report["success"] is True   # FINALIZED on-chain even with zero wallet delta
 
@@ -210,6 +212,34 @@ def test_run_finalize_and_verify_idempotent_when_already_finalized():
     assert report["success"] is True and report["finalized"] is True
     settlement.finalize_ready_batches.assert_not_awaited()  # no double-finalize
     contract.is_finalizable.assert_not_awaited()            # short-circuited
+
+
+def test_run_finalize_and_verify_polls_past_stale_rpc_read():
+    """sp1045 — a finalize tx mines but the RPC read replica lags: the first
+    post-finalize balance read is STALE (pre-settle), a later poll sees the
+    settled balance. The reported delta must reflect the settled state, not the
+    stale read (the bug the live Sepolia proof exposed)."""
+    from unittest.mock import MagicMock
+    from prsm.settlement.e2e_proof import run_finalize_and_verify
+    bid = b"\xbb" * 32
+    contract = AsyncMock()
+    contract.is_finalizable.return_value = True
+    contract.get_batch_status.side_effect = [1, 2]
+    settlement = AsyncMock()
+    settlement.is_finalized_locally = MagicMock(return_value=False)
+    settlement.finalize_ready_batches.return_value = [
+        FinalizedBatch(batch_id=bid, tx_submitted=True)]
+    escrow = AsyncMock()
+    # before=0, then a STALE read (still 0), then the settled read (rose)
+    escrow.ftns_balance_of.side_effect = [0, 0, ONE_FTNS]
+    escrow.balance_of.return_value = 0
+    report = _run(run_finalize_and_verify(
+        settlement_client=settlement, contract_client=contract, escrow_client=escrow,
+        batch_id=bid, requester_address=REQ, recipient_address=PROV,
+        settle_confirm_attempts=4, settle_confirm_delay_s=0,
+    ))
+    assert report["success"] is True
+    assert report["recipient_ftns_delta"] == ONE_FTNS   # polled past the stale read
 
 
 def test_run_finalize_and_verify_reports_failure_if_not_finalized_onchain():
