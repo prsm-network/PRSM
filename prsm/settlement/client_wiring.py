@@ -242,6 +242,26 @@ _POLL_PHASES = (
 )
 
 
+def get_settlement_status(client: Optional[Any]) -> dict:
+    """sp1051 — operator-facing on-chain-settlement status for /health surfaces.
+    ``client`` is the node's built BatchSettlementClient (or None when settlement
+    is off). When off, returns {enabled: False, reason}; when on, wraps the
+    client's status() snapshot under enabled=True."""
+    if client is None:
+        return {
+            "enabled": False,
+            "reason": "on-chain settlement not active (PRSM_ONCHAIN_SETTLEMENT "
+                      "off, no resolvable network, key/provider mismatch, or a "
+                      "corrupt state file turned it off — see daemon startup logs)",
+        }
+    try:
+        st = {"enabled": True}
+        st.update(client.status())
+        return st
+    except Exception as exc:  # noqa: BLE001 - status must never raise on a health path
+        return {"enabled": True, "status_error": f"{type(exc).__name__}: {exc}"}
+
+
 async def run_settlement_poll_cycle(client: Any) -> dict:
     """Sprint 1038 (brick 2) — drive ONE commit/finalize/reconcile cycle of the
     on-chain settlement client.

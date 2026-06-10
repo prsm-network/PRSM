@@ -476,6 +476,24 @@ class BatchSettlementClient:
     def get_tracked(self, batch_id: bytes) -> Optional[CommittedBatch]:
         return self._tracked.get(batch_id)
 
+    def status(self) -> Dict[str, object]:
+        """sp1051 — read-only lifecycle snapshot for operator observability. A
+        non-zero ``pending_commits`` (broadcast-but-unconfirmed quarantine) or
+        ``committing_intents`` (commit-intent WAL entries awaiting chain-scan
+        recovery) means escrow may be mid-flight and warrants attention."""
+        pending = len(self._pending_commits)
+        intents = len(self._committing)
+        return {
+            "provider_address": self._provider,
+            "write_capable": getattr(self._contract, "address", None) is not None,
+            "durable_state": self._store is not None,
+            "tracked_batches": len(self._tracked),
+            "finalized_locally": len(self._finalized_ids),
+            "pending_commits": pending,
+            "committing_intents": intents,
+            "funds_in_flight": bool(pending or intents),
+        }
+
     def pending_commits(self) -> List[PendingCommit]:
         """Snapshot of broadcast-but-unconfirmed commits awaiting reconciliation.
         Non-empty here means operator attention may be warranted: these receipts

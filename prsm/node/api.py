@@ -15985,6 +15985,24 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 "error": str(exc),
             }
 
+        # Sprint 1051 — on-chain settlement rail observability. Read-only snapshot
+        # of the live rail (tracked/finalized + quarantined/orphaned commit counts
+        # = the funds-in-flight signal). An off-by-config rail is opt-out, NOT an
+        # error → status 'not_wired' (per the sprint-147 convention below), so it
+        # never drags the core aggregate. Not added to `core`.
+        try:
+            from prsm.settlement.client_wiring import get_settlement_status
+            _settle = get_settlement_status(
+                getattr(node, "_onchain_settlement_client", None))
+            subsystems["settlement"] = {
+                "available": bool(_settle.get("enabled")),
+                "status": "ok" if _settle.get("enabled") else "not_wired",
+                **_settle,
+            }
+        except Exception as exc:  # noqa: BLE001
+            subsystems["settlement"] = {
+                "available": False, "status": "error", "error": str(exc)}
+
         # Aggregate status.
         # Sprint 147 — `not_wired` / `disabled` is operator opt-out,
         # not a degradation. Only count an optional subsystem as
