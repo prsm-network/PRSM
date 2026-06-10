@@ -84,7 +84,7 @@ class IntelDCAPBackend:
     # IntelASPBackend (whose handles_vendor='intel') rather than being DCAP-rejected.
     handles_vendor: str = "intel-sgx"
 
-    def __init__(self, trusted_root_pem: bytes):
+    def __init__(self, trusted_root_pem: bytes, crls_pem: Optional[bytes] = None):
         if not trusted_root_pem:
             raise ValueError(
                 "IntelDCAPBackend requires trusted_root_pem (Intel SGX Root CA in "
@@ -93,6 +93,21 @@ class IntelDCAPBackend:
             self._root = x509.load_pem_x509_certificate(trusted_root_pem)
         except Exception as exc:  # noqa: BLE001
             raise ValueError(f"trusted_root_pem is not a valid certificate: {exc}")
+        # sp1060 — optional operator-supplied CRLs (Intel Root-CA CRL revoking
+        # intermediates + PCK-CA CRL revoking PCK leaves). When present, a revoked
+        # PCK chain cert fails verification. None → no revocation check (unchanged).
+        self._crls = self._load_crls(crls_pem) if crls_pem else None
+
+    @staticmethod
+    def _load_crls(crls_pem: bytes) -> Optional[list]:
+        crls = []
+        marker = b"-----BEGIN X509 CRL-----"
+        for part in crls_pem.split(marker)[1:]:
+            try:
+                crls.append(x509.load_pem_x509_crl(marker + part))
+            except Exception:  # noqa: BLE001 - skip unparseable block
+                continue
+        return crls or None
 
     def verify(self, blob: Optional[bytes]) -> AttestationVerificationResult:
         if not isinstance(blob, (bytes, bytearray)):
@@ -199,7 +214,11 @@ class IntelDCAPBackend:
         hardened validator (sp1049 — same path-validation Intel + AMD use, with the
         load-bearing CA-flag check from the sp1044 review)."""
         from prsm.compute.inference.x509_path import verify_cert_chain
-        return verify_cert_chain(chain, self._root)
+        # require_crl=False: revocation is enforced for any cert whose issuer CRL is
+        # supplied, but a chain whose issuer has no configured CRL still verifies —
+        # so configuring one of Intel's two CRLs can't brick the other path. An
+        # operator wanting strict revocation passes both CRLs.
+        return verify_cert_chain(chain, self._root, crls=self._crls, require_crl=False)
 
 
 def build_intel_dcap_backend_or_none(env: Optional[dict] = None):
@@ -230,8 +249,23 @@ def build_intel_dcap_backend_or_none(env: Optional[dict] = None):
                 return None
     if not root_bytes:
         return None
+    # sp1060 — optional CRLs (revocation). PEM inline or file; concatenate multiple
+    # (Root-CA CRL + PCK-CA CRL). Absent → no revocation check (unchanged).
+    crls_bytes = None
+    crl_pem = (environ.get("PRSM_INTEL_SGX_CRL_PEM", "") or "").strip()
+    if crl_pem:
+        crls_bytes = crl_pem.encode() if isinstance(crl_pem, str) else crl_pem
+    else:
+        crl_path = (environ.get("PRSM_INTEL_SGX_CRL_FILE", "") or "").strip()
+        if crl_path:
+            try:
+                with open(crl_path, "rb") as f:
+                    crls_bytes = f.read()
+            except OSError as exc:
+                logger.warning("Intel SGX CRL file unreadable (%s) — proceeding "
+                               "WITHOUT revocation checking", exc)
     try:
-        return IntelDCAPBackend(trusted_root_pem=root_bytes)
+        return IntelDCAPBackend(trusted_root_pem=root_bytes, crls_pem=crls_bytes)
     except ValueError as exc:
         logger.warning("Intel SGX Root CA invalid (%s) — DCAP verification OFF, "
                        "structural fallback", exc)

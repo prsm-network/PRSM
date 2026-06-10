@@ -77,7 +77,7 @@ class AMDSEVSNPBackend:
     # this backend returns is still "amd-sev-snp" (the actual vendor).
     handles_vendor: str = "amd-sev-snp-envelope"
 
-    def __init__(self, trusted_root_pem: bytes):
+    def __init__(self, trusted_root_pem: bytes, crls_pem: Optional[bytes] = None):
         if not trusted_root_pem:
             raise ValueError(
                 "AMDSEVSNPBackend requires trusted_root_pem (AMD ARK in production) "
@@ -86,6 +86,20 @@ class AMDSEVSNPBackend:
             self._root = x509.load_pem_x509_certificate(trusted_root_pem)
         except Exception as exc:  # noqa: BLE001
             raise ValueError(f"trusted_root_pem is not a valid certificate: {exc}")
+        # sp1060 — optional AMD KDS CRLs (ARK CRL revoking ASK, ASK CRL revoking
+        # VCEK). Present → a revoked VCEK chain cert fails; None → no check (unchanged).
+        self._crls = self._load_crls(crls_pem) if crls_pem else None
+
+    @staticmethod
+    def _load_crls(crls_pem: bytes) -> Optional[list]:
+        crls = []
+        marker = b"-----BEGIN X509 CRL-----"
+        for part in crls_pem.split(marker)[1:]:
+            try:
+                crls.append(x509.load_pem_x509_crl(marker + part))
+            except Exception:  # noqa: BLE001 - skip unparseable block
+                continue
+        return crls or None
 
     def verify(self, blob: Optional[bytes]) -> AttestationVerificationResult:
         if not isinstance(blob, (bytes, bytearray)):
@@ -151,7 +165,8 @@ class AMDSEVSNPBackend:
         except Exception as exc:  # noqa: BLE001
             return fail(f"SEV-SNP report signature check error: {exc}")
 
-        chain_ok, chain_err = verify_cert_chain(chain, self._root)
+        chain_ok, chain_err = verify_cert_chain(
+            chain, self._root, crls=self._crls, require_crl=False)
         if not chain_ok:
             return fail(f"VCEK chain does not verify to ARK root: {chain_err}")
 
@@ -181,8 +196,22 @@ def build_amd_sev_snp_backend_or_none(env: Optional[dict] = None):
                 return None
     if not root_bytes:
         return None
+    # sp1060 — optional AMD KDS CRLs (PEM inline / file; concatenate ARK + ASK CRLs).
+    crls_bytes = None
+    crl_pem = (environ.get("PRSM_AMD_SEV_SNP_CRL_PEM", "") or "").strip()
+    if crl_pem:
+        crls_bytes = crl_pem.encode() if isinstance(crl_pem, str) else crl_pem
+    else:
+        crl_path = (environ.get("PRSM_AMD_SEV_SNP_CRL_FILE", "") or "").strip()
+        if crl_path:
+            try:
+                with open(crl_path, "rb") as f:
+                    crls_bytes = f.read()
+            except OSError as exc:
+                logger.warning("AMD KDS CRL file unreadable (%s) — proceeding "
+                               "WITHOUT revocation checking", exc)
     try:
-        return AMDSEVSNPBackend(trusted_root_pem=root_bytes)
+        return AMDSEVSNPBackend(trusted_root_pem=root_bytes, crls_pem=crls_bytes)
     except ValueError as exc:
         logger.warning("AMD ARK invalid (%s) — SEV-SNP verification OFF, structural "
                        "fallback", exc)
