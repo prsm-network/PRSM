@@ -41,6 +41,11 @@ from prsm.settlement.state_store import (
     SettlementStateCorruptError,
     SettlementStateStore,
 )
+# BroadcastFailedError's class is defined unconditionally (its module guards the
+# web3 import), so this adds no hard web3 dependency — and a module-level import
+# (vs a lazy one that could swallow to False) removes the sp1052-review footgun
+# where an import failure would reclassify a BroadcastFailed as a safe-retry.
+from prsm.economy.web3.provenance_registry import BroadcastFailedError
 
 logger = logging.getLogger(__name__)
 
@@ -300,15 +305,32 @@ class BatchSettlementClient:
                         f"UNCONFIRMED (tx {tx_hash}); quarantined to avoid "
                         f"double settlement — will reconcile, not retry"
                     )
+                elif self._is_broadcast_failed(exc):
+                    # sp1052 — BroadcastFailedError has NO tx_hash, but the
+                    # send_raw_transaction throwing does NOT prove the tx didn't
+                    # land (a dropped RPC response after the node accepted it —
+                    # the mainnet lag class). Blindly re-committing the receipts
+                    # would mint a DISTINCT on-chain batchId → double-settle. So
+                    # KEEP the durable intent (root-based recovery marker) and POP
+                    # the receipts from the accumulator so they can NEVER be blindly
+                    # re-committed; recover_committing_intents adopts the batch if it
+                    # actually landed, else the intent stays surfaced
+                    # (status funds_in_flight) for operator attention.
+                    self._accumulator.pop_batch(ready.key)
+                    self._persist()  # intent already persisted above
+                    logger.error(
+                        f"batch commit for key {ready.key} BROADCAST FAILED "
+                        f"({exc}); intent retained + receipts quarantined — "
+                        f"recover-by-root will adopt if it landed, NOT blind-retry"
+                    )
                 else:
-                    # BroadcastFailedError (chain saw nothing) / OnChainRevertedError
-                    # (atomic rollback) — the commit did NOT land, so drop the
-                    # intent; receipts stay in the accumulator (popped only on
-                    # success below) and are safe to retry next poll.
+                    # OnChainRevertedError — the tx MINED and atomically reverted,
+                    # so NOTHING was committed → safe to retry: drop the intent,
+                    # receipts stay in the accumulator for the next poll.
                     self._committing.pop(intent_key, None)
                     self._persist()
                     logger.warning(
-                        f"batch commit failed for key {ready.key}: "
+                        f"batch commit reverted for key {ready.key}: "
                         f"{type(exc).__name__}: {exc} — receipts retained "
                         f"in accumulator for retry"
                     )
@@ -334,6 +356,13 @@ class BatchSettlementClient:
         ]
         tree = build_tree_and_proofs(leaf_hashes)
         return leaf_hashes, tree.root
+
+    @staticmethod
+    def _is_broadcast_failed(exc: Exception) -> bool:
+        """sp1052 — BroadcastFailedError (send_raw_transaction threw) MAY have
+        landed (dropped RPC response), so it is quarantined-not-retried; an
+        OnChainRevertedError is a confirmed atomic revert and is safe to retry."""
+        return isinstance(exc, BroadcastFailedError)
 
     @staticmethod
     def _intent_key(accumulator_key: Tuple, root: bytes) -> str:
@@ -555,6 +584,11 @@ class BatchSettlementClient:
                 trigger_reason=intent.trigger_reason,
             )
             del self._committing[intent_key]
+            # sp1052 — pop the receipts from the accumulator on adopt. No-op for a
+            # crash-orphaned intent (its receipts were popped on the original commit
+            # success), but for a BroadcastFailed-quarantined intent this guarantees
+            # the now-adopted batch can never be re-committed (double-settle).
+            self._accumulator.pop_batch(intent.accumulator_key)
             self._persist()
             logger.info(
                 f"recovered orphaned commit (root {intent.merkle_root.hex()[:12]}…) "
