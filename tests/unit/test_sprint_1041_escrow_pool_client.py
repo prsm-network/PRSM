@@ -248,5 +248,30 @@ def test_address_property_reflects_key():
     assert _make_client(with_key=False).address is None
 
 
+@pytest.mark.asyncio
+async def test_deposit_txs_carry_explicit_gas_no_estimate():
+    """sp1047 — approve + deposit set an explicit gas limit so build_transaction
+    SKIPS eth_estimateGas (which can spuriously revert against a lagging RPC
+    replica that hasn't yet seen the just-mined approve — the mainnet failure)."""
+    _reset()
+    _CFG["allowance"] = 0          # forces both approve + deposit
+    client = _make_client()
+    await client.deposit(1000)
+    signed_txs = [c.args[0] for c in
+                  client.web3.eth.account.sign_transaction.call_args_list]
+    assert len(signed_txs) >= 2    # approve + deposit
+    assert all("gas" in tx and tx["gas"] > 0 for tx in signed_txs)
+
+
+@pytest.mark.asyncio
+async def test_withdraw_tx_carries_explicit_gas():
+    _reset()
+    client = _make_client()
+    await client.withdraw(500)
+    signed_txs = [c.args[0] for c in
+                  client.web3.eth.account.sign_transaction.call_args_list]
+    assert all("gas" in tx and tx["gas"] > 0 for tx in signed_txs)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

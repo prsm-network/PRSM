@@ -66,6 +66,15 @@ _ERC20_ABI = [
 ]
 
 _RECEIPT_TIMEOUT_SECONDS = 120
+# sp1047 — explicit gas limits so build_transaction does NOT call eth_estimateGas.
+# On a public RPC (Base mainnet), estimateGas can simulate against a read replica
+# that hasn't yet observed a just-mined approve, spuriously reverting the deposit
+# with ERC20InsufficientAllowance even though the approve landed. Broadcasting with
+# a fixed limit executes against canonical chain state instead. Generous bounds;
+# only gasUsed is charged, so over-provisioning the limit is safe.
+_APPROVE_GAS = 100_000
+_DEPOSIT_GAS = 250_000
+_WITHDRAW_GAS = 200_000
 
 
 class EscrowPoolClient:
@@ -143,10 +152,13 @@ class EscrowPoolClient:
                 # Approve exactly what's needed (overwrites any short allowance).
                 approve_tx = self.ftns.functions.approve(
                     self.pool_address, amount,
-                ).build_transaction(self._tx_overrides())
+                ).build_transaction(self._tx_overrides(gas=_APPROVE_GAS))
                 self._sign_send_wait(approve_tx)
+            # Explicit gas (sp1047): the deposit's transferFrom reads the allowance
+            # the approve above just set; estimateGas against a lagging RPC replica
+            # would see the OLD (zero) allowance and spuriously revert the estimate.
             deposit_tx = self.pool.functions.deposit(amount).build_transaction(
-                self._tx_overrides())
+                self._tx_overrides(gas=_DEPOSIT_GAS))
             receipt = self._sign_send_wait(deposit_tx)
         return "0x" + receipt_tx_hash(receipt)
 
@@ -157,20 +169,26 @@ class EscrowPoolClient:
             raise ValueError(f"withdraw amount must be positive (got {amount})")
         with self._tx_lock:
             tx = self.pool.functions.withdraw(amount).build_transaction(
-                self._tx_overrides())
+                self._tx_overrides(gas=_WITHDRAW_GAS))
             receipt = self._sign_send_wait(tx)
         return "0x" + receipt_tx_hash(receipt)
 
     # ── Helpers (mirror Web3SettlementContractClient) ─────────────────────────
 
-    def _tx_overrides(self) -> dict:
-        return {
+    def _tx_overrides(self, gas: Optional[int] = None) -> dict:
+        ov = {
             "from": self._account.address,
             "nonce": self.web3.eth.get_transaction_count(
                 self._account.address, "pending"),
             "gasPrice": self.web3.eth.gas_price,
             "chainId": self.web3.eth.chain_id,
         }
+        if gas is not None:
+            # Setting an explicit gas limit makes web3 SKIP eth_estimateGas — the
+            # tx is broadcast and executes against canonical state, immune to
+            # read-replica lag on a just-mined dependency (sp1047).
+            ov["gas"] = int(gas)
+        return ov
 
     def _sign_send_wait(self, tx: dict):
         """Sign → broadcast → wait. Three-tier errors: BroadcastFailedError (never
