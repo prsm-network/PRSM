@@ -309,7 +309,15 @@ class BitTorrentClient:
                 fs = lt.file_storage()
 
                 if path.is_file():
-                    fs.add_file(str(path), path.stat().st_size)
+                    # sp1071 — add by BASENAME (not str(path)). With a full path,
+                    # libtorrent builds a MULTI-file torrent named after the parent
+                    # dir (e.g. the staging-dir basename), so the infohash depended on
+                    # the operator's filesystem layout AND couldn't be reproduced by a
+                    # non-libtorrent node. The basename yields a clean single-file
+                    # torrent whose v1 infohash == prsm.core.torrent_infohash's
+                    # pure-Python value (golden-verified). set_piece_hashes below reads
+                    # the bytes from path.parent, so the file still resolves.
+                    fs.add_file(path.name, path.stat().st_size)
                 else:
                     # Add directory recursively
                     for f in sorted(path.rglob("*")):
@@ -317,8 +325,18 @@ class BitTorrentClient:
                             rel_path = f.relative_to(path)
                             fs.add_file(str(rel_path), f.stat().st_size)
 
-                # Create the torrent
-                t = lt.create_torrent(fs, piece_size=piece_length)
+                # Create the torrent. sp1071 — pin to v1_only so the infohash is the
+                # canonical BEP-3 v1 SHA-1 that prsm.core.torrent_infohash computes in
+                # pure Python (libtorrent 2.x otherwise defaults to HYBRID v1+v2, whose
+                # info dict carries v2 file-tree/piece-layers fields → a different
+                # infohash a non-libtorrent node can't reproduce). v1_only keeps every
+                # node — libtorrent or not — assigning the SAME CID to the same bytes.
+                # Older libtorrent (1.x) is v1-only already and lacks the flag.
+                _v1_only = getattr(lt.create_torrent, "v1_only", None)
+                if _v1_only is not None:
+                    t = lt.create_torrent(fs, piece_size=piece_length, flags=_v1_only)
+                else:
+                    t = lt.create_torrent(fs, piece_size=piece_length)
 
                 # Set comment if provided
                 if comment:

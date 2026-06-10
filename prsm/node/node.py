@@ -2588,9 +2588,38 @@ class PRSMNode:
                 "uploads now distribute via the BitTorrent layer."
             )
         else:
-            logger.info("BitTorrent not available - libtorrent may not be installed")
-            self.content_publisher = None
-            self.content_retriever = None
+            # sp1071 — libtorrent absent: instead of leaving content_publisher=None
+            # (every upload then failed "content_publisher is None — cannot publish"),
+            # use the pure-Python LocalContentPublisher. It computes the SAME canonical
+            # v1 CID a libtorrent v1_only node would (sp1070, byte-identical) and stages
+            # the bytes; ContentUploader then registers the content with ContentProvider,
+            # which serves it over the P2P substrate (INLINE/CHUNKED, no libtorrent), and
+            # cross-node fetch uses ContentProvider.request_content (also libtorrent-free).
+            # So a default operator's Tier-A (public) uploads now actually publish +
+            # become retrievable. Tier B/C encrypted still needs the BitTorrent/
+            # ContentStore path (LocalContentPublisher raises a clear error for it).
+            try:
+                from prsm.node.local_content_publisher import LocalContentPublisher
+                staging_dir = _data_dir / "content_publish_staging"
+                self.content_publisher = LocalContentPublisher(
+                    staging_dir=staging_dir,
+                    node_id=self.identity.node_id if self.identity else "",
+                )
+                self.content_retriever = None   # BT retriever needs libtorrent; fetch
+                #   goes through ContentProvider.request_content (libtorrent-free)
+                self.content_uploader.content_publisher = self.content_publisher
+                logger.info(
+                    "libtorrent not available — using LocalContentPublisher (Tier A, "
+                    "pure-Python v1 infohash). Uploads publish + serve over the P2P "
+                    "substrate without libtorrent; install libtorrent for the BT swarm "
+                    "+ Tier B/C encrypted content."
+                )
+            except Exception as _lcp_exc:  # noqa: BLE001 — never block startup
+                logger.warning(
+                    "LocalContentPublisher wiring failed (%s) — uploads disabled until "
+                    "libtorrent is installed", _lcp_exc)
+                self.content_publisher = None
+                self.content_retriever = None
 
         # ── Inference Executor (Sprint 438) ───────────────────────
         # /compute/inference returns 503 "Inference executor not
