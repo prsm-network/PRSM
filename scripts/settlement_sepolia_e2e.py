@@ -20,6 +20,16 @@ full on-chain path executes; funds leave self's escrow and return to self's
 wallet. Optional: lower the challenge window first (owner-only, snapshotted at
 commit) to finalize sooner, e.g. setChallengeWindowSeconds(3600).
 
+TWO-PARTY proof (requester-payment, sprint 1058) — REAL cross-party value transfer:
+requester A signs an EIP-712 PaymentAuthorization, provider B verifies it + commits;
+finalize draws from A's escrow into B's wallet. Pass --two-party with --requester-key
+(or env REQUESTER_PRIVATE_KEY) as A; PRIVATE_KEY is provider/settler B. A must hold
+the FTNS to deposit (B's deposit funds A's escrow in this harness). Phase 2 finalize
+is identical (the committed batch already names A as requester / B as provider):
+
+  PHASE 1: PRSM_NETWORK=testnet PRIVATE_KEY=0x<B> REQUESTER_PRIVATE_KEY=0x<A> python scripts/settlement_sepolia_e2e.py --phase deposit-commit --two-party --amount-ftns 1
+  PHASE 2: PRSM_NETWORK=testnet PRIVATE_KEY=0x<B> python scripts/settlement_sepolia_e2e.py --phase finalize
+
 Env: PRIVATE_KEY (or FTNS_WALLET_PRIVATE_KEY / PRSM_DEPLOYER_PRIVATE_KEY) — the
 signer; PRSM_NETWORK=testnet selects Base Sepolia. Mainnet (chainId 8453) is
 REFUSED unless --i-understand-mainnet is passed (it sends real transactions).
@@ -70,6 +80,7 @@ async def _amain(args) -> int:
         run_deposit_and_commit,
         run_finalize_and_verify,
         run_finalize_by_batch_id,
+        run_two_party_deposit_and_commit,
     )
     from prsm.node.identity import generate_node_identity
     from eth_account import Account
@@ -95,11 +106,32 @@ async def _amain(args) -> int:
 
     key = _read_key()
     signer = Account.from_key(key).address
-    print(f"signer={signer} (self-pay: requester==provider==recipient)")
+    # Two-party (requester-payment) mode: A=requester (--requester-key /
+    # REQUESTER_PRIVATE_KEY) signs the auth + funds escrow; B=signer is provider.
+    requester_key = None
+    requester_addr = signer
+    if args.two_party:
+        rk = (args.requester_key or os.environ.get("REQUESTER_PRIVATE_KEY", "") or "").strip()
+        if not rk:
+            print("ERROR: --two-party requires --requester-key or REQUESTER_PRIVATE_KEY "
+                  "(the paying requester A; PRIVATE_KEY is provider B)", file=sys.stderr)
+            return 2
+        requester_key = rk if rk.startswith("0x") else "0x" + rk
+        requester_addr = Account.from_key(requester_key).address
+        if requester_addr.lower() == signer.lower():
+            print("ERROR: --two-party requester and provider must differ (that's "
+                  "just self-pay; drop --two-party)", file=sys.stderr)
+            return 2
+        print(f"requester(A)={requester_addr}  provider/settler(B)={signer}")
+    else:
+        print(f"signer={signer} (self-pay: requester==provider==recipient)")
 
+    # Escrow client signs as the REQUESTER (A funds + approves their own escrow);
+    # in self-pay A==B so this is the same key.
     escrow = EscrowPoolClient(
         rpc_url=endpoints.rpc_url, escrow_pool_address=endpoints.escrow_pool,
-        ftns_token_address=endpoints.ftns_token, private_key=key)
+        ftns_token_address=endpoints.ftns_token,
+        private_key=requester_key or key)
     contract = Web3SettlementContractClient(
         rpc_url=endpoints.rpc_url, contract_address=endpoints.settlement_registry,
         private_key=key)
@@ -131,17 +163,50 @@ async def _amain(args) -> int:
             return 1
         identity = generate_node_identity(display_name="sepolia-e2e-settler")
         job_id = f"e2e-{int(time.time())}"
-        receipt = build_signed_batched_receipt(
-            identity=identity, job_id=job_id,
-            output_hash=hashlib.sha256(job_id.encode()).hexdigest(),
-            executed_at_unix=int(time.time()),
-            requester_address=signer, provider_address=signer,
-            value_wei=amount_wei, local_escrow_id=job_id)
-        print(f"depositing {args.amount_ftns} FTNS + committing batch …")
-        report = await run_deposit_and_commit(
-            escrow_client=escrow, settlement_client=settlement,
-            batched_receipt=receipt, deposit_amount_wei=amount_wei,
-            requester_address=signer)
+        if args.two_party:
+            # Requester A signs an EIP-712 PaymentAuthorization bound to a synthetic
+            # request; provider B verifies it (balance pre-flight OFF — escrow is
+            # funded by the deposit that follows; finalize enforces funding), then
+            # deposits A's escrow + commits naming A→B.
+            from prsm.settlement.payment_client import build_payment_authorization
+            from prsm.settlement.payment_authorization import inference_request_fields
+            from prsm.settlement.payment_authorization_verifier import (
+                InMemoryNonceStore, PaymentAuthorizationVerifier,
+            )
+            request_fields = inference_request_fields(
+                model_id="gpt2", prompt=f"two-party-proof-{job_id}", max_tokens=16,
+                privacy_tier="standard", content_tier="A")
+            auth = build_payment_authorization(
+                requester_key=requester_key, provider_address=signer,
+                max_spend_ftns=args.amount_ftns, expiry_unix=int(time.time()) + 86400,
+                **request_fields)
+            verifier = PaymentAuthorizationVerifier(
+                provider_address=signer, nonce_store=InMemoryNonceStore(),
+                chain_id=chain_id, balance_reader=None)
+            print(f"requester A signing auth + depositing {args.amount_ftns} FTNS, "
+                  f"provider B committing batch …")
+            report = await run_two_party_deposit_and_commit(
+                escrow_client=escrow, settlement_client=settlement,
+                verifier=verifier, payment_authorization=auth,
+                request_fields=request_fields, provider_address=signer,
+                identity=identity, job_id=job_id,
+                output_hash=hashlib.sha256(job_id.encode()).hexdigest(),
+                executed_at_unix=int(time.time()), value_wei=amount_wei,
+                local_escrow_id=job_id, deposit_amount_wei=amount_wei)
+            print(f"  verified requester={report['requester_address']} "
+                  f"provider={report['provider_address']}")
+        else:
+            receipt = build_signed_batched_receipt(
+                identity=identity, job_id=job_id,
+                output_hash=hashlib.sha256(job_id.encode()).hexdigest(),
+                executed_at_unix=int(time.time()),
+                requester_address=signer, provider_address=signer,
+                value_wei=amount_wei, local_escrow_id=job_id)
+            print(f"depositing {args.amount_ftns} FTNS + committing batch …")
+            report = await run_deposit_and_commit(
+                escrow_client=escrow, settlement_client=settlement,
+                batched_receipt=receipt, deposit_amount_wei=amount_wei,
+                requester_address=signer)
         print(f"  deposit_tx={report['deposit_tx']}")
         print(f"  batch_id={report['batch_id']}")
         print(f"  escrow_balance={report['escrow_balance']} wei")
@@ -233,6 +298,15 @@ def main(argv=None) -> int:
                              "window is short)")
     parser.add_argument("--amount-ftns", type=float, default=1.0,
                         help="FTNS to deposit + settle (default 1.0)")
+    parser.add_argument("--two-party", action="store_true",
+                        help="requester-payment cross-party proof (sprint 1058): "
+                             "requester A (--requester-key / REQUESTER_PRIVATE_KEY) "
+                             "signs an EIP-712 auth, provider B (PRIVATE_KEY) verifies "
+                             "+ commits; finalize draws A->B. Phase 1 only; phase 2 "
+                             "finalize is identical.")
+    parser.add_argument("--requester-key", default=None,
+                        help="[--two-party] paying requester A's private key (or env "
+                             "REQUESTER_PRIVATE_KEY); must differ from PRIVATE_KEY (B)")
     parser.add_argument("--state-file", default=_default_state_file(),
                         help="durable settlement state file bridging the two phases")
     parser.add_argument("--batch-id", default=None,
