@@ -133,6 +133,11 @@ def detect_vendor(blob: Optional[bytes]) -> str:
         return "unknown"
     if blob.startswith(SOFTWARE_TEE_ATTESTATION_PREFIX):
         return "software-fallback"
+    # sp1050 — the PRSM SEV-SNP envelope (report + VCEK/ASK chain) gets a DISTINCT
+    # tag so only the real AMDSEVSNPBackend claims it; a RAW SEV-SNP report
+    # (version u32==2, below) still routes to the structural AMDKDSBackend.
+    if blob.startswith(b"PRSMSNP1"):
+        return "amd-sev-snp-envelope"
     # Read version (little-endian uint16)
     version = struct.unpack("<H", blob[:2])[0]
     if version == 3:
@@ -539,9 +544,37 @@ def register_intel_dcap(registry, env=None) -> bool:
     return True
 
 
+def register_amd_sev_snp(registry, env=None) -> bool:
+    """Sprint 1050 — register a REAL AMD SEV-SNP verifier on ``registry`` when an
+    AMD ARK is configured (PRSM_AMD_SEV_SNP_ARK_PEM / _FILE). Front-of-chain; claims
+    the PRSM SEV-SNP envelope only (handles_vendor 'amd-sev-snp-envelope'), so raw
+    reports still route to the structural backend. Idempotent; lazy import."""
+    from prsm.compute.inference.amd_sev_snp import (
+        AMDSEVSNPBackend, build_amd_sev_snp_backend_or_none,
+    )
+    if any(isinstance(b, AMDSEVSNPBackend) for b in registry.backends):
+        return False
+    backend = build_amd_sev_snp_backend_or_none(env)
+    if backend is None:
+        return False
+    registry.register(backend)
+    return True
+
+
+def configure_attestation_registry(registry, env=None) -> dict:
+    """Activate whichever real TEE verifiers are configured (Intel SGX DCAP and/or
+    AMD SEV-SNP) on ``registry``. Returns {'intel_sgx': bool, 'amd_sev_snp': bool}."""
+    return {
+        "intel_sgx": register_intel_dcap(registry, env),
+        "amd_sev_snp": register_amd_sev_snp(registry, env),
+    }
+
+
 def configure_default_registry_from_env(env=None) -> bool:
-    """Activate real Intel SGX DCAP verification on the DEFAULT registry (the one
-    backing ``verify_attestation`` + /compute/receipt/verify) if an Intel SGX Root
-    CA is configured. Call once at node startup; fail-open (no anchor → unchanged
-    structural behavior). Returns True iff DCAP was activated."""
-    return register_intel_dcap(_DEFAULT_REGISTRY, env)
+    """Activate real TEE attestation verification (Intel SGX DCAP + AMD SEV-SNP) on
+    the DEFAULT registry (the one backing ``verify_attestation`` +
+    /compute/receipt/verify) for whichever vendor anchors are configured. Call once
+    at node startup; fail-open (no anchor → unchanged structural behavior). Returns
+    True iff ANY real verifier was activated."""
+    result = configure_attestation_registry(_DEFAULT_REGISTRY, env)
+    return any(result.values())

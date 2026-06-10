@@ -71,7 +71,11 @@ def _load_chain(cert_pem: bytes) -> List[x509.Certificate]:
 class AMDSEVSNPBackend:
     """Cryptographic verifier for AMD SEV-SNP attestation reports (envelope form)."""
 
-    handles_vendor: str = "amd-sev-snp"
+    # Registry routing key for the PRSM SEV-SNP envelope (sp1050). Distinct from a
+    # raw report's "amd-sev-snp" so this real backend claims ONLY the envelope and a
+    # raw report still routes to the structural AMDKDSBackend. The result.vendor
+    # this backend returns is still "amd-sev-snp" (the actual vendor).
+    handles_vendor: str = "amd-sev-snp-envelope"
 
     def __init__(self, trusted_root_pem: bytes):
         if not trusted_root_pem:
