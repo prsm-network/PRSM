@@ -19,7 +19,27 @@ from typing import List, Optional, Tuple
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, ed448, rsa
+
+
+def _verify_cert_signature(issuer_pub, child) -> None:
+    """Verify ``child``'s signature against ``issuer_pub``, dispatching on the issuer
+    key type. sp1066 — a golden-vector test against the REAL AMD Milan chain caught
+    that ARK/ASK are RSA-4096 (RSA-PSS), not EC: a hardcoded ec.ECDSA verify rejected
+    the real AMD chain on actual hardware. ECDSA-only was also wrong in principle.
+    Raises InvalidSignature on mismatch (or TypeError on an unsupported key type)."""
+    sig = child.signature
+    tbs = child.tbs_certificate_bytes
+    if isinstance(issuer_pub, ec.EllipticCurvePublicKey):
+        issuer_pub.verify(sig, tbs, ec.ECDSA(child.signature_hash_algorithm))
+    elif isinstance(issuer_pub, rsa.RSAPublicKey):
+        # RSA cert sig: padding (PKCS1v15 or PSS) is in signature_algorithm_parameters.
+        issuer_pub.verify(sig, tbs, child.signature_algorithm_parameters,
+                          child.signature_hash_algorithm)
+    elif isinstance(issuer_pub, (ed25519.Ed25519PublicKey, ed448.Ed448PublicKey)):
+        issuer_pub.verify(sig, tbs)   # EdDSA takes no separate hash
+    else:
+        raise TypeError(f"unsupported issuer key type {type(issuer_pub).__name__}")
 
 
 def _within_validity(cert, now) -> bool:
@@ -142,10 +162,7 @@ def verify_cert_chain(
             return False, (f"{issuer.subject.rfc4514_string()} pathLenConstraint={plen} "
                            f"exceeded ({cas_below} CA(s) below)")
         try:
-            issuer.public_key().verify(
-                child.signature, child.tbs_certificate_bytes,
-                ec.ECDSA(child.signature_hash_algorithm),
-            )
+            _verify_cert_signature(issuer.public_key(), child)
         except InvalidSignature:
             return False, f"{child.subject.rfc4514_string()} not signed by its issuer"
         except Exception as exc:  # noqa: BLE001
@@ -167,10 +184,7 @@ def verify_cert_chain(
     if not _is_ca(trusted_root):
         return False, "configured trusted root is not a CA"
     try:
-        trusted_root.public_key().verify(
-            trusted_root.signature, trusted_root.tbs_certificate_bytes,
-            ec.ECDSA(trusted_root.signature_hash_algorithm),
-        )
+        _verify_cert_signature(trusted_root.public_key(), trusted_root)
     except Exception as exc:  # noqa: BLE001
         return False, f"trusted root is not self-consistent: {exc}"
     return True, None
