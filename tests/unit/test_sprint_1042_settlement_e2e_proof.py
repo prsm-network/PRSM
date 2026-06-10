@@ -73,12 +73,14 @@ def test_run_deposit_and_commit_happy():
     from prsm.settlement.e2e_proof import run_deposit_and_commit
     escrow = AsyncMock()
     escrow.deposit.return_value = "0xdeposit"
-    escrow.balance_of.return_value = ONE_FTNS
+    # not-yet-funded on the pre-check, funded on the post-deposit poll
+    escrow.balance_of.side_effect = [0, ONE_FTNS]
     settlement = AsyncMock()
     settlement.commit_ready_batches.return_value = [_committed()]
     report = _run(run_deposit_and_commit(
         escrow_client=escrow, settlement_client=settlement,
         batched_receipt=object(), deposit_amount_wei=ONE_FTNS, requester_address=REQ,
+        deposit_confirm_delay_s=0,
     ))
     escrow.deposit.assert_awaited_once_with(ONE_FTNS)
     settlement.accumulate.assert_awaited_once()
@@ -88,16 +90,55 @@ def test_run_deposit_and_commit_happy():
     assert report["batch_id"] == (b"\xbb" * 32).hex()
 
 
+def test_run_deposit_and_commit_skips_deposit_when_already_funded():
+    """sp1048 — a prior run deposited but failed pre-commit; re-running must NOT
+    double-deposit. Escrow already covers the amount → skip deposit, go to commit."""
+    from prsm.settlement.e2e_proof import run_deposit_and_commit
+    escrow = AsyncMock()
+    escrow.balance_of.return_value = ONE_FTNS    # already funded
+    settlement = AsyncMock()
+    settlement.commit_ready_batches.return_value = [_committed()]
+    report = _run(run_deposit_and_commit(
+        escrow_client=escrow, settlement_client=settlement,
+        batched_receipt=object(), deposit_amount_wei=ONE_FTNS, requester_address=REQ,
+        deposit_confirm_delay_s=0,
+    ))
+    escrow.deposit.assert_not_awaited()          # no double-deposit
+    settlement.commit_ready_batches.assert_awaited_once()
+    assert "skipped:escrow-already-funded" in report["deposit_tx"]
+    assert report["batch_id"] == (b"\xbb" * 32).hex()
+
+
+def test_run_deposit_and_commit_polls_past_stale_balance():
+    """sp1048 — the deposit lands but the immediate post-deposit read is STALE
+    (lagging replica shows 0); a later poll sees it funded → no false 'underfunded'."""
+    from prsm.settlement.e2e_proof import run_deposit_and_commit
+    escrow = AsyncMock()
+    escrow.deposit.return_value = "0xdeposit"
+    # pre-check 0 (deposit) → stale 0 → funded
+    escrow.balance_of.side_effect = [0, 0, ONE_FTNS]
+    settlement = AsyncMock()
+    settlement.commit_ready_batches.return_value = [_committed()]
+    report = _run(run_deposit_and_commit(
+        escrow_client=escrow, settlement_client=settlement,
+        batched_receipt=object(), deposit_amount_wei=ONE_FTNS, requester_address=REQ,
+        deposit_confirm_attempts=5, deposit_confirm_delay_s=0,
+    ))
+    assert report["escrow_balance"] == ONE_FTNS
+    settlement.commit_ready_batches.assert_awaited_once()
+
+
 def test_run_deposit_and_commit_raises_if_escrow_underfunded():
     from prsm.settlement.e2e_proof import run_deposit_and_commit
     escrow = AsyncMock()
     escrow.deposit.return_value = "0xdeposit"
-    escrow.balance_of.return_value = 0          # deposit didn't land
+    escrow.balance_of.return_value = 0          # never funds, even after polling
     settlement = AsyncMock()
-    with pytest.raises(RuntimeError, match="escrow"):
+    with pytest.raises(RuntimeError, match="underfunded"):
         _run(run_deposit_and_commit(
             escrow_client=escrow, settlement_client=settlement,
             batched_receipt=object(), deposit_amount_wei=ONE_FTNS, requester_address=REQ,
+            deposit_confirm_attempts=3, deposit_confirm_delay_s=0,
         ))
     settlement.commit_ready_batches.assert_not_awaited()
 
@@ -113,6 +154,7 @@ def test_run_deposit_and_commit_raises_if_not_committed():
         _run(run_deposit_and_commit(
             escrow_client=escrow, settlement_client=settlement,
             batched_receipt=object(), deposit_amount_wei=ONE_FTNS, requester_address=REQ,
+            deposit_confirm_delay_s=0,
         ))
 
 

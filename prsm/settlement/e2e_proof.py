@@ -106,17 +106,39 @@ async def run_deposit_and_commit(
     batched_receipt: Any,
     deposit_amount_wei: int,
     requester_address: str,
+    deposit_confirm_attempts: int = 6,
+    deposit_confirm_delay_s: float = 2.0,
 ) -> dict:
     """Phase 1: fund the requester's escrow, accumulate the signed receipt, and
-    commit the batch on-chain. Raises RuntimeError if the deposit didn't credit
-    the escrow or the batch didn't commit. Returns a report dict."""
-    deposit_tx = await escrow_client.deposit(int(deposit_amount_wei))
+    commit the batch on-chain. Returns a report dict.
+
+    sp1048 — IDEMPOTENT + lag-tolerant deposit. A prior run can deposit on-chain
+    then fail before committing (e.g. an RPC-replica-lag false 'underfunded' on the
+    post-deposit read); re-depositing would DOUBLE-fund. So: if the requester
+    escrow already covers the amount, SKIP the deposit and go straight to commit.
+    Otherwise deposit, then POLL the escrow balance past replica lag before
+    concluding underfunded (a single immediate read can hit a stale replica that
+    hasn't seen the just-mined deposit)."""
+    amount = int(deposit_amount_wei)
     escrow_balance = int(await escrow_client.balance_of(requester_address))
-    if escrow_balance < int(deposit_amount_wei):
-        raise RuntimeError(
-            f"escrow underfunded after deposit: balance {escrow_balance} < "
-            f"deposited {deposit_amount_wei} (tx {deposit_tx})"
-        )
+    if escrow_balance >= amount:
+        # already funded by a prior (commit-less) run — don't double-deposit
+        deposit_tx = f"skipped:escrow-already-funded({escrow_balance})"
+    else:
+        deposit_tx = await escrow_client.deposit(amount)
+        import asyncio as _asyncio
+        for attempt in range(max(1, deposit_confirm_attempts)):
+            escrow_balance = int(await escrow_client.balance_of(requester_address))
+            if escrow_balance >= amount:
+                break
+            if attempt < deposit_confirm_attempts - 1 and deposit_confirm_delay_s > 0:
+                await _asyncio.sleep(deposit_confirm_delay_s)
+        if escrow_balance < amount:
+            raise RuntimeError(
+                f"escrow underfunded after deposit: balance {escrow_balance} < "
+                f"deposited {amount} (tx {deposit_tx}) — even after polling past "
+                f"RPC lag; check the deposit tx on-chain before retrying"
+            )
 
     await settlement_client.accumulate(batched_receipt)
     committed = await settlement_client.commit_ready_batches()
