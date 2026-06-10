@@ -22,6 +22,8 @@ Protocol — the client has no direct dependency on web3.
 """
 from __future__ import annotations
 
+import asyncio
+import functools
 import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Protocol, Tuple
@@ -50,6 +52,20 @@ from prsm.economy.web3.provenance_registry import BroadcastFailedError
 logger = logging.getLogger(__name__)
 
 _STATE_VERSION = 1
+
+
+def _locked(method):
+    """sp1053 — serialize a state-mutating async method under the client's
+    asyncio.Lock so accumulate() (from the /compute/inference settle path) and the
+    background poll loop (commit/recover/finalize) cannot interleave their
+    read-modify-write of the shared _accumulator/_tracked/_committing/_pending state
+    across an await and drop a concurrently-added receipt. None of the wrapped
+    methods calls another wrapped method, so the non-reentrant lock can't deadlock."""
+    @functools.wraps(method)
+    async def wrapper(self, *args, **kwargs):
+        async with self._lock:
+            return await method(self, *args, **kwargs)
+    return wrapper
 
 
 class SettlementContractClient(Protocol):
@@ -224,6 +240,9 @@ class BatchSettlementClient:
         # cleared once the batch is promoted to _tracked; leftovers on restart are
         # resolved by recover_committing_intents (chain scan by root).
         self._committing: Dict[str, CommitIntent] = {}
+        # sp1053 — serializes the state-mutating async methods (see @_locked) so a
+        # concurrent accumulate (inference settle path) + poll cycle can't race.
+        self._lock = asyncio.Lock()
         # sp1039 (brick 2.5) — durable post-commit state. None => in-memory only
         # (pre-1039 behavior, no filesystem touch). When set, the three dicts
         # above are rehydrated here and re-persisted after every mutation, so a
@@ -237,6 +256,7 @@ class BatchSettlementClient:
 
     # ── Accumulation ─────────────────────────────────────────────
 
+    @_locked
     async def accumulate(self, br: BatchedReceipt) -> None:
         """Record a receipt. Caller (MarketplaceOrchestrator or a
         provider-side ComputeProvider hook) invokes this after each
@@ -266,6 +286,7 @@ class BatchSettlementClient:
 
     # ── Commit path ──────────────────────────────────────────────
 
+    @_locked
     async def commit_ready_batches(self) -> List[CommittedBatch]:
         """Poll the accumulator for batches that crossed a threshold;
         commit each one on chain. On commit failure the receipts stay
@@ -454,6 +475,7 @@ class BatchSettlementClient:
 
     # ── Finalize path ────────────────────────────────────────────
 
+    @_locked
     async def finalize_ready_batches(self) -> List[FinalizedBatch]:
         """For each locally-tracked batch whose on-chain challenge
         window has elapsed, submit finalizeBatch. Idempotent: batches
@@ -537,6 +559,7 @@ class BatchSettlementClient:
         recover_committing_intents (chain scan)."""
         return list(self._committing.values())
 
+    @_locked
     async def recover_committing_intents(self) -> int:
         """sp1040 (brick 2.6) — resolve write-ahead commit intents left over from
         a crash in the commit→persist window. For each intent, scan the chain for
@@ -597,6 +620,7 @@ class BatchSettlementClient:
             adopted += 1
         return adopted
 
+    @_locked
     async def reconcile_pending_commits(self) -> int:
         """Resolve quarantined broadcast-but-unconfirmed commits. For each, ask the
         contract whether its tx actually landed (get_committed_batch_for_tx). If it
@@ -640,6 +664,7 @@ class BatchSettlementClient:
         reconcile against on-chain state (use get_batch_status for that)."""
         return batch_id in self._finalized_ids
 
+    @_locked
     async def reconcile_finalized(self) -> int:
         """Query on-chain BatchStatus for each tracked batch and mark
         any that reached FINALIZED as locally finalized (status=2 per
