@@ -8459,10 +8459,25 @@ def _server_detail_or(response, fallback: str) -> str:
     actionable server reason (e.g. "ContentPublisher … libtorrent not installed")
     instead of a generic guess; a hard-coded message buried the real cause at the
     Tier-1 live bench."""
+    detail = None
     try:
         detail = (response.json() or {}).get("detail")
     except Exception:  # noqa: BLE001 - non-JSON / empty body
         detail = None
+    if not (isinstance(detail, str) and detail.strip()):
+        # sp1072 — fall back to parsing the raw body text as JSON. Some responses (and
+        # test doubles) expose the body via ``.text`` without a working ``.json()``;
+        # without this the actionable server detail is silently dropped for the
+        # generic fallback (the bug the sp832 actionable-503 test was guarding).
+        try:
+            import json as _json
+            body = getattr(response, "text", None)
+            if isinstance(body, str) and body.strip():
+                d2 = (_json.loads(body) or {}).get("detail")
+                if isinstance(d2, str) and d2.strip():
+                    detail = d2
+        except Exception:  # noqa: BLE001
+            pass
     return detail if isinstance(detail, str) and detail.strip() else fallback
 
 
@@ -8651,12 +8666,13 @@ def upload(
     elif response.status_code == 503:
         # sp1027 — surface the server's actual detail (e.g. the libtorrent hint)
         # rather than a generic guess that buries the real cause.
+        # sp1072 — surface the server's actionable detail AND the node-start hint
+        # together (previously the detail REPLACED the hint, so a "Content uploader
+        # not initialized" 503 lost the "run prsm node start" remedy).
         console.print(
             "[red]FAIL[/red] /content/upload returned 503 — "
-            + _server_detail_or(
-                response,
-                "Content uploader not available. Is the daemon up? Run prsm node start.",
-            )
+            + _server_detail_or(response, "Content uploader not available.")
+            + " Is the daemon up? Run: prsm node start."
         )
         raise SystemExit(1)
     elif response.status_code == 413:
