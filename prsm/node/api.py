@@ -338,6 +338,7 @@ async def _settle_streaming_escrow(
                 from prsm.settlement.client_wiring import (
                     accumulate_settled_inference_receipt,
                 )
+                _paid = _take_paid_requester(node, job_id)
                 _acc = await accumulate_settled_inference_receipt(
                     client=getattr(node, "_onchain_settlement_client", None),
                     identity=node.identity,
@@ -345,6 +346,8 @@ async def _settle_streaming_escrow(
                     receipt=result.receipt,
                     release_ftns=decision.release_to_operator,
                     job_id=job_id,
+                    requester_address=(_paid or {}).get("requester"),
+                    max_spend_wei=(_paid or {}).get("max_spend_wei"),
                 )
                 if _acc != "skipped:no-client":
                     logger.info(
@@ -685,6 +688,104 @@ def _resolve_requester_key(request: Any) -> str:
     client = getattr(request, "client", None)
     host = getattr(client, "host", "") if client else ""
     return host or "anonymous"
+
+
+# Bound on the in-flight authenticated-requester carrier so a node taking paid
+# traffic with a non-trivial failure rate (jobs that error/disconnect between
+# ingress and the settle hook, never popping their entry) can't grow it without
+# limit (review sp1058 MEDIUM #2). Oldest entries evict first (insertion-ordered
+# dict); an evicted entry just means that long-pending job settles self-pay if it
+# ever completes — rare + harmless (no fund loss).
+_PAID_REQUESTER_CARRIER_CAP = 4096
+
+
+async def _resolve_paid_requester_or_402(
+    node: Any, body: Dict[str, Any], budget_ftns: float,
+) -> Optional[Dict[str, Any]]:
+    """Sprint 1056 (requester-payment brick 3) — verify an optional signed
+    PaymentAuthorization in the inference body and return the authenticated
+    requester info ``{"requester": <addr>, "max_spend_wei": <int>}`` (or None when
+    no auth is supplied = self-pay).
+
+    Computes the request-hash binding from the ACTUAL request body fields (the same
+    canonical hash the requester signed) and uses ``budget_ftns`` as the quoted
+    price ceiling. A rejected authorization raises HTTPException(402) so a paid job
+    we can't honor is never served. Fail-CLOSED on the authorization; the on-chain
+    settlement itself stays best-effort/fail-open at the settle site.
+
+    NONCE SEMANTIC (review sp1058 HIGH): the verifier consumes the auth's job_nonce
+    here, at ingress = single-use-on-acceptance. This deliberately protects the
+    PROVIDER from doing duplicate free work for two concurrent same-nonce requests;
+    consuming at settle-time would reopen that. A job that fails after acceptance
+    does NOT touch the requester's escrow (no on-chain settle without a receipt), so
+    the only cost of a retry is the requester re-signing with a fresh nonce (a free
+    local op). Clients must therefore sign a new authorization per attempt."""
+    payment_authorization = body.get("payment_authorization")
+    if payment_authorization is None:
+        return None
+    from decimal import Decimal as _D
+    from prsm.settlement.payment_authorization import (
+        canonical_request_hash, inference_request_fields,
+    )
+    from prsm.settlement.client_wiring import resolve_paid_requester
+    from prsm.settlement.payment_authorization_verifier import AuthorizationRejected
+    request_hash = canonical_request_hash(inference_request_fields(
+        model_id=body.get("model_id", ""),
+        prompt=body.get("prompt", ""),
+        max_tokens=int(body.get("max_tokens") or 0),
+        privacy_tier=str(body.get("privacy_tier", "standard")),
+        content_tier=str(body.get("content_tier", "A")),
+    ))
+    quoted_price_wei = int(_D(str(budget_ftns)) * (_D(10) ** 18))
+    try:
+        requester = await resolve_paid_requester(
+            verifier=getattr(node, "_payment_verifier", None),
+            payment_authorization=payment_authorization,
+            request_hash=request_hash,
+            quoted_price_wei=quoted_price_wei,
+        )
+    except AuthorizationRejected as exc:
+        raise HTTPException(
+            status_code=402,
+            detail=f"payment authorization rejected: {exc.reason}"
+                   + (f" ({exc.detail})" if exc.detail else ""),
+        )
+    if requester is None:
+        return None
+    # Carry the signed ceiling so the settle site can enforce value <= max_spend
+    # against the ACTUAL settled value (defense-in-depth; review sp1058 MEDIUM #3).
+    try:
+        max_spend_wei = int(payment_authorization["payload"]["max_spend_wei"])
+    except (KeyError, TypeError, ValueError):
+        max_spend_wei = None
+    return {"requester": requester, "max_spend_wei": max_spend_wei}
+
+
+def _record_paid_requester(node: Any, job_id: str, info: Dict[str, Any]) -> None:
+    """Record the authenticated requester info for ``job_id`` in the bounded
+    in-flight carrier (sprint 1056). Evicts the oldest entry when at capacity so a
+    stream of non-settling paid jobs can't leak memory (review sp1058 MEDIUM #2)."""
+    table = getattr(node, "_paid_requester_by_job", None)
+    if not isinstance(table, dict):
+        table = {}
+        node._paid_requester_by_job = table
+    while len(table) >= _PAID_REQUESTER_CARRIER_CAP:
+        try:
+            table.pop(next(iter(table)))   # evict oldest (insertion order)
+        except StopIteration:
+            break
+    table[job_id] = info
+
+
+def _take_paid_requester(node: Any, job_id: str) -> Optional[Dict[str, Any]]:
+    """Pop the authenticated requester info recorded at ingress for ``job_id``
+    (sprint 1056). Returns None when the job was self-pay or the map is absent — the
+    settle path then defaults to provider self-pay, unchanged. The returned dict has
+    keys ``requester`` (eth address) and ``max_spend_wei`` (the signed ceiling)."""
+    table = getattr(node, "_paid_requester_by_job", None)
+    if not isinstance(table, dict):
+        return None
+    return table.pop(job_id, None)
 
 
 def register_parallax_streams_endpoint(app: Any, node: Any) -> None:
@@ -8018,6 +8119,14 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         # both the escrow and the signed receipt.
         job_id = "infer-" + _uuid.uuid4().hex[:12]
 
+        # Sprint 1056 (requester-payment brick 3) — if the body carries a signed
+        # PaymentAuthorization, verify it FAIL-CLOSED before doing any work and
+        # stash the authenticated requester for the settle path; absent → unchanged
+        # self-pay. A rejected auth → 402 (do not serve a paid job we can't honor).
+        _paid_requester = await _resolve_paid_requester_or_402(node, body, budget_ftns)
+        if _paid_requester is not None:
+            _record_paid_requester(node, job_id, _paid_requester)
+
         # Sprint 251 — record IN_PROGRESS in JobHistoryStore so
         # inference jobs surface in prsm_jobs_list +
         # /compute/status/{job_id} alongside forge jobs. Best-
@@ -8198,6 +8307,7 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                             from prsm.settlement.client_wiring import (
                                 accumulate_settled_inference_receipt,
                             )
+                            _paid = _take_paid_requester(node, job_id)
                             _acc = await accumulate_settled_inference_receipt(
                                 client=getattr(
                                     node, "_onchain_settlement_client", None,
@@ -8209,6 +8319,8 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                                 receipt=receipt,
                                 release_ftns=decision.release_to_operator,
                                 job_id=job_id,
+                                requester_address=(_paid or {}).get("requester"),
+                                max_spend_wei=(_paid or {}).get("max_spend_wei"),
                             )
                             if _acc != "skipped:no-client":
                                 logger.info(
@@ -8626,6 +8738,13 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             raise HTTPException(status_code=400, detail=f"Invalid request: {e}")
 
         job_id = "infer-stream-" + _uuid.uuid4().hex[:12]
+
+        # Sprint 1056 (requester-payment brick 3) — verify an optional signed
+        # PaymentAuthorization FAIL-CLOSED before serving the stream; stash the
+        # authenticated requester for the settle path (parity with the unary path).
+        _paid_requester = await _resolve_paid_requester_or_402(node, body, budget_ftns)
+        if _paid_requester is not None:
+            _record_paid_requester(node, job_id, _paid_requester)
 
         # Sprint 252 — JobHistoryStore wiring for the streaming
         # path. Mirror of sprint 251's /compute/inference write

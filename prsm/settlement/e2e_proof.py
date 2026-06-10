@@ -169,6 +169,69 @@ async def run_deposit_and_commit(
     return report
 
 
+async def run_two_party_deposit_and_commit(
+    *,
+    escrow_client: Any,
+    settlement_client: Any,
+    verifier: Any,
+    payment_authorization: dict,
+    request_fields: dict,
+    provider_address: str,
+    identity: Any,
+    job_id: str,
+    output_hash: str,
+    executed_at_unix: int,
+    value_wei: int,
+    local_escrow_id: str,
+    deposit_amount_wei: int,
+    deposit_confirm_attempts: int = 6,
+    deposit_confirm_delay_s: float = 2.0,
+) -> dict:
+    """Sprint 1058 (brick 5) — the TWO-PARTY analogue of ``run_deposit_and_commit``.
+
+    Requester A signs a PaymentAuthorization; provider B (this caller) verifies it
+    FAIL-CLOSED (proving A authorized the spend for THIS request), then funds A's
+    escrow, builds a batched receipt naming A as requester + B as provider, and
+    commits. finalize (phase 2, reuse ``run_finalize_and_verify`` /
+    ``run_finalize_by_batch_id``) then draws from A's escrow into B's wallet — real
+    cross-party value transfer.
+
+    A rejected authorization raises ``AuthorizationRejected`` BEFORE any deposit or
+    commit, so a forged/expired/over-spend auth never moves money. The verified
+    requester address (not a caller-supplied one) is what the receipt + deposit use.
+    """
+    from prsm.settlement.payment_authorization import (
+        canonical_request_hash, inference_request_fields,
+    )
+
+    request_hash = canonical_request_hash(inference_request_fields(**request_fields))
+    payload = payment_authorization["payload"]
+    signature = payment_authorization["signature"]
+    # FAIL-CLOSED verify — raises AuthorizationRejected before touching the chain.
+    requester = await verifier.verify(
+        payload, signature, request_hash=request_hash, quoted_price_wei=value_wei,
+    )
+
+    batched = build_signed_batched_receipt(
+        identity=identity, job_id=job_id, output_hash=output_hash,
+        executed_at_unix=executed_at_unix, requester_address=requester,
+        provider_address=provider_address, value_wei=value_wei,
+        local_escrow_id=local_escrow_id,
+    )
+    report = await run_deposit_and_commit(
+        escrow_client=escrow_client, settlement_client=settlement_client,
+        batched_receipt=batched, deposit_amount_wei=deposit_amount_wei,
+        requester_address=requester,
+        deposit_confirm_attempts=deposit_confirm_attempts,
+        deposit_confirm_delay_s=deposit_confirm_delay_s,
+    )
+    report["requester_address"] = requester
+    report["provider_address"] = provider_address
+    logger.info("two-party deposit+commit: batch %s requester=%s provider=%s",
+                report["batch_id"][:12], requester, provider_address)
+    return report
+
+
 async def run_finalize_and_verify(
     *,
     settlement_client: Any,

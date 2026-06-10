@@ -4124,6 +4124,38 @@ class PRSMNode:
                 _settle_exc,
             )
 
+        # Sprint 1056 (requester-payment brick 3) — build the per-request
+        # PaymentAuthorization verifier (OFF unless PRSM_REQUESTER_PAYMENT=1). When
+        # the on-chain settlement client carries a contract with an EscrowPool
+        # client, wire its balance_of as the pre-flight balance reader; else the
+        # pre-flight is skipped (finalizeBatch still enforces funding). Fail-open.
+        self._payment_verifier = None
+        self._paid_requester_by_job = {}
+        try:
+            from prsm.settlement.client_wiring import (
+                build_payment_verifier_or_none,
+            )
+            _balance_reader = None
+            _sc = self._onchain_settlement_client
+            _escrow = getattr(getattr(_sc, "_contract", None), "escrow_pool", None)
+            if _escrow is not None and hasattr(_escrow, "balance_of"):
+                _balance_reader = _escrow.balance_of
+            self._payment_verifier = build_payment_verifier_or_none(
+                provider_address=self._operator_address,
+                balance_reader=_balance_reader,
+            )
+            if self._payment_verifier is not None:
+                logger.info(
+                    "Requester-payment verifier wired (provider=%s, "
+                    "escrow_preflight=%s).",
+                    self._operator_address, _balance_reader is not None,
+                )
+        except Exception as _pay_exc:  # noqa: BLE001
+            logger.warning(
+                "Requester-payment verifier build failed (non-fatal): %s",
+                _pay_exc,
+            )
+
         # ── Settler Registry (Phase 6: L2-style staking for batch security) ──
         from prsm.node.settler_registry import SettlerRegistry
         self._settler_registry = SettlerRegistry(

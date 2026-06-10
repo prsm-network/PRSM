@@ -70,7 +70,7 @@ PaymentAuthorization {
   provider:      address   // the node being paid (binds the auth to THIS provider)
   max_spend_wei: uint256   // ceiling the requester authorizes for this job
   job_nonce:     bytes32   // unique per job (anti-replay)
-  expiry_unix:   uint64    // auth invalid after this (anti-replay / staleness)
+  expiry_unix:   uint256   // auth invalid after this (anti-replay / staleness)
   request_hash:  bytes32   // keccak of the canonical inference-request params
 }
 ```

@@ -159,6 +159,7 @@ async def accumulate_settled_inference_receipt(
     job_id: str,
     requester_address: Optional[str] = None,
     executed_at_unix: Optional[int] = None,
+    max_spend_wei: Optional[int] = None,
 ) -> str:
     """Sprint 1037 (brick 1.5) — feed a just-settled InferenceReceipt into the
     on-chain settlement accumulator.
@@ -201,6 +202,18 @@ async def accumulate_settled_inference_receipt(
         value_wei = int(rel * (Decimal(10) ** 18))   # FTNS -> wei (18 dec)
         if value_wei <= 0:
             return "skipped:sub-wei"   # release below 1 wei rounds to 0
+        # sp1058 review MEDIUM #3 — defense-in-depth price ceiling: when a paying
+        # requester supplied a signed max_spend, the value we book on-chain against
+        # THEIR escrow must not exceed what they authorized. The escrow clamp makes
+        # this hold today, but enforce it against the ACTUAL settled value so a
+        # future re-pricing/top-up path can't silently overrun the signed ceiling.
+        if max_spend_wei is not None and value_wei > int(max_spend_wei):
+            logger.warning(
+                "on-chain settlement skipped: settled value %s wei exceeds the "
+                "requester's signed max_spend %s wei (job=%s)",
+                value_wei, max_spend_wei, job_id,
+            )
+            return "skipped:exceeds-max-spend"
         if executed_at_unix is None:
             import time as _time
             executed_at_unix = int(_time.time())
@@ -240,6 +253,101 @@ _POLL_PHASES = (
     ("finalize", "finalize_ready_batches"),
     ("reconcile_finalized", "reconcile_finalized"),
 )
+
+
+async def resolve_paid_requester(
+    *,
+    verifier: Optional[Any],
+    payment_authorization: Optional[dict],
+    request_hash: Any,
+    quoted_price_wei: int,
+) -> Optional[str]:
+    """Sprint 1056 (brick 3) — turn an optional signed PaymentAuthorization from
+    the inference request body into an authenticated requester eth address.
+
+    Fail-CLOSED on the authorization (a bad/paid request must not silently serve):
+      - ``payment_authorization`` None → return None (unchanged self-pay path).
+      - present but ``verifier`` None → AuthorizationRejected('verifier-not-wired')
+        (the node can't verify a paid job; do not downgrade to self-pay silently).
+      - present but missing payload/signature → 'malformed-authorization'.
+      - present + verifier → ``verifier.verify`` returns the authenticated
+        requester, or raises AuthorizationRejected (propagated to the caller).
+
+    The caller (api.py) computes ``request_hash`` from the ACTUAL request body via
+    ``canonical_request_hash`` so the request-hash binding covers this exact work,
+    and passes the provider's quote as ``quoted_price_wei``.
+    """
+    from prsm.settlement.payment_authorization_verifier import AuthorizationRejected
+
+    if payment_authorization is None:
+        return None
+    if verifier is None:
+        raise AuthorizationRejected(
+            "verifier-not-wired",
+            "a payment_authorization was supplied but on-chain settlement / the "
+            "payment verifier is not enabled on this node",
+        )
+    if not isinstance(payment_authorization, dict):
+        raise AuthorizationRejected("malformed-authorization", "not an object")
+    payload = payment_authorization.get("payload")
+    signature = payment_authorization.get("signature")
+    if not isinstance(payload, dict) or not signature:
+        raise AuthorizationRejected(
+            "malformed-authorization",
+            "expected {payload: {...}, signature: '0x..'}",
+        )
+    return await verifier.verify(
+        payload, signature, request_hash=request_hash,
+        quoted_price_wei=quoted_price_wei,
+    )
+
+
+def build_payment_verifier_or_none(
+    environ=None, *, provider_address: Optional[str] = None,
+    balance_reader: Optional[Any] = None,
+) -> Optional[Any]:
+    """Sprint 1056 (brick 3) — build a PaymentAuthorizationVerifier for the node, or
+    None when the requester-payment path is not enabled.
+
+    Gated ON only when ``PRSM_REQUESTER_PAYMENT`` is truthy AND a
+    ``provider_address`` is known (the verifier pins this provider). The nonce store
+    is durable (``PRSM_PAYMENT_NONCE_FILE``, default ~/.prsm/payment_nonces.json) so
+    a restart can't reopen a replay window; ``:memory:`` selects the in-memory store.
+    ``balance_reader`` (an async callable like EscrowPoolClient.balance_of) is wired
+    by the caller when an RPC is available; absent → pre-flight skipped (finalizeBatch
+    still enforces funding). Fail-open: any error returns None + logs."""
+    import os as _os
+    from pathlib import Path
+
+    environ = _os.environ if environ is None else environ
+    try:
+        flag = str(environ.get("PRSM_REQUESTER_PAYMENT", "")).strip().lower()
+        if flag not in ("1", "true", "yes", "on"):
+            return None
+        if not provider_address:
+            logger.warning(
+                "PRSM_REQUESTER_PAYMENT set but no provider_address resolved; "
+                "requester-payment verification stays OFF")
+            return None
+        from prsm.settlement.payment_authorization_verifier import (
+            DurableNonceStore, InMemoryNonceStore, PaymentAuthorizationVerifier,
+        )
+        nonce_file = str(environ.get("PRSM_PAYMENT_NONCE_FILE", "")).strip()
+        if nonce_file == ":memory:":
+            store: Any = InMemoryNonceStore()
+        else:
+            path = nonce_file or str(Path.home() / ".prsm" / "payment_nonces.json")
+            store = DurableNonceStore(path)
+        return PaymentAuthorizationVerifier(
+            provider_address=provider_address,
+            nonce_store=store,
+            balance_reader=balance_reader,
+        )
+    except Exception as exc:  # noqa: BLE001 - never crash startup over this
+        logger.warning(
+            "requester-payment verifier build failed (staying OFF): %s: %s",
+            type(exc).__name__, exc)
+        return None
 
 
 def get_settlement_status(client: Optional[Any]) -> dict:
