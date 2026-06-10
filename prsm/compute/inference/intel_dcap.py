@@ -194,97 +194,12 @@ class IntelDCAPBackend:
         return certs
 
     def _verify_chain(self, chain: List[x509.Certificate]):
-        """X.509 path validation of the PCK chain up to the configured trusted
-        root. ``chain`` is [end-entity(PCK leaf), intermediate(s)...]; the trust
-        anchor is appended. For each (child, issuer) pair this enforces — beyond
-        the signature — the path-validation rules WITHOUT which a signature-only
-        walk is forgeable (sp1044 review, CRITICAL):
-
-          - the ISSUER is a CA: BasicConstraints present + ca=True. This is the
-            load-bearing check: a real but non-CA PCK leaf can NOT be used to
-            "issue" an attacker's forged cert (the reproduced critical bypass).
-          - the ISSUER's KeyUsage (if present) permits keyCertSign.
-          - the ISSUER's pathLenConstraint (if set) allows the depth below it.
-          - name chaining: child.issuer == issuer.subject.
-          - validity: every cert is within [not_valid_before, not_valid_after] now.
-
-        Only the end-entity (chain[0], which signs the QE report) may be non-CA."""
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc)
-        full = list(chain) + [self._root]
-
-        def _within_validity(cert) -> bool:
-            try:
-                nvb, nva = cert.not_valid_before_utc, cert.not_valid_after_utc
-            except AttributeError:  # older cryptography: naive UTC datetimes
-                nvb = cert.not_valid_before.replace(tzinfo=timezone.utc)
-                nva = cert.not_valid_after.replace(tzinfo=timezone.utc)
-            return nvb <= now <= nva
-
-        def _is_ca(cert) -> bool:
-            try:
-                bc = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
-            except x509.ExtensionNotFound:
-                return False
-            return bool(bc.ca)
-
-        def _ca_path_len(cert):
-            try:
-                bc = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
-            except x509.ExtensionNotFound:
-                return None
-            return bc.path_length
-
-        def _allows_cert_sign(cert) -> bool:
-            try:
-                ku = cert.extensions.get_extension_for_class(x509.KeyUsage).value
-            except x509.ExtensionNotFound:
-                return True  # KeyUsage absent → unconstrained (RFC 5280)
-            return bool(ku.key_cert_sign)
-
-        # every cert must be within its validity window (incl. the leaf + root)
-        for cert in full:
-            if not _within_validity(cert):
-                return False, f"{cert.subject.rfc4514_string()} outside its validity window"
-
-        # walk child -> issuer; count CA hops below each issuer for pathLen
-        for depth, (child, issuer) in enumerate(zip(full, full[1:])):
-            if child.issuer != issuer.subject:
-                return False, "issuer/subject name mismatch in chain"
-            if not _is_ca(issuer):
-                return False, (
-                    f"{issuer.subject.rfc4514_string()} is not a CA "
-                    f"(BasicConstraints ca!=True) — cannot issue certificates")
-            if not _allows_cert_sign(issuer):
-                return False, f"{issuer.subject.rfc4514_string()} KeyUsage forbids keyCertSign"
-            plen = _ca_path_len(issuer)
-            # number of CA certs strictly between this issuer and the end-entity
-            cas_below = sum(1 for c in full[1:depth + 1] if _is_ca(c))
-            if plen is not None and cas_below > plen:
-                return False, (
-                    f"{issuer.subject.rfc4514_string()} pathLenConstraint={plen} "
-                    f"exceeded ({cas_below} CA(s) below)")
-            try:
-                issuer.public_key().verify(
-                    child.signature, child.tbs_certificate_bytes,
-                    ec.ECDSA(child.signature_hash_algorithm),
-                )
-            except InvalidSignature:
-                return False, f"{child.subject.rfc4514_string()} not signed by its issuer"
-            except Exception as exc:  # noqa: BLE001
-                return False, f"chain verify error: {exc}"
-
-        # the trust anchor must be a self-signed CA (it is the configured root)
-        if not _is_ca(self._root):
-            return False, "configured trusted root is not a CA"
-        try:
-            self._root.public_key().verify(
-                self._root.signature, self._root.tbs_certificate_bytes,
-                ec.ECDSA(self._root.signature_hash_algorithm),
-            )
-        except Exception as exc:  # noqa: BLE001
-            return False, f"trusted root is not self-consistent: {exc}"
-        return True, None
+        """X.509 path validation of the PCK chain (end-entity PCK leaf →
+        intermediate(s)) up to the configured trusted root, via the shared
+        hardened validator (sp1049 — same path-validation Intel + AMD use, with the
+        load-bearing CA-flag check from the sp1044 review)."""
+        from prsm.compute.inference.x509_path import verify_cert_chain
+        return verify_cert_chain(chain, self._root)
 
 
 def build_intel_dcap_backend_or_none(env: Optional[dict] = None):
