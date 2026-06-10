@@ -77,16 +77,23 @@ class AMDSEVSNPBackend:
     # this backend returns is still "amd-sev-snp" (the actual vendor).
     handles_vendor: str = "amd-sev-snp-envelope"
 
-    def __init__(self, trusted_root_pem: bytes, crls_pem: Optional[bytes] = None,
-                 tcb_policy=None):
-        if not trusted_root_pem:
+    def __init__(self, trusted_root_pem: Optional[bytes] = None,
+                 crls_pem: Optional[bytes] = None, tcb_policy=None,
+                 trusted_root_pems: Optional[List[bytes]] = None):
+        # sp1067 — AMD has per-product ARKs (Milan/Genoa/Turin), so accept a SET of
+        # roots; a VCEK chain selects its product's ARK by name. A single
+        # trusted_root_pem still works (back-compat). At least one is required.
+        pems = list(trusted_root_pems or [])
+        if trusted_root_pem:
+            pems.append(trusted_root_pem)
+        if not pems:
             raise ValueError(
-                "AMDSEVSNPBackend requires trusted_root_pem (AMD ARK in production) "
-                "— vendor_verified is only as strong as this anchor")
+                "AMDSEVSNPBackend requires at least one trusted root (AMD ARK) — "
+                "vendor_verified is only as strong as these anchors")
         try:
-            self._root = x509.load_pem_x509_certificate(trusted_root_pem)
+            self._roots = [x509.load_pem_x509_certificate(p) for p in pems]
         except Exception as exc:  # noqa: BLE001
-            raise ValueError(f"trusted_root_pem is not a valid certificate: {exc}")
+            raise ValueError(f"a trusted root is not a valid certificate: {exc}")
         # sp1060 — optional AMD KDS CRLs (ARK CRL revoking ASK, ASK CRL revoking
         # VCEK). Present → a revoked VCEK chain cert fails; None → no check (unchanged).
         self._crls = self._load_crls(crls_pem) if crls_pem else None
@@ -94,6 +101,19 @@ class AMDSEVSNPBackend:
         # report whose REPORTED_TCB doesn't bind to its VCEK's issued TCB, or falls
         # below the floor, is rejected. None → no TCB check (signature-chain only).
         self._tcb_policy = tcb_policy
+
+    def _select_root(self, chain):
+        """Pick the trusted ARK whose subject issued this chain's top cert (the ASK).
+        With a single configured root, use it (verify_cert_chain then reports any
+        name mismatch). With multiple (the bundled per-product ARKs), select by the
+        ASK's issuer name so the right product's ARK is used."""
+        if len(self._roots) == 1:
+            return self._roots[0]
+        issuer = chain[-1].issuer
+        for r in self._roots:
+            if r.subject == issuer:
+                return r
+        return None
 
     @staticmethod
     def _load_crls(crls_pem: bytes) -> Optional[list]:
@@ -170,8 +190,12 @@ class AMDSEVSNPBackend:
         except Exception as exc:  # noqa: BLE001
             return fail(f"SEV-SNP report signature check error: {exc}")
 
+        root = self._select_root(chain)
+        if root is None:
+            return fail(f"no configured AMD ARK matches the chain's issuer "
+                        f"{chain[-1].issuer.rfc4514_string()} (unknown product?)")
         chain_ok, chain_err = verify_cert_chain(
-            chain, self._root, crls=self._crls, require_crl=False)
+            chain, root, crls=self._crls, require_crl=False)
         if not chain_ok:
             return fail(f"VCEK chain does not verify to ARK root: {chain_err}")
 
@@ -230,8 +254,23 @@ def build_amd_sev_snp_backend_or_none(env: Optional[dict] = None):
                 logger.warning("AMD ARK file unreadable (%s) — SEV-SNP verification "
                                "OFF, structural fallback", exc)
                 return None
+    bundled_arks = None
     if not root_bytes:
-        return None
+        # sp1067 — default to the bundled (fingerprint-pinned) AMD product ARKs so a
+        # daemon does real SEV-SNP verification without sourcing the ARK PEMs. Opt out
+        # with PRSM_AMD_SEV_SNP_USE_BUNDLED_ROOT=0 (→ structural fallback).
+        if str(environ.get("PRSM_AMD_SEV_SNP_USE_BUNDLED_ROOT", "")).strip().lower() in (
+                "0", "false", "no", "off"):
+            return None
+        try:
+            from prsm.compute.inference.vendor_anchors import bundled_amd_arks
+            bundled_arks = list(bundled_amd_arks().values())
+            logger.info("Using bundled AMD ARKs (Milan/Genoa/Turin) for SEV-SNP "
+                        "verification (set PRSM_AMD_SEV_SNP_USE_BUNDLED_ROOT=0 to disable)")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("bundled AMD ARKs unusable (%s) — SEV-SNP OFF, structural "
+                           "fallback", exc)
+            return None
     # sp1060 — optional AMD KDS CRLs (PEM inline / file; concatenate ARK + ASK CRLs).
     crls_bytes = None
     crl_pem = (environ.get("PRSM_AMD_SEV_SNP_CRL_PEM", "") or "").strip()
@@ -261,8 +300,9 @@ def build_amd_sev_snp_backend_or_none(env: Optional[dict] = None):
                      "structural fallback (vendor_verified=false)", exc)
         return None
     try:
-        return AMDSEVSNPBackend(trusted_root_pem=root_bytes, crls_pem=crls_bytes,
-                                tcb_policy=tcb_policy)
+        return AMDSEVSNPBackend(trusted_root_pem=root_bytes,
+                                trusted_root_pems=bundled_arks,
+                                crls_pem=crls_bytes, tcb_policy=tcb_policy)
     except ValueError as exc:
         logger.warning("AMD ARK invalid (%s) — SEV-SNP verification OFF, structural "
                        "fallback", exc)

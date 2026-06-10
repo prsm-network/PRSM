@@ -36,9 +36,18 @@ def test_detect_vendor_recognizes_envelope():
     assert detect_vendor(_raw_v2_report()) == "amd-sev-snp"
 
 
-def test_build_amd_backend_none_without_config():
+def test_build_defaults_to_bundled_arks():
+    """sp1067 — no operator ARK configured → default to the bundled (pinned) AMD
+    product ARKs (real SEV-SNP verification). Opt-out restores structural fallback."""
+    from prsm.compute.inference.amd_sev_snp import (
+        build_amd_sev_snp_backend_or_none, AMDSEVSNPBackend)
+    assert isinstance(build_amd_sev_snp_backend_or_none(env={}), AMDSEVSNPBackend)
+
+
+def test_build_amd_backend_none_when_bundled_opted_out():
     from prsm.compute.inference.amd_sev_snp import build_amd_sev_snp_backend_or_none
-    assert build_amd_sev_snp_backend_or_none(env={}) is None
+    assert build_amd_sev_snp_backend_or_none(
+        env={"PRSM_AMD_SEV_SNP_USE_BUNDLED_ROOT": "0"}) is None
 
 
 def test_register_amd_activates_real_verification():
@@ -54,11 +63,12 @@ def test_register_amd_activates_real_verification():
     assert res.vendor_data["measurement_hex"] == expected["measurement"]
 
 
-def test_register_amd_none_without_config():
+def test_register_amd_none_when_bundled_opted_out():
     from prsm.compute.inference.attestation_backends import (
         AttestationBackendRegistry, register_amd_sev_snp)
     reg = AttestationBackendRegistry()
-    assert register_amd_sev_snp(reg, env={}) is False
+    assert register_amd_sev_snp(
+        reg, env={"PRSM_AMD_SEV_SNP_USE_BUNDLED_ROOT": "0"}) is False
 
 
 def test_raw_sev_snp_report_still_structural_when_amd_wired():

@@ -300,7 +300,21 @@ def build_intel_dcap_backend_or_none(env: Optional[dict] = None):
                                "verification OFF, structural fallback", exc)
                 return None
     if not root_bytes:
-        return None
+        # sp1067 — default to the bundled (fingerprint-pinned) Intel SGX Root CA so a
+        # daemon does real DCAP without the operator sourcing the PEM. Opt out with
+        # PRSM_INTEL_SGX_USE_BUNDLED_ROOT=0 (→ structural fallback, the old default).
+        if str(environ.get("PRSM_INTEL_SGX_USE_BUNDLED_ROOT", "")).strip().lower() in (
+                "0", "false", "no", "off"):
+            return None
+        try:
+            from prsm.compute.inference.vendor_anchors import bundled_intel_sgx_root_ca
+            root_bytes = bundled_intel_sgx_root_ca()
+            logger.info("Using bundled Intel SGX Root CA for DCAP verification "
+                        "(set PRSM_INTEL_SGX_USE_BUNDLED_ROOT=0 to disable)")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("bundled Intel SGX Root CA unusable (%s) — DCAP OFF, "
+                           "structural fallback", exc)
+            return None
     # sp1060 — optional CRLs (revocation). PEM inline or file; concatenate multiple
     # (Root-CA CRL + PCK-CA CRL). Absent → no revocation check (unchanged).
     crls_bytes = None

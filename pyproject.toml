@@ -323,7 +323,7 @@ exclude = [
 include-package-data = false
 
 [tool.setuptools.package-data]
-prsm = ["*.py", "*/*.py", "*/*/*.py", "py.typed", "skills/*.yaml", "ui_mockup/*.html", "ui_mockup/css/*.css", "ui_mockup/js/*.js", "ui_mockup/assets/*"]
+prsm = ["*.py", "*/*.py", "*/*/*.py", "py.typed", "skills/*.yaml", "ui_mockup/*.html", "ui_mockup/css/*.css", "ui_mockup/js/*.js", "ui_mockup/assets/*", "compute/inference/vendor_anchors/*.pem"]
 
 [tool.setuptools.exclude-package-data]
 "*" = [

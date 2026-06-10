@@ -32,9 +32,19 @@ def _sgx_quote_and_root():
 # ── build_intel_dcap_backend_or_none ──────────────────────────────────────────
 
 
-def test_build_none_without_config():
+def test_build_uses_bundled_root_by_default():
+    """sp1067 — with no operator root configured, the build defaults to the bundled
+    (fingerprint-pinned) Intel SGX Root CA (real DCAP), removing the bring-up
+    ceremony. The opt-out env restores the old structural-fallback behavior."""
+    from prsm.compute.inference.intel_dcap import (
+        build_intel_dcap_backend_or_none, IntelDCAPBackend)
+    assert isinstance(build_intel_dcap_backend_or_none(env={}), IntelDCAPBackend)
+
+
+def test_build_none_when_bundled_opted_out():
     from prsm.compute.inference.intel_dcap import build_intel_dcap_backend_or_none
-    assert build_intel_dcap_backend_or_none(env={}) is None
+    assert build_intel_dcap_backend_or_none(
+        env={"PRSM_INTEL_SGX_USE_BUNDLED_ROOT": "0"}) is None
 
 
 def test_build_from_pem_env():
@@ -82,14 +92,14 @@ def test_registry_does_real_verification_when_configured():
     assert res.signature_chain_ok is True
 
 
-def test_registry_structural_fallback_without_config():
-    """No Intel root configured → unchanged behavior: structural IntelASPBackend
-    handles SGX with vendor_verified=False."""
+def test_registry_structural_fallback_when_bundled_opted_out():
+    """With DCAP opted out (PRSM_INTEL_SGX_USE_BUNDLED_ROOT=0) and no operator root,
+    SGX falls through to the structural IntelASPBackend (vendor_verified=False)."""
     from prsm.compute.inference.attestation_backends import (
         AttestationBackendRegistry, register_intel_dcap)
     quote, _root = _sgx_quote_and_root()
     reg = AttestationBackendRegistry()
-    assert register_intel_dcap(reg, env={}) is False    # nothing configured
+    assert register_intel_dcap(reg, env={"PRSM_INTEL_SGX_USE_BUNDLED_ROOT": "0"}) is False
     res = reg.verify(quote)
     assert res.vendor == "intel-sgx"
     assert res.vendor_verified is False
