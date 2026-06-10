@@ -84,7 +84,10 @@ class IntelDCAPBackend:
     # IntelASPBackend (whose handles_vendor='intel') rather than being DCAP-rejected.
     handles_vendor: str = "intel-sgx"
 
-    def __init__(self, trusted_root_pem: bytes, crls_pem: Optional[bytes] = None):
+    def __init__(self, trusted_root_pem: bytes, crls_pem: Optional[bytes] = None,
+                 tcb_info_json: Optional[bytes] = None,
+                 tcb_signer_cert_pem: Optional[bytes] = None,
+                 tcb_policy=None):
         if not trusted_root_pem:
             raise ValueError(
                 "IntelDCAPBackend requires trusted_root_pem (Intel SGX Root CA in "
@@ -97,6 +100,21 @@ class IntelDCAPBackend:
         # intermediates + PCK-CA CRL revoking PCK leaves). When present, a revoked
         # PCK chain cert fails verification. None → no revocation check (unchanged).
         self._crls = self._load_crls(crls_pem) if crls_pem else None
+        # sp1061-1063 — optional TCB-recency enforcement. When BOTH the signed
+        # TCB-Info and its signer cert are supplied, a validly-signed quote from a
+        # DOWNLEVEL (out-of-date) TEE is rejected per the policy. Absent → no TCB
+        # check (signature-chain only, unchanged).
+        self._tcb_info_json = bytes(tcb_info_json) if tcb_info_json else None
+        self._tcb_signer = None
+        if tcb_signer_cert_pem:
+            try:
+                self._tcb_signer = x509.load_pem_x509_certificate(bytes(tcb_signer_cert_pem))
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(f"tcb_signer_cert_pem is not a valid certificate: {exc}")
+        if tcb_policy is None:
+            from prsm.compute.inference.sgx_tcb import default_tcb_policy
+            tcb_policy = default_tcb_policy()
+        self._tcb_policy = tcb_policy
 
     @staticmethod
     def _load_crls(crls_pem: bytes) -> Optional[list]:
@@ -192,9 +210,43 @@ class IntelDCAPBackend:
             return fail(f"PCK chain does not verify to trusted root: {chain_err}",
                         chain_ok=False)
 
+        # sp1061-1063 — TCB-recency: the chain proves AUTHENTICITY; this proves the
+        # platform isn't running a known-vulnerable (downlevel/revoked) TCB. Only
+        # enforced when the operator configured a signed TCB-Info + its signer.
+        if self._tcb_info_json is not None and self._tcb_signer is not None:
+            tcb_status, tcb_err = self._evaluate_tcb(pck_leaf)
+            if tcb_status is not None:
+                vendor_data["tcb_status"] = tcb_status
+            if tcb_err is not None:
+                # the chain verified, so signature_chain_ok=True, but vendor_verified
+                # is False — the TEE is authentic yet not recency-acceptable.
+                return AttestationVerificationResult(
+                    vendor="intel-sgx", vendor_verified=False, signature_chain_ok=True,
+                    structural_parse_ok=True, vendor_data=vendor_data, error=tcb_err)
+
         return AttestationVerificationResult(
             vendor="intel-sgx", vendor_verified=True, signature_chain_ok=True,
             structural_parse_ok=True, vendor_data=vendor_data, error=None)
+
+    def _evaluate_tcb(self, pck_leaf):
+        """Return (tcb_status, error). error is None when the platform's TCB status is
+        policy-acceptable; otherwise a message (and vendor_verified must be False).
+        A parse/verify/FMSPC failure is fail-closed (error set, status maybe None)."""
+        from prsm.compute.inference.sgx_tcb import (
+            TcbInfoError, evaluate_tcb_status, parse_and_verify_tcb_info,
+            parse_pck_sgx_extension,
+        )
+        try:
+            pck_tcb = parse_pck_sgx_extension(pck_leaf)
+            tcb_info = parse_and_verify_tcb_info(self._tcb_info_json, self._tcb_signer)
+            status = evaluate_tcb_status(pck_tcb, tcb_info)
+        except TcbInfoError as exc:
+            return None, f"TCB-Info check failed (fail-closed): {exc}"
+        except ValueError as exc:
+            return None, f"TCB level unreadable (fail-closed): {exc}"
+        if not self._tcb_policy.is_acceptable(status):
+            return status, f"TCB status '{status}' is not acceptable (downlevel/revoked TEE)"
+        return status, None
 
     @staticmethod
     def _load_chain(cert_pem: bytes) -> List[x509.Certificate]:
@@ -264,9 +316,37 @@ def build_intel_dcap_backend_or_none(env: Optional[dict] = None):
             except OSError as exc:
                 logger.warning("Intel SGX CRL file unreadable (%s) — proceeding "
                                "WITHOUT revocation checking", exc)
+    # sp1061-1063 — optional TCB-recency enforcement: a signed TCB-Info + its signer
+    # cert. Both required to enable; one without the other is a likely misconfig
+    # (log + leave TCB checking OFF rather than fail). Absent → signature-chain only.
+    def _read_cfg(pem_var, file_var, label):
+        v = (environ.get(pem_var, "") or "").strip()
+        if v:
+            return v.encode() if isinstance(v, str) else v
+        path = (environ.get(file_var, "") or "").strip()
+        if path:
+            try:
+                with open(path, "rb") as f:
+                    return f.read()
+            except OSError as exc:
+                logger.warning("%s file unreadable (%s) — TCB enforcement OFF", label, exc)
+        return None
+
+    tcb_info = _read_cfg("PRSM_INTEL_SGX_TCB_INFO_JSON",
+                         "PRSM_INTEL_SGX_TCB_INFO_FILE", "Intel SGX TCB-Info")
+    tcb_signer = _read_cfg("PRSM_INTEL_SGX_TCB_SIGNING_PEM",
+                           "PRSM_INTEL_SGX_TCB_SIGNING_FILE", "Intel SGX TCB Signing cert")
+    if bool(tcb_info) != bool(tcb_signer):
+        logger.warning("Intel SGX TCB enforcement needs BOTH the TCB-Info and the "
+                       "TCB Signing cert — only one configured; TCB checking OFF")
+        tcb_info = tcb_signer = None
+    from prsm.compute.inference.sgx_tcb import tcb_policy_from_env
     try:
-        return IntelDCAPBackend(trusted_root_pem=root_bytes, crls_pem=crls_bytes)
+        return IntelDCAPBackend(
+            trusted_root_pem=root_bytes, crls_pem=crls_bytes,
+            tcb_info_json=tcb_info, tcb_signer_cert_pem=tcb_signer,
+            tcb_policy=tcb_policy_from_env(environ))
     except ValueError as exc:
-        logger.warning("Intel SGX Root CA invalid (%s) — DCAP verification OFF, "
-                       "structural fallback", exc)
+        logger.warning("Intel SGX Root CA / TCB config invalid (%s) — DCAP "
+                       "verification OFF, structural fallback", exc)
         return None
