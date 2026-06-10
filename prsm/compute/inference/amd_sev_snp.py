@@ -77,7 +77,8 @@ class AMDSEVSNPBackend:
     # this backend returns is still "amd-sev-snp" (the actual vendor).
     handles_vendor: str = "amd-sev-snp-envelope"
 
-    def __init__(self, trusted_root_pem: bytes, crls_pem: Optional[bytes] = None):
+    def __init__(self, trusted_root_pem: bytes, crls_pem: Optional[bytes] = None,
+                 tcb_policy=None):
         if not trusted_root_pem:
             raise ValueError(
                 "AMDSEVSNPBackend requires trusted_root_pem (AMD ARK in production) "
@@ -89,6 +90,10 @@ class AMDSEVSNPBackend:
         # sp1060 — optional AMD KDS CRLs (ARK CRL revoking ASK, ASK CRL revoking
         # VCEK). Present → a revoked VCEK chain cert fails; None → no check (unchanged).
         self._crls = self._load_crls(crls_pem) if crls_pem else None
+        # sp1064-1065 — optional TCB-recency enforcement. When a policy is set, a
+        # report whose REPORTED_TCB doesn't bind to its VCEK's issued TCB, or falls
+        # below the floor, is rejected. None → no TCB check (signature-chain only).
+        self._tcb_policy = tcb_policy
 
     @staticmethod
     def _load_crls(crls_pem: bytes) -> Optional[list]:
@@ -170,9 +175,40 @@ class AMDSEVSNPBackend:
         if not chain_ok:
             return fail(f"VCEK chain does not verify to ARK root: {chain_err}")
 
+        # sp1064-1065 — TCB-recency: the chain proves AUTHENTICITY; this proves the
+        # report's TCB binds to the VCEK's issued TCB AND meets the floor. Only when
+        # the operator configured a policy.
+        if self._tcb_policy is not None:
+            tcb_err = self._evaluate_tcb(report, vcek, vendor_data)
+            if tcb_err is not None:
+                return AttestationVerificationResult(
+                    vendor="amd-sev-snp", vendor_verified=False, signature_chain_ok=True,
+                    structural_parse_ok=True, vendor_data=vendor_data, error=tcb_err)
+
         return AttestationVerificationResult(
             vendor="amd-sev-snp", vendor_verified=True, signature_chain_ok=True,
             structural_parse_ok=True, vendor_data=vendor_data, error=None)
+
+    def _evaluate_tcb(self, report: bytes, vcek, vendor_data: dict):
+        """Return an error message if the report's TCB doesn't bind to the VCEK or
+        falls below the policy floor; None if acceptable. Adds reported_tcb to
+        vendor_data. Fail-closed on any parse error."""
+        from prsm.compute.inference.amd_tcb import (
+            SnpTcbError, check_tcb_binding, parse_reported_tcb, parse_vcek_tcb,
+        )
+        try:
+            reported = parse_reported_tcb(report)
+            issued = parse_vcek_tcb(vcek)
+            vendor_data["reported_tcb"] = {
+                "bootloader": reported.bootloader, "tee": reported.tee,
+                "snp": reported.snp, "microcode": reported.microcode}
+            check_tcb_binding(reported, issued)
+        except SnpTcbError as exc:
+            return f"TCB binding/parse failed (fail-closed): {exc}"
+        if not self._tcb_policy.is_acceptable(reported):
+            return (f"TCB below the configured floor (downlevel TEE): reported "
+                    f"{vendor_data['reported_tcb']}")
+        return None
 
 
 def build_amd_sev_snp_backend_or_none(env: Optional[dict] = None):
@@ -210,8 +246,23 @@ def build_amd_sev_snp_backend_or_none(env: Optional[dict] = None):
             except OSError as exc:
                 logger.warning("AMD KDS CRL file unreadable (%s) — proceeding "
                                "WITHOUT revocation checking", exc)
+    # sp1064-1065 — optional TCB-recency policy (PRSM_AMD_SEV_SNP_MIN_TCB =
+    # "bootloader,tee,snp,microcode"). Absent → no TCB check (unchanged).
+    from prsm.compute.inference.amd_tcb import snp_tcb_policy_from_env
     try:
-        return AMDSEVSNPBackend(trusted_root_pem=root_bytes, crls_pem=crls_bytes)
+        tcb_policy = snp_tcb_policy_from_env(environ)
+    except ValueError as exc:
+        # sp1065 review #5 — the operator ASKED for TCB enforcement but the value is
+        # malformed. Building the backend with enforcement silently OFF would let a
+        # downlevel TEE pass (vendor_verified=true). FAIL CLOSED: refuse to build the
+        # real backend → structural fallback returns vendor_verified=false.
+        logger.error("PRSM_AMD_SEV_SNP_MIN_TCB invalid (%s) — REFUSING to build the "
+                     "SEV-SNP backend (would skip the TCB enforcement you configured); "
+                     "structural fallback (vendor_verified=false)", exc)
+        return None
+    try:
+        return AMDSEVSNPBackend(trusted_root_pem=root_bytes, crls_pem=crls_bytes,
+                                tcb_policy=tcb_policy)
     except ValueError as exc:
         logger.warning("AMD ARK invalid (%s) — SEV-SNP verification OFF, structural "
                        "fallback", exc)
