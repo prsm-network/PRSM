@@ -2730,6 +2730,23 @@ class PRSMNode:
         else:
             self.inference_executor = None
 
+        # Sprint 1046 — activate REAL Intel SGX DCAP attestation verification on
+        # the default registry (the one backing /compute/receipt/verify) when an
+        # Intel SGX Root CA is configured (PRSM_INTEL_SGX_ROOT_CA_PEM / _FILE).
+        # Without the anchor: unchanged structural behavior (vendor_verified=False).
+        # FAIL-OPEN: a misconfig must never crash daemon initialize().
+        try:
+            from prsm.compute.inference.attestation_backends import (
+                configure_default_registry_from_env,
+            )
+            if configure_default_registry_from_env():
+                logger.info("Sprint 1046: Intel SGX DCAP attestation verification "
+                            "ACTIVE (root CA configured) — vendor_verified is now "
+                            "cryptographically enforced for SGX quotes")
+        except Exception as _dcap_exc:  # noqa: BLE001
+            logger.warning("Sprint 1046 DCAP activation failed (non-fatal; "
+                           "structural fallback): %s", _dcap_exc)
+
         # ── Payment Escrow & Result Consensus ─────────────────────
         from prsm.node.payment_escrow import PaymentEscrow
         from prsm.node.result_consensus import ResultConsensus

@@ -517,3 +517,31 @@ def verify_attestation(
     Callers that don't need custom backend registration can
     use this directly."""
     return _DEFAULT_REGISTRY.verify(blob)
+
+
+def register_intel_dcap(registry, env=None) -> bool:
+    """Sprint 1046 — register a REAL Intel SGX DCAP verifier on ``registry`` when
+    an Intel SGX Root CA is configured (PRSM_INTEL_SGX_ROOT_CA_PEM / _FILE), so SGX
+    quotes get cryptographic ``vendor_verified``. Front-of-chain registration means
+    it overrides the structural IntelASPBackend for SGX (and only SGX —
+    handles_vendor='intel-sgx' — so TDX still falls through). Idempotent: returns
+    False if nothing is configured OR a DCAP backend is already present. Lazy import
+    avoids the circular dependency (intel_dcap imports from this module)."""
+    from prsm.compute.inference.intel_dcap import (
+        IntelDCAPBackend, build_intel_dcap_backend_or_none,
+    )
+    if any(isinstance(b, IntelDCAPBackend) for b in registry.backends):
+        return False
+    backend = build_intel_dcap_backend_or_none(env)
+    if backend is None:
+        return False
+    registry.register(backend)
+    return True
+
+
+def configure_default_registry_from_env(env=None) -> bool:
+    """Activate real Intel SGX DCAP verification on the DEFAULT registry (the one
+    backing ``verify_attestation`` + /compute/receipt/verify) if an Intel SGX Root
+    CA is configured. Call once at node startup; fail-open (no anchor → unchanged
+    structural behavior). Returns True iff DCAP was activated."""
+    return register_intel_dcap(_DEFAULT_REGISTRY, env)

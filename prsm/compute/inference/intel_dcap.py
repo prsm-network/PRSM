@@ -80,7 +80,9 @@ class IntelDCAPBackend:
     REQUIRED (no default): in production pass Intel's SGX Root CA PEM; the strength
     of ``vendor_verified`` is exactly the strength of this anchor."""
 
-    handles_vendor: str = "intel"
+    # SGX v3 only — so Intel TDX (v4) quotes still fall through to the structural
+    # IntelASPBackend (whose handles_vendor='intel') rather than being DCAP-rejected.
+    handles_vendor: str = "intel-sgx"
 
     def __init__(self, trusted_root_pem: bytes):
         if not trusted_root_pem:
@@ -283,3 +285,39 @@ class IntelDCAPBackend:
         except Exception as exc:  # noqa: BLE001
             return False, f"trusted root is not self-consistent: {exc}"
         return True, None
+
+
+def build_intel_dcap_backend_or_none(env: Optional[dict] = None):
+    """sp1046 — construct an IntelDCAPBackend from operator config, or None.
+
+    Reads the Intel SGX Root CA trust anchor from (in order):
+      - ``PRSM_INTEL_SGX_ROOT_CA_PEM``  — inline PEM, or
+      - ``PRSM_INTEL_SGX_ROOT_CA_FILE`` — path to a PEM file.
+    Returns None when neither is set (→ structural-only fallback, unchanged
+    behavior) OR when the configured anchor is unreadable/invalid (fail-open: a
+    misconfigured root must not crash startup or silently weaken trust; it logs
+    and falls back to structural, which reports vendor_verified=False)."""
+    import os
+    environ = env if env is not None else os.environ
+    pem = (environ.get("PRSM_INTEL_SGX_ROOT_CA_PEM", "") or "").strip()
+    root_bytes = None
+    if pem:
+        root_bytes = pem.encode() if isinstance(pem, str) else pem
+    else:
+        path = (environ.get("PRSM_INTEL_SGX_ROOT_CA_FILE", "") or "").strip()
+        if path:
+            try:
+                with open(path, "rb") as f:
+                    root_bytes = f.read()
+            except OSError as exc:
+                logger.warning("Intel SGX Root CA file unreadable (%s) — DCAP "
+                               "verification OFF, structural fallback", exc)
+                return None
+    if not root_bytes:
+        return None
+    try:
+        return IntelDCAPBackend(trusted_root_pem=root_bytes)
+    except ValueError as exc:
+        logger.warning("Intel SGX Root CA invalid (%s) — DCAP verification OFF, "
+                       "structural fallback", exc)
+        return None
