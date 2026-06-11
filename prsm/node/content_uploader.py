@@ -2257,17 +2257,34 @@ class ContentUploader:
             raise
 
     async def _fetch_content(self, cid: str) -> Optional[bytes]:
-        """Fetch content bytes by torrent infohash via the BitTorrent layer.
+        """Fetch content bytes by CID.
+
+        With the BitTorrent retriever wired (libtorrent present) it goes through that.
+        sp1073 — WITHOUT it (libtorrent absent, sp1071 LocalContentPublisher path), it
+        routes through ``ContentProvider.request_content``, which handles BOTH
+        self-published content (the local_content shortcut) AND cross-node fetch over
+        the P2P substrate (INLINE/CHUNKED) — both libtorrent-free. So a default
+        operator can now RETRIEVE content (its own + others'), not just publish.
 
         Returns the content bytes on success or None on failure.
         """
         if self.content_retriever is None:
-            logger.error(
-                "ContentUploader.content_retriever is None — cannot fetch "
-                "%s. Wire content_retriever in the constructor.",
-                cid,
-            )
-            return None
+            # libtorrent-free fetch via the P2P substrate.
+            provider = self._content_provider
+            if provider is None:
+                logger.error(
+                    "ContentUploader: neither content_retriever nor content_provider "
+                    "is wired — cannot fetch %s.", cid,
+                )
+                return None
+            try:
+                return await provider.request_content(cid)
+            except Exception as e:  # noqa: BLE001 - never raise out of fetch
+                logger.error(
+                    "Libtorrent-free fetch via ContentProvider failed for %s: %s",
+                    cid, e,
+                )
+                return None
         try:
             return await self.content_retriever.fetch(cid)
         except Exception as e:

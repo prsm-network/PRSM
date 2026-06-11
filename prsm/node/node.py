@@ -2575,6 +2575,10 @@ class PRSMNode:
                 self.content_provider.content_retriever = (
                     self.content_retriever
                 )
+                # sp1073 — also wire the publisher so ContentProvider._fetch_local can
+                # serve self-published Tier-A content via the local_publish_path
+                # shortcut (no BT swarm needed even with libtorrent present).
+                self.content_provider.content_publisher = self.content_publisher
             # Sprint 428 (F8) — wire the publisher back into the
             # retriever so it can short-circuit the BT swarm for
             # locally-published content. Closes single-node Vision §4
@@ -2608,6 +2612,11 @@ class PRSMNode:
                 self.content_retriever = None   # BT retriever needs libtorrent; fetch
                 #   goes through ContentProvider.request_content (libtorrent-free)
                 self.content_uploader.content_publisher = self.content_publisher
+                # sp1073 — wire the publisher into ContentProvider so its _fetch_local
+                # local_publish_path shortcut can serve this node's own Tier-A uploads
+                # (self-fetch + serving to peers), all without libtorrent.
+                if self.content_provider is not None:
+                    self.content_provider.content_publisher = self.content_publisher
                 logger.info(
                     "libtorrent not available — using LocalContentPublisher (Tier A, "
                     "pure-Python v1 infohash). Uploads publish + serve over the P2P "

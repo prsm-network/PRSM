@@ -1304,10 +1304,24 @@ class ContentProvider:
         Returns None (never raises) for: no retriever wired, cid not
         in ``_local_content``, or retriever errors.
         """
+        if content_id not in getattr(self, "_local_content", {}):
+            return None
+        # sp1073 — direct-publisher shortcut FIRST (libtorrent-free). If a publisher is
+        # wired and it locally published this cid as a Tier-A staged file, serve those
+        # bytes with NO BT retriever. This is what lets a non-libtorrent node
+        # (sp1071 LocalContentPublisher) self-fetch + serve its own uploads; it also
+        # short-circuits the BT swarm for the libtorrent ContentPublisher's own Tier-A
+        # content (the F8 shortcut, now reachable without a retriever).
+        pub = getattr(self, "content_publisher", None)
+        if pub is not None:
+            try:
+                staged = pub.local_publish_path(content_id)
+                if staged is not None and staged.is_file():
+                    return staged.read_bytes()
+            except Exception:  # noqa: BLE001 - fall through to the retriever path
+                pass
         retriever = getattr(self, "content_retriever", None)
         if retriever is None:
-            return None
-        if content_id not in self._local_content:
             return None
         try:
             # Sprint 484 (F24): propagate timeout. asyncio.wait_for
