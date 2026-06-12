@@ -110,16 +110,16 @@ class _DeadBootstrapSentinel:
 
 
 def _authenticated_capability_node_id(data: Dict[str, Any]) -> Optional[str]:
-    """Sprint 1086 — the cryptographically-authenticated node_id for a libp2p
-    ``capability_announce``, or None to DROP it. Mirrors the WebSocket
-    ``discovery._authenticated_announce_node_id``: the announce must carry a
-    self-verifying origin attestation — ``sha256(origin_pubkey)[:32] == node_id`` AND a
-    valid signature over the canonical announce content bound to node_id + nonce. Unlike
-    the WS path there is NO handshake-bound peer fallback (gossip is broadcast with no
-    authenticated channel), so an unattested or mis-signed announce is dropped outright.
-    This closes the sp1010 Residual A index-poisoning vector for the capability path: an
-    attacker can no longer inject an arbitrary (node_id -> capabilities/attestation)
-    entry under a victim's node_id."""
+    """Sprint 1086/1087 — the cryptographically-authenticated node_id for a libp2p
+    gossip announce (``capability_announce`` / ``shard_available``), or None to DROP it.
+    Mirrors the WebSocket ``discovery._authenticated_announce_node_id``: the announce
+    must carry a self-verifying origin attestation — ``sha256(origin_pubkey)[:32] ==
+    node_id`` AND a valid signature over the canonical announce content bound to node_id
+    + nonce. Unlike the WS path there is NO handshake-bound peer fallback (gossip is
+    broadcast with no authenticated channel), so an unattested or mis-signed announce is
+    dropped outright. This closes the sp1010 Residual A index/cache-poisoning vector: an
+    attacker can no longer inject an arbitrary (node_id -> capabilities/attestation, or
+    node_id -> shard-provider) entry under a victim's node_id."""
     claimed = data.get("node_id")
     if not claimed:
         return None
@@ -877,13 +877,17 @@ class Libp2pDiscovery:
         """
         node_id = self.transport.identity.node_id
 
-        # 1. Ephemeral GossipSub announcement
+        # 1. Ephemeral GossipSub announcement — sp1087: attested so receivers can
+        # authenticate node_id (a peer can't claim a victim provides a shard, nor
+        # advertise a shard it doesn't hold under a forged id).
         if self.gossip is not None:
             try:
-                await self.gossip.publish(
-                    "shard_available",
-                    {"cid": cid, "node_id": node_id},
-                )
+                payload = {
+                    "cid": cid, "node_id": node_id, "nonce": secrets.token_hex(16),
+                }
+                _attest_announce_payload(
+                    self.transport.identity, payload, payload["nonce"])
+                await self.gossip.publish("shard_available", payload)
             except Exception as exc:
                 logger.debug("GossipSub provide_content error: %s", exc)
 
@@ -1089,10 +1093,21 @@ class Libp2pDiscovery:
     async def _on_shard_available(
         self, subtype: str, data: Dict[str, Any], sender_id: str
     ) -> None:
-        """Update shard cache from a ``shard_available`` message."""
+        """Update shard cache from a ``shard_available`` message.
+
+        Sprint 1087 — the provider's node_id must be cryptographically authenticated
+        (origin attestation) before it's cached; an unattested / mis-signed announce is
+        dropped so an attacker can't poison the content-routing cache (claim a victim
+        provides a shard, or advertise a shard under a forged node_id)."""
         cid = data.get("cid", "")
-        node_id = data.get("node_id", sender_id)
-        if not cid or not node_id:
+        if not cid:
+            return
+        node_id = _authenticated_capability_node_id(data)
+        if not node_id:
+            logger.debug(
+                "dropping unauthenticated shard_available from sender=%s",
+                (sender_id or "?")[:8],
+            )
             return
 
         providers = self._shard_cache.setdefault(cid, [])

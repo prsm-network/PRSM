@@ -36,6 +36,13 @@ def _attested_capability(
     return data
 
 
+def _attested_shard(identity, cid, *, nonce="s1"):
+    """Sprint 1087 — an origin-attested shard_available announce."""
+    data = {"cid": cid, "node_id": identity.node_id, "nonce": nonce}
+    _attest_announce_payload(identity, data, nonce)
+    return data
+
+
 def _make_transport(node_id: str = "local-node-001") -> MagicMock:
     transport = MagicMock()
     transport.identity = MagicMock()
@@ -193,14 +200,12 @@ class TestShardCache:
         transport = _make_transport()
         discovery = Libp2pDiscovery(transport)
 
+        peer = generate_node_identity("shard-peer-001")
         await discovery._on_shard_available(
-            "shard_available",
-            {"cid": "QmTest123", "node_id": "shard-peer-001"},
-            "shard-peer-001",
-        )
+            "shard_available", _attested_shard(peer, "QmTest123"), peer.node_id)
 
         assert "QmTest123" in discovery._shard_cache
-        assert "shard-peer-001" in discovery._shard_cache["QmTest123"]
+        assert peer.node_id in discovery._shard_cache["QmTest123"]
 
     @pytest.mark.asyncio
     async def test_shard_cache_multiple_providers(self) -> None:
@@ -209,11 +214,9 @@ class TestShardCache:
 
         cid = "QmMultiProvider"
         for i in range(3):
+            peer = generate_node_identity(f"peer-{i}")
             await discovery._on_shard_available(
-                "shard_available",
-                {"cid": cid, "node_id": f"peer-{i}"},
-                f"peer-{i}",
-            )
+                "shard_available", _attested_shard(peer, cid), peer.node_id)
 
         assert len(discovery._shard_cache[cid]) == 3
 
@@ -223,14 +226,32 @@ class TestShardCache:
         discovery = Libp2pDiscovery(transport)
 
         cid = "QmDup"
-        for _ in range(5):
+        peer = generate_node_identity("shard-peer")
+        for n in range(5):
             await discovery._on_shard_available(
-                "shard_available",
-                {"cid": cid, "node_id": "shard-peer"},
-                "shard-peer",
-            )
+                "shard_available", _attested_shard(peer, cid, nonce=f"s{n}"),
+                peer.node_id)
 
         assert len(discovery._shard_cache[cid]) == 1
+
+    @pytest.mark.asyncio
+    async def test_unattested_shard_dropped(self) -> None:
+        """sp1087 — a shard_available with no valid origin attestation is dropped."""
+        discovery = Libp2pDiscovery(_make_transport())
+        await discovery._on_shard_available(
+            "shard_available", {"cid": "QmX", "node_id": "spoofed"}, "spoofed")
+        assert discovery._shard_cache == {}
+
+    @pytest.mark.asyncio
+    async def test_shard_attacker_claims_victim_dropped(self) -> None:
+        """An attacker claims the VICTIM provides a shard — sig won't match → dropped."""
+        discovery = Libp2pDiscovery(_make_transport())
+        victim = generate_node_identity("victim")
+        attacker = generate_node_identity("attacker")
+        data = _attested_shard(attacker, "QmY")
+        data["node_id"] = victim.node_id
+        await discovery._on_shard_available("shard_available", data, attacker.node_id)
+        assert discovery._shard_cache == {}
 
 
 class TestBootstrapDegraded:
