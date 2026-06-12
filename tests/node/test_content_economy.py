@@ -166,6 +166,52 @@ async def test_process_content_access_basic(content_economy, ledger):
 
 
 @pytest.mark.asyncio
+async def test_process_content_access_uses_authenticated_rate(content_economy):
+    """sp1077 (Gap B) — a forged advertise-lane royalty_rate is overridden by the
+    on-chain REGISTERED rate for content with a registered provenance_hash. The
+    payment amount reflects the authentic rate, not the attacker's."""
+    from prsm.economy.web3.provenance_registry import ContentRecord
+    client = MagicMock()
+    client.get_content.return_value = ContentRecord(
+        creator="0x" + "11" * 20, royalty_rate_bps=200,   # registered = 2%
+        registered_at=1, metadata_uri="")
+    content_economy._get_provenance_client = lambda: client
+
+    payment = await content_economy.process_content_access(
+        content_id="reg-cid",
+        accessor_id="test-node-abc123",
+        content_metadata={
+            "royalty_rate": 0.50,                  # forged advertise rate (50%)
+            "creator_id": "creator-xyz",
+            "parent_cids": [],
+            "provenance_hash": "0x" + "ab" * 32,
+        },
+    )
+    assert payment.status == PaymentStatus.COMPLETED
+    assert payment.amount == Decimal("0.02")        # registered rate, NOT the forged 0.50
+
+
+@pytest.mark.asyncio
+async def test_process_content_access_unregistered_keeps_advertise_rate(content_economy):
+    """Unregistered content has no authenticated source → the (sp1004-bounded)
+    advertise rate stands."""
+    client = MagicMock()
+    client.get_content.return_value = None   # not registered on-chain
+    content_economy._get_provenance_client = lambda: client
+    payment = await content_economy.process_content_access(
+        content_id="unreg-cid",
+        accessor_id="test-node-abc123",
+        content_metadata={
+            "royalty_rate": 0.03,
+            "creator_id": "creator-xyz",
+            "parent_cids": [],
+            "provenance_hash": "0x" + "cd" * 32,
+        },
+    )
+    assert payment.amount == Decimal("0.03")
+
+
+@pytest.mark.asyncio
 async def test_royalty_distribution_phase4_model(content_economy, ledger, mock_content_index):
     """Test royalty distribution with Phase4 model (8% original, 1% derivative)."""
     # Process payment for derivative content

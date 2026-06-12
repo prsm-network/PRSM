@@ -129,6 +129,26 @@ to the **authenticated** source. Two shapes:
 signed, first-writer-wins ledger; route off-chain credit through it rather
 than the gossip copy. No new wire format, no new signatures on the hot path.
 
+**Partially CLOSED (sp1077, 2026-06-11) — the `royalty_rate` leg.** Option A is
+now applied to the rate: `ContentEconomy.process_content_access` calls
+`_authenticated_royalty_rate`, which for content with a REGISTERED `provenance_hash`
+reads the rate from the on-chain `ProvenanceRegistry` (`get_content` →
+`royaltyRateBps / 10000`, the same authoritative source the on-chain royalty leg
+dispatches on, sp996) and overrides the forgeable advertise-lane value. Cached per
+content_hash (≤1 RPC per content on the hot path), bounded, out-of-range rejected.
+So a malicious first-advertiser can no longer skew the per-access payment amount /
+pool-split weighting with a forged rate for registered content. Unregistered / no
+provenance client → the sp1004-bounded advertise value stands (no authenticated
+source exists for it). Pinned by `test_sprint_1077_authenticated_royalty_rate.py` +
+two `process_content_access` integration tests.
+
+**Still open — the `creator` leg.** The off-chain FTNS credit + §14 reputation key on
+a node-id (`creator_id`) / `creator_eth_address`, but the registry stores only the
+creator's **eth address** (no node-id mapping). The on-chain royalty leg already pays
+the *registered* creator (backstopped, sp996); the off-chain node-id credit can't be
+authenticated from the registry alone without a node-id↔eth binding — a separate
+follow-on (Option B advertise-signing, or a node-id↔eth attestation).
+
 ## Not-a-bug (refuted or already-backstopped, recorded for audit)
 
 - **Provenance/dedup forgery (finding 6's provenance half):** the *ledger*
