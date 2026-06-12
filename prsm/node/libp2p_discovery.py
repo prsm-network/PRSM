@@ -17,12 +17,20 @@ bootstrap address; if zero succeed the status is set to degraded.
 """
 
 import asyncio
+import base64
+import hashlib
 import logging
 import os
+import secrets
 import time
 from typing import Any, Dict, List, Optional
 
-from prsm.node.discovery import PeerInfo
+from prsm.node.discovery import (
+    PeerInfo,
+    _announce_signing_bytes,
+    _attest_announce_payload,
+)
+from prsm.node.identity import verify_signature
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +107,35 @@ class _DeadBootstrapSentinel:
             "dead-sentinel: previous bootstrap reconnect attempt "
             "failed; will retry on next tick"
         )
+
+
+def _authenticated_capability_node_id(data: Dict[str, Any]) -> Optional[str]:
+    """Sprint 1086 — the cryptographically-authenticated node_id for a libp2p
+    ``capability_announce``, or None to DROP it. Mirrors the WebSocket
+    ``discovery._authenticated_announce_node_id``: the announce must carry a
+    self-verifying origin attestation — ``sha256(origin_pubkey)[:32] == node_id`` AND a
+    valid signature over the canonical announce content bound to node_id + nonce. Unlike
+    the WS path there is NO handshake-bound peer fallback (gossip is broadcast with no
+    authenticated channel), so an unattested or mis-signed announce is dropped outright.
+    This closes the sp1010 Residual A index-poisoning vector for the capability path: an
+    attacker can no longer inject an arbitrary (node_id -> capabilities/attestation)
+    entry under a victim's node_id."""
+    claimed = data.get("node_id")
+    if not claimed:
+        return None
+    pubkey = data.get("origin_pubkey", "")
+    sig = data.get("origin_sig", "")
+    nonce = data.get("nonce", "")
+    if not (pubkey and sig):
+        return None
+    try:
+        derived = hashlib.sha256(base64.b64decode(pubkey)).hexdigest()[:32]
+        if derived == claimed and verify_signature(
+                pubkey, _announce_signing_bytes(claimed, data, nonce), sig):
+            return claimed
+    except Exception:  # noqa: BLE001 — any parse/verify error → drop
+        return None
+    return None
 
 
 class Libp2pDiscovery:
@@ -802,16 +839,20 @@ class Libp2pDiscovery:
         """
         if self.gossip is None:
             return 0
-        return await self.gossip.publish(
-            "capability_announce",
-            {
-                "node_id": self.transport.identity.node_id,
-                "capabilities": self._local_capabilities,
-                "supported_backends": self._local_backends,
-                "gpu_available": self._local_gpu_available,
-                "startup_timestamp": self._startup_timestamp,
-            },
-        )
+        # Sprint 1086 — self-verifying origin attestation so receivers can authenticate
+        # node_id (sha256(pubkey)==node_id + signature) rather than trusting the raw
+        # gossip claim. A fresh nonce is bound into the signed content per announce.
+        payload = {
+            "node_id": self.transport.identity.node_id,
+            "capabilities": self._local_capabilities,
+            "supported_backends": self._local_backends,
+            "gpu_available": self._local_gpu_available,
+            "startup_timestamp": self._startup_timestamp,
+            "nonce": secrets.token_hex(16),
+        }
+        _attest_announce_payload(
+            self.transport.identity, payload, payload["nonce"])
+        return await self.gossip.publish("capability_announce", payload)
 
     def record_job_success(self, node_id: str) -> None:
         """Record a successful job completion for a peer."""
@@ -994,9 +1035,19 @@ class Libp2pDiscovery:
 
         Resets reliability counters only on restart (new startup_timestamp)
         or capability change. Periodic heartbeats only refresh last_seen.
+
+        Sprint 1086 — the announce's node_id must be CRYPTOGRAPHICALLY authenticated
+        (origin attestation) before it's trusted; an unattested / mis-signed announce is
+        dropped (never inserted into the capability index that feeds peer selection +
+        the sp1083 attestation pool).
         """
-        node_id = data.get("node_id", sender_id)
+        node_id = _authenticated_capability_node_id(data)
         if not node_id:
+            logger.debug(
+                "dropping unauthenticated capability_announce from sender=%s "
+                "(no valid origin attestation)",
+                (sender_id or "?")[:8],
+            )
             return
 
         new_startup = data.get("startup_timestamp", 0.0)

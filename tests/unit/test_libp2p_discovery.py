@@ -10,11 +10,30 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from prsm.node.discovery import PeerInfo
+from prsm.node.discovery import PeerInfo, _attest_announce_payload
+from prsm.node.identity import generate_node_identity
 from prsm.node.libp2p_discovery import Libp2pDiscovery
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _attested_capability(
+    identity, *, caps=None, backends=None, gpu=False, startup=0.0, nonce="n1",
+):
+    """Sprint 1086 — a capability_announce carrying a valid origin attestation
+    (node_id == sha256(pubkey)[:32] + a signature), the shape _on_capability now
+    requires. node_id is the identity's real (pubkey-derived) node_id."""
+    data = {
+        "node_id": identity.node_id,
+        "capabilities": caps or [],
+        "supported_backends": backends or [],
+        "gpu_available": gpu,
+        "startup_timestamp": startup,
+        "nonce": nonce,
+    }
+    _attest_announce_payload(identity, data, nonce)
+    return data
 
 
 def _make_transport(node_id: str = "local-node-001") -> MagicMock:
@@ -58,6 +77,59 @@ def _peer_info(
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
 
+class TestCapabilityAnnounceAuth:
+    """Sprint 1086 — _on_capability authenticates node_id before trusting the announce."""
+
+    @pytest.mark.asyncio
+    async def test_unattested_announce_dropped(self):
+        d = Libp2pDiscovery(_make_transport())
+        # legacy-shape announce with no origin attestation → dropped
+        await d._on_capability("capability_announce", {
+            "node_id": "spoofed-peer", "capabilities": ["inference"],
+            "gpu_available": True,
+        }, "spoofed-peer")
+        assert d._capability_index == {}
+
+    @pytest.mark.asyncio
+    async def test_attacker_claiming_victim_node_id_dropped(self):
+        """An attacker signs with their own key but claims the VICTIM's node_id —
+        sha256(attacker_pubkey)[:32] != victim_node_id, so it's dropped."""
+        d = Libp2pDiscovery(_make_transport())
+        victim = generate_node_identity("victim")
+        attacker = generate_node_identity("attacker")
+        data = _attested_capability(attacker, caps=["inference"], gpu=True)
+        data["node_id"] = victim.node_id   # claim the victim's id (sig won't match)
+        await d._on_capability("capability_announce", data, attacker.node_id)
+        assert victim.node_id not in d._capability_index
+        assert d._capability_index == {}
+
+    @pytest.mark.asyncio
+    async def test_tampered_payload_dropped(self):
+        """A relayer flips gpu_available after the announcer signed → signature breaks."""
+        d = Libp2pDiscovery(_make_transport())
+        peer = generate_node_identity("peer")
+        data = _attested_capability(peer, caps=["inference"], gpu=False)
+        data["gpu_available"] = True   # tamper post-signature
+        await d._on_capability("capability_announce", data, peer.node_id)
+        assert d._capability_index == {}
+
+    @pytest.mark.asyncio
+    async def test_announce_capabilities_emits_attested_payload(self):
+        transport = _make_transport()
+        # give the transport a real identity so the producer can actually sign
+        ident = generate_node_identity("local")
+        transport.identity = ident
+        gossip = _make_gossip()
+        d = Libp2pDiscovery(transport, gossip=gossip)
+        await d.announce_capabilities()
+        published = gossip.publish.await_args.args[1]
+        assert published["node_id"] == ident.node_id
+        assert published.get("origin_pubkey") and published.get("origin_sig")
+        # round-trips through the verifier
+        from prsm.node.libp2p_discovery import _authenticated_capability_node_id
+        assert _authenticated_capability_node_id(published) == ident.node_id
+
+
 class TestCapabilityIndex:
     """_on_capability updates the index and find_peers_with_gpu works."""
 
@@ -66,17 +138,14 @@ class TestCapabilityIndex:
         transport = _make_transport()
         discovery = Libp2pDiscovery(transport)
 
-        data = {
-            "node_id": "peer-gpu-001",
-            "capabilities": ["inference"],
-            "supported_backends": ["local"],
-            "gpu_available": True,
-        }
-        await discovery._on_capability("capability_announce", data, "peer-gpu-001")
+        peer = generate_node_identity("gpu-peer")
+        data = _attested_capability(
+            peer, caps=["inference"], backends=["local"], gpu=True)
+        await discovery._on_capability("capability_announce", data, peer.node_id)
 
         gpu_peers = discovery.find_peers_with_gpu()
         assert len(gpu_peers) == 1
-        assert gpu_peers[0].node_id == "peer-gpu-001"
+        assert gpu_peers[0].node_id == peer.node_id
         assert gpu_peers[0].gpu_available is True
 
     @pytest.mark.asyncio
@@ -84,23 +153,22 @@ class TestCapabilityIndex:
         transport = _make_transport()
         discovery = Libp2pDiscovery(transport)
 
+        peer = generate_node_identity("peer-001")
         # First announcement
         await discovery._on_capability(
             "capability_announce",
-            {"node_id": "peer-001", "capabilities": ["inference"],
-             "supported_backends": [], "gpu_available": False},
-            "peer-001",
+            _attested_capability(peer, caps=["inference"], gpu=False, nonce="a"),
+            peer.node_id,
         )
-        assert not discovery._capability_index["peer-001"].gpu_available
+        assert not discovery._capability_index[peer.node_id].gpu_available
 
         # Second announcement with GPU now available
         await discovery._on_capability(
             "capability_announce",
-            {"node_id": "peer-001", "capabilities": ["inference"],
-             "supported_backends": [], "gpu_available": True},
-            "peer-001",
+            _attested_capability(peer, caps=["inference"], gpu=True, nonce="b"),
+            peer.node_id,
         )
-        assert discovery._capability_index["peer-001"].gpu_available is True
+        assert discovery._capability_index[peer.node_id].gpu_available is True
 
     @pytest.mark.asyncio
     async def test_non_gpu_peer_not_in_gpu_list(self) -> None:
@@ -431,51 +499,45 @@ class TestConditionalReset:
     @pytest.mark.asyncio
     async def test_restart_resets_reliability(self):
         d = _make_discovery()
-        d._capability_index["peer1"] = PeerInfo(
-            node_id="peer1", address="",
+        peer = generate_node_identity("peer1")
+        d._capability_index[peer.node_id] = PeerInfo(
+            node_id=peer.node_id, address="",
             startup_timestamp=1000.0,
             job_success_count=5, job_failure_count=3,
         )
-        await d._on_capability("capability_announce", {
-            "node_id": "peer1",
-            "capabilities": [],
-            "supported_backends": [],
-            "gpu_available": False,
-            "startup_timestamp": 2000.0,
-        }, "peer1")
-        assert d._capability_index["peer1"].job_failure_count == 0
-        assert d._capability_index["peer1"].job_success_count == 0
-        assert d._capability_index["peer1"].startup_timestamp == 2000.0
+        await d._on_capability(
+            "capability_announce",
+            _attested_capability(peer, startup=2000.0), peer.node_id)
+        assert d._capability_index[peer.node_id].job_failure_count == 0
+        assert d._capability_index[peer.node_id].job_success_count == 0
+        assert d._capability_index[peer.node_id].startup_timestamp == 2000.0
 
     @pytest.mark.asyncio
     async def test_capability_change_resets_reliability(self):
         d = _make_discovery()
-        d._capability_index["peer1"] = PeerInfo(
-            node_id="peer1", address="",
+        peer = generate_node_identity("peer1")
+        d._capability_index[peer.node_id] = PeerInfo(
+            node_id=peer.node_id, address="",
             capabilities=["compute"],
             startup_timestamp=1000.0,
             job_success_count=5, job_failure_count=3,
         )
-        await d._on_capability("capability_announce", {
-            "node_id": "peer1",
-            "capabilities": ["compute", "gpu"],
-            "supported_backends": [],
-            "gpu_available": True,
-            "startup_timestamp": 1000.0,
-        }, "peer1")
-        assert d._capability_index["peer1"].job_failure_count == 0
-        assert d._capability_index["peer1"].job_success_count == 0
+        await d._on_capability(
+            "capability_announce",
+            _attested_capability(
+                peer, caps=["compute", "gpu"], gpu=True, startup=1000.0),
+            peer.node_id)
+        assert d._capability_index[peer.node_id].job_failure_count == 0
+        assert d._capability_index[peer.node_id].job_success_count == 0
 
     @pytest.mark.asyncio
     async def test_new_peer_announcement(self):
         d = _make_discovery()
-        await d._on_capability("capability_announce", {
-            "node_id": "new_peer",
-            "capabilities": ["storage"],
-            "supported_backends": [],
-            "gpu_available": False,
-            "startup_timestamp": 5000.0,
-        }, "new_peer")
-        assert "new_peer" in d._capability_index
-        assert d._capability_index["new_peer"].startup_timestamp == 5000.0
-        assert d._capability_index["new_peer"].reliability_score == 1.0
+        peer = generate_node_identity("new_peer")
+        await d._on_capability(
+            "capability_announce",
+            _attested_capability(peer, caps=["storage"], startup=5000.0),
+            peer.node_id)
+        assert peer.node_id in d._capability_index
+        assert d._capability_index[peer.node_id].startup_timestamp == 5000.0
+        assert d._capability_index[peer.node_id].reliability_score == 1.0

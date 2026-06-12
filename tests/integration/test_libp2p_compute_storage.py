@@ -14,15 +14,33 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock
 
 from prsm.node.transport import MSG_GOSSIP, MSG_DIRECT, P2PMessage, PeerConnection
-from prsm.node.discovery import PeerInfo
+from prsm.node.discovery import PeerInfo, _attest_announce_payload
+from prsm.node.identity import generate_node_identity
+
+
+def _attested_capability(identity, *, caps=None, backends=None, gpu=False,
+                         startup=0.0, nonce="n1"):
+    """Sprint 1086 — an origin-attested capability_announce (the shape
+    Libp2pDiscovery._on_capability now requires)."""
+    data = {
+        "node_id": identity.node_id,
+        "capabilities": caps or [],
+        "supported_backends": backends or [],
+        "gpu_available": gpu,
+        "startup_timestamp": startup,
+        "nonce": nonce,
+    }
+    _attest_announce_payload(identity, data, nonce)
+    return data
 
 
 class MockLibp2pTransport:
     """In-process transport that routes messages with JSON serialization fidelity."""
 
     def __init__(self, node_id: str, network: "MockNetwork"):
-        self.identity = MagicMock()
-        self.identity.node_id = node_id
+        # Sprint 1086 — a REAL signing identity so announce_capabilities can attest
+        # (the producer now signs; the consumer verifies sha256(pubkey)==node_id).
+        self.identity = generate_node_identity(node_id)
         self._handlers: Dict[str, List[Callable]] = {}
         self._network = network
         self._peers: Dict[str, PeerConnection] = {}
@@ -226,13 +244,14 @@ class TestCapabilityDiscovery:
 
         gpu_peers = disc_b.find_peers_with_gpu()
         assert len(gpu_peers) == 1
-        assert gpu_peers[0].node_id == "node_a"
+        assert gpu_peers[0].node_id == t_a.identity.node_id
 
         storage_peers = disc_a.find_peers_with_capability("storage")
         assert len(storage_peers) == 1
-        assert storage_peers[0].node_id == "node_b"
+        assert storage_peers[0].node_id == t_b.identity.node_id
 
-        assert all(p.node_id != "node_a" for p in disc_a.find_peers_with_capability("storage"))
+        assert all(p.node_id != t_a.identity.node_id
+                   for p in disc_a.find_peers_with_capability("storage"))
 
 
 class TestReliabilityTracking:
@@ -249,39 +268,35 @@ class TestReliabilityTracking:
         disc = Libp2pDiscovery(transport=t_req, gossip=g_req)
         await disc.start()
 
-        await disc._on_capability("capability_announce", {
-            "node_id": "provider",
-            "capabilities": ["compute", "gpu"],
-            "supported_backends": ["local"],
-            "gpu_available": True,
-            "startup_timestamp": 1000.0,
-        }, "provider")
+        prov = t_prov.identity   # the real provider identity (attests its announces)
+        pid = prov.node_id
+        await disc._on_capability(
+            "capability_announce",
+            _attested_capability(prov, caps=["compute", "gpu"], backends=["local"],
+                                 gpu=True, startup=1000.0, nonce="a"),
+            pid)
 
-        disc.record_job_success("provider")
-        disc.record_job_success("provider")
-        disc.record_job_failure("provider")
+        disc.record_job_success(pid)
+        disc.record_job_success(pid)
+        disc.record_job_failure(pid)
 
-        peer = disc._capability_index["provider"]
+        peer = disc._capability_index[pid]
         assert abs(peer.reliability_score - 0.6667) < 0.01
 
         # Same startup_timestamp — no reset, counters accumulate
-        await disc._on_capability("capability_announce", {
-            "node_id": "provider",
-            "capabilities": ["compute", "gpu"],
-            "supported_backends": ["local"],
-            "gpu_available": True,
-            "startup_timestamp": 1000.0,
-        }, "provider")
+        await disc._on_capability(
+            "capability_announce",
+            _attested_capability(prov, caps=["compute", "gpu"], backends=["local"],
+                                 gpu=True, startup=1000.0, nonce="b"),
+            pid)
         assert peer.job_failure_count == 1
 
         # New startup_timestamp — counters reset
-        await disc._on_capability("capability_announce", {
-            "node_id": "provider",
-            "capabilities": ["compute", "gpu"],
-            "supported_backends": ["local"],
-            "gpu_available": True,
-            "startup_timestamp": 2000.0,
-        }, "provider")
+        await disc._on_capability(
+            "capability_announce",
+            _attested_capability(prov, caps=["compute", "gpu"], backends=["local"],
+                                 gpu=True, startup=2000.0, nonce="c"),
+            pid)
         assert peer.job_failure_count == 0
         assert peer.job_success_count == 0
         assert peer.reliability_score == 1.0
