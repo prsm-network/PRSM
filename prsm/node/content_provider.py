@@ -931,41 +931,72 @@ class ContentProvider:
 
     @staticmethod
     def _cid_anchor_rejects(cid: str, content_bytes: bytes) -> bool:
-        """sp1003 — return True iff ``cid`` is an unambiguous ContentHash
-        content-address AND ``content_bytes`` does NOT hash to it (a
-        content-substitution attempt that must be rejected).
+        """Return True iff ``cid`` is a RECOMPUTABLE content identity AND
+        ``content_bytes`` does NOT match it (a content-substitution attempt that
+        must be rejected). Two anchors:
 
-        Returns False (no opinion) when ``cid`` is not a recomputable
-        content address — e.g. a 40/64-char BitTorrent infohash, whose
-        integrity cannot be checked from inline bytes (documented residual
-        gap). The caller then falls back to the gossip-supplied-hash check.
+        * sp1003 — a canonical ContentHash (algorithm-prefixed sha256-family) CID:
+          re-hash the bytes and compare.
+        * sp1076 — a 40-hex BitTorrent v1 infohash CID: the infohash IS recomputable
+          from the bytes (``prsm.core.torrent_infohash``), so re-derive it and
+          compare. This closes the residual gap the sp1003 docstring noted — a
+          malicious provider can no longer substitute bytes for an infohash CID
+          (the only prior check, the gossip-supplied ``expected_hash``, is
+          attacker-controllable). Both INLINE and CHUNKED fetches funnel through
+          here (the chunked reassembly re-verifies via ``_request_from_provider``).
 
-        The guard is strict: the CID must round-trip through ``from_hex``
-        (canonical algorithm-prefixed form) AND carry the algorithm's
-        canonical digest length, so a BT infohash whose leading bytes happen
-        to parse as a valid algorithm id still falls through rather than
-        triggering a false reject.
+        Returns False (no opinion → caller falls back to the gossip-hash check) when
+        ``cid`` is neither — i.e. not a recomputable identity.
         """
+        ch_verdict = ContentProvider._contenthash_anchor_verdict(cid, content_bytes)
+        if ch_verdict is not None:
+            return ch_verdict
+        return ContentProvider._infohash_anchor_rejects(cid, content_bytes)
+
+    @staticmethod
+    def _contenthash_anchor_verdict(cid: str, content_bytes: bytes):
+        """sp1003 ContentHash anchor. Returns True/False for a CANONICAL ContentHash
+        CID (reject / accept), or None when ``cid`` is not an unambiguous ContentHash
+        (defer — strict round-trip + digest-length guard, so a BT infohash that
+        happens to parse as an algorithm id falls through rather than false-rejects)."""
         try:
             from prsm.storage import ContentHash
         except Exception:  # pragma: no cover - storage always importable
-            return False
+            return None
         try:
             parsed = ContentHash.from_hex(cid)
         except (ValueError, TypeError):
-            return False
+            return None
         try:
             canonical = parsed.hex() == cid
             expected_len = len(
                 ContentHash.from_data(b"", parsed.algorithm_id).digest
             )
         except (ValueError, TypeError):
-            return False
+            return None
         if not canonical or len(parsed.digest) != expected_len:
-            # Not an unambiguous content address (e.g. BT infohash) — defer.
-            return False
+            return None
         recomputed = ContentHash.from_data(content_bytes, parsed.algorithm_id)
         return recomputed.digest != parsed.digest
+
+    @staticmethod
+    def _infohash_anchor_rejects(cid: str, content_bytes: bytes) -> bool:
+        """sp1076 — True iff ``cid`` is a 40-hex BitTorrent v1 infohash and
+        ``content_bytes`` does not re-derive to it. False (defer) for any other CID
+        shape or on a computation error (fail-OPEN to the gossip-hash check, never a
+        false reject of a non-infohash CID)."""
+        if not (isinstance(cid, str) and len(cid) == 40):
+            return False
+        low = cid.lower()
+        if any(c not in "0123456789abcdef" for c in low):
+            return False
+        try:
+            import hashlib
+            from prsm.core.torrent_infohash import compute_v1_infohash_single_file
+            name = hashlib.sha256(content_bytes).hexdigest()
+            return compute_v1_infohash_single_file(content_bytes, name) != low
+        except Exception:  # noqa: BLE001 - can't recompute → defer, don't false-reject
+            return False
 
     async def _request_from_provider(
         self,

@@ -57,46 +57,36 @@ content-addressed, so genuine content always re-hashes to its CID (cipher or
 plaintext — the CID addresses whatever bytes were stored), making this
 non-regressing. Closes substitution for all `ContentHash`-addressed content.
 
-## ★ RESIDUAL GAP A — BitTorrent-infohash CIDs are not verifiable from inline bytes
+## ✅ RESIDUAL GAP A — CLOSED (sp1076, 2026-06-11) — BitTorrent-infohash CIDs are now verifiable from inline bytes
 
-A CID published by the BitTorrent upload path is a **v1 infohash** =
-`sha1(bencode(info-dict))`, where the info-dict carries `piece_length`,
-`name`, and the per-piece hashes. It is content-derived but **cannot be
-reconstructed from the raw inline bytes alone** — `ContentResponseMessage`
-carries only `data`/`content_hash`/`size`/`filename`, not the torrent
-metadata. So for a BT-infohash CID on the INLINE/GATEWAY lane there is **no
-trustworthy integrity anchor**: the sp1003 CID-anchor correctly defers (no
-false reject), and the only remaining check is the attacker-controllable
-gossip `content_hash`. An empty gossip hash → bytes accepted unverified.
+**Resolved.** The 2026-06-04 premise was that a BT-infohash CID "cannot be
+reconstructed from the raw inline bytes alone" because the info-dict carries an
+arbitrary `piece_length` and `name`. The sp1070-1071 libtorrent-decoupling work
+removed that arbitrariness: the PRSM v1 infohash is now computed over a
+**canonical** single-file info-dict — `piece_length` fixed at 262144 and
+`name = sha256(bytes)` (`prsm/core/torrent_infohash.py`), and the libtorrent seed
+path is pinned to `v1_only` + basename so every node (libtorrent or not) derives the
+SAME infohash from the same bytes. That makes the infohash **fully recomputable from
+the raw inline bytes** — essentially the doc's "Option B, made trivial."
 
-This is pinned by `test_bt_infohash_residual_gap_documented` in
-`tests/unit/test_sprint_1003_cid_anchored_integrity.py` (it asserts the
-current accept-unverified behaviour; the assertion flips when the gap closes).
+So sp1076 added a **v1-infohash anchor** to `ContentProvider._cid_anchor_rejects`
+(`_infohash_anchor_rejects`): a 40-hex BT-infohash CID is now re-derived from the
+fetched bytes and rejected on mismatch, exactly like the sp1003 ContentHash anchor.
+Both INLINE and CHUNKED fetches funnel through it (the chunked reassembly re-verifies
+via `_request_from_provider`). A malicious provider can no longer substitute bytes
+for an infohash CID, even with an empty/attacker-controlled gossip `content_hash`.
 
-The piece-verifying path (`ContentRetriever.fetch`, libtorrent) DOES anchor on
-the infohash, but is gated to `_local_content` (this node's own content) to
-avoid swarming the BT layer for arbitrary CIDs.
+Pinned by `test_bt_infohash_substitution_now_rejected` +
+`test_bt_infohash_cid_authentic_bytes_served_no_false_reject` (sp1003 file, updated
+from the old gap pins) and `test_sprint_1076_infohash_cid_anchor.py`.
 
-**Design decision (retrieval routing / wire protocol):**
-- **Option A — route remote BT-infohash fetches through the piece-verifying
-  swarm.** For a deliberately-requested CID, joining the swarm by infohash and
-  letting libtorrent verify pieces against the CID is the correct content-
-  addressing guarantee. Cost: heavier than the INLINE fast-path; needs the
-  torrent manifest discoverable for remote CIDs; risks regressing the tuned
-  F7/F8 single-node retrieve path — wants a multi-node test bench to verify.
-- **Option B — carry the torrent info-dict (or `piece_length`+`name`) in the
-  response** so the retriever can recompute the infohash from the inline
-  bytes and check it against the CID. Smaller change, but grows the wire
-  message and only covers single-file v1 torrents cleanly.
-- **Option C — deprecate BT-infohash CIDs in favour of `ContentHash` content-
-  addresses end-to-end** (already self-verifying per sp1003). Largest change;
-  cleanest long-term trust model.
-
-**Recommendation:** Option A is the true content-addressing fix and reuses the
-existing piece-verifying retriever; gate it behind a multi-node verification of
-the F7/F8 retrieve path. Until one lands, BT-infohash remote content on the
-INLINE/GATEWAY lane is integrity-unverified and operators should treat
-BT-served bytes as best-effort.
+Residual (narrow): the anchor assumes the PRSM canonical single-file form. Content
+published with a non-canonical torrent (a different `piece_length`/`name`, e.g. by a
+foreign client) wouldn't re-derive — but all PRSM publish paths now produce the
+canonical form (`ContentPublisher` v1_only+basename, sp1071; `LocalContentPublisher`,
+sp1071/1075), so PRSM-served content is covered end to end. The libtorrent-free fetch
+path additionally re-checks the binding at the uploader layer
+(`ContentUploader._decode_bundle_if_present`, sp1075) as defense in depth.
 
 ## ★ RESIDUAL GAP B — advertise-lane credit fields are unauthenticated (findings 3, 5, 6)
 

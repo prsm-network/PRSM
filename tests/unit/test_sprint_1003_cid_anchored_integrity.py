@@ -148,13 +148,14 @@ async def test_sha3_contenthash_cid_anchored():
 
 
 @pytest.mark.asyncio
-async def test_bt_infohash_cid_falls_through_to_gossip_hash_no_false_reject():
-    """A 40-char BT infohash is NOT a recomputable content address from
-    inline bytes. The CID-anchor must skip it (no false reject) and fall
-    back to the gossip-hash check — legit content with a matching gossip
-    hash is still served."""
-    bt_infohash = "6c01ee255d2e20d45ed90dea19e6722cd6c96713"  # 40 hex / SHA-1
+async def test_bt_infohash_cid_authentic_bytes_served_no_false_reject():
+    """sp1076 — a 40-char BT v1 infohash IS recomputable from the bytes now, so the
+    CID-anchor verifies it. AUTHENTIC content (whose infohash == the CID) must still
+    be served (no false reject)."""
+    from prsm.core.torrent_infohash import compute_v1_infohash_single_file
     body = b"legit BT-published content"
+    bt_infohash = compute_v1_infohash_single_file(
+        body, hashlib.sha256(body).hexdigest())
     gossip_hash = hashlib.sha256(body).hexdigest()
 
     p = _make_provider()
@@ -167,23 +168,20 @@ async def test_bt_infohash_cid_falls_through_to_gossip_hash_no_false_reject():
 
 
 @pytest.mark.asyncio
-async def test_bt_infohash_residual_gap_documented():
-    """RESIDUAL GAP PIN (documented in
-    docs/2026-06-04-content-data-plane-trust-anchors.md): a BT-infohash CID
-    with an empty gossip hash cannot be verified from inline bytes today, so
-    bytes are still accepted unverified. This test pins the KNOWN gap so the
-    eventual fix (route remote BT fetches through the piece-verifying swarm,
-    or carry torrent metadata to recompute the infohash) flips it.
-
-    If this assertion ever starts FAILING (i.e. the bytes are rejected), the
-    residual gap has been closed — update this pin and the doc."""
-    bt_infohash = "6c01ee255d2e20d45ed90dea19e6722cd6c96713"
-    body = b"unverifiable-but-served BT content"
+async def test_bt_infohash_substitution_now_rejected():
+    """sp1076 — the sp1003 residual gap is now CLOSED. Bytes that do NOT re-derive to
+    the BT v1 infohash CID are rejected, even with an empty/attacker-controlled gossip
+    hash (previously these were served unverified)."""
+    from prsm.core.torrent_infohash import compute_v1_infohash_single_file
+    real = b"the authentic BT-published content"
+    bt_infohash = compute_v1_infohash_single_file(
+        real, hashlib.sha256(real).hexdigest())
+    evil = b"substituted bytes advertised under the same CID"
 
     p = _make_provider()
-    _wire_inline_response(p, bt_infohash, body)
+    _wire_inline_response(p, bt_infohash, evil)
 
     out = await p._request_from_provider(
         bt_infohash, "prov", timeout=5.0, expected_hash="",
     )
-    assert out == body  # documents the still-open BT-infohash gap
+    assert out is None  # gap CLOSED — substituted bytes rejected by the infohash anchor
