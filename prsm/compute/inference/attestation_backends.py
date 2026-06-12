@@ -578,3 +578,30 @@ def configure_default_registry_from_env(env=None) -> bool:
     True iff ANY real verifier was activated."""
     result = configure_attestation_registry(_DEFAULT_REGISTRY, env)
     return any(result.values())
+
+
+def reload_intel_dcap(registry=None, env=None) -> bool:
+    """Sprint 1081 — rebuild the Intel SGX DCAP backend from the CURRENT env + CRL
+    cache, replacing any existing one in place. Called by the collateral-refresh loop
+    after a refresh updates the cached CRL/QE-Identity so a long-running node picks up
+    fresh revocation data WITHOUT a restart. Returns True iff a DCAP backend is present
+    after the reload. Fail-open: if rebuilding fails, the prior backend stays."""
+    from prsm.compute.inference.intel_dcap import (
+        IntelDCAPBackend, build_intel_dcap_backend_or_none,
+    )
+    reg = registry if registry is not None else _DEFAULT_REGISTRY
+    try:
+        rebuilt = build_intel_dcap_backend_or_none(env)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Intel DCAP reload failed (%s) — keeping the existing backend", exc)
+        return any(isinstance(b, IntelDCAPBackend) for b in reg.backends)
+    if rebuilt is None:
+        # Nothing configured now — leave the existing backend untouched (don't downgrade).
+        return any(isinstance(b, IntelDCAPBackend) for b in reg.backends)
+    # sp1081 review M3 — rebind to a fully-built list in ONE assignment so a concurrent
+    # verify() can never observe a transient zero-DCAP window (it would fall through to
+    # the structural backend → vendor_verified=False). The new DCAP backend goes at the
+    # front (override), with the old DCAP backend(s) filtered out.
+    reg.backends = [rebuilt] + [b for b in reg.backends
+                                if not isinstance(b, IntelDCAPBackend)]
+    return True

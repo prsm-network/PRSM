@@ -365,6 +365,18 @@ def build_intel_dcap_backend_or_none(env: Optional[dict] = None):
             except OSError as exc:
                 logger.warning("Intel SGX CRL file unreadable (%s) — proceeding "
                                "WITHOUT revocation checking", exc)
+    if not crls_bytes:
+        # sp1081 — fall back to the auto-refreshed CRL cache (kept current by the
+        # CollateralRefresher) so revocation enforcement does not silently lapse when a
+        # bundled/static CRL expires. Absent → unchanged (no revocation check).
+        try:
+            from prsm.compute.inference.collateral_refresh import read_cached_intel_crls
+            cached = read_cached_intel_crls(environ)
+            if cached:
+                crls_bytes = cached
+                logger.info("Using auto-refreshed Intel PCK CRL cache for revocation")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("no refreshed Intel CRL cache: %s", exc)
     # sp1061-1063 — optional TCB-recency enforcement: a signed TCB-Info + its signer
     # cert. Both required to enable; one without the other is a likely misconfig
     # (log + leave TCB checking OFF rather than fail). Absent → signature-chain only.
@@ -392,6 +404,18 @@ def build_intel_dcap_backend_or_none(env: Optional[dict] = None):
     # sp1079 — optional QE-Identity (verified against the same TCB Signing cert).
     qe_identity = _read_cfg("PRSM_INTEL_SGX_QE_IDENTITY_JSON",
                             "PRSM_INTEL_SGX_QE_IDENTITY_FILE", "Intel SGX QE Identity")
+    if not qe_identity:
+        # sp1081 — fall back to the auto-refreshed QE-Identity cache (usable only when
+        # the TCB Signing cert is also configured, the QE signer).
+        try:
+            from prsm.compute.inference.collateral_refresh import (
+                read_cached_intel_qe_identity)
+            cached_qe = read_cached_intel_qe_identity(environ)
+            if cached_qe:
+                qe_identity = cached_qe
+                logger.info("Using auto-refreshed Intel QE-Identity cache for pinning")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("no refreshed Intel QE-Identity cache: %s", exc)
     if qe_identity and not tcb_signer:
         logger.warning("Intel SGX QE-Identity pinning needs the TCB Signing cert "
                        "(PRSM_INTEL_SGX_TCB_SIGNING_PEM/_FILE) too — QE pinning OFF")

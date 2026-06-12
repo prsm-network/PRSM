@@ -2241,6 +2241,7 @@ class PRSMNode:
         # Tasks created on start() — None until then.
         self._compensation_scheduler_task = None
         self._settlement_poll_task = None  # sp1038 brick 2
+        self._collateral_refresh_task = None  # sp1081 — attestation collateral refresh
         self._heartbeat_scheduler_task = None
         self._key_distribution_watcher_task = None
         self._storage_slashing_watcher_task = None
@@ -2773,6 +2774,23 @@ class PRSMNode:
         # Intel SGX Root CA is configured (PRSM_INTEL_SGX_ROOT_CA_PEM / _FILE).
         # Without the anchor: unchanged structural behavior (vendor_verified=False).
         # FAIL-OPEN: a misconfig must never crash daemon initialize().
+        try:
+            # Sprint 1081 — default the attestation-collateral cache dir (where the
+            # CollateralRefresher writes auto-refreshed CRLs/QE-Identity, read by the
+            # DCAP backend) to <data_dir>/attestation_collateral unless the operator
+            # set it. Set it BEFORE configuring the registry so the first build reads
+            # any already-cached (persisted-across-restart) collateral.
+            import os as _os_collat
+            if not (_os_collat.environ.get("PRSM_ATTESTATION_COLLATERAL_DIR", "") or "").strip():
+                _collat_dir = _Path(self.config.data_dir) / "attestation_collateral"
+                try:
+                    _collat_dir.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    pass
+                _os_collat.environ["PRSM_ATTESTATION_COLLATERAL_DIR"] = str(_collat_dir)
+        except Exception as _collat_exc:  # noqa: BLE001
+            logger.debug("collateral cache dir default skipped: %s", _collat_exc)
+
         try:
             from prsm.compute.inference.attestation_backends import (
                 configure_default_registry_from_env,
@@ -5060,6 +5078,18 @@ class PRSMNode:
                 "inert until a funded settler key is provisioned)."
             )
 
+        # Sprint 1081 — attestation collateral (Intel PCK CRL + QE-Identity) auto
+        # refresh. Opt-in via PRSM_COLLATERAL_AUTO_REFRESH so a long-running node keeps
+        # revocation enforcement current instead of silently lapsing when a static CRL
+        # expires. Off by default (no outbound calls unless asked).
+        import os as _os_cr
+        if str(_os_cr.environ.get("PRSM_COLLATERAL_AUTO_REFRESH", "")).strip().lower() in (
+                "1", "true", "yes", "on"):
+            self._collateral_refresh_task = asyncio.create_task(
+                self._collateral_refresh_loop(),
+            )
+            logger.info("Sprint 1081 attestation collateral auto-refresh loop launched.")
+
         # Start management API in background
         self._api_task = asyncio.create_task(self._run_api())
 
@@ -5643,6 +5673,59 @@ class PRSMNode:
                 )
             await asyncio.sleep(interval)
 
+    async def _collateral_refresh_loop(self) -> None:
+        """Sprint 1081 — periodically refresh the Intel SGX attestation collateral
+        (PCK CRLs + QE-Identity) from Intel PCS into the cache dir the DCAP backend
+        reads, then reload the backend so a long-running node picks up fresh revocation
+        data without a restart. Each item is validated (issuer chain to the Intel root +
+        signature + freshness) BEFORE the atomic swap, so a refresh can never downgrade
+        good cached collateral. The loop never raises and survives iteration errors."""
+        import os as _os
+        from prsm.compute.inference.collateral_refresh import (
+            CollateralRefresher, collateral_cache_dir)
+        try:
+            interval = float(_os.environ.get("PRSM_COLLATERAL_REFRESH_INTERVAL_S", "86400"))
+        except (TypeError, ValueError):
+            interval = 86400.0
+        interval = max(60.0, interval)
+        cache = collateral_cache_dir()
+        if cache is None:
+            logger.warning("Sprint 1081 collateral refresh: no cache dir — loop idle")
+            return
+        # sp1081 review M1 — pass the operator-configured TCB signer so the refreshed
+        # QE-Identity is validated under the SAME cert the verify path uses.
+        _signer_pem = (_os.environ.get("PRSM_INTEL_SGX_TCB_SIGNING_PEM", "") or "").strip()
+        _signer_bytes = _signer_pem.encode() if _signer_pem else None
+        if not _signer_bytes:
+            _sf = (_os.environ.get("PRSM_INTEL_SGX_TCB_SIGNING_FILE", "") or "").strip()
+            if _sf:
+                try:
+                    with open(_sf, "rb") as _f:
+                        _signer_bytes = _f.read()
+                except OSError:
+                    _signer_bytes = None
+        refresher = CollateralRefresher(cache, tcb_signer_pem=_signer_bytes)
+        while True:
+            try:
+                results = await refresher.refresh_all()
+                if any(r.ok for r in results.values()):
+                    from prsm.compute.inference.attestation_backends import (
+                        reload_intel_dcap)
+                    try:
+                        reload_intel_dcap()
+                        logger.info("Sprint 1081: reloaded DCAP backend with refreshed "
+                                    "collateral (%s)",
+                                    {k: v.ok for k, v in results.items()})
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Sprint 1081 DCAP reload error: %s", exc)
+                else:
+                    logger.debug("Sprint 1081 collateral refresh: no items updated")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — keep the loop alive
+                logger.warning("Sprint 1081 collateral refresh iteration error: %s", exc)
+            await asyncio.sleep(interval)
+
     async def stop(self) -> None:
         """Gracefully shut down all subsystems."""
         if not self._started:
@@ -5726,6 +5809,7 @@ class PRSMNode:
             "_compensation_distributor_watcher_task",
             "_pending_withdraw_reconciler_task",  # sp916
             "_settlement_poll_task",  # sp1038
+            "_collateral_refresh_task",  # sp1081
         ):
             task = getattr(self, task_attr, None)
             if task is not None:
