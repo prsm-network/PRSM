@@ -414,17 +414,15 @@ class ContentEconomy:
 
     _AUTH_RATE_CACHE_CAP = 4096
 
-    async def _authenticated_royalty_rate(self, content_metadata):
-        """sp1077 (content-data-plane Gap B) — the AUTHORITATIVE royalty rate for
-        content with a registered provenance_hash, read from the on-chain
-        ProvenanceRegistry (the same source the on-chain royalty leg dispatches on,
-        sp996). Returns the registered rate (royaltyRateBps / 10000) or None when
-        there's no provenance_hash, no provenance client, the hash is unregistered, or
-        the lookup fails / is out of range — in which case the caller keeps the
-        sp1004-bounded advertise-lane value. Cached per content_hash (bounded), so the
-        hot retrieve path does at most one RPC per content. This stops a malicious
-        first-advertiser from skewing off-chain credit with a forged rate for
-        REGISTERED content."""
+    async def _authenticated_provenance_record(self, content_metadata):
+        """sp1077/1078 (content-data-plane Gap B) — the on-chain ProvenanceRegistry
+        record for content with a registered provenance_hash, or None. The shared,
+        cached AUTHORITATIVE source for the off-chain rate (sp1077) + creator (sp1078)
+        authentication (the same source the on-chain royalty leg dispatches on, sp996).
+        Returns None when there's no provenance_hash, no provenance client, the hash is
+        unregistered, or the lookup fails. Cached per content_hash (bounded), so the hot
+        retrieve path does at most one RPC per content (None cached too — a later
+        registration is picked up after eviction/restart, a minor freshness tradeoff)."""
         import asyncio
         ph = content_metadata.get("provenance_hash") if content_metadata else None
         if not ph:
@@ -436,13 +434,13 @@ class ContentEconomy:
         if len(content_hash) != 32:
             return None
 
-        cache = getattr(self, "_auth_rate_cache", None)
+        cache = getattr(self, "_auth_prov_cache", None)
         if cache is None:
-            cache = self._auth_rate_cache = {}
+            cache = self._auth_prov_cache = {}
         if content_hash in cache:
             return cache[content_hash]
 
-        rate = None
+        record = None
         client = self._get_provenance_client()
         if client is not None:
             try:
@@ -451,21 +449,42 @@ class ContentEconomy:
                 logger.debug("provenance get_content failed for %s: %s",
                              content_hash.hex()[:12], exc)
                 record = None
-            # MAX_ROYALTY_RATE_BPS = 9800 on the registry; reject anything out of range
-            # rather than trusting a corrupt read.
-            if record is not None and 0 <= int(record.royalty_rate_bps) <= 9800:
-                rate = int(record.royalty_rate_bps) / 10000.0
 
-        # Bounded cache (evict oldest). Caching None (unregistered) avoids re-RPCing
-        # the hot path for every access; a later registration is picked up after
-        # eviction / restart — a minor freshness tradeoff, not a security gap.
-        if len(cache) >= self._AUTH_RATE_CACHE_CAP:
+        if len(cache) >= self._AUTH_RATE_CACHE_CAP:   # bounded (evict oldest)
             try:
                 cache.pop(next(iter(cache)))
             except StopIteration:
                 pass
-        cache[content_hash] = rate
-        return rate
+        cache[content_hash] = record
+        return record
+
+    async def _authenticated_royalty_rate(self, content_metadata):
+        """sp1077 — the AUTHORITATIVE royalty rate (royaltyRateBps/10000) for content
+        with a registered provenance_hash, or None (caller keeps the sp1004-bounded
+        advertise value). Stops a forged advertise rate from skewing off-chain credit
+        for REGISTERED content."""
+        record = await self._authenticated_provenance_record(content_metadata)
+        if record is None:
+            return None
+        bps = int(record.royalty_rate_bps)
+        # MAX_ROYALTY_RATE_BPS = 9800; reject out-of-range rather than trust a corrupt read.
+        if 0 <= bps <= 9800:
+            return bps / 10000.0
+        return None
+
+    async def _authenticated_creator(self, content_metadata):
+        """sp1078 (Gap B creator leg) — the AUTHORITATIVE creator eth address (the
+        registry's `creator`) for content with a registered provenance_hash, or None
+        (caller keeps the forgeable advertise/own value). Used to override the
+        advertise-lane creator_eth_address before crediting reputation, so a malicious
+        advertiser can't poison the §14 reputation of a creator they don't control."""
+        record = await self._authenticated_provenance_record(content_metadata)
+        if record is None:
+            return None
+        creator = getattr(record, "creator", None)
+        if isinstance(creator, str) and creator.startswith("0x") and len(creator) == 42:
+            return creator
+        return None
 
     def _get_royalty_distributor(self):
         """Lazy-init RoyaltyDistributorClient. Returns None if disabled."""

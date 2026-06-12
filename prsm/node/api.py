@@ -10094,6 +10094,7 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             content_hash = None
             filename = None
             creator_eth_address = None
+            provenance_hash = None
             if node.content_index:
                 record = node.content_index.lookup(cid)
                 if record:
@@ -10101,6 +10102,9 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                     filename = record.filename
                     creator_eth_address = getattr(
                         record, "creator_eth_address", None,
+                    )
+                    provenance_hash = getattr(
+                        record, "provenance_hash", None,
                     )
 
             # Sprint 494 (F35 fix) — content_index is populated
@@ -10134,6 +10138,36 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                         creator_eth_address = getattr(
                             _local, "creator_eth_address", None,
                         )
+                        if provenance_hash is None:
+                            provenance_hash = getattr(
+                                _local, "provenance_hash", None,
+                            )
+
+            # sp1078 (content-data-plane Gap B, creator leg) — the index/advertise-lane
+            # creator_eth_address is forgeable (a malicious advertiser can set it). For
+            # content with a REGISTERED provenance_hash, override it with the on-chain-
+            # authoritative creator (the ProvenanceRegistry's `creator`) so the §14
+            # reputation credit below can't be poisoned for a creator the advertiser
+            # doesn't control. Unregistered / no economy → the existing value stands
+            # (authentic for this node's own uploads; best-effort for advertise-lane).
+            if provenance_hash:
+                _economy = getattr(node, "content_economy", None)
+                if _economy is not None and hasattr(_economy, "_authenticated_creator"):
+                    try:
+                        _auth_creator = await _economy._authenticated_creator(
+                            {"provenance_hash": provenance_hash})
+                        if _auth_creator:
+                            if creator_eth_address and (
+                                _auth_creator.lower() != str(creator_eth_address).lower()):
+                                logger.info(
+                                    "content %s: using on-chain-registered creator %s "
+                                    "for reputation (advertise lane claimed %s)",
+                                    cid[:12], _auth_creator[:14],
+                                    str(creator_eth_address)[:14])
+                            creator_eth_address = _auth_creator
+                    except Exception as _ace:  # noqa: BLE001 - never block retrieve
+                        logger.debug("authenticated-creator lookup failed for %s: %s",
+                                     cid[:12], _ace)
 
             # Sprint 288 — auto-record creator access against
             # the marketplace reputation tracker. Best-effort;

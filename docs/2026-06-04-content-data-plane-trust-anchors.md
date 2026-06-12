@@ -142,12 +142,23 @@ provenance client → the sp1004-bounded advertise value stands (no authenticate
 source exists for it). Pinned by `test_sprint_1077_authenticated_royalty_rate.py` +
 two `process_content_access` integration tests.
 
-**Still open — the `creator` leg.** The off-chain FTNS credit + §14 reputation key on
-a node-id (`creator_id`) / `creator_eth_address`, but the registry stores only the
-creator's **eth address** (no node-id mapping). The on-chain royalty leg already pays
-the *registered* creator (backstopped, sp996); the off-chain node-id credit can't be
-authenticated from the registry alone without a node-id↔eth binding — a separate
-follow-on (Option B advertise-signing, or a node-id↔eth attestation).
+**Partially CLOSED (sp1078, 2026-06-11) — the `creator` REPUTATION leg.** The §14
+reputation auto-record (retrieve → `CreatorReputationTracker.record_access`) keys on
+`creator_eth_address` — an **eth address**, exactly what the registry stores as
+`creator`. So it's authenticatable directly (no node-id↔eth binding needed):
+`ContentEconomy._authenticated_creator` returns the registered creator (shared cached
+record with the rate, sp1077), and the api.py retrieve path overrides the forgeable
+advertise `creator_eth_address` with it for content with a registered provenance_hash
+before `record_access`. So a malicious advertiser can no longer poison the reputation
+of a creator they don't control. Pinned by `test_sprint_1078_authenticated_creator.py`
++ `test_content_retrieve_creator_hook.py::test_retrieve_overrides_forged_creator_with_registered`.
+
+**Still open — the `creator_id` (node-id) FTNS-ledger-credit leg.** The off-chain FTNS
+ledger credit in `_distribute_royalties` keys on a node-id (`creator_id`), and the
+registry stores only the eth address (no node-id mapping). The on-chain royalty leg
+already pays the *registered* creator (backstopped, sp996), so the authoritative
+payout is fine; the off-chain node-id credit needs a node-id↔eth binding (Option B
+advertise-signing, or a node-id↔eth attestation) — the narrow remaining follow-on.
 
 ## Not-a-bug (refuted or already-backstopped, recorded for audit)
 

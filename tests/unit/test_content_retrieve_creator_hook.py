@@ -180,6 +180,47 @@ def test_retrieve_skips_recording_when_no_operator_address():
     assert t.access_count("0xcreator") == 0
 
 
+def test_retrieve_overrides_forged_creator_with_registered():
+    """sp1078 (content-data-plane Gap B, creator leg) — when the content has a
+    REGISTERED provenance_hash, the forgeable advertise-lane creator_eth_address is
+    overridden by the on-chain-authoritative creator before reputation record_access.
+    So a malicious advertiser can't poison the §14 reputation of a creator it doesn't
+    control."""
+    from unittest.mock import AsyncMock
+    t = CreatorReputationTracker()
+    forged = "0x" + "f" * 40       # attacker's advertised creator
+    authentic = "0x" + "a" * 40    # the on-chain-registered creator
+
+    node = MagicMock()
+    node.identity.node_id = "test-node"
+    node.ftns_ledger = MagicMock()
+    node.ftns_ledger._connected_address = "0xoperator"
+    node._creator_reputation_tracker = t
+    node._content_filter_store = None
+    node.content_provider = _FakeContentProvider()
+
+    rec = MagicMock()
+    rec.content_hash = "h"
+    rec.filename = "f"
+    rec.creator_eth_address = forged
+    rec.provenance_hash = "0x" + "cd" * 32   # registered on-chain
+    idx = MagicMock()
+    idx.lookup = lambda cid: rec
+    node.content_index = idx
+    node.content_uploader.uploaded_content = {}
+
+    econ = MagicMock()
+    econ._authenticated_creator = AsyncMock(return_value=authentic)
+    node.content_economy = econ
+
+    cli = TestClient(create_api_app(node, enable_security=False),
+                     raise_server_exceptions=False)
+    resp = cli.get("/content/retrieve/bafy-abc")
+    assert resp.status_code == 200
+    assert t.access_count(authentic) == 1   # credited to the AUTHENTIC creator
+    assert t.access_count(forged) == 0      # NOT the forged advertise value
+
+
 def test_retrieve_not_recorded_on_not_found():
     """Content not found → no access to record."""
     class _NoneProvider:
