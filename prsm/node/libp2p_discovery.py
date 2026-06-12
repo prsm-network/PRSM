@@ -108,6 +108,14 @@ class Libp2pDiscovery:
     code can swap implementations without changes.
     """
 
+    # Sprint 1085 — the libp2p gossip path does NOT authenticate a peer's claimed
+    # node_id (sp1010 Residual A: it trusts a payload-supplied node_id without the
+    # sha256(pubkey)==node_id + signature check the WebSocket PeerDiscovery enforces).
+    # The DHT pool provider reads this to refuse honoring an attestation-derived
+    # hardware tier from a libp2p-discovered peer (the sp1083 binding is void without an
+    # authenticated node_id). Flip to True when libp2p origin-auth is ported.
+    node_id_authenticated: bool = False
+
     def __init__(
         self,
         transport: Any,

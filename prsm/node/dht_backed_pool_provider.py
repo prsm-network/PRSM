@@ -42,6 +42,8 @@ _BYTES_PER_LAYER_GB = 2.0
 def _hw_dict_to_parallax_gpu(
     node_id: str, hw: Any, region: str,
     stake_reader: Optional[Any] = None,
+    *,
+    node_id_authenticated: bool = True,
 ) -> Optional[ParallaxGPU]:
     """Map a HardwareProfile.to_dict() shape → ParallaxGPU.
 
@@ -227,7 +229,16 @@ def _hw_dict_to_parallax_gpu(
     # Tier B/C work via the sp702 TierGateAdapter). Never raises.
     tier_attestation = TIER_ATTESTATION_NONE
     _att_blob = hw.get("attestation")
-    if _att_blob:
+    if _att_blob and not node_id_authenticated:
+        # Sprint 1085 — the discovery transport did NOT authenticate this peer's node_id
+        # (the libp2p gossip path trusts a payload-supplied node_id; sp1010 Residual A).
+        # The sp1083 report_data↔node_id binding is then meaningless — an attacker picks
+        # the node_id — so an attestation must NOT grant a hardware tier here. Fail-closed
+        # to tier-none (ineligible for confidential work) until libp2p origin-auth lands.
+        logger.debug("ignoring attestation from %s — node_id NOT authenticated by the "
+                     "discovery transport (libp2p origin-auth gap); tier-none",
+                     node_id[:8])
+    elif _att_blob:
         try:
             # node_id binding closes the replay gap: the quote's REPORT_DATA must commit
             # to THIS node, so a genuine quote from another TEE node can't be re-advertised.
@@ -337,6 +348,12 @@ def build_dht_backed_pool_provider(
         # provide it). Fall back to `.known_peers.values()` for
         # callers (legacy test fixtures, mock objects) where
         # the method returns something unusable.
+        # Sprint 1085 — whether this discovery transport AUTHENTICATES a peer's node_id.
+        # The WebSocket PeerDiscovery verifies sha256(pubkey)==node_id + a signature on
+        # every announce; the libp2p gossip path does not (sp1010 Residual A). When the
+        # node_id isn't authenticated, a peer's attestation must not grant a hardware tier
+        # (the sp1083 binding is void). Default True for back-compat (WS + test fixtures).
+        _node_id_authd = bool(getattr(discovery, "node_id_authenticated", True))
         peer_list: List[Any] = []
         getter = getattr(discovery, "get_known_peers", None)
         if callable(getter):
@@ -374,6 +391,7 @@ def build_dht_backed_pool_provider(
                 }
             gpu = _hw_dict_to_parallax_gpu(
                 peer_id, peer_hw, region, stake_reader=stake_reader,
+                node_id_authenticated=_node_id_authd,
             )
             if gpu is not None:
                 gpus.append(gpu)

@@ -350,6 +350,12 @@ class PeerDiscovery:
     4. Maintain a target number of connections.
     """
 
+    # Sprint 1085 — the WebSocket discovery authenticates a peer's node_id
+    # (_authenticated_announce_node_id: sha256(pubkey)==node_id + ed25519 signature, or
+    # a handshake-authenticated peer_id; unauthenticated announces are dropped). So the
+    # DHT pool provider may honor an attestation-derived hardware tier for these peers.
+    node_id_authenticated: bool = True
+
     def __init__(
         self,
         transport: WebSocketTransport,

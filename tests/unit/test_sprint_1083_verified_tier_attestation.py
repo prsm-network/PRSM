@@ -221,5 +221,31 @@ def test_merge_attestation_invalid_b64_skipped(monkeypatch):
     assert "attestation" not in data   # fail-safe: garbage → no advertise → tier-none
 
 
+# ── sp1085: an UNAUTHENTICATED-node_id transport (libp2p gossip) can't grant a tier ──
+
+def test_attestation_ignored_when_node_id_not_authenticated(monkeypatch):
+    """Over a transport that doesn't authenticate node_id (libp2p gossip), the
+    report_data↔node_id binding is meaningless (the attacker picks the node_id), so a
+    verified attestation must NOT grant a hardware tier — fail-closed to tier-none."""
+    import prsm.node.dht_backed_pool_provider as mod
+    # would verify to tier-sgx if honored
+    monkeypatch.setattr(mod, "verified_tier_attestation",
+                        lambda blob, *, node_id=None: "tier-sgx")
+    hw = dict(_HW, attestation="QUOTEB64")
+    gpu = mod._hw_dict_to_parallax_gpu(
+        "n" * 32, hw, "us-east", node_id_authenticated=False)
+    assert gpu.tier_attestation == TIER_ATTESTATION_NONE
+
+
+def test_attestation_honored_when_node_id_authenticated(monkeypatch):
+    import prsm.node.dht_backed_pool_provider as mod
+    monkeypatch.setattr(mod, "verified_tier_attestation",
+                        lambda blob, *, node_id=None: "tier-sgx")
+    hw = dict(_HW, attestation="QUOTEB64")
+    gpu = mod._hw_dict_to_parallax_gpu(
+        "n" * 32, hw, "us-east", node_id_authenticated=True)   # the WS path
+    assert gpu.tier_attestation == "tier-sgx"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
