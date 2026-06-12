@@ -29,6 +29,8 @@ from prsm.node.discovery import (
     PeerInfo,
     _announce_signing_bytes,
     _attest_announce_payload,
+    _build_announce_credential,
+    _verify_peer_credential,
 )
 from prsm.node.identity import verify_signature
 
@@ -433,6 +435,9 @@ class Libp2pDiscovery:
                     # bootstrap-server can relay it to other
                     # operators.
                     hardware_profile=self._local_hardware_profile,
+                    # Sprint 1088 — a portable signed credential the server relays so
+                    # receivers can authenticate node_id + the advertised hw_profile.
+                    announce_credential=self._own_announce_credential(),
                 )
                 peers = await client.connect()
                 await client.start_heartbeat()
@@ -463,6 +468,31 @@ class Libp2pDiscovery:
                 continue
         return False
 
+    def _own_announce_credential(self) -> Optional[Dict[str, Any]]:
+        """Sprint 1088 — build this node's portable, self-verifying credential for the
+        bootstrap relay: a signed record binding its node_id (== sha256(pubkey)[:32]) to
+        its advertised capabilities + hardware_profile. The bootstrap server relays it
+        and other nodes re-verify it (``_verify_peer_credential``), so a malicious server
+        — or a peer registering under a forged node_id — cannot get an unauthenticated
+        (node_id -> attestation) entry honored in the Parallax pool. None when the
+        identity can't sign (e.g. a stub transport in tests)."""
+        identity = getattr(self.transport, "identity", None)
+        if identity is None or not hasattr(identity, "sign"):
+            return None
+        payload: Dict[str, Any] = {
+            "node_id": identity.node_id,
+            "capabilities": list(self._local_capabilities or []),
+        }
+        if isinstance(self._local_hardware_profile, dict):
+            payload["hardware_profile"] = self._local_hardware_profile
+        nonce = secrets.token_hex(16)
+        try:
+            _attest_announce_payload(identity, payload, nonce)
+            return _build_announce_credential(identity.node_id, payload, nonce)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("could not build own announce credential: %s", exc)
+            return None
+
     def _hydrate_peers_from_bootstrap(self, peers: List[Any]) -> None:
         """Sprint 165 — populate _capability_index from bootstrap-
         server peer payloads. Skips self (avoids self-edges in the
@@ -492,14 +522,45 @@ class Libp2pDiscovery:
             # (sp682) sees real fleet capacity for cold-start
             # joiners instead of sp836's conservative synthesis.
             bp_hw = getattr(bp, "hardware_profile", None)
+            bp_hw = bp_hw if isinstance(bp_hw, dict) else None
+            # Sprint 1088 — verify the peer's portable credential (relayed by the
+            # bootstrap server). When it verifies AND matches the relayed peer_id, the
+            # node_id is cryptographically authenticated → trust the SIGNED
+            # hardware_profile (not the server's relayed copy, which a malicious server
+            # could tamper) and mark the peer authenticated so the pool may honor its
+            # attestation. An absent/invalid credential keeps the entry (for routing/
+            # liveness) but marks it UNAUTHENTICATED → its attestation grants no tier.
+            cred = getattr(bp, "announce_credential", None)
+            authed_id = _verify_peer_credential(cred) if cred else None
+            node_authenticated = bool(authed_id) and authed_id == pid
+            # When authenticated, prefer the SIGNED capabilities + hardware_profile over
+            # the server-relayed (unsigned) copies a malicious server could rewrite
+            # (review MEDIUM-2). FRESHNESS NOTE (review MEDIUM-1): the bootstrap credential
+            # vouches for IDENTITY, not recency — it carries no announce_time and is NOT
+            # replay-checked here (unlike the sp1005 PEX path). That is intentional: the
+            # attestation's own revocation/recency is enforced at the pool builder by
+            # verified_tier_attestation (sp1060 CRL + sp1061-1083 TCB/QE), so a replayed
+            # credential carrying a revoked/downlevel quote still resolves to tier-none.
+            relayed_caps = list(getattr(bp, "capabilities", []) or [])
+            caps = relayed_caps
+            if node_authenticated:
+                signed = cred.get("signed_payload") or {}
+                signed_hw = signed.get("hardware_profile")
+                if isinstance(signed_hw, dict):
+                    bp_hw = signed_hw
+                signed_caps = signed.get("capabilities")
+                if isinstance(signed_caps, list):
+                    caps = list(signed_caps)
             self._capability_index[pid] = PeerInfo(
                 node_id=pid,
                 address=f"{getattr(bp, 'address', '')}:"
                         f"{getattr(bp, 'port', 0)}",
-                capabilities=list(getattr(bp, "capabilities", []) or []),
+                capabilities=caps,
                 last_seen=time.time(),
                 last_capability_update=time.time(),
-                hardware_profile=bp_hw if isinstance(bp_hw, dict) else None,
+                hardware_profile=bp_hw,
+                announce_credential=cred if node_authenticated else None,
+                node_id_authenticated=node_authenticated,
             )
             hydrated += 1
         # Sprint 167 — track how many peers the bootstrap server
@@ -1076,6 +1137,10 @@ class Libp2pDiscovery:
             existing.gpu_available = data.get("gpu_available", existing.gpu_available)
             existing.last_seen = time.time()
             existing.last_capability_update = time.time()
+            # sp1088 review LOW-1 — this announce is origin-authenticated (sp1086), so a
+            # previously-unauthenticated entry (e.g. a credential-less bootstrap hydrate)
+            # is UPGRADED to authenticated rather than left stuck at tier-none.
+            existing.node_id_authenticated = True
         else:
             self._capability_index[node_id] = PeerInfo(
                 node_id=node_id,
@@ -1088,6 +1153,10 @@ class Libp2pDiscovery:
                 last_seen=time.time(),
                 last_capability_update=time.time(),
                 startup_timestamp=new_startup,
+                # sp1088 — this announce was origin-authenticated (sp1086), so the peer's
+                # node_id is cryptographically established: mark it so the pool provider
+                # may honor an attestation it carries.
+                node_id_authenticated=True,
             )
 
     async def _on_shard_available(

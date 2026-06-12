@@ -389,9 +389,14 @@ def build_dht_backed_pool_provider(
                     "gpu_vram_gb": 0.0,
                     "memory_bandwidth_gbps": 25.0,
                 }
+            # Sprint 1088 — a per-peer marker (set by an authenticated gossip announce
+            # or a verified bootstrap-relay credential) overrides the coarse
+            # discovery-level default; None → use the transport default (_node_id_authd).
+            _peer_authd = getattr(info, "node_id_authenticated", None)
+            _authd = _node_id_authd if _peer_authd is None else bool(_peer_authd)
             gpu = _hw_dict_to_parallax_gpu(
                 peer_id, peer_hw, region, stake_reader=stake_reader,
-                node_id_authenticated=_node_id_authd,
+                node_id_authenticated=_authd,
             )
             if gpu is not None:
                 gpus.append(gpu)

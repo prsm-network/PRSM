@@ -437,6 +437,13 @@ class BootstrapServer:
         hardware_profile = (
             supplied_hw if isinstance(supplied_hw, dict) else None
         )
+        # Sprint 1088 — the peer's portable signed credential (opaque relayable data;
+        # the server forwards it for end-to-end consumer verification, it does not need
+        # to verify it). Accept only a dict; ignore other shapes defensively.
+        supplied_cred = data.get("announce_credential")
+        announce_credential = (
+            supplied_cred if isinstance(supplied_cred, dict) else None
+        )
 
         # Sprint 566: honor a client-supplied `address` field when
         # present + non-empty string. Operators co-located with a
@@ -469,12 +476,20 @@ class BootstrapServer:
         # already had. New value overwrites old (operator may
         # have upgraded hardware).
         existing_hw = None
+        existing_cred = None
         existing = self.peers.get(peer_id)
         if existing is not None:
             existing_hw = existing.hardware_profile
+            existing_cred = existing.announce_credential
         effective_hw = (
             hardware_profile if hardware_profile is not None
             else existing_hw
+        )
+        # Sprint 1088 — preserve a cached credential when a (legacy/re-)registration
+        # omits one, same posture as the hw_profile preservation above.
+        effective_cred = (
+            announce_credential if announce_credential is not None
+            else existing_cred
         )
         peer = PeerInfo(
             peer_id=peer_id,
@@ -487,6 +502,7 @@ class BootstrapServer:
             version=version,
             connection_count=self.peers.get(peer_id, PeerInfo(peer_id, client_ip, port)).connection_count + 1,
             hardware_profile=effective_hw,
+            announce_credential=effective_cred,
         )
         
         # Check max peers limit
@@ -746,6 +762,10 @@ class BootstrapServer:
             # identical for legacy fleets.
             if peer.hardware_profile is not None:
                 entry["hardware_profile"] = peer.hardware_profile
+            # Sprint 1088 — relay the portable credential so receivers can authenticate
+            # the (node_id, hardware_profile) end-to-end. Omitted when absent (byte-compat).
+            if peer.announce_credential is not None:
+                entry["announce_credential"] = peer.announce_credential
             peers.append(entry)
         
         # Sort by last seen (most recent first)

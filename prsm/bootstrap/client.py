@@ -82,6 +82,10 @@ class BootstrapPeer:
     # when the peer hasn't advertised one (pre-838 client OR
     # operator without local profile detection).
     hardware_profile: Optional[Dict[str, Any]] = None
+    # Sprint 1088 — the peer's portable, self-verifying announce credential, relayed by
+    # the bootstrap server so a receiver can authenticate node_id + the advertised
+    # hardware_profile (_verify_peer_credential) instead of trusting the server's relay.
+    announce_credential: Optional[Dict[str, Any]] = None
 
 
 class BootstrapClient:
@@ -119,6 +123,7 @@ class BootstrapClient:
         on_peers_discovered: Optional[Callable[[List[BootstrapPeer]], Any]] = None,
         advertise_address: Optional[str] = None,
         hardware_profile: Optional[Dict[str, Any]] = None,
+        announce_credential: Optional[Dict[str, Any]] = None,
     ):
         self.bootstrap_url = bootstrap_url
         self.node_id = node_id
@@ -135,6 +140,9 @@ class BootstrapClient:
         # peers so cold-start joiners see real fleet capacity
         # without waiting on direct DISCOVERY_ANNOUNCE.
         self.hardware_profile = hardware_profile
+        # Sprint 1088 — the node's portable signed credential; sent in the registration
+        # so the server can relay it for receiver-side node_id authentication.
+        self.announce_credential = announce_credential
         # Sprint 566: operator-supplied address the bootstrap-server
         # should record + advertise to other peers. When None, the
         # server falls back to the WS client_ip (pre-566 behavior).
@@ -246,6 +254,10 @@ class BootstrapClient:
             # byte-identical register messages.
             if self.hardware_profile is not None:
                 register_msg["hardware_profile"] = self.hardware_profile
+            # Sprint 1088: include the portable signed credential when present
+            # (omitted otherwise → byte-identical to pre-1088 register messages).
+            if self.announce_credential is not None:
+                register_msg["announce_credential"] = self.announce_credential
             await self._ws.send(json.dumps(register_msg))
             logger.debug("Sent register message for node %s", self.node_id)
 
@@ -285,6 +297,9 @@ class BootstrapClient:
                         # profile when present; tolerates pre-838
                         # servers that omit the key.
                         hardware_profile=p.get("hardware_profile"),
+                        # Sprint 1088 — relayed portable credential (verified by the
+                        # consumer); tolerates pre-1088 servers that omit it.
+                        announce_credential=p.get("announce_credential"),
                     ))
 
                 logger.info(
@@ -461,6 +476,8 @@ class BootstrapClient:
                 # Sprint 838 — relayed hw_profile, sibling
                 # to the register-ack path above.
                 hardware_profile=p.get("hardware_profile"),
+                # Sprint 1088 — relayed portable credential.
+                announce_credential=p.get("announce_credential"),
             ))
 
         self._peers = peers

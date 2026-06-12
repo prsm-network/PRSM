@@ -68,6 +68,14 @@ class PeerInfo:
     # (_handle_peer_request) and re-verified by the receiver. None for peers
     # learned via a direct/legacy path with no attestation (not PEX-relayable).
     announce_credential: Optional[Dict[str, Any]] = None
+    # Sprint 1088 — per-peer node_id authentication marker. None → "use the discovery
+    # transport's default" (the coarse Libp2pDiscovery/PeerDiscovery.node_id_authenticated
+    # the sp1085 pool builder reads). True/False overrides it for THIS peer: set True when
+    # the peer's node_id was cryptographically authenticated (an attested gossip announce,
+    # sp1086/1087, or a verified bootstrap-relay credential, sp1088), False when an entry
+    # was learned WITHOUT authentication. The pool provider honors an attestation-derived
+    # hardware tier only for authenticated peers (sp1083 binding is meaningless otherwise).
+    node_id_authenticated: Optional[bool] = None
     # Sprint 680 — opt-in hardware advertisement. Carries serialized
     # HardwareProfile.to_dict() (or a subset). Consumed by the DHT-
     # backed GpuPoolProvider (sprint 681+) to construct ParallaxGPU

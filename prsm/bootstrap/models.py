@@ -85,7 +85,15 @@ class PeerInfo:
     # registration time + re-broadcasts in peer-list responses.
     hardware_profile: Optional[Dict[str, Any]] = None
     """Hardware profile relayed from the peer's registration."""
-    
+
+    # Sprint 1088 — the peer's portable, self-verifying announce credential (signed at
+    # registration). The server caches + re-broadcasts it verbatim so a receiver can
+    # cryptographically authenticate the relayed (node_id, hardware_profile) instead of
+    # trusting the server. The server never needs to verify it (end-to-end at the
+    # consumer), but stores it as opaque relayable data.
+    announce_credential: Optional[Dict[str, Any]] = None
+    """Portable signed credential relayed from the peer's registration."""
+
     connection_count: int = 0
     """Number of times this peer has connected."""
     
@@ -118,6 +126,9 @@ class PeerInfo:
         # that don't advertise hw at all (legacy compatibility).
         if self.hardware_profile is not None:
             out["hardware_profile"] = self.hardware_profile
+        # Sprint 1088 — only emit the credential when present (legacy byte-compat).
+        if self.announce_credential is not None:
+            out["announce_credential"] = self.announce_credential
         return out
     
     @classmethod
@@ -141,6 +152,8 @@ class PeerInfo:
             # Sprint 838 — defensive: accept hw_profile if present,
             # default to None for legacy serialized peers.
             hardware_profile=data.get("hardware_profile"),
+            # Sprint 1088 — accept the relayed credential if present.
+            announce_credential=data.get("announce_credential"),
         )
     
     @property
