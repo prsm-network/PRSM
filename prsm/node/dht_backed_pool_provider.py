@@ -18,6 +18,9 @@ import logging
 import os
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from prsm.compute.parallax_scheduling.trust_adapter import (
+    verified_tier_attestation,
+)
 from prsm.compute.parallax_scheduling.prsm_types import (
     ParallaxGPU, TIER_ATTESTATION_NONE,
 )
@@ -216,13 +219,31 @@ def _hw_dict_to_parallax_gpu(
             )
             stake_amount = 0
 
+    # Sprint 1083 — derive the tier-attestation from a CRYPTOGRAPHICALLY VERIFIED
+    # attestation blob, never from a self-advertised tier string. Mirrors the sp788
+    # operator-delegation pattern: a node self-asserts a capability (here an attestation
+    # quote) and the consumer verifies it before trusting it. No blob / unverified /
+    # software → TIER_ATTESTATION_NONE (the safe default — ineligible for confidential
+    # Tier B/C work via the sp702 TierGateAdapter). Never raises.
+    tier_attestation = TIER_ATTESTATION_NONE
+    _att_blob = hw.get("attestation")
+    if _att_blob:
+        try:
+            # node_id binding closes the replay gap: the quote's REPORT_DATA must commit
+            # to THIS node, so a genuine quote from another TEE node can't be re-advertised.
+            tier_attestation = verified_tier_attestation(_att_blob, node_id=node_id)
+        except Exception as exc:  # noqa: BLE001 — fail closed, never raise
+            logger.debug("attestation verification raised for node %s: %s — tier-none",
+                         node_id[:8], exc)
+            tier_attestation = TIER_ATTESTATION_NONE
+
     try:
         return ParallaxGPU(
             node_id=node_id,
             region=region,
             layer_capacity=layer_capacity,
             stake_amount=stake_amount,
-            tier_attestation=TIER_ATTESTATION_NONE,
+            tier_attestation=tier_attestation,
             tflops_fp16=tflops_fp16,
             memory_gb=memory_gb,
             memory_bandwidth_gbps=memory_bandwidth_gbps,

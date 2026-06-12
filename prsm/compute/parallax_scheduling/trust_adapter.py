@@ -161,6 +161,89 @@ def is_hardware_attestation(attestation: str, *, hardware_prefixes: frozenset = 
     return attestation in hardware_prefixes
 
 
+# Sprint 1083 — a genuine SGX/TDX/SEV quote is ≤ ~10 KB; cap the accepted attestation so
+# a malicious operator can't relay a near-1-MiB blob across the gossip network and force
+# every peer to base64-decode + cert-chain-parse it on each pool build (review LOW DoS).
+_MAX_ATTESTATION_BYTES = 64 * 1024
+
+# Sprint 1083 — map a §7-registry vendor string to its parallax tier-type token. Only
+# these REAL hardware vendors can earn a hardware tier (and only when vendor_verified).
+_VENDOR_TO_TEE_TYPE = {
+    "intel-sgx": "sgx",
+    "intel-tdx": "tdx",
+    "amd-sev-snp": "sev",
+    "amd-sev-snp-envelope": "sev",
+    "apple-sep": "secure_enclave",
+}
+
+
+def expected_attestation_report_data(node_id: str) -> str:
+    """Sprint 1083 — the canonical node-identity commitment a node must embed in the
+    first 32 bytes of its TEE quote's REPORT_DATA: ``sha256(node_id)`` (hex). The
+    consumer checks the verified quote carries THIS commitment so a quote can't be
+    replayed by a different node (binding the hardware attestation to the node_id, the
+    parallel to the sp788 operator-delegation node_id binding)."""
+    import hashlib
+    return hashlib.sha256((node_id or "").encode()).hexdigest()
+
+
+def verified_tier_attestation(blob, *, node_id=None, registry=None) -> str:
+    """Sprint 1083 — the missing bridge between the §7 attestation engines
+    (sp1044-1082, which compute ``vendor_verified``) and the parallax tier gate
+    (sp702 ``TierGateAdapter``, which filters on a tier-attestation string).
+
+    Returns a hardware tier string (e.g. ``"tier-sgx"``) for ``blob`` ONLY when it is a
+    real attestation that the registry CRYPTOGRAPHICALLY ``vendor_verified`` AND (when
+    ``node_id`` is given) whose REPORT_DATA binds to THIS node — otherwise
+    ``TIER_ATTESTATION_NONE``. So a node's eligibility for confidential (Tier B/C) work
+    depends on a VERIFIED attestation bound to its identity, not a self-advertised tier
+    prefix and not a replayable third-party quote. FAIL-CLOSED: a missing blob, a
+    structural/unverified result, an unknown vendor, a REPORT_DATA that doesn't bind to
+    ``node_id``, or any error during verification all yield ``tier-none``.
+
+    ``blob`` may be raw bytes or a base64 string (as carried in a capability announce).
+    When ``node_id`` is None the binding check is skipped (callers that bind elsewhere);
+    the live pool-admission path always passes ``node_id``.
+    """
+    if not blob:
+        return TIER_ATTESTATION_NONE
+    if isinstance(blob, str):
+        if len(blob) > _MAX_ATTESTATION_BYTES * 2:   # base64 ≈ 4/3 raw; cheap pre-check
+            return TIER_ATTESTATION_NONE
+        try:
+            import base64
+            blob = base64.b64decode(blob, validate=True)
+        except Exception:  # noqa: BLE001
+            return TIER_ATTESTATION_NONE
+    if len(blob) > _MAX_ATTESTATION_BYTES:
+        return TIER_ATTESTATION_NONE   # oversized quote → not a real TEE quote, refuse
+    try:
+        if registry is not None:
+            result = registry.verify(blob)
+        else:
+            from prsm.compute.inference.attestation_backends import verify_attestation
+            result = verify_attestation(blob)
+    except Exception:  # noqa: BLE001 — verification error must never grant a tier
+        return TIER_ATTESTATION_NONE
+    if not getattr(result, "vendor_verified", False):
+        return TIER_ATTESTATION_NONE
+    tee_type = _VENDOR_TO_TEE_TYPE.get(getattr(result, "vendor", ""))
+    if tee_type is None:
+        return TIER_ATTESTATION_NONE
+    # Replay/binding guard: the verified quote's REPORT_DATA must commit to THIS node.
+    if node_id:
+        report_data_hex = ""
+        vendor_data = getattr(result, "vendor_data", None) or {}
+        if isinstance(vendor_data, dict):
+            report_data_hex = (vendor_data.get("report_data_hex") or "").lower()
+        expected = expected_attestation_report_data(node_id)
+        # REPORT_DATA is 64 bytes (128 hex); the node commits sha256(node_id) (32 bytes)
+        # in its first half. A quote from a DIFFERENT node carries a different commitment.
+        if not report_data_hex or report_data_hex[:len(expected)] != expected:
+            return TIER_ATTESTATION_NONE
+    return f"tier-{tee_type}"
+
+
 @dataclass(frozen=True)
 class TierGateAdapter:
     """Filter ParallaxGPUs by privacy-tier requirements at request time.

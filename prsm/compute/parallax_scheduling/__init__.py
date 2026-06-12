@@ -70,6 +70,7 @@ from prsm.compute.parallax_scheduling.trust_adapter import (
     TierGateRejected,
     TrustStack,
     is_hardware_attestation,
+    verified_tier_attestation,
 )
 
 __all__ = [
@@ -121,6 +122,7 @@ __all__ = [
     "ChallengeSubmitter",
     "TrustStack",
     "is_hardware_attestation",
+    "verified_tier_attestation",
     "DEFAULT_HARDWARE_TIER_PREFIXES",
     "DEFAULT_FULLY_STAKED_THRESHOLD",
     "MIN_STAKE_FOR_PARTICIPATION",
