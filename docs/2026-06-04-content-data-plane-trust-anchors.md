@@ -153,12 +153,23 @@ before `record_access`. So a malicious advertiser can no longer poison the reput
 of a creator they don't control. Pinned by `test_sprint_1078_authenticated_creator.py`
 + `test_content_retrieve_creator_hook.py::test_retrieve_overrides_forged_creator_with_registered`.
 
-**Still open — the `creator_id` (node-id) FTNS-ledger-credit leg.** The off-chain FTNS
-ledger credit in `_distribute_royalties` keys on a node-id (`creator_id`), and the
-registry stores only the eth address (no node-id mapping). The on-chain royalty leg
-already pays the *registered* creator (backstopped, sp996), so the authoritative
-payout is fine; the off-chain node-id credit needs a node-id↔eth binding (Option B
-advertise-signing, or a node-id↔eth attestation) — the narrow remaining follow-on.
+**Accepted best-effort (2026-06-11) — the `creator_id` (node-id) FTNS-ledger-credit
+leg.** A node-id↔eth-binding investigation (the binding primitive exists:
+`wallet_binding.py`, EIP-191-attested) found the binding is the **wrong tool** here:
+`_distribute_royalties` first tries `_try_onchain_distribute`, so for content with a
+**registered** provenance_hash + on-chain enabled the payout goes on-chain to the
+*registered* creator (backstopped, sp996) — the forgeable local-ledger path only runs
+for **unregistered** content (or a transient on-chain fall-through). Unregistered
+content has **no authoritative on-chain creator to bind against**, so a node-id↔eth
+binding cannot authenticate it; only **Option B** (signing the advertise) could, a
+larger high-fanout-lane protocol change.
+
+Decision (Ryne, 2026-06-11): **accept as a documented best-effort limitation.** The
+authoritative payout is backstopped on-chain (sp996) and registered content's rate +
+creator-reputation are authenticated (sp1077/1078); the off-chain local-ledger credit
+for *unregistered* content stays best-effort (the bounded sp1004 values). Re-open with
+Option B only if unregistered off-chain credit becomes a real abuse vector. **Gap B is
+now as closed as Option A can make it.**
 
 ## Not-a-bug (refuted or already-backstopped, recorded for audit)
 
