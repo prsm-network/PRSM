@@ -314,6 +314,18 @@ def build_amd_sev_snp_backend_or_none(env: Optional[dict] = None):
             except OSError as exc:
                 logger.warning("AMD KDS CRL file unreadable (%s) — proceeding "
                                "WITHOUT revocation checking", exc)
+    if not crls_bytes:
+        # sp1082 — fall back to the auto-refreshed AMD VCEK CRL cache (kept current by
+        # the CollateralRefresher) so revocation enforcement does not silently lapse
+        # when a static CRL expires. Absent → unchanged (no revocation check).
+        try:
+            from prsm.compute.inference.collateral_refresh import read_cached_amd_crls
+            cached = read_cached_amd_crls(environ)
+            if cached:
+                crls_bytes = cached
+                logger.info("Using auto-refreshed AMD VCEK CRL cache for revocation")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("no refreshed AMD CRL cache: %s", exc)
     # sp1064-1065 — optional TCB-recency policy (PRSM_AMD_SEV_SNP_MIN_TCB =
     # "bootloader,tee,snp,microcode"). Absent → no TCB check (unchanged).
     from prsm.compute.inference.amd_tcb import snp_tcb_policy_from_env

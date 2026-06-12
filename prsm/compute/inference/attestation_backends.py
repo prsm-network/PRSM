@@ -605,3 +605,24 @@ def reload_intel_dcap(registry=None, env=None) -> bool:
     reg.backends = [rebuilt] + [b for b in reg.backends
                                 if not isinstance(b, IntelDCAPBackend)]
     return True
+
+
+def reload_amd_sev_snp(registry=None, env=None) -> bool:
+    """Sprint 1082 — rebuild the AMD SEV-SNP backend from the CURRENT env + AMD VCEK CRL
+    cache (the parallel to reload_intel_dcap), so a long-running node picks up fresh
+    revocation data WITHOUT a restart. One atomic list rebind (no transient zero-backend
+    window). Fail-open: if rebuilding fails or yields None, the prior backend stays."""
+    from prsm.compute.inference.amd_sev_snp import (
+        AMDSEVSNPBackend, build_amd_sev_snp_backend_or_none,
+    )
+    reg = registry if registry is not None else _DEFAULT_REGISTRY
+    try:
+        rebuilt = build_amd_sev_snp_backend_or_none(env)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("AMD SEV-SNP reload failed (%s) — keeping the existing backend", exc)
+        return any(isinstance(b, AMDSEVSNPBackend) for b in reg.backends)
+    if rebuilt is None:
+        return any(isinstance(b, AMDSEVSNPBackend) for b in reg.backends)
+    reg.backends = [rebuilt] + [b for b in reg.backends
+                                if not isinstance(b, AMDSEVSNPBackend)]
+    return True

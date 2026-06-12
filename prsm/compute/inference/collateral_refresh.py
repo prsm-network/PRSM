@@ -45,6 +45,15 @@ INTEL_PCK_PLATFORM_CRL_FILE = "intel_pck_platform.crl.pem"
 INTEL_PCK_PROCESSOR_CRL_FILE = "intel_pck_processor.crl.pem"
 INTEL_QE_IDENTITY_FILE = "intel_qe_identity.json"
 
+# AMD KDS (kdsintf.amd.com) — public per-product VCEK CRL + cert_chain (no platform
+# secret needed). KDS uses Capitalized product names in the URL path.
+AMD_KDS_BASE = "https://kdsintf.amd.com"
+_AMD_PRODUCTS = ("milan", "genoa", "turin")
+
+
+def amd_crl_cache_file(product: str) -> str:
+    return f"amd_{product.lower()}.crl.pem"
+
 
 def collateral_cache_dir(environ=None) -> Optional[Path]:
     """The attestation-collateral cache dir, or None when unset. Set by the node from
@@ -79,6 +88,29 @@ def read_cached_intel_crls(environ=None) -> Optional[bytes]:
     return b"\n".join(parts) if parts else None
 
 
+def read_cached_amd_crls(environ=None) -> Optional[bytes]:
+    """Concatenated PEM of the cached AMD VCEK CRLs (one per product the refresher has
+    fetched), or None if the cache dir is unset / no AMD CRL has been refreshed yet."""
+    cache = collateral_cache_dir(environ)
+    if cache is None:
+        return None
+    parts = []
+    present = []
+    for product in _AMD_PRODUCTS:
+        try:
+            parts.append((cache / amd_crl_cache_file(product)).read_bytes())
+            present.append(product)
+        except OSError:
+            continue
+    if parts:
+        # sp1082 review L4 — name which products have a live CRL so an operator can tell
+        # which platforms have revocation enforced (a missing product only affects that
+        # product's nodes — AMD products are independent platforms, unlike Intel's H1).
+        logger.info("AMD VCEK CRL cache present for: %s (revocation enforced for these)",
+                    ", ".join(present))
+    return b"\n".join(parts) if parts else None
+
+
 def read_cached_intel_qe_identity(environ=None) -> Optional[bytes]:
     """The cached Intel QE-Identity JSON, or None. Usable by the backend only when the
     TCB Signing cert is also configured (the QE signer)."""
@@ -96,6 +128,28 @@ class RefreshResult:
     ok: bool
     cached: bool = False
     reason: Optional[str] = None
+
+
+def _load_crl_any(data: bytes):
+    """Parse a CRL from PEM or DER (AMD KDS serves DER, Intel PCS PEM). None on failure."""
+    try:
+        return x509.load_pem_x509_crl(data)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return x509.load_der_x509_crl(data)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _crl_to_pem(data: bytes) -> Optional[bytes]:
+    """Normalize a CRL (PEM or DER) to PEM bytes so the backends' PEM-split CRL loaders
+    can read it uniformly. None if it doesn't parse as a CRL."""
+    crl = _load_crl_any(data)
+    if crl is None:
+        return None
+    from cryptography.hazmat.primitives import serialization
+    return crl.public_bytes(serialization.Encoding.PEM)
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -123,9 +177,8 @@ def crl_is_valid_and_current(pem: bytes, issuer_cert: x509.Certificate,
     AND currently within [thisUpdate, nextUpdate]. Total — never raises."""
     if now is None:
         now = _dt.datetime.now(_dt.timezone.utc)
-    try:
-        crl = x509.load_pem_x509_crl(pem)
-    except Exception:  # noqa: BLE001
+    crl = _load_crl_any(pem)
+    if crl is None:
         return False
     try:
         if not crl.is_signature_valid(issuer_cert.public_key()):
@@ -308,12 +361,18 @@ class CollateralRefresher:
     def __init__(self, cache_dir, *, fetch: Optional[FetchWithHeaders] = None,
                  intel_root_pem: Optional[bytes] = None, now_fn=None,
                  intel_pcs_base: str = INTEL_PCS_BASE,
-                 tcb_signer_pem: Optional[bytes] = None):
+                 tcb_signer_pem: Optional[bytes] = None,
+                 amd_ark_pems: Optional[dict] = None,
+                 amd_kds_base: str = AMD_KDS_BASE):
         self.cache_dir = Path(cache_dir)
         self._fetch = fetch or httpx_fetch_with_headers
         self._intel_root_pem = intel_root_pem
         self._now_fn = now_fn or (lambda: _dt.datetime.now(_dt.timezone.utc))
         self._intel_pcs_base = intel_pcs_base.rstrip("/")
+        # sp1082 — bundled (fingerprint-pinned) AMD ARKs per product; the trust anchor
+        # for the KDS-supplied ASK that signs the VCEK CRL. Default → bundled_amd_arks().
+        self._amd_ark_pems = amd_ark_pems
+        self._amd_kds_base = amd_kds_base.rstrip("/")
         # sp1081 review M1 — the operator's configured QE signer (the same TCB Signing
         # cert the verify path uses). When set, the refreshed QE-Identity is validated
         # under IT (not just the header-chain leaf) so a refresh can't cache a QE the
@@ -391,12 +450,80 @@ class CollateralRefresher:
             url=url, header_name=_INTEL_QE_ISSUER_HEADER,
             cache_name="intel_qe_identity.json", validate_under_leaf=_validate)
 
+    def _amd_arks(self) -> dict:
+        if self._amd_ark_pems is not None:
+            return self._amd_ark_pems
+        from prsm.compute.inference.vendor_anchors import bundled_amd_arks
+        return bundled_amd_arks()
+
+    async def refresh_amd_crl(self, product: str) -> RefreshResult:
+        """Refresh the AMD VCEK CRL for ``product`` ('milan'/'genoa'/'turin'). The CRL
+        (DER from KDS) is signed by the ASK; the ASK is fetched from the KDS cert_chain
+        endpoint and validated to the BUNDLED, fingerprint-pinned ARK (never a
+        KDS-supplied root), then the CRL is validated under the ASK + cached as PEM."""
+        product = product.lower()
+        arks = self._amd_arks()
+        ark_pem = arks.get(product)
+        if not ark_pem:
+            return RefreshResult(ok=False, cached=False, reason=f"no-ark-for-{product}")
+        kds_product = product.capitalize()
+        crl_url = f"{self._amd_kds_base}/vcek/v1/{kds_product}/crl"
+        chain_url = f"{self._amd_kds_base}/vcek/v1/{kds_product}/cert_chain"
+        try:
+            crl_body, _ = await self._fetch(crl_url)
+            chain_body, _ = await self._fetch(chain_url)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("AMD KDS fetch failed for %s: %s — keeping cached copy",
+                           product, exc)
+            return RefreshResult(ok=False, cached=False, reason=f"fetch-failed: {exc}")
+
+        # KDS serves the CRL as DER — normalize to PEM so the backend's PEM-split loader
+        # reads it, and so validate-before-swap operates on the cached bytes.
+        crl_pem = _crl_to_pem(crl_body)
+        if crl_pem is None:
+            return RefreshResult(ok=False, cached=False, reason="unparseable-crl")
+
+        from prsm.compute.inference.x509_path import verify_cert_chain
+
+        def validate(data: bytes) -> bool:
+            chain = _split_pem_certs(chain_body)   # [ASK, ARK] from KDS
+            if not chain:
+                logger.warning("no ASK chain from KDS for %s — refusing refresh", product)
+                return False
+            try:
+                ark = x509.load_pem_x509_certificate(ark_pem)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("bundled AMD ARK unusable for %s: %s", product, exc)
+                return False
+            # Validate ONLY the ASK (chain[0]) to OUR pinned ARK — discard the
+            # KDS-supplied ARK; we never trust a self-supplied root.
+            ok, err = verify_cert_chain([chain[0]], ark, now=self._now_fn(),
+                                        require_crl=False)
+            if not ok:
+                logger.warning("AMD ASK for %s does not chain to the bundled ARK: %s",
+                               product, err)
+                return False
+            return crl_is_valid_and_current(data, chain[0], self._now_fn())
+
+        return _cache_if_valid(crl_pem, validate,
+                               self.cache_dir / amd_crl_cache_file(product),
+                               label=crl_url)
+
     async def refresh_all(self) -> dict:
         """Refresh every supported item; return {name: RefreshResult}. Never raises."""
         results: dict = {}
         for ca in ("platform", "processor"):
             results[f"intel_pck_{ca}_crl"] = await self.refresh_intel_pck_crl(ca)
         results["intel_qe_identity"] = await self.refresh_intel_qe_identity()
+        # AMD VCEK CRLs — only products whose ARK is available (skip the rest quietly).
+        try:
+            available = self._amd_arks()
+        except Exception as exc:  # noqa: BLE001
+            available = {}
+            logger.debug("AMD ARKs unavailable for refresh: %s", exc)
+        for product in _AMD_PRODUCTS:
+            if available.get(product):
+                results[f"amd_{product}_crl"] = await self.refresh_amd_crl(product)
         ok = sum(1 for r in results.values() if r.ok)
         logger.info("collateral refresh complete: %d/%d items updated", ok, len(results))
         return results

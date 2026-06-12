@@ -5710,14 +5710,21 @@ class PRSMNode:
                 results = await refresher.refresh_all()
                 if any(r.ok for r in results.values()):
                     from prsm.compute.inference.attestation_backends import (
-                        reload_intel_dcap)
-                    try:
-                        reload_intel_dcap()
-                        logger.info("Sprint 1081: reloaded DCAP backend with refreshed "
-                                    "collateral (%s)",
-                                    {k: v.ok for k, v in results.items()})
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("Sprint 1081 DCAP reload error: %s", exc)
+                        reload_amd_sev_snp, reload_intel_dcap)
+                    # Reload only the vendor(s) whose collateral actually changed.
+                    if any(k.startswith("intel") and v.ok for k, v in results.items()):
+                        try:
+                            reload_intel_dcap()
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("Sprint 1081 DCAP reload error: %s", exc)
+                    if any(k.startswith("amd") and v.ok for k, v in results.items()):
+                        try:
+                            reload_amd_sev_snp()
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("Sprint 1082 SEV-SNP reload error: %s", exc)
+                    logger.info("Sprint 1081/1082: reloaded attestation backend(s) with "
+                                "refreshed collateral (%s)",
+                                {k: v.ok for k, v in results.items()})
                 else:
                     logger.debug("Sprint 1081 collateral refresh: no items updated")
             except asyncio.CancelledError:
