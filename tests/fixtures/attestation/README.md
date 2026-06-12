@@ -11,6 +11,7 @@ CRL) — **no secrets, no platform-identifying leaf certs**. Safe for an externa
 | File | What | Source (fetched 2026-06-10) |
 |------|------|------|
 | `intel_tcb_info_00906ed50000.json` | Real signed Intel SGX TCB-Info (v3, fmspc `00906ed50000`, 21 tcbLevels) | `https://api.trustedservices.intel.com/sgx/certification/v4/tcb?fmspc=00906ed50000` |
+| `intel_qe_identity.json` | Real signed Intel SGX QE Identity (`enclaveIdentity` v2, mrsigner/isvprodid/6 tcbLevels) — signed by the same TCB Signing cert | `https://api.trustedservices.intel.com/sgx/certification/v4/qe/identity` |
 | `intel_tcb_signing.pem` | Intel SGX TCB Signing cert (ECDSA-P256) — signs the TCB-Info | `TCB-Info-Issuer-Chain` response header (above), first cert |
 | `intel_sgx_root_ca.pem` | Intel SGX Root CA | `SGX-PCK-CRL-Issuer-Chain` header, root |
 | `intel_sgx_platform_ca.pem` | Intel SGX PCK Platform CA | same issuer chain, intermediate |

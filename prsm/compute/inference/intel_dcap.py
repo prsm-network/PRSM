@@ -87,7 +87,8 @@ class IntelDCAPBackend:
     def __init__(self, trusted_root_pem: bytes, crls_pem: Optional[bytes] = None,
                  tcb_info_json: Optional[bytes] = None,
                  tcb_signer_cert_pem: Optional[bytes] = None,
-                 tcb_policy=None):
+                 tcb_policy=None,
+                 qe_identity_json: Optional[bytes] = None):
         if not trusted_root_pem:
             raise ValueError(
                 "IntelDCAPBackend requires trusted_root_pem (Intel SGX Root CA in "
@@ -115,6 +116,11 @@ class IntelDCAPBackend:
             from prsm.compute.inference.sgx_tcb import default_tcb_policy
             tcb_policy = default_tcb_policy()
         self._tcb_policy = tcb_policy
+        # sp1079 — optional QE-Identity pinning. When a signed QE Identity is supplied
+        # (verified against the SAME TCB Signing cert as the TCB-Info), the QE report's
+        # MRSIGNER/ISVPRODID/ISVSVN are checked against Intel's published QE Identity —
+        # proving the Quoting Enclave is a genuine, current Intel QE. Absent → no check.
+        self._qe_identity_json = bytes(qe_identity_json) if qe_identity_json else None
 
     @staticmethod
     def _load_crls(crls_pem: bytes) -> Optional[list]:
@@ -224,9 +230,38 @@ class IntelDCAPBackend:
                     vendor="intel-sgx", vendor_verified=False, signature_chain_ok=True,
                     structural_parse_ok=True, vendor_data=vendor_data, error=tcb_err)
 
+        # sp1079 — QE-Identity pinning: prove the Quoting Enclave is a genuine Intel QE
+        # (MRSIGNER/ISVPRODID match + ISVSVN current). Only when a signed QE Identity +
+        # the TCB Signing cert are configured.
+        if self._qe_identity_json is not None and self._tcb_signer is not None:
+            qe_status, qe_err = self._evaluate_qe_identity(qe_report, vendor_data)
+            if qe_status is not None:
+                vendor_data["qe_tcb_status"] = qe_status
+            if qe_err is not None:
+                return AttestationVerificationResult(
+                    vendor="intel-sgx", vendor_verified=False, signature_chain_ok=True,
+                    structural_parse_ok=True, vendor_data=vendor_data, error=qe_err)
+
         return AttestationVerificationResult(
             vendor="intel-sgx", vendor_verified=True, signature_chain_ok=True,
             structural_parse_ok=True, vendor_data=vendor_data, error=None)
+
+    def _evaluate_qe_identity(self, qe_report, vendor_data):
+        """Return (qe_tcb_status, error). error is None when the QE matches Intel's QE
+        Identity (genuine + current); otherwise a message (vendor_verified→False).
+        Fail-closed on parse/verify failure."""
+        from prsm.compute.inference.qe_identity import (
+            QeIdentityError, parse_and_verify_qe_identity, parse_qe_report_identity,
+            qe_tcb_status, verify_qe_identity,
+        )
+        try:
+            qe_rep = parse_qe_report_identity(qe_report)
+            identity = parse_and_verify_qe_identity(self._qe_identity_json, self._tcb_signer)
+            status = qe_tcb_status(qe_rep, identity)
+            verify_qe_identity(qe_rep, identity)
+        except QeIdentityError as exc:
+            return None, f"QE-Identity check failed (fail-closed): {exc}"
+        return status, None
 
     def _evaluate_tcb(self, pck_leaf):
         """Return (tcb_status, error). error is None when the platform's TCB status is
@@ -354,12 +389,20 @@ def build_intel_dcap_backend_or_none(env: Optional[dict] = None):
         logger.warning("Intel SGX TCB enforcement needs BOTH the TCB-Info and the "
                        "TCB Signing cert — only one configured; TCB checking OFF")
         tcb_info = tcb_signer = None
+    # sp1079 — optional QE-Identity (verified against the same TCB Signing cert).
+    qe_identity = _read_cfg("PRSM_INTEL_SGX_QE_IDENTITY_JSON",
+                            "PRSM_INTEL_SGX_QE_IDENTITY_FILE", "Intel SGX QE Identity")
+    if qe_identity and not tcb_signer:
+        logger.warning("Intel SGX QE-Identity pinning needs the TCB Signing cert "
+                       "(PRSM_INTEL_SGX_TCB_SIGNING_PEM/_FILE) too — QE pinning OFF")
+        qe_identity = None
     from prsm.compute.inference.sgx_tcb import tcb_policy_from_env
     try:
         return IntelDCAPBackend(
             trusted_root_pem=root_bytes, crls_pem=crls_bytes,
             tcb_info_json=tcb_info, tcb_signer_cert_pem=tcb_signer,
-            tcb_policy=tcb_policy_from_env(environ))
+            tcb_policy=tcb_policy_from_env(environ),
+            qe_identity_json=qe_identity)
     except ValueError as exc:
         logger.warning("Intel SGX Root CA / TCB config invalid (%s) — DCAP "
                        "verification OFF, structural fallback", exc)
