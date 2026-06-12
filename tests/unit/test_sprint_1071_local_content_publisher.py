@@ -98,9 +98,13 @@ def test_manifest_pieces_cover_content(tmp_path):
     assert out.manifest.pieces[0].index == 0
 
 
-def test_tier_bc_raises_clear_error(tmp_path):
-    pub = LocalContentPublisher(staging_dir=tmp_path)
-    with pytest.raises(NotImplementedError):
+def test_tier_bc_requires_a_content_store(tmp_path):
+    """sp1075 — Tier B/C is now SUPPORTED (artifact bundle), but needs a ContentStore
+    for the encryption; without one it raises (not a silent no-op)."""
+    from prsm.storage import close_content_store
+    close_content_store()
+    pub = LocalContentPublisher(staging_dir=tmp_path, content_store=None)
+    with pytest.raises(RuntimeError):
         _run(pub.publish(b"secret", provenance_id="", tier=ContentTier.B))
 
 

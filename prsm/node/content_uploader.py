@@ -2278,17 +2278,62 @@ class ContentUploader:
                 )
                 return None
             try:
-                return await provider.request_content(cid)
+                blob = await provider.request_content(cid)
             except Exception as e:  # noqa: BLE001 - never raise out of fetch
                 logger.error(
                     "Libtorrent-free fetch via ContentProvider failed for %s: %s",
                     cid, e,
                 )
                 return None
+            return await self._decode_bundle_if_present(blob, cid)
         try:
             return await self.content_retriever.fetch(cid)
         except Exception as e:
             logger.error(f"Content fetch failed for {cid}: {e}")
+            return None
+
+    async def _decode_bundle_if_present(
+        self, blob: Optional[bytes], cid: str,
+    ) -> Optional[bytes]:
+        """sp1075 — if a libtorrent-free fetch returned a Tier-B/C artifact bundle
+        (sp1074 magic), unbundle + decrypt it via the ContentStore so the caller
+        always gets plaintext. Tier-A plaintext (no magic) passes through unchanged.
+        Fail-soft: a decrypt error returns None (an honest miss) rather than raising
+        or handing back ciphertext."""
+        if blob is None:
+            return None
+        try:
+            # sp1075 review (premise) — a bundle CID is a BitTorrent v1 infohash that
+            # is NOT re-verified from bytes on the libtorrent-free fetch path, so a
+            # malicious provider could hand arbitrary bytes into the parser/decrypt.
+            # Bind the fetched bytes to the CID here: recompute the v1 infohash and
+            # reject a mismatch. (Only for the 40-hex infohash CID shape; other CID
+            # schemes keep their own verification.)
+            if isinstance(cid, str) and len(cid) == 40 and all(
+                    c in "0123456789abcdef" for c in cid.lower()):
+                import hashlib as _hashlib
+                from prsm.core.torrent_infohash import (
+                    compute_v1_infohash_single_file)
+                name = _hashlib.sha256(blob).hexdigest()
+                if compute_v1_infohash_single_file(blob, name) != cid.lower():
+                    logger.error(
+                        "fetched bytes for %s do not match the CID (v1 infohash "
+                        "mismatch) — rejecting", cid)
+                    return None
+            from prsm.node.artifact_bundle import is_bundle
+            if not is_bundle(blob):
+                return blob
+            from prsm.storage import get_content_store
+            store = get_content_store()
+            if store is None:
+                logger.error(
+                    "fetched a Tier-B/C bundle for %s but no ContentStore is "
+                    "available to decrypt it", cid)
+                return None
+            from prsm.node.local_content_publisher import unbundle_and_decrypt
+            return await unbundle_and_decrypt(blob, store)
+        except Exception as e:  # noqa: BLE001 - never raise out of fetch
+            logger.error("Tier-B/C bundle decode/decrypt failed for %s: %s", cid, e)
             return None
 
     async def _on_content_access(self, subtype: str, data: Dict[str, Any], origin: str) -> None:

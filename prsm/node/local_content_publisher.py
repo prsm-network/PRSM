@@ -29,20 +29,38 @@ from prsm.compute.inference.models import ContentTier
 from prsm.core.bittorrent_manifest import FileEntry, PieceInfo, TorrentManifest
 from prsm.core.torrent_infohash import (
     DEFAULT_PIECE_LENGTH, compute_v1_infohash_single_file)
-from prsm.node.content_publisher import PublishedContent
+from prsm.node.artifact_bundle import bundle_artifacts, unbundle_artifacts
+from prsm.node.content_publisher import (
+    PublishedContent, _deserialize_key_shares, _serialize_key_shares)
 
 logger = logging.getLogger(__name__)
+
+
+async def unbundle_and_decrypt(blob: bytes, content_store) -> bytes:
+    """Inverse of LocalContentPublisher's Tier-B/C publish: unbundle the artifacts
+    from a fetched single blob (sp1074) and decrypt via the ContentStore. The
+    retrieval path calls this when ``artifact_bundle.is_bundle(blob)`` is True; a
+    non-bundle (Tier-A plaintext) blob is returned to the caller as-is."""
+    encrypted_manifest, keyshares_json, shard_blobs = unbundle_artifacts(blob)
+    key_shares = _deserialize_key_shares(keyshares_json)
+    return await content_store.retrieve_with_artifacts(
+        encrypted_manifest=encrypted_manifest,
+        key_shares=key_shares,
+        shard_blobs=shard_blobs,
+    )
 
 
 class LocalContentPublisher:
     """Pure-Python Tier-A publisher (no libtorrent). Drop-in for ContentPublisher."""
 
     def __init__(self, staging_dir, *, node_id: str = "",
-                 piece_length: int = DEFAULT_PIECE_LENGTH) -> None:
+                 piece_length: int = DEFAULT_PIECE_LENGTH,
+                 content_store=None) -> None:
         self.staging_dir = Path(staging_dir).expanduser()
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         self._node_id = node_id
         self._piece_length = int(piece_length)
+        self._content_store = content_store
         # infohash → staged Path, so ContentRetriever's F8 local shortcut works.
         self._published_paths: Dict[str, Path] = {}
 
@@ -69,32 +87,60 @@ class LocalContentPublisher:
     ) -> PublishedContent:
         """Stage ``data`` content-addressed and return its PublishedContent with the
         pure-Python v1 infohash as the CID. Tier A only."""
-        if tier is not ContentTier.A:
-            raise NotImplementedError(
-                "LocalContentPublisher (no libtorrent) supports Tier A (public) "
-                "only; Tier B/C encrypted publishing needs the BitTorrent/ContentStore "
-                "path — install libtorrent and use ContentPublisher")
+        if tier is ContentTier.A:
+            # Content-addressed staging filename = sha256 hex (identical to
+            # ContentPublisher._publish_tier_a, so the torrent NAME — and thus the
+            # infohash — matches a libtorrent node's for the same bytes).
+            blob = data
+        else:
+            # sp1074 — Tier B/C: encrypt via the ContentStore (no libtorrent), then
+            # BUNDLE the artifacts into ONE blob distributed + identified exactly like
+            # a Tier-A single file. Per-publish (AES key rotates), so the CID is the
+            # bundle's sha256, not the plaintext's.
+            blob = await self._encrypt_and_bundle(data, replication_factor)
 
-        # Content-addressed staging filename = sha256 hex (identical to
-        # ContentPublisher._publish_tier_a, so the torrent NAME — and thus the
-        # infohash — matches a libtorrent node's for the same bytes).
-        staged_filename = hashlib.sha256(data).hexdigest()
+        staged_filename = hashlib.sha256(blob).hexdigest()
         staged_path = self.staging_dir / staged_filename
         if not staged_path.exists():
             tmp_path = staged_path.with_suffix(".tmp")
-            tmp_path.write_bytes(data)
+            tmp_path.write_bytes(blob)
             tmp_path.replace(staged_path)   # atomic — a reader never sees a partial file
 
         infohash = compute_v1_infohash_single_file(
-            data, staged_filename, self._piece_length)
-        manifest = self._build_manifest(data, staged_filename, infohash, provenance_id)
+            blob, staged_filename, self._piece_length)
+        manifest = self._build_manifest(blob, staged_filename, infohash, provenance_id)
         self._published_paths[infohash] = staged_path
 
         logger.info(
-            "Content published (tier=A, no libtorrent): infohash=%s name=%s size=%d "
-            "provenance_id=%s", infohash, staged_filename, len(data), provenance_id)
+            "Content published (tier=%s, no libtorrent): infohash=%s name=%s size=%d "
+            "provenance_id=%s", tier.value, infohash, staged_filename, len(blob),
+            provenance_id)
         return PublishedContent(
             torrent_infohash=infohash, staged_path=staged_path, manifest=manifest)
+
+    async def _encrypt_and_bundle(self, data: bytes, replication_factor: int) -> bytes:
+        """Tier B/C: encrypt+shard via the ContentStore and bundle the artifacts into
+        one canonical blob (sp1074). Reuses the EXACT ContentStore crypto the BT path
+        uses (no crypto reimplementation)."""
+        store = self._resolve_content_store()
+        artefacts = await store.store_local_with_artifacts(
+            data, replication_factor=replication_factor)
+        keyshares_json = _serialize_key_shares(artefacts.key_shares)
+        shard_blobs = [Path(p).read_bytes() for p in artefacts.shard_paths]
+        return bundle_artifacts(
+            artefacts.encrypted_manifest, keyshares_json, shard_blobs)
+
+    def _resolve_content_store(self):
+        if self._content_store is not None:
+            return self._content_store
+        from prsm.storage import get_content_store
+        store = get_content_store()
+        if store is None:
+            raise RuntimeError(
+                "LocalContentPublisher: Tier B/C publish requires a ContentStore. "
+                "Initialise via prsm.storage.init_content_store() or pass "
+                "content_store= to the constructor.")
+        return store
 
     def _build_manifest(self, data: bytes, name: str, infohash: str,
                         provenance_id: str) -> TorrentManifest:

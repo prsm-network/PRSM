@@ -103,5 +103,63 @@ def test_end_to_end_local_publish_then_self_fetch(tmp_path):
     assert got == data   # served from the staged file, no libtorrent involved
 
 
+def test_fetched_tier_a_plaintext_passes_through(tmp_path):
+    """A non-bundle (Tier-A) blob from the provider is returned as-is."""
+    prov = MagicMock()
+    prov.request_content = AsyncMock(return_value=b"plain tier-A bytes")
+    up = _uploader(retriever=None, provider=prov)
+    assert _run(up._fetch_content("cid-a")) == b"plain tier-A bytes"
+
+
+def test_fetch_rejects_blob_not_matching_cid():
+    """sp1075 review (premise) — a provider returning bytes whose v1 infohash != the
+    requested 40-hex CID is rejected (binds fetched bytes to the CID)."""
+    import hashlib
+    from prsm.core.torrent_infohash import compute_v1_infohash_single_file
+    real = b"the authentic content bytes"
+    cid = compute_v1_infohash_single_file(real, hashlib.sha256(real).hexdigest())
+    prov = MagicMock()
+    prov.request_content = AsyncMock(return_value=b"DIFFERENT substituted bytes")
+    up = _uploader(retriever=None, provider=prov)
+    assert _run(up._fetch_content(cid)) is None   # mismatch → rejected
+
+
+def test_fetch_accepts_blob_matching_cid():
+    import hashlib
+    from prsm.core.torrent_infohash import compute_v1_infohash_single_file
+    real = b"the authentic content bytes"
+    cid = compute_v1_infohash_single_file(real, hashlib.sha256(real).hexdigest())
+    prov = MagicMock()
+    prov.request_content = AsyncMock(return_value=real)
+    up = _uploader(retriever=None, provider=prov)
+    assert _run(up._fetch_content(cid)) == real
+
+
+def test_fetched_tier_bc_bundle_is_decrypted(tmp_path):
+    """sp1075 — a fetched Tier-B/C bundle is auto-detected + decrypted to plaintext."""
+    from prsm.storage.content_store import ContentStore
+    from prsm.node.local_content_publisher import LocalContentPublisher
+    from prsm.compute.inference.models import ContentTier
+    import prsm.storage as storage_mod
+
+    store = ContentStore(data_dir=str(tmp_path / "store"), node_id="n")
+    pub = LocalContentPublisher(staging_dir=tmp_path / "staging", content_store=store)
+    data = b"encrypted-then-bundled content " * 100
+    out = _run(pub.publish(data, provenance_id="", tier=ContentTier.B))
+    bundle = out.staged_path.read_bytes()
+
+    prov = MagicMock()
+    prov.request_content = AsyncMock(return_value=bundle)
+    up = _uploader(retriever=None, provider=prov)
+    # _decode_bundle_if_present resolves the store via get_content_store()
+    prev = storage_mod._content_store
+    storage_mod._content_store = store
+    try:
+        got = _run(up._fetch_content(out.torrent_infohash))
+    finally:
+        storage_mod._content_store = prev
+    assert got == data   # decrypted plaintext, not the bundle
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
