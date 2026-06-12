@@ -77,6 +77,15 @@ from prsm.node.identity import NodeIdentity
 logger = logging.getLogger(__name__)
 
 
+def _tier_gate_advisory_enabled() -> bool:
+    """Sprint 702 / 1084 — True iff PRSM_PARALLAX_TIER_GATE=advisory (the live-attest
+    bypass that lets a software runtime serve tier>=standard so the DP-injection path
+    can be exercised without real TEE hardware). Production default + any typo → False."""
+    import os as _os
+    return (_os.environ.get("PRSM_PARALLAX_TIER_GATE", "")
+            .strip().lower() == "advisory")
+
+
 _UNKNOWN_REQUEST_ID = "<unknown>"
 
 # Phase 3.x.7.1 H1 round-1 remediation: hard cap on the assembled
@@ -1854,14 +1863,45 @@ class LayerStageServer:
         # Step 6: privacy-tier gate against the local TEE runtime.
         if request.privacy_tier != PrivacyLevel.NONE:
             tee_type = self._tee_runtime.tee_type
-            if not self._is_hardware_tee(tee_type):
-                return _GateResult(error=(
-                    StageErrorCode.TIER_GATE,
-                    f"privacy_tier={request.privacy_tier.value} requires "
-                    f"hardware TEE; local runtime is {tee_type.value}",
-                ))
+            really_hardware = tee_type.value in HARDWARE_TEE_TYPES
+            if not really_hardware:
+                if _tier_gate_advisory_enabled():
+                    # Sprint 1084 — advisory is bypassing a CONFIDENTIAL request on a
+                    # SOFTWARE runtime, which silently defeats the sp1083 attestation
+                    # gate (confidential Tier B/C work runs with NO real TEE
+                    # confidentiality). advisory is a deliberate live-attest convenience,
+                    # but it must NEVER run silently against confidential work — warn
+                    # loudly (rate-limited per tier), then allow.
+                    self._warn_advisory_confidential_bypass(
+                        request.privacy_tier, tee_type)
+                else:
+                    return _GateResult(error=(
+                        StageErrorCode.TIER_GATE,
+                        f"privacy_tier={request.privacy_tier.value} requires "
+                        f"hardware TEE; local runtime is {tee_type.value}",
+                    ))
 
         return _GateResult(model=model)
+
+    def _warn_advisory_confidential_bypass(self, privacy_tier, tee_type) -> None:
+        """Sprint 1084 — loud, rate-limited (once per tier) warning that advisory mode is
+        defeating the attestation gate for a confidential request. So an operator can
+        never run advisory against real confidential workloads WITHOUT a clear signal."""
+        warned = getattr(self, "_advisory_confidential_warned", None)
+        if warned is None:
+            warned = set()
+            self._advisory_confidential_warned = warned
+        if privacy_tier.value in warned:
+            return
+        warned.add(privacy_tier.value)
+        logger.warning(
+            "SECURITY: PRSM_PARALLAX_TIER_GATE=advisory is BYPASSING the hardware-TEE "
+            "requirement for a CONFIDENTIAL privacy_tier=%s request on a SOFTWARE runtime "
+            "(%s). Confidential Tier B/C work is running WITHOUT real TEE confidentiality "
+            "— the sp1083 attestation gate is DEFEATED. This is for live-attest/testing "
+            "ONLY; UNSET PRSM_PARALLAX_TIER_GATE in production.",
+            privacy_tier.value, tee_type.value,
+        )
 
     def _dispatch_inline_incremental(
         self, request: RunLayerSliceRequest,
@@ -2232,11 +2272,7 @@ class LayerStageServer:
         real TEE hardware. Production posture (default + typo
         fallthrough) is unchanged.
         """
-        import os as _os
-        if (
-            _os.environ.get("PRSM_PARALLAX_TIER_GATE", "")
-            .strip().lower() == "advisory"
-        ):
+        if _tier_gate_advisory_enabled():
             return True
         return tee_type.value in HARDWARE_TEE_TYPES
 

@@ -607,6 +607,47 @@ class TestErrorPaths:
         msg = parse_message(server.handle(encode_message(request)))
         assert isinstance(msg, RunLayerSliceResponse)
 
+    # Sprint 1084 — advisory bypass of a confidential request must be LOUD ---
+
+    def test_advisory_software_confidential_warns_and_allows(
+        self, stage_identity, registry, runner, tee_runtime, anchor,
+        settler_identity, monkeypatch, caplog
+    ):
+        """advisory + SOFTWARE runtime + HIGH privacy: the request is allowed (advisory's
+        purpose) but a loud SECURITY warning fires so it can't run silently."""
+        import logging
+        monkeypatch.setenv("PRSM_PARALLAX_TIER_GATE", "advisory")
+        server = LayerStageServer(
+            identity=stage_identity, registry=registry, runner=runner,
+            tee_runtime=tee_runtime, anchor=anchor, clock=lambda: 1000.0,
+        )
+        request = _make_request(
+            settler_identity=settler_identity, privacy_tier=PrivacyLevel.HIGH)
+        with caplog.at_level(logging.WARNING):
+            msg = parse_message(server.handle(encode_message(request)))
+        assert isinstance(msg, RunLayerSliceResponse)   # allowed, not TIER_GATE
+        assert any("advisory" in r.message.lower() and "SECURITY" in r.message
+                   for r in caplog.records)
+
+    def test_advisory_software_none_privacy_no_warning(
+        self, stage_identity, registry, runner, tee_runtime, anchor,
+        settler_identity, monkeypatch, caplog
+    ):
+        """privacy_tier=NONE is never gated → advisory must not emit the confidential
+        bypass warning for ordinary non-confidential traffic."""
+        import logging
+        monkeypatch.setenv("PRSM_PARALLAX_TIER_GATE", "advisory")
+        server = LayerStageServer(
+            identity=stage_identity, registry=registry, runner=runner,
+            tee_runtime=tee_runtime, anchor=anchor, clock=lambda: 1000.0,
+        )
+        request = _make_request(
+            settler_identity=settler_identity, privacy_tier=PrivacyLevel.NONE)
+        with caplog.at_level(logging.WARNING):
+            server.handle(encode_message(request))
+        assert not any("attestation gate is DEFEATED" in r.message
+                       for r in caplog.records)
+
     # ACTIVATION_INVALID ----------------------------------------------------
 
     def test_activation_size_mismatch(self, server, settler_identity):
