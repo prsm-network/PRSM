@@ -79,7 +79,8 @@ class AMDSEVSNPBackend:
 
     def __init__(self, trusted_root_pem: Optional[bytes] = None,
                  crls_pem: Optional[bytes] = None, tcb_policy=None,
-                 trusted_root_pems: Optional[List[bytes]] = None):
+                 trusted_root_pems: Optional[List[bytes]] = None,
+                 vmpl_policy=None):
         # sp1067 — AMD has per-product ARKs (Milan/Genoa/Turin), so accept a SET of
         # roots; a VCEK chain selects its product's ARK by name. A single
         # trusted_root_pem still works (back-compat). At least one is required.
@@ -101,6 +102,9 @@ class AMDSEVSNPBackend:
         # report whose REPORTED_TCB doesn't bind to its VCEK's issued TCB, or falls
         # below the floor, is rejected. None → no TCB check (signature-chain only).
         self._tcb_policy = tcb_policy
+        # sp1080 — optional VMPL / guest-policy enforcement. When set, a report from a
+        # less-privileged VMPL or a DEBUG-enabled guest is rejected. None → no check.
+        self._vmpl_policy = vmpl_policy
 
     def _select_root(self, chain):
         """Pick the trusted ARK whose subject issued this chain's top cert (the ASK).
@@ -209,9 +213,34 @@ class AMDSEVSNPBackend:
                     vendor="amd-sev-snp", vendor_verified=False, signature_chain_ok=True,
                     structural_parse_ok=True, vendor_data=vendor_data, error=tcb_err)
 
+        # sp1080 — VMPL / guest-policy: reject a less-privileged VMPL or a DEBUG-enabled
+        # (inspectable, non-confidential) guest. Only when the operator set a policy.
+        if self._vmpl_policy is not None:
+            vmpl_err = self._evaluate_vmpl(report, vendor_data)
+            if vmpl_err is not None:
+                return AttestationVerificationResult(
+                    vendor="amd-sev-snp", vendor_verified=False, signature_chain_ok=True,
+                    structural_parse_ok=True, vendor_data=vendor_data, error=vmpl_err)
+
         return AttestationVerificationResult(
             vendor="amd-sev-snp", vendor_verified=True, signature_chain_ok=True,
             structural_parse_ok=True, vendor_data=vendor_data, error=None)
+
+    def _evaluate_vmpl(self, report: bytes, vendor_data: dict):
+        """Return an error message if the report's VMPL/guest-policy violates the
+        configured policy; None if acceptable. Adds vmpl/debug to vendor_data.
+        Fail-closed on any parse error."""
+        from prsm.compute.inference.amd_vmpl import (
+            SnpPolicyError, parse_snp_report_flags, verify_snp_vmpl_policy,
+        )
+        try:
+            flags = parse_snp_report_flags(report)
+            vendor_data["vmpl"] = flags.vmpl
+            vendor_data["debug"] = flags.debug
+            verify_snp_vmpl_policy(flags, self._vmpl_policy)
+        except SnpPolicyError as exc:
+            return f"VMPL/guest-policy check failed (fail-closed): {exc}"
+        return None
 
     def _evaluate_tcb(self, report: bytes, vcek, vendor_data: dict):
         """Return an error message if the report's TCB doesn't bind to the VCEK or
@@ -299,10 +328,21 @@ def build_amd_sev_snp_backend_or_none(env: Optional[dict] = None):
                      "SEV-SNP backend (would skip the TCB enforcement you configured); "
                      "structural fallback (vendor_verified=false)", exc)
         return None
+    # sp1080 — optional VMPL / guest-policy enforcement. Malformed → refuse to build
+    # (same fail-closed reasoning as the TCB policy: silently skipping a policy the
+    # operator asked for would let a debug/less-privileged guest pass).
+    from prsm.compute.inference.amd_vmpl import snp_vmpl_policy_from_env
+    try:
+        vmpl_policy = snp_vmpl_policy_from_env(environ)
+    except ValueError as exc:
+        logger.error("PRSM_AMD_SEV_SNP_VMPL_POLICY config invalid (%s) — REFUSING to "
+                     "build the SEV-SNP backend; structural fallback", exc)
+        return None
     try:
         return AMDSEVSNPBackend(trusted_root_pem=root_bytes,
                                 trusted_root_pems=bundled_arks,
-                                crls_pem=crls_bytes, tcb_policy=tcb_policy)
+                                crls_pem=crls_bytes, tcb_policy=tcb_policy,
+                                vmpl_policy=vmpl_policy)
     except ValueError as exc:
         logger.warning("AMD ARK invalid (%s) — SEV-SNP verification OFF, structural "
                        "fallback", exc)
