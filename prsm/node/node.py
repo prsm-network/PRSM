@@ -4186,6 +4186,7 @@ class PRSMNode:
         # client, wire its balance_of as the pre-flight balance reader; else the
         # pre-flight is skipped (finalizeBatch still enforces funding). Fail-open.
         self._payment_verifier = None
+        self._relayer_verifier = None   # sp1094 — delegated-auth (relayer) verifier
         self._paid_requester_by_job = {}
         try:
             from prsm.settlement.client_wiring import (
@@ -4205,6 +4206,20 @@ class PRSMNode:
                     "Requester-payment verifier wired (provider=%s, "
                     "escrow_preflight=%s).",
                     self._operator_address, _balance_reader is not None,
+                )
+            # sp1094 (relayer brick 4) — also build the relayer (delegated-auth) verifier
+            # under the same gate, sharing the escrow pre-flight reader. A request that
+            # carries a payment_delegation routes here (a gateway signing on a funder's
+            # behalf); a plain payment_authorization stays on the self-signed verifier.
+            from prsm.settlement.client_wiring import build_relayer_verifier_or_none
+            self._relayer_verifier = build_relayer_verifier_or_none(
+                provider_address=self._operator_address,
+                balance_reader=_balance_reader,
+            )
+            if self._relayer_verifier is not None:
+                logger.info(
+                    "Relayer (delegated-auth) payment verifier wired (provider=%s).",
+                    self._operator_address,
                 )
         except Exception as _pay_exc:  # noqa: BLE001
             logger.warning(

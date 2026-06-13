@@ -721,13 +721,16 @@ async def _resolve_paid_requester_or_402(
     the only cost of a retry is the requester re-signing with a fresh nonce (a free
     local op). Clients must therefore sign a new authorization per attempt."""
     payment_authorization = body.get("payment_authorization")
-    if payment_authorization is None:
+    payment_delegation = body.get("payment_delegation")   # sp1094 — relayer path
+    if payment_authorization is None and payment_delegation is None:
         return None
     from decimal import Decimal as _D
     from prsm.settlement.payment_authorization import (
         canonical_request_hash, inference_request_fields,
     )
-    from prsm.settlement.client_wiring import resolve_paid_requester
+    from prsm.settlement.client_wiring import (
+        resolve_paid_requester, resolve_relayer_requester,
+    )
     from prsm.settlement.payment_authorization_verifier import AuthorizationRejected
     request_hash = canonical_request_hash(inference_request_fields(
         model_id=body.get("model_id", ""),
@@ -738,12 +741,24 @@ async def _resolve_paid_requester_or_402(
     ))
     quoted_price_wei = int(_D(str(budget_ftns)) * (_D(10) ** 18))
     try:
-        requester = await resolve_paid_requester(
-            verifier=getattr(node, "_payment_verifier", None),
-            payment_authorization=payment_authorization,
-            request_hash=request_hash,
-            quoted_price_wei=quoted_price_wei,
-        )
+        if payment_delegation is not None:
+            # sp1094 — a gateway/relayer signed the per-request auth on a funder's
+            # behalf; verify the funder's delegation + the relayer auth as one chain and
+            # settle from the FUNDER's escrow. The returned address is the funder.
+            requester = await resolve_relayer_requester(
+                verifier=getattr(node, "_relayer_verifier", None),
+                payment_authorization=payment_authorization,
+                payment_delegation=payment_delegation,
+                request_hash=request_hash,
+                quoted_price_wei=quoted_price_wei,
+            )
+        else:
+            requester = await resolve_paid_requester(
+                verifier=getattr(node, "_payment_verifier", None),
+                payment_authorization=payment_authorization,
+                request_hash=request_hash,
+                quoted_price_wei=quoted_price_wei,
+            )
     except AuthorizationRejected as exc:
         raise HTTPException(
             status_code=402,

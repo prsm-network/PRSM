@@ -302,6 +302,104 @@ async def resolve_paid_requester(
     )
 
 
+async def resolve_relayer_requester(
+    *,
+    verifier: Optional[Any],
+    payment_authorization: Optional[dict],
+    payment_delegation: Optional[dict],
+    request_hash: Any,
+    quoted_price_wei: int,
+) -> Optional[str]:
+    """Sprint 1094 (relayer brick 4) — turn a relayer-signed PaymentAuthorization plus
+    the funder's PaymentDelegation from the inference body into the authenticated FUNDING
+    requester eth address (whose escrow pays). Fail-CLOSED, mirroring
+    ``resolve_paid_requester``:
+      - no ``payment_delegation`` → return None (caller falls back to the self-signed path).
+      - delegation present but ``verifier`` None → AuthorizationRejected('verifier-not-wired').
+      - either part malformed → 'malformed-authorization' / 'malformed-delegation'.
+      - else → ``verifier.verify`` returns the funder, or raises AuthorizationRejected.
+    """
+    from prsm.settlement.payment_authorization_verifier import AuthorizationRejected
+
+    if payment_delegation is None:
+        return None
+    if verifier is None:
+        raise AuthorizationRejected(
+            "verifier-not-wired",
+            "a payment_delegation was supplied but the relayer payment verifier is "
+            "not enabled on this node")
+    if not isinstance(payment_authorization, dict):
+        raise AuthorizationRejected("malformed-authorization", "not an object")
+    if not isinstance(payment_delegation, dict):
+        raise AuthorizationRejected("malformed-delegation", "not an object")
+    auth_payload = payment_authorization.get("payload")
+    auth_sig = payment_authorization.get("signature")
+    deleg_payload = payment_delegation.get("payload")
+    deleg_sig = payment_delegation.get("signature")
+    if not isinstance(auth_payload, dict) or not auth_sig:
+        raise AuthorizationRejected(
+            "malformed-authorization", "expected {payload: {...}, signature: '0x..'}")
+    if not isinstance(deleg_payload, dict) or not deleg_sig:
+        raise AuthorizationRejected(
+            "malformed-delegation", "expected {payload: {...}, signature: '0x..'}")
+    return await verifier.verify(
+        auth_payload, auth_sig, deleg_payload, deleg_sig,
+        request_hash=request_hash, quoted_price_wei=quoted_price_wei)
+
+
+def build_relayer_verifier_or_none(
+    environ=None, *, provider_address: Optional[str] = None,
+    balance_reader: Optional[Any] = None,
+) -> Optional[Any]:
+    """Sprint 1094 (relayer brick 4) — build a RelayerAuthorizationVerifier for the node,
+    or None. Same gate as the self-signed verifier (``PRSM_REQUESTER_PAYMENT`` truthy +
+    a known ``provider_address``) — the relayer path is part of requester-payment. Uses
+    durable nonce + budget stores (``PRSM_RELAYER_NONCE_FILE`` /
+    ``PRSM_DELEGATION_BUDGET_FILE``, default under ~/.prsm; ``:memory:`` → in-memory) so a
+    restart can't reopen a replay window or already-spent delegation budget. Fail-open:
+    any error returns None + logs."""
+    import os as _os
+    from pathlib import Path
+
+    environ = _os.environ if environ is None else environ
+    try:
+        flag = str(environ.get("PRSM_REQUESTER_PAYMENT", "")).strip().lower()
+        if flag not in ("1", "true", "yes", "on"):
+            return None
+        if not provider_address:
+            logger.warning(
+                "PRSM_REQUESTER_PAYMENT set but no provider_address resolved; "
+                "relayer payment verification stays OFF")
+            return None
+        from prsm.settlement.payment_authorization_verifier import (
+            DurableNonceStore, InMemoryNonceStore, RelayerAuthorizationVerifier,
+        )
+        from prsm.settlement.delegation_budget import (
+            DurableDelegationBudgetStore, InMemoryDelegationBudgetStore,
+        )
+        nonce_file = str(environ.get("PRSM_RELAYER_NONCE_FILE", "")).strip()
+        if nonce_file == ":memory:":
+            nonce_store: Any = InMemoryNonceStore()
+        else:
+            nonce_store = DurableNonceStore(
+                nonce_file or str(Path.home() / ".prsm" / "relayer_nonces.json"))
+        budget_file = str(environ.get("PRSM_DELEGATION_BUDGET_FILE", "")).strip()
+        if budget_file == ":memory:":
+            budget_store: Any = InMemoryDelegationBudgetStore()
+        else:
+            budget_store = DurableDelegationBudgetStore(
+                budget_file or str(Path.home() / ".prsm" / "delegation_budgets.json"))
+        return RelayerAuthorizationVerifier(
+            provider_address=provider_address,
+            nonce_store=nonce_store, budget_store=budget_store,
+            balance_reader=balance_reader)
+    except Exception as exc:  # noqa: BLE001 - never crash startup over this
+        logger.warning(
+            "relayer payment verifier build failed (staying OFF): %s: %s",
+            type(exc).__name__, exc)
+        return None
+
+
 def build_payment_verifier_or_none(
     environ=None, *, provider_address: Optional[str] = None,
     balance_reader: Optional[Any] = None,
