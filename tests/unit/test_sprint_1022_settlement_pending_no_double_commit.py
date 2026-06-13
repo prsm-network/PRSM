@@ -34,8 +34,8 @@ from prsm.settlement.accumulator import (
 )
 from prsm.settlement.client import BatchSettlementClient
 from prsm.economy.web3.provenance_registry import (
-    BroadcastFailedError,
     OnChainPendingError,
+    OnChainRevertedError,
 )
 
 ONE_FTNS = 10 ** 18
@@ -96,17 +96,21 @@ def test_pending_commit_quarantined_not_retried():
 
 
 def test_safe_to_retry_errors_still_retained_and_retried():
+    # sp1052 reclassified BroadcastFailedError as quarantine-not-retry (a dropped RPC
+    # response may mean the tx LANDED → blind retry would double-commit). The genuinely
+    # safe-to-retry class is now OnChainRevertedError: the tx MINED and atomically
+    # reverted, so NOTHING was committed → receipts stay in the accumulator for retry.
     calls = {"n": 0}
 
-    async def commit_broadcast_fail(**kw):
+    async def commit_reverted(**kw):
         calls["n"] += 1
-        raise BroadcastFailedError("network down")  # no tx_hash → safe to retry
+        raise OnChainRevertedError("execution reverted")  # mined+reverted → safe to retry
 
-    acc, contract, client = _client(commit_broadcast_fail)
+    acc, contract, client = _client(commit_reverted)
     _run(client.accumulate(_make_batched(0)))
 
     _run(client.commit_ready_batches())
-    assert acc.total_receipt_count() == 1  # retained (chain saw nothing)
+    assert acc.total_receipt_count() == 1  # retained (the revert rolled back atomically)
     assert client.pending_commits() == []  # not quarantined
 
     _run(client.commit_ready_batches())  # retries
