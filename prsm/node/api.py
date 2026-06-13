@@ -16156,6 +16156,27 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             subsystems["settlement"] = {
                 "available": False, "status": "error", "error": str(exc)}
 
+        # Sprint 1090 — attestation-collateral auto-refresh status (sp1081-1089): per
+        # cached item present? fresh (within nextUpdate)? age? — so an operator can SEE
+        # that revocation + TCB-recency enforcement is being kept current. Opt-out/off
+        # is 'not_wired' (per the sprint-147 convention); never in the core aggregate.
+        try:
+            from prsm.compute.inference.collateral_refresh import (
+                collateral_refresh_status)
+            _collat = collateral_refresh_status()
+            _items = _collat.get("items") or {}
+            _stale = [k for k, v in _items.items() if v.get("fresh") is False]
+            subsystems["attestation_collateral"] = {
+                "available": bool(_collat.get("enabled")),
+                "status": ("degraded" if _stale else
+                           "ok" if _collat.get("enabled") else "not_wired"),
+                "stale_items": _stale,
+                **_collat,
+            }
+        except Exception as exc:  # noqa: BLE001
+            subsystems["attestation_collateral"] = {
+                "available": False, "status": "error", "error": str(exc)}
+
         # Aggregate status.
         # Sprint 147 — `not_wired` / `disabled` is operator opt-out,
         # not a degradation. Only count an optional subsystem as

@@ -639,3 +639,86 @@ class CollateralRefresher:
         ok = sum(1 for r in results.values() if r.ok)
         logger.info("collateral refresh complete: %d/%d items updated", ok, len(results))
         return results
+
+
+# ── observability (sp1090) ───────────────────────────────────────────────────────
+
+def _crl_next_update(blob: bytes):
+    crl = _load_crl_any(blob)
+    if crl is None:
+        return None
+    try:
+        return crl.next_update_utc
+    except AttributeError:  # pragma: no cover - cryptography < 42
+        nu = crl.next_update
+        return nu.replace(tzinfo=_dt.timezone.utc) if nu is not None else None
+
+
+def _json_next_update(blob: bytes, top_key: str):
+    """Read <top_key>.nextUpdate from a cached signed-collateral envelope (display-only
+    freshness of an already-verified cached file; no re-verification needed here)."""
+    import json as _json
+    try:
+        obj = _json.loads(blob).get(top_key) or {}
+        ts = obj.get("nextUpdate")
+        if not isinstance(ts, str):
+            return None
+        return _dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def collateral_refresh_status(environ=None, *, now: Optional[_dt.datetime] = None) -> dict:
+    """Sprint 1090 — operator-facing status of the auto-refreshed attestation collateral
+    (for /health/detailed). Reports, per cached item: present? fresh (now within its
+    nextUpdate)? age (file mtime)? + the resolved nextUpdate. Never raises (a health
+    endpoint must not crash on a corrupt cache file → fresh=None = unknown)."""
+    if now is None:
+        now = _dt.datetime.now(_dt.timezone.utc)
+    environ = environ if environ is not None else os.environ
+    enabled = str(environ.get("PRSM_COLLATERAL_AUTO_REFRESH", "")).strip().lower() in (
+        "1", "true", "yes", "on")
+    cache = collateral_cache_dir(environ)
+    out: dict = {"enabled": enabled,
+                 "cache_dir": str(cache) if cache is not None else None,
+                 "items": {}}
+    if cache is None:
+        return out
+
+    # (status-key, filename, freshness-extractor) for every refreshable item.
+    specs = [
+        ("intel_pck_platform_crl", INTEL_PCK_PLATFORM_CRL_FILE, _crl_next_update),
+        ("intel_pck_processor_crl", INTEL_PCK_PROCESSOR_CRL_FILE, _crl_next_update),
+        ("intel_qe_identity", INTEL_QE_IDENTITY_FILE,
+         lambda b: _json_next_update(b, "enclaveIdentity")),
+    ]
+    fmspc = _configured_fmspc(environ)
+    if fmspc:
+        specs.append((f"intel_tcb_info_{fmspc}", intel_tcb_info_cache_file(fmspc),
+                      lambda b: _json_next_update(b, "tcbInfo")))
+    for product in _AMD_PRODUCTS:
+        specs.append((f"amd_{product}_crl", amd_crl_cache_file(product), _crl_next_update))
+
+    for key, filename, next_update_of in specs:
+        path = cache / filename
+        try:
+            blob = path.read_bytes()
+        except OSError:
+            continue   # absent items are simply omitted (not "present: False" noise)
+        try:
+            age = max(0, int(now.timestamp() - path.stat().st_mtime))
+        except OSError:
+            age = None
+        nu = None
+        try:
+            nu = next_update_of(blob)
+        except Exception:  # noqa: BLE001
+            nu = None
+        fresh = (now <= nu) if nu is not None else None
+        out["items"][key] = {
+            "present": True,
+            "fresh": fresh,
+            "age_seconds": age,
+            "next_update": nu.isoformat() if nu is not None else None,
+        }
+    return out
