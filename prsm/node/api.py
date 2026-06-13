@@ -354,6 +354,8 @@ async def _settle_streaming_escrow(
                         "Sprint 1037 on-chain settlement accumulate "
                         "(stream job=%s): %s", job_id, _acc,
                     )
+                # sp1095 — capture: release the unused delegation-budget remainder.
+                await _capture_relayer_budget(node, _paid, decision.release_to_operator)
             except Exception as _acc_exc:  # noqa: BLE001
                 logger.debug(
                     "Sprint 1037 accumulate hook error: %s", _acc_exc,
@@ -773,7 +775,17 @@ async def _resolve_paid_requester_or_402(
         max_spend_wei = int(payment_authorization["payload"]["max_spend_wei"])
     except (KeyError, TypeError, ValueError):
         max_spend_wei = None
-    return {"requester": requester, "max_spend_wei": max_spend_wei}
+    info = {"requester": requester, "max_spend_wei": max_spend_wei}
+    # sp1095 — for a relayer job the verifier reserved the per-request ceiling
+    # (max_spend_wei) against the funder's delegation budget; carry the delegation_nonce
+    # + reserved amount so the settle site can CAPTURE (release the unused remainder).
+    if payment_delegation is not None:
+        try:
+            info["delegation_nonce"] = payment_delegation["payload"]["delegation_nonce"]
+            info["reserved_wei"] = max_spend_wei
+        except (KeyError, TypeError):
+            pass
+    return info
 
 
 def _record_paid_requester(node: Any, job_id: str, info: Dict[str, Any]) -> None:
@@ -801,6 +813,31 @@ def _take_paid_requester(node: Any, job_id: str) -> Optional[Dict[str, Any]]:
     if not isinstance(table, dict):
         return None
     return table.pop(job_id, None)
+
+
+async def _capture_relayer_budget(
+    node: Any, paid_info: Optional[Dict[str, Any]], settled_ftns: Any,
+) -> None:
+    """Sprint 1095 — auth-and-capture for a relayer job: the verifier RESERVED the
+    per-request ceiling against the funder's delegation budget at ingress; after the
+    actual (<= ceiling) settle, release the unused remainder so a cheaper-than-ceiling
+    request doesn't permanently consume the funder's cap. No-op for self-pay /
+    self-signed jobs (no delegation_nonce). Fail-open — a capture error must never break
+    the settle path."""
+    try:
+        if not paid_info or not paid_info.get("delegation_nonce"):
+            return
+        verifier = getattr(node, "_relayer_verifier", None)
+        if verifier is None:
+            return
+        reserved = int(paid_info.get("reserved_wei") or 0)
+        from decimal import Decimal as _D
+        settled_wei = int(_D(str(settled_ftns or 0)) * (_D(10) ** 18))
+        remainder = reserved - settled_wei
+        if remainder > 0:
+            await verifier.release_reservation(paid_info["delegation_nonce"], remainder)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("relayer budget capture skipped (non-fatal): %s", exc)
 
 
 def register_parallax_streams_endpoint(app: Any, node: Any) -> None:
@@ -8342,6 +8379,9 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                                     "Sprint 1037 on-chain settlement "
                                     "accumulate (job=%s): %s", job_id, _acc,
                                 )
+                            # sp1095 — capture the unused delegation-budget remainder.
+                            await _capture_relayer_budget(
+                                node, _paid, decision.release_to_operator)
                         except Exception as _acc_exc:  # noqa: BLE001
                             logger.debug(
                                 "Sprint 1037 accumulate hook error: %s",

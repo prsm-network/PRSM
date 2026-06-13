@@ -181,5 +181,26 @@ def test_concurrent_same_nonce_only_one_succeeds():
     assert len(successes) == 1 and len(rejects) == 1   # exactly one served, one replayed
 
 
+def test_release_reservation_frees_budget_for_next_request():
+    """sp1095 — capture: releasing a reservation's unused remainder lets the freed
+    budget serve a later request that would otherwise exceed the delegation cap."""
+    v = _verifier()
+    d = _delegation(max_total=10**16)
+    a1 = _auth(max_spend=10**16, job_nonce="0x" + "01" * 32)   # reserves the full cap
+    asig1, dsig = _signed(a1, d)
+    _run(v.verify(a1, asig1, d, dsig, request_hash=a1["request_hash"], quoted_price_wei=10**16))
+    # budget now fully consumed → a second request (ceiling 5·10^15) is rejected
+    a2 = _auth(max_spend=5 * 10**15, job_nonce="0x" + "02" * 32)
+    asig2, _ = _signed(a2, d)
+    with pytest.raises(AuthorizationRejected):
+        _run(v.verify(a2, asig2, d, dsig, request_hash=a2["request_hash"], quoted_price_wei=5 * 10**15))
+    # the first job actually settled cheap (10^15) → release the 0.9·10^16 remainder
+    _run(v.release_reservation(d["delegation_nonce"], 10**16 - 10**15))
+    # consumed is now 10^15; the second request (5·10^15) fits in the freed budget
+    funder = _run(v.verify(a2, asig2, d, dsig,
+                           request_hash=a2["request_hash"], quoted_price_wei=5 * 10**15))
+    assert funder.lower() == _FUNDER.address.lower()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

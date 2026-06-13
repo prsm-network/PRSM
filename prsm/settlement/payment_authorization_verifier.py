@@ -349,3 +349,18 @@ class RelayerAuthorizationVerifier:
         # All checks passed + budget reserved — consume the nonce, return the funder.
         self._nonce_store.remember(nonce)
         return funder
+
+    async def release_reservation(self, delegation_nonce: str, amount_wei: int) -> None:
+        """Sprint 1095 — return ``amount_wei`` of a previously-reserved delegation budget:
+        the unused remainder after a cheaper-than-ceiling settle (capture), or the full
+        per-request hold when a job was admitted but never settled (failure/eviction).
+        Serialized by the same lock as verify() so a release can't interleave with a
+        concurrent reserve. Fail-open (a release error must never break the caller)."""
+        import asyncio
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            try:
+                self._budget_store.release(str(delegation_nonce), int(amount_wei))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("delegation budget release failed (non-fatal): %s", exc)

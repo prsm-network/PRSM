@@ -71,6 +71,27 @@ def test_durable_survives_restart(tmp_path):
     assert s2.reserve(_NONCE, 4 * 10**17, _CAP) is True
 
 
+def test_release_returns_budget_and_floors_at_zero():
+    # sp1095 — auth-and-capture: release the unused remainder (or a full hold on failure).
+    s = InMemoryDelegationBudgetStore()
+    assert s.reserve(_NONCE, _CAP, _CAP) is True       # fully reserved
+    s.release(_NONCE, 4 * 10**17)                        # release 0.4
+    assert s.consumed(_NONCE) == 6 * 10**17
+    assert s.reserve(_NONCE, 3 * 10**17, _CAP) is True   # the released budget is reusable
+    # over-release floors at 0 (never negative)
+    s.release(_NONCE, 10**24)
+    assert s.consumed(_NONCE) == 0
+
+
+def test_durable_release_persists(tmp_path):
+    path = tmp_path / "budget.json"
+    s1 = DurableDelegationBudgetStore(path)
+    s1.reserve(_NONCE, _CAP, _CAP)
+    s1.release(_NONCE, 7 * 10**17)
+    s2 = DurableDelegationBudgetStore(path)
+    assert s2.consumed(_NONCE) == 3 * 10**17   # release survived the restart
+
+
 def test_durable_corrupt_file_refuses_to_start_empty(tmp_path):
     path = tmp_path / "budget.json"
     path.write_text("{ this is not valid json")

@@ -55,6 +55,16 @@ class InMemoryDelegationBudgetStore:
         self._consumed[k] = new_total
         return True
 
+    def release(self, nonce: str, amount: int) -> None:
+        """sp1095 — return ``amount`` of previously-reserved budget (the unused remainder
+        after a cheaper-than-ceiling settle, or a full hold whose job never settled).
+        Floors at 0 so an over-release can never make budget go negative."""
+        amount = int(amount)
+        if amount <= 0:
+            return
+        k = _key(nonce)
+        self._consumed[k] = max(0, self._consumed.get(k, 0) - amount)
+
 
 class DurableDelegationBudgetStore:
     """Atomic-JSON-backed consumed-budget map so a restart can't reopen budget the funder
@@ -86,8 +96,21 @@ class DurableDelegationBudgetStore:
         self._consumed[k] = new_total
         # Persist BEFORE returning True so a crash can't lose a reservation we then act
         # on (the no-overspend invariant must survive a restart).
+        self._persist()
+        return True
+
+    def release(self, nonce: str, amount: int) -> None:
+        """sp1095 — durably return ``amount`` of reserved budget (unused remainder or a
+        non-settled hold). Floors at 0. Persists so the reclaim survives a restart."""
+        amount = int(amount)
+        if amount <= 0:
+            return
+        k = _key(nonce)
+        self._consumed[k] = max(0, self._consumed.get(k, 0) - amount)
+        self._persist()
+
+    def _persist(self) -> None:
         self._store.save({
             "version": 1,
             "consumed": {kk: str(vv) for kk, vv in sorted(self._consumed.items())},
         })
-        return True
