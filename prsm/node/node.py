@@ -5704,7 +5704,11 @@ class PRSMNode:
                         _signer_bytes = _f.read()
                 except OSError:
                     _signer_bytes = None
-        refresher = CollateralRefresher(cache, tcb_signer_pem=_signer_bytes)
+        # sp1089 — pass the platform FMSPC (if configured) so the per-FMSPC TCB-Info is
+        # refreshed alongside the CRLs + QE-Identity.
+        _fmspc = (_os.environ.get("PRSM_INTEL_SGX_FMSPC", "") or "").strip() or None
+        refresher = CollateralRefresher(cache, tcb_signer_pem=_signer_bytes,
+                                        intel_fmspc=_fmspc)
         while True:
             try:
                 results = await refresher.refresh_all()

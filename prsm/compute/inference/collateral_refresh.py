@@ -38,12 +38,30 @@ FetchWithHeaders = Callable[[str], Awaitable[Tuple[bytes, Mapping[str, str]]]]
 INTEL_PCS_BASE = "https://api.trustedservices.intel.com/sgx/certification/v4"
 _INTEL_PCK_CRL_ISSUER_HEADER = "SGX-PCK-CRL-Issuer-Chain"
 _INTEL_QE_ISSUER_HEADER = "SGX-Enclave-Identity-Issuer-Chain"
+_INTEL_TCB_INFO_ISSUER_HEADER = "TCB-Info-Issuer-Chain"
 
 # Cached-collateral file names (shared by the refresher [writer] and the DCAP backend
 # build [reader] so they agree on the layout under the collateral cache dir).
 INTEL_PCK_PLATFORM_CRL_FILE = "intel_pck_platform.crl.pem"
 INTEL_PCK_PROCESSOR_CRL_FILE = "intel_pck_processor.crl.pem"
 INTEL_QE_IDENTITY_FILE = "intel_qe_identity.json"
+
+
+def intel_tcb_info_cache_file(fmspc: str) -> str:
+    return f"intel_tcb_{fmspc.lower()}.json"
+
+
+def _is_valid_fmspc(fmspc: str) -> bool:
+    """An Intel FMSPC is exactly 6 bytes = 12 hex chars. Validating it before it reaches
+    a URL / cache filename removes any path/query metacharacter surface (review #4)."""
+    return (isinstance(fmspc, str) and len(fmspc) == 12
+            and all(c in "0123456789abcdef" for c in fmspc))
+
+
+def _configured_fmspc(environ=None) -> Optional[str]:
+    environ = environ if environ is not None else os.environ
+    raw = (environ.get("PRSM_INTEL_SGX_FMSPC", "") or "").strip().lower()
+    return raw if _is_valid_fmspc(raw) else None
 
 # AMD KDS (kdsintf.amd.com) — public per-product VCEK CRL + cert_chain (no platform
 # secret needed). KDS uses Capitalized product names in the URL path.
@@ -119,6 +137,20 @@ def read_cached_intel_qe_identity(environ=None) -> Optional[bytes]:
         return None
     try:
         return (cache / INTEL_QE_IDENTITY_FILE).read_bytes()
+    except OSError:
+        return None
+
+
+def read_cached_intel_tcb_info(environ=None) -> Optional[bytes]:
+    """The cached per-FMSPC Intel TCB-Info JSON for the configured PRSM_INTEL_SGX_FMSPC,
+    or None (no fmspc configured / no cache dir / not refreshed yet). Usable by the
+    backend only when the TCB Signing cert is also configured (its signer)."""
+    cache = collateral_cache_dir(environ)
+    fmspc = _configured_fmspc(environ)
+    if cache is None or not fmspc:
+        return None
+    try:
+        return (cache / intel_tcb_info_cache_file(fmspc)).read_bytes()
     except OSError:
         return None
 
@@ -201,13 +233,55 @@ def crl_is_valid_and_current(pem: bytes, issuer_cert: x509.Certificate,
 
 def tcb_info_is_valid(json_bytes: bytes, signer_cert: x509.Certificate) -> bool:
     """True iff the signed Intel TCB-Info verifies against ``signer_cert`` (reuses the
-    sp1062 verifier). Total — never raises."""
+    sp1062 verifier). Total — never raises. (Signature only; see
+    ``tcb_info_is_valid_and_current`` for the freshness-gated form.)"""
     try:
         from prsm.compute.inference.sgx_tcb import parse_and_verify_tcb_info
         parse_and_verify_tcb_info(json_bytes, signer_cert)
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+def _tcb_info_is_current(json_bytes: bytes, now: _dt.datetime) -> bool:
+    """sp1089 — freshness gate for a signed TCB-Info: parse issueDate / nextUpdate from
+    the VERIFIED tcbInfo bytes (not the raw blob — a raw decoy could carry an unsigned
+    duplicate) and require now within [issueDate, nextUpdate]. A correctly-signed-but-
+    stale TCB-Info must be rejected so the sp1061-1063 recency check can't keep passing a
+    TEE Intel has since marked OutOfDate. Absent nextUpdate → fail (we promise freshness)."""
+    import json as _json
+    from prsm.compute.inference.sgx_tcb import _extract_tcb_info_bytes
+    try:
+        body = _json.loads(_extract_tcb_info_bytes(json_bytes))
+    except Exception:  # noqa: BLE001
+        return False
+
+    def _parse(ts):
+        if not isinstance(ts, str):
+            return None
+        try:
+            return _dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    issue = _parse(body.get("issueDate"))
+    nxt = _parse(body.get("nextUpdate"))
+    if nxt is None:
+        return False
+    if issue is not None and now < issue:
+        return False
+    return now <= nxt
+
+
+def tcb_info_is_valid_and_current(json_bytes: bytes, signer_cert: x509.Certificate,
+                                  now: Optional[_dt.datetime] = None) -> bool:
+    """True iff the signed Intel TCB-Info verifies against ``signer_cert`` AND is within
+    its [issueDate, nextUpdate] freshness window (sp1089)."""
+    if now is None:
+        now = _dt.datetime.now(_dt.timezone.utc)
+    if not tcb_info_is_valid(json_bytes, signer_cert):
+        return False
+    return _tcb_info_is_current(json_bytes, now)
 
 
 def _qe_identity_is_current(json_bytes: bytes, now: _dt.datetime) -> bool:
@@ -353,9 +427,8 @@ class CollateralRefresher:
     intermediate, RSA-PSS, DER), so it needs a KDS cert_chain fetch + the bundled ARK,
     a heavier path than the Intel issuer-chain-in-header model used here.
 
-    TCB-Info is intentionally NOT auto-refreshed here: it is per-FMSPC (platform
-    specific), so refreshing it needs the node's own PCK cert FMSPC — left to operator
-    config / a future platform-aware refresh.
+    TCB-Info (sp1089) IS refreshed per-FMSPC when the operator configures the platform
+    FMSPC (``intel_fmspc`` / PRSM_INTEL_SGX_FMSPC); absent → skipped (it's platform-specific).
     """
 
     def __init__(self, cache_dir, *, fetch: Optional[FetchWithHeaders] = None,
@@ -363,8 +436,12 @@ class CollateralRefresher:
                  intel_pcs_base: str = INTEL_PCS_BASE,
                  tcb_signer_pem: Optional[bytes] = None,
                  amd_ark_pems: Optional[dict] = None,
-                 amd_kds_base: str = AMD_KDS_BASE):
+                 amd_kds_base: str = AMD_KDS_BASE,
+                 intel_fmspc: Optional[str] = None):
         self.cache_dir = Path(cache_dir)
+        # sp1089 — the platform FMSPC (12-hex) whose TCB-Info to refresh; None disables
+        # TCB-Info refresh (it's per-platform, so the operator supplies it).
+        self._intel_fmspc = (intel_fmspc or "").strip().lower() or None
         self._fetch = fetch or httpx_fetch_with_headers
         self._intel_root_pem = intel_root_pem
         self._now_fn = now_fn or (lambda: _dt.datetime.now(_dt.timezone.utc))
@@ -450,6 +527,37 @@ class CollateralRefresher:
             url=url, header_name=_INTEL_QE_ISSUER_HEADER,
             cache_name="intel_qe_identity.json", validate_under_leaf=_validate)
 
+    def _tcb_signer_or_leaf(self, leaf):
+        """The operator-pinned TCB Signing cert when configured (matches the verify
+        path), else the header-chain leaf. None signals a bad configured signer."""
+        if not self._tcb_signer_pem:
+            return leaf
+        try:
+            return x509.load_pem_x509_certificate(self._tcb_signer_pem)
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def refresh_intel_tcb_info(self, fmspc: str) -> RefreshResult:
+        """sp1089 — refresh the per-FMSPC Intel TCB-Info. Validated like the QE-Identity:
+        issuer chain (TCB-Info-Issuer-Chain header) to the bundled Intel root, then the
+        signed TCB-Info under the configured TCB signer (or the header leaf) + its
+        [issueDate, nextUpdate] freshness window — so a stale TCB-Info can't keep the
+        recency check (sp1061-1063) passing a now-OutOfDate TEE."""
+        fmspc = (fmspc or "").strip().lower()
+        if not _is_valid_fmspc(fmspc):
+            return RefreshResult(ok=False, cached=False, reason="invalid-fmspc")
+        url = f"{self._intel_pcs_base}/tcb?fmspc={fmspc}"
+
+        def _validate(data, leaf):
+            signer = self._tcb_signer_or_leaf(leaf)
+            if signer is None:
+                return False
+            return tcb_info_is_valid_and_current(data, signer, self._now_fn())
+
+        return await self._refresh_chain_validated(
+            url=url, header_name=_INTEL_TCB_INFO_ISSUER_HEADER,
+            cache_name=intel_tcb_info_cache_file(fmspc), validate_under_leaf=_validate)
+
     def _amd_arks(self) -> dict:
         if self._amd_ark_pems is not None:
             return self._amd_ark_pems
@@ -515,6 +623,10 @@ class CollateralRefresher:
         for ca in ("platform", "processor"):
             results[f"intel_pck_{ca}_crl"] = await self.refresh_intel_pck_crl(ca)
         results["intel_qe_identity"] = await self.refresh_intel_qe_identity()
+        # sp1089 — per-FMSPC TCB-Info, only when the operator configured the platform fmspc.
+        if self._intel_fmspc:
+            results[f"intel_tcb_info_{self._intel_fmspc}"] = \
+                await self.refresh_intel_tcb_info(self._intel_fmspc)
         # AMD VCEK CRLs — only products whose ARK is available (skip the rest quietly).
         try:
             available = self._amd_arks()

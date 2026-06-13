@@ -397,6 +397,29 @@ def build_intel_dcap_backend_or_none(env: Optional[dict] = None):
                          "PRSM_INTEL_SGX_TCB_INFO_FILE", "Intel SGX TCB-Info")
     tcb_signer = _read_cfg("PRSM_INTEL_SGX_TCB_SIGNING_PEM",
                            "PRSM_INTEL_SGX_TCB_SIGNING_FILE", "Intel SGX TCB Signing cert")
+    if not tcb_info:
+        # sp1089 — fall back to the auto-refreshed per-FMSPC TCB-Info cache (kept current
+        # by the CollateralRefresher) so a configured-but-stale TCB-Info doesn't keep the
+        # recency check passing a now-OutOfDate TEE. Usable only with the TCB signer.
+        try:
+            from prsm.compute.inference.collateral_refresh import (
+                read_cached_intel_tcb_info, _tcb_info_is_current)
+            cached_tcb = read_cached_intel_tcb_info(environ)
+            if cached_tcb:
+                tcb_info = cached_tcb
+                # sp1089 review 3b — still use a stale cached TCB-Info (enforcing against
+                # an old baseline still catches everything that baseline marked OutOfDate,
+                # strictly better than no recency check), but LOG it so an operator whose
+                # auto-refresh loop has silently died sees the staleness.
+                import datetime as _dt
+                if not _tcb_info_is_current(cached_tcb, _dt.datetime.now(_dt.timezone.utc)):
+                    logger.warning("Cached Intel TCB-Info is STALE (past nextUpdate) — "
+                                   "enforcing recency against an old baseline; is the "
+                                   "collateral auto-refresh loop running?")
+                else:
+                    logger.info("Using auto-refreshed Intel TCB-Info cache for recency")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("no refreshed Intel TCB-Info cache: %s", exc)
     if bool(tcb_info) != bool(tcb_signer):
         logger.warning("Intel SGX TCB enforcement needs BOTH the TCB-Info and the "
                        "TCB Signing cert — only one configured; TCB checking OFF")
