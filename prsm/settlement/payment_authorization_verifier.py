@@ -207,3 +207,145 @@ class PaymentAuthorizationVerifier:
         # All checks passed — consume the nonce + return the authenticated address.
         self._nonce_store.remember(nonce)
         return recovered
+
+
+class RelayerAuthorizationVerifier:
+    """Sprint 1093 — fail-closed verifier for the RELAYER delegated-auth path (brick 3).
+
+    Combines the sp1091 two-signature chain verifier (a funder's PaymentDelegation + a
+    relayer-signed per-request PaymentAuthorization) with the stateful guards: the sp1055
+    job-nonce anti-replay, the sp1092 cumulative delegation budget, and the optional
+    on-chain escrow pre-flight. Returns the authenticated FUNDING requester (whose escrow
+    settleFromRequester draws from) on success; raises ``AuthorizationRejected`` otherwise.
+
+    Mirrors ``PaymentAuthorizationVerifier`` cheap-to-costly ordering + consume-on-success:
+    the nonce + budget are committed ONLY after every check passes, so a rejected request
+    burns neither. verify() is serialized by an internal lock so concurrent same-nonce
+    requests can't both pass the seen()->remember() window.
+
+    Residual (deferred, sp1092): the budget reservation is durable but NOT released — a
+    caller crash AFTER verify() returns but BEFORE the work settles permanently consumes
+    the funder's cap for that request (a liveness/fairness cost, not fund-loss; the funder
+    can sign a fresh delegation). A reserve-keyed-by-job_nonce release/reconcile on
+    settle-failure is the additive refinement.
+    """
+
+    def __init__(
+        self,
+        *,
+        provider_address: str,
+        nonce_store: Any = None,
+        budget_store: Any = None,
+        balance_reader: Optional[BalanceReader] = None,
+        chain_id: Optional[int] = None,
+        now: Optional[Callable[[], float]] = None,
+    ) -> None:
+        if not provider_address:
+            raise ValueError("provider_address is required")
+        self._provider = provider_address
+        self._nonce_store = nonce_store if nonce_store is not None else InMemoryNonceStore()
+        if budget_store is None:
+            from prsm.settlement.delegation_budget import InMemoryDelegationBudgetStore
+            budget_store = InMemoryDelegationBudgetStore()
+        self._budget_store = budget_store
+        self._balance_reader = balance_reader
+        self._chain_id = chain_id
+        self._now = now or time.time
+        # sp1093 review #2 — serialize verify() so the seen()->remember() window (which
+        # spans the `await balance_reader`) can't let two concurrent same-nonce requests
+        # both pass (the sp1053 settlement-client race, here for the nonce + budget
+        # stores the sp1092 docstring assumes a lock guards). Lazily created so the
+        # verifier stays usable outside a running loop (tests construct it freely).
+        self._lock: Any = None
+
+    async def verify(self, *args, **kwargs) -> str:
+        import asyncio
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            return await self._verify_locked(*args, **kwargs)
+
+    async def _verify_locked(
+        self,
+        auth_payload: dict,
+        auth_signature: Any,
+        delegation_payload: dict,
+        delegation_signature: Any,
+        *,
+        request_hash: Any,
+        quoted_price_wei: int,
+    ) -> str:
+        from prsm.settlement.payment_delegation import (
+            DelegatedAuthError,
+            verify_delegated_authorization,
+        )
+        chain_kw = {} if self._chain_id is None else {"chain_id": self._chain_id}
+
+        # 1. The full delegated-auth chain: relayer signed the auth, funder signed a
+        #    delegation authorizing THAT relayer for THAT funder, neither expired, and
+        #    the per-request max_spend is within the delegation's cumulative cap.
+        try:
+            funder = verify_delegated_authorization(
+                auth_payload=auth_payload, auth_signature=auth_signature,
+                delegation_payload=delegation_payload,
+                delegation_signature=delegation_signature,
+                now=self._now, **chain_kw,
+            )
+        except DelegatedAuthError as exc:
+            raise AuthorizationRejected("delegated-auth", str(exc))
+
+        # 2. Provider pin — the auth can't be replayed against a different node.
+        if str(auth_payload.get("provider", "")).lower() != self._provider.lower():
+            raise AuthorizationRejected(
+                "provider-mismatch",
+                f"auth provider {auth_payload.get('provider')} != this {self._provider}")
+
+        # 3. Request-hash binding — the auth covers THIS work.
+        try:
+            auth_rh = _to_bytes32("request_hash", auth_payload["request_hash"])
+            want_rh = _to_bytes32("request_hash", request_hash)
+        except (KeyError, ValueError) as exc:
+            raise AuthorizationRejected("request-hash-mismatch", str(exc))
+        if auth_rh != want_rh:
+            raise AuthorizationRejected("request-hash-mismatch")
+
+        # 4. Quoted price within the per-request signed ceiling.
+        if int(quoted_price_wei) > int(auth_payload["max_spend_wei"]):
+            raise AuthorizationRejected(
+                "exceeds-max-spend",
+                f"price {quoted_price_wei} > max_spend {auth_payload['max_spend_wei']}")
+
+        # 5. Per-request nonce unseen (anti-replay) — checked before the costly reads.
+        nonce = str(auth_payload["job_nonce"])
+        if self._nonce_store.seen(nonce):
+            raise AuthorizationRejected("nonce-replayed", nonce)
+
+        # 6. On-chain escrow pre-flight on the FUNDER (settleFromRequester draws here).
+        if self._balance_reader is not None:
+            balance = int(await self._balance_reader(funder))
+            if balance < int(quoted_price_wei):
+                raise AuthorizationRejected(
+                    "insufficient-escrow-balance",
+                    f"funder balance {balance} < price {quoted_price_wei}")
+
+        # 7. Reserve the per-request CEILING (max_spend_wei), not the quote, against the
+        #    delegation's cumulative budget (sp1093 review #1). The settle path clamps
+        #    the booked value at max_spend_wei, so reserving the ceiling guarantees
+        #    cumulative settled <= cumulative reserved <= cap WITHOUT depending on the
+        #    ingress threading the exact quote — the conservative no-overspend invariant
+        #    the sp1092 store was built for (releasing the unused remainder after the
+        #    actual settle is a documented additive refinement). Done LAST so a request
+        #    rejected earlier never consumes budget; a reject here leaves the nonce
+        #    unburnt too (retryable if the funder raises the cap).
+        dnonce = str(delegation_payload["delegation_nonce"])
+        cap = int(delegation_payload["max_total_spend_wei"])
+        reserve_amount = int(auth_payload["max_spend_wei"])
+        if not self._budget_store.reserve(dnonce, reserve_amount, cap):
+            raise AuthorizationRejected(
+                "delegation-budget-exceeded",
+                f"reserving {reserve_amount} (per-request ceiling) would exceed "
+                f"delegation cap {cap} (consumed {self._budget_store.consumed(dnonce)})")
+
+        # All checks passed + budget reserved — consume the nonce, return the funder.
+        self._nonce_store.remember(nonce)
+        return funder
