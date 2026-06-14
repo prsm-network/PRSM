@@ -8,6 +8,7 @@ which is reconciled via gossip when connected to the network.
 """
 
 import asyncio
+import hashlib
 import json
 import time
 import uuid
@@ -454,8 +455,17 @@ class LocalLedger(LedgerNodeServicesMixin):
         tx_type: TransactionType,
         description: str = "",
         signature: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Transaction:
-        """Credit FTNS to a wallet (from_wallet is None for system grants)."""
+        """Credit FTNS to a wallet (from_wallet is None for system grants).
+
+        sp1101 (Domain-05 review F1) — when ``idempotency_key`` is supplied, the
+        transaction's ``tx_id`` is DETERMINISTIC (derived from the key), so crediting
+        the same logical event twice (e.g. a bridge deposit re-presented by the
+        sprint-543 restart catch-up scan after a crash between credit and the dedup
+        mark) collides on the ``transactions`` PRIMARY KEY and is a NO-OP that returns
+        the existing transaction — exactly-once instead of at-least-once. Without a key
+        the tx_id is a fresh UUID (unchanged default behavior)."""
         if not wallet_id:
             # Phase 1.3 Task 3g pass-6: refuse empty wallet credits.
             # An empty wallet_id creates a phantom row that can't be
@@ -468,8 +478,14 @@ class LocalLedger(LedgerNodeServicesMixin):
                 f"description={description!r})"
             )
         await self._ensure_wallet(wallet_id)
+        if idempotency_key:
+            tx_id = "idem-" + hashlib.sha256(
+                idempotency_key.encode("utf-8")
+            ).hexdigest()[:48]
+        else:
+            tx_id = str(uuid.uuid4())
         tx = Transaction(
-            tx_id=str(uuid.uuid4()),
+            tx_id=tx_id,
             tx_type=tx_type,
             from_wallet=None,
             to_wallet=wallet_id,
@@ -478,6 +494,18 @@ class LocalLedger(LedgerNodeServicesMixin):
             timestamp=time.time(),
             signature=signature,
         )
+        if idempotency_key:
+            # Atomic exactly-once: the PRIMARY KEY makes a replayed credit a no-op.
+            # We must NOT swallow a genuine logic error, so we check existence first
+            # and only treat a same-tx_id collision as the idempotent case.
+            if await self.has_transaction(tx_id):
+                return tx
+            try:
+                await self._insert_tx(tx)
+            except aiosqlite.IntegrityError:
+                # Lost the race to a concurrent identical credit → already applied.
+                return tx
+            return tx
         await self._insert_tx(tx)
         return tx
 

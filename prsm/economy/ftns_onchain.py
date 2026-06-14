@@ -772,6 +772,12 @@ class InboundMonitor:
         # ledger entry is traceable to the on-chain TX.
         from prsm.node.local_ledger import TransactionType
         try:
+            # sp1101 (Domain-05 review F1) — make the credit IDEMPOTENT at the durable
+            # ledger, BELOW the checkpoint-store dedup. The credit fires before the
+            # mark is persisted, so a crash in that window + the restart catch-up scan
+            # would re-present this Transfer and double-credit (withdrawable as real
+            # FTNS). A deterministic idempotency key keyed on the on-chain identity
+            # (recipient + tx_hash) makes a replay a PRIMARY-KEY no-op → exactly-once.
             await self._local_ledger.credit(
                 wallet_id=wallet_id,
                 amount=amount,
@@ -779,6 +785,7 @@ class InboundMonitor:
                 description=(
                     f"bridge deposit from {from_addr} tx={tx_hash}"
                 ),
+                idempotency_key=f"bridge-deposit:{recipient_addr}:{tx_hash}",
             )
             self._credited_tx_hashes.add(tx_hash)
             # Sprint 544: persist the dedup record alongside the

@@ -169,10 +169,14 @@ class _RecordingLocalLedger:
             return self._wallet
         return None
 
-    async def credit(self, *, wallet_id, amount, tx_type, description):
+    async def credit(self, *, wallet_id, amount, tx_type, description,
+                     idempotency_key=None):
+        # sp1101 — mirror the real LocalLedger.credit signature (the inbound
+        # monitor now passes a deterministic idempotency_key for exactly-once).
         self.credits.append({
             "wallet_id": wallet_id, "amount": amount,
             "tx_type": tx_type, "description": description,
+            "idempotency_key": idempotency_key,
         })
 
 
