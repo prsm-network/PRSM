@@ -24,8 +24,25 @@ Integrity guarantees:
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass
 from typing import Iterable, List
+
+
+def _max_reassembly_bytes() -> int:
+    """sp1097 (Domain-02 review F4) — receiver-side ceiling on a reassembled shard
+    payload. A hostile sender could declare a huge ``payload_bytes`` / ``total_chunks``
+    and stream valid-checksum chunks, OOMing the receiver before the finalize-time length
+    check fires. Default 1 GiB (matches the streamed-activation cap); PRSM_MAX_SHARD_
+    REASSEMBLY_BYTES overrides. Falls back to the default on a missing/invalid value."""
+    raw = (os.environ.get("PRSM_MAX_SHARD_REASSEMBLY_BYTES", "") or "").strip()
+    if not raw:
+        return 1 << 30
+    try:
+        v = int(raw)
+    except (ValueError, TypeError):
+        return 1 << 30
+    return v if v > 0 else 1 << 30
 
 
 __all__ = [
@@ -162,7 +179,16 @@ class ShardAssembler:
     """
 
     def __init__(self, manifest: ShardManifest) -> None:
+        # sp1097 (F4) — refuse a manifest declaring more than the reassembly ceiling
+        # BEFORE buffering anything, so an oversized declaration can't OOM the receiver.
+        _cap = _max_reassembly_bytes()
+        if int(getattr(manifest, "payload_bytes", 0)) > _cap:
+            raise StreamingError(
+                f"manifest payload_bytes {manifest.payload_bytes} exceeds the reassembly "
+                f"cap {_cap} (PRSM_MAX_SHARD_REASSEMBLY_BYTES)")
         self._manifest = manifest
+        self._max_bytes = _cap
+        self._received_bytes = 0
         self._buffer: List[bytes] = []
         self._next_sequence = 0
         self._hasher = hashlib.sha256()
@@ -191,6 +217,17 @@ class ShardAssembler:
             raise ChunkChecksumMismatch(
                 f"chunk {chunk.sequence}: digest mismatch"
             )
+
+        # sp1097 (F4) — bound the running reassembly size against BOTH the declared
+        # payload and the absolute cap, so a sender that streams more than it declared
+        # (or a huge declaration that slipped __init__) is rejected mid-stream, not after
+        # buffering gigabytes.
+        self._received_bytes += len(chunk.data)
+        _limit = min(int(self._manifest.payload_bytes), self._max_bytes)
+        if self._received_bytes > _limit:
+            raise StreamingError(
+                f"reassembly exceeded {_limit} bytes at chunk {chunk.sequence} "
+                f"(declared payload_bytes={self._manifest.payload_bytes})")
 
         self._buffer.append(chunk.data)
         self._hasher.update(chunk.data)

@@ -27,11 +27,19 @@ from typing import Any, Dict, List, Optional
 
 from prsm.node.discovery import (
     PeerInfo,
+    _announce_is_stale_replay,
     _announce_signing_bytes,
     _attest_announce_payload,
     _build_announce_credential,
+    _join_bootstrap_address,
+    _max_known_peers,
     _verify_peer_credential,
 )
+
+# sp1097 — bound on distinct providers cached per CID (the shard-cache analog of the
+# _max_known_peers routing-table cap; prevents a Sybil flood from making one CID resolve
+# to unbounded bogus providers / exhausting memory).
+_MAX_SHARD_PROVIDERS = 64
 from prsm.node.identity import verify_signature
 
 logger = logging.getLogger(__name__)
@@ -553,8 +561,12 @@ class Libp2pDiscovery:
                     caps = list(signed_caps)
             self._capability_index[pid] = PeerInfo(
                 node_id=pid,
-                address=f"{getattr(bp, 'address', '')}:"
-                        f"{getattr(bp, 'port', 0)}",
+                # sp1097 (Domain-02 review F5) — use the sp1026 join helper instead of a
+                # naive f"{addr}:{port}", which produced "host:port:port" (undialable, the
+                # Tier-1-bench bug) when the operator advertised the documented host:port
+                # form. The WS path was fixed in sp1026; this ports it to libp2p.
+                address=_join_bootstrap_address(
+                    getattr(bp, "address", "") or "", getattr(bp, "port", 0) or 0),
                 capabilities=caps,
                 last_seen=time.time(),
                 last_capability_update=time.time(),
@@ -909,6 +921,9 @@ class Libp2pDiscovery:
             "supported_backends": self._local_backends,
             "gpu_available": self._local_gpu_available,
             "startup_timestamp": self._startup_timestamp,
+            # sp1097 — signed monotonic timestamp so a receiver can reject a replayed
+            # (stale) announce (parity with the WS sp941 defense).
+            "announce_time": time.time(),
             "nonce": secrets.token_hex(16),
         }
         _attest_announce_payload(
@@ -944,7 +959,9 @@ class Libp2pDiscovery:
         if self.gossip is not None:
             try:
                 payload = {
-                    "cid": cid, "node_id": node_id, "nonce": secrets.token_hex(16),
+                    "cid": cid, "node_id": node_id,
+                    "announce_time": time.time(),   # sp1097 — replay defense
+                    "nonce": secrets.token_hex(16),
                 }
                 _attest_announce_payload(
                     self.transport.identity, payload, payload["nonce"])
@@ -1115,10 +1132,25 @@ class Libp2pDiscovery:
             )
             return
 
+        existing = self._capability_index.get(node_id)
+        # sp1097 (Domain-02 review F1) — reject a replayed (stale-timestamp) announce so a
+        # captured genuine envelope can't re-assert an old address/caps or refresh
+        # last_seen for a dead/changed peer (parity with the WS sp941 defense).
+        if existing is not None and _announce_is_stale_replay(
+                data, existing.last_announce_time):
+            return
+        # sp1097 (F2) — bound the capability index (memory + eclipse-magnitude defense);
+        # only NEW node_ids are subject to the cap (a tracked peer always refreshes). Sybil
+        # node_ids are free, so without this the index grows unbounded under a flood.
+        if existing is None and len(self._capability_index) >= _max_known_peers():
+            logger.debug(
+                "libp2p capability index at cap (%d) — dropping new announce from %s",
+                _max_known_peers(), node_id[:8])
+            return
+
         new_startup = data.get("startup_timestamp", 0.0)
         new_caps = {c.lower() for c in data.get("capabilities", [])}
 
-        existing = self._capability_index.get(node_id)
         if existing is not None:
             old_startup = existing.startup_timestamp
             old_caps = {c.lower() for c in existing.capabilities}
@@ -1137,6 +1169,8 @@ class Libp2pDiscovery:
             existing.gpu_available = data.get("gpu_available", existing.gpu_available)
             existing.last_seen = time.time()
             existing.last_capability_update = time.time()
+            # sp1097 — record the accepted announce_time for the next replay check.
+            existing.last_announce_time = float(data.get("announce_time") or 0.0)
             # sp1088 review LOW-1 — this announce is origin-authenticated (sp1086), so a
             # previously-unauthenticated entry (e.g. a credential-less bootstrap hydrate)
             # is UPGRADED to authenticated rather than left stuck at tier-none.
@@ -1153,6 +1187,8 @@ class Libp2pDiscovery:
                 last_seen=time.time(),
                 last_capability_update=time.time(),
                 startup_timestamp=new_startup,
+                # sp1097 — seed the replay-defense timestamp from the signed announce.
+                last_announce_time=float(data.get("announce_time") or 0.0),
                 # sp1088 — this announce was origin-authenticated (sp1086), so the peer's
                 # node_id is cryptographically established: mark it so the pool provider
                 # may honor an attestation it carries.
@@ -1181,4 +1217,12 @@ class Libp2pDiscovery:
 
         providers = self._shard_cache.setdefault(cid, [])
         if node_id not in providers:
+            # sp1097 (Domain-02 review F2) — bound the per-CID providers list so a Sybil
+            # flood (free-to-mint node_ids, each a valid signed announce) can't make one
+            # CID resolve to unbounded bogus providers / exhaust memory.
+            if len(providers) >= _MAX_SHARD_PROVIDERS:
+                logger.debug(
+                    "shard providers for %s at cap (%d) — dropping %s",
+                    cid[:12], _MAX_SHARD_PROVIDERS, node_id[:8])
+                return
             providers.append(node_id)
