@@ -110,6 +110,15 @@ PROTECTED_PREFIXES = [
     "/marketplace/creator-reputation/",
     "/peers/connect",
     "/billing/",
+    # Sprint 1103 — Domain-07 review HIGH. The /onboarding/* wizard WRITES the node's
+    # signing identity (POST /onboarding/identity import → config/node_identity.json)
+    # and config (POST /onboarding/launch → config/node_config.json). Mounted on the
+    # daemon app, it was in NEITHER this set nor the loopback gate → an unauthenticated
+    # attacker on a publicly-bound, KEYED node could overwrite the identity and take the
+    # node over on the next restart. Now gated by the operator's API key (dev/no-key
+    # mode is unaffected — auth_enabled gates the whole check, and a no-key public bind
+    # is already refused at startup).
+    "/onboarding/",
 ]
 
 # Sprint 1012 — protected paths with an EMBEDDED parameter that a startswith

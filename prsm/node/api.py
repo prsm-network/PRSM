@@ -663,6 +663,23 @@ def _check_not_preempted_or_503() -> None:
     )
 
 
+def _host_is_loopback(host: str) -> bool:
+    """sp1103 — module-level loopback check (mirrors the admin-loopback middleware's
+    nested _is_loopback): canonical loopback names, the whole 127/8 block, and the
+    IPv4-mapped IPv6 loopback form a dual-stack daemon sees."""
+    if not host:
+        return False
+    if host in ("127.0.0.1", "::1", "localhost", "testclient"):
+        return True
+    if host.lower().startswith("::ffff:127."):
+        return True
+    if host.startswith("127.") and host.count(".") == 3:
+        parts = host.split(".")
+        if all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+            return True
+    return False
+
+
 def _resolve_requester_key(request: Any) -> str:
     """Sprint 741 F69 — resolve a per-requester rate-limit bucket
     key from an HTTP request. Proxy-aware: prefers X-Forwarded-For
@@ -675,8 +692,17 @@ def _resolve_requester_key(request: Any) -> str:
     fallback ensures the rate limiter still works rather than
     crashing).
     """
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", "") if client else ""
+    # sp1103 (Domain-07 review MEDIUM) — only trust the proxy-forwarded client headers
+    # when the IMMEDIATE socket peer is loopback (i.e. a co-located trusted reverse
+    # proxy). On a directly-exposed node these headers are attacker-controlled, so an
+    # attacker could rotate X-Forwarded-For to get a fresh rate-limit bucket per request
+    # and defeat the per-requester cap. Mirrors the admin-loopback middleware's
+    # is_loopback_immediate precondition (sprints 737/738) which this helper previously
+    # copied the precedence from but dropped the trust gate.
     headers = getattr(request, "headers", None)
-    if headers is not None:
+    if headers is not None and _host_is_loopback(host):
         xff = headers.get("x-forwarded-for", "") if hasattr(
             headers, "get",
         ) else ""
@@ -689,8 +715,6 @@ def _resolve_requester_key(request: Any) -> str:
         ) else ""
         if x_real and x_real.strip():
             return x_real.strip()
-    client = getattr(request, "client", None)
-    host = getattr(client, "host", "") if client else ""
     return host or "anonymous"
 
 
