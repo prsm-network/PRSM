@@ -119,8 +119,20 @@ class PaymentAuthorizationVerifier:
         self._balance_reader = balance_reader
         self._chain_id = chain_id
         self._now = now or time.time
+        # sp1096 (review #5) — serialize verify() so the seen()->remember() window (which
+        # spans the `await balance_reader`) can't let two concurrent same-nonce requests
+        # both pass. Mirrors the RelayerAuthorizationVerifier lock; lazily created so the
+        # verifier is usable outside a running loop (tests construct it freely).
+        self._lock: Any = None
 
-    async def verify(
+    async def verify(self, *args, **kwargs) -> str:
+        import asyncio
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            return await self._verify_locked(*args, **kwargs)
+
+    async def _verify_locked(
         self,
         payload: dict,
         signature: Any,
@@ -364,3 +376,14 @@ class RelayerAuthorizationVerifier:
                 self._budget_store.release(str(delegation_nonce), int(amount_wei))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("delegation budget release failed (non-fatal): %s", exc)
+
+    def release_reservation_sync(self, delegation_nonce: str, amount_wei: int) -> None:
+        """Sprint 1096 — lock-free release for a SYNC caller (the carrier-eviction path,
+        which isn't async). Safe without the lock: ``release`` is monotonic (decrement,
+        floor at 0), so a release racing a concurrent ``reserve`` can only make the
+        reserve see a slightly-stale (higher) consumed value → it may reject a request
+        that would have fit (fail-closed), never accept one that shouldn't. Fail-open."""
+        try:
+            self._budget_store.release(str(delegation_nonce), int(amount_wei))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("delegation budget sync-release failed (non-fatal): %s", exc)

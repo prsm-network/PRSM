@@ -354,8 +354,10 @@ async def _settle_streaming_escrow(
                         "Sprint 1037 on-chain settlement accumulate "
                         "(stream job=%s): %s", job_id, _acc,
                     )
-                # sp1095 — capture: release the unused delegation-budget remainder.
-                await _capture_relayer_budget(node, _paid, decision.release_to_operator)
+                # sp1095/1096 — capture: release the unused remainder (or, when the
+                # on-chain accumulate was skipped, the full reservation).
+                await _capture_relayer_budget(
+                    node, _paid, decision.release_to_operator, _acc)
             except Exception as _acc_exc:  # noqa: BLE001
                 logger.debug(
                     "Sprint 1037 accumulate hook error: %s", _acc_exc,
@@ -798,10 +800,29 @@ def _record_paid_requester(node: Any, job_id: str, info: Dict[str, Any]) -> None
         node._paid_requester_by_job = table
     while len(table) >= _PAID_REQUESTER_CARRIER_CAP:
         try:
-            table.pop(next(iter(table)))   # evict oldest (insertion order)
+            _evicted = table.pop(next(iter(table)))   # evict oldest (insertion order)
+            # sp1096 (review A1) — an evicted relayer entry never settled, so release its
+            # held delegation-budget reservation (else the funder's cap leaks until a
+            # fresh delegation). No-op for self-pay / self-signed entries.
+            _release_relayer_reservation(node, _evicted)
         except StopIteration:
             break
     table[job_id] = info
+
+
+def _release_relayer_reservation(node: Any, info: Optional[Dict[str, Any]]) -> None:
+    """Sprint 1096 — release a relayer job's full held delegation-budget reservation
+    (used when the job did NOT settle: evicted, or failed before settle). No-op for
+    non-relayer entries; fail-open."""
+    try:
+        if not info or not info.get("delegation_nonce"):
+            return
+        verifier = getattr(node, "_relayer_verifier", None)
+        reserved = int(info.get("reserved_wei") or 0)
+        if verifier is not None and reserved > 0:
+            verifier.release_reservation_sync(info["delegation_nonce"], reserved)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("relayer reservation release skipped (non-fatal): %s", exc)
 
 
 def _take_paid_requester(node: Any, job_id: str) -> Optional[Dict[str, Any]]:
@@ -817,13 +838,20 @@ def _take_paid_requester(node: Any, job_id: str) -> Optional[Dict[str, Any]]:
 
 async def _capture_relayer_budget(
     node: Any, paid_info: Optional[Dict[str, Any]], settled_ftns: Any,
+    accumulate_result: Any = None,
 ) -> None:
     """Sprint 1095 — auth-and-capture for a relayer job: the verifier RESERVED the
     per-request ceiling against the funder's delegation budget at ingress; after the
     actual (<= ceiling) settle, release the unused remainder so a cheaper-than-ceiling
     request doesn't permanently consume the funder's cap. No-op for self-pay /
     self-signed jobs (no delegation_nonce). Fail-open — a capture error must never break
-    the settle path."""
+    the settle path.
+
+    sp1096 (review A2): if the on-chain accumulate was SKIPPED (``accumulate_result``
+    starts with ``skipped:`` — e.g. multi-stage-deferred, no-client, zero-release), then
+    NOTHING settled against the funder's on-chain escrow for this job, so release the
+    FULL reservation, not ``reserved - settled`` (the off-chain release didn't touch the
+    funder's on-chain delegation budget)."""
     try:
         if not paid_info or not paid_info.get("delegation_nonce"):
             return
@@ -831,11 +859,15 @@ async def _capture_relayer_budget(
         if verifier is None:
             return
         reserved = int(paid_info.get("reserved_wei") or 0)
-        from decimal import Decimal as _D
-        settled_wei = int(_D(str(settled_ftns or 0)) * (_D(10) ** 18))
-        remainder = reserved - settled_wei
-        if remainder > 0:
-            await verifier.release_reservation(paid_info["delegation_nonce"], remainder)
+        if isinstance(accumulate_result, str) and accumulate_result.startswith("skipped:"):
+            release_amount = reserved   # nothing booked on-chain → release the whole hold
+        else:
+            from decimal import Decimal as _D
+            settled_wei = int(_D(str(settled_ftns or 0)) * (_D(10) ** 18))
+            release_amount = reserved - settled_wei
+        if release_amount > 0:
+            await verifier.release_reservation(
+                paid_info["delegation_nonce"], release_amount)
     except Exception as exc:  # noqa: BLE001
         logger.debug("relayer budget capture skipped (non-fatal): %s", exc)
 
@@ -8379,9 +8411,10 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                                     "Sprint 1037 on-chain settlement "
                                     "accumulate (job=%s): %s", job_id, _acc,
                                 )
-                            # sp1095 — capture the unused delegation-budget remainder.
+                            # sp1095/1096 — capture the unused remainder (or full
+                            # reservation when the on-chain accumulate was skipped).
                             await _capture_relayer_budget(
-                                node, _paid, decision.release_to_operator)
+                                node, _paid, decision.release_to_operator, _acc)
                         except Exception as _acc_exc:  # noqa: BLE001
                             logger.debug(
                                 "Sprint 1037 accumulate hook error: %s",
