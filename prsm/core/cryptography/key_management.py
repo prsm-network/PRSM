@@ -179,9 +179,21 @@ class KeyManager:
                 self.master_key = Fernet.generate_key()
                 logger.warning("Generated new master key - store securely in production")
         else:
-            # In production, integrate with HSM/KMS
-            self.master_key = Fernet.generate_key()
-            logger.warning("Using generated master key - integrate with HSM/KMS for production")
+            # sp1106 (Domain-08 review HIGH-4) — selecting an HSM/KMS master-key source
+            # asserts HARDWARE-backed key protection. There is no real HSM/KMS
+            # integration yet, and silently minting an ephemeral in-process Fernet key
+            # (the prior behavior) gave a FALSE sense of hardware protection while the
+            # key was software-only and lost on restart — a fail-OPEN on a
+            # security-relevant config. Fail CLOSED: refuse to start under a security
+            # posture we can't actually provide.
+            raise NotImplementedError(
+                f"master_key_source={master_key_source!r} requests hardware-backed key "
+                "protection (HSM/KMS), but no HSM/KMS integration is implemented. "
+                "Refusing to silently fall back to a software key that would falsely "
+                "advertise hardware protection. Use master_key_source='environment' "
+                "with a securely-provisioned PRSM_MASTER_KEY, or implement the HSM/KMS "
+                "backend."
+            )
     
     async def generate_key(self, request: KeyGenerationRequest) -> CryptoKey:
         """Generate a new cryptographic key"""
