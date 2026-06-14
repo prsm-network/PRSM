@@ -134,9 +134,20 @@ class MockZKCircuit:
     
     def generate_proof(self, private, public, key) -> Dict[str, Any]:
         return {"proof": b"mock_proof", "proof_size": 10, "generation_time_ms": 1}
-    
+
     def verify_proof(self, proof, public, key) -> bool:
-        return True
+        # sp1104 (Domain-08 review CRITICAL) — this is a MOCK circuit with no real
+        # soundness; it must NEVER assert cryptographic validity. Returning True here
+        # made the live POST /api/v1/crypto/proofs/{id}/verify endpoint report ANY
+        # stored proof (bytes literally b"mock_proof") as is_valid=True, so any
+        # authenticated user could mint a meaningless "verified" proof. Fail CLOSED:
+        # refuse to verify until a real ZK circuit is implemented. ZKProofSystem.
+        # verify_proof wraps this in try/except → the endpoint reports is_valid=False.
+        raise NotImplementedError(
+            "ZK proof verification is not implemented (MockZKCircuit has no soundness); "
+            "refusing to assert validity — a real circuit must replace this before the "
+            "proof endpoints can report a verified result"
+        )
 
 class ZKCircuitRegistry:
     def __init__(self):

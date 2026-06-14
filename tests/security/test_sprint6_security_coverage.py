@@ -673,7 +673,10 @@ class TestZKProofSystem:
         )
         result = await zk.generate_proof(request)
         is_valid = await zk.verify_proof(result.proof_data, "verifier_1")
-        assert is_valid is True
+        # sp1104 (Domain-08 CRITICAL) — the mock ZK system has no soundness, so it must
+        # FAIL CLOSED: a generated mock proof must NOT be reported valid (was a vuln:
+        # returning True let any user mint a meaningless "verified" proof).
+        assert is_valid is False
 
     @pytest.mark.asyncio
     async def test_verify_nonexistent_proof(self):
@@ -751,8 +754,11 @@ class TestMockZKCircuit:
         assert "proof_size" in result
 
     def test_verify_proof(self):
+        # sp1104 (Domain-08 CRITICAL) — the mock circuit must fail CLOSED, never assert
+        # validity. It now raises NotImplementedError rather than returning True.
         circuit = MockZKCircuit("test", "Test circuit")
-        assert circuit.verify_proof(b"proof", [], b"vk") is True
+        with pytest.raises(NotImplementedError):
+            circuit.verify_proof(b"proof", [], b"vk")
 
 
 class TestAssertInfo:
