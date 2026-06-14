@@ -45,6 +45,81 @@ from prsm.node.result_consensus import ResultConsensus
 logger = logging.getLogger(__name__)
 
 
+# sp1100 (Domain-04 review) — operator-side ceilings on the LIVE untrusted-WASM path.
+# Defaults are deliberately modest; an operator raises them via env if its hardware can
+# afford to. The point is that the REQUESTER cannot dictate the host's resource exposure.
+_WASM_MAX_MEMORY_BYTES_DEFAULT = 512 * 1024 * 1024   # 512 MB
+_WASM_MAX_EXECUTION_SECONDS_DEFAULT = 60             # wall-clock seconds
+_WASM_MAX_OUTPUT_BYTES_DEFAULT = 10 * 1024 * 1024    # 10 MB
+_WASM_MAX_MODULE_BYTES_DEFAULT = 5 * 1024 * 1024     # 5 MB (matches WASMModule)
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = (os.environ.get(name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        v = int(raw)
+    except (ValueError, TypeError):
+        return default
+    return v if v > 0 else default
+
+
+def clamp_wasm_resource_limits(payload: Dict[str, Any]) -> "ResourceLimits":
+    """Build ResourceLimits from a requester payload CLAMPED to operator ceilings.
+
+    Domain-04 HIGH #1: the requester previously chose its own limits with no cap
+    (``payload.get(k, default)`` only supplied a default), so one authenticated peer
+    could demand 64 GB / 1 hour and OOM/CPU-starve the host. Each value is now
+    ``min(max(1, requested), operator_ceiling)`` — a hostile huge request is capped, a
+    zero/negative request is floored to 1 (never bypasses a cap or trips __post_init__).
+    """
+    from prsm.compute.wasm.models import ResourceLimits
+
+    mem_max = _env_positive_int(
+        "PRSM_WASM_MAX_MEMORY_BYTES", _WASM_MAX_MEMORY_BYTES_DEFAULT)
+    sec_max = _env_positive_int(
+        "PRSM_WASM_MAX_EXECUTION_SECONDS", _WASM_MAX_EXECUTION_SECONDS_DEFAULT)
+    out_max = _env_positive_int(
+        "PRSM_WASM_MAX_OUTPUT_BYTES", _WASM_MAX_OUTPUT_BYTES_DEFAULT)
+
+    def _clamp(requested: Any, default: int, ceiling: int) -> int:
+        try:
+            req = int(requested)
+        except (ValueError, TypeError):
+            req = default
+        return min(max(1, req), ceiling)
+
+    return ResourceLimits(
+        max_memory_bytes=_clamp(
+            payload.get("max_memory_bytes", min(256 * 1024 * 1024, mem_max)),
+            min(256 * 1024 * 1024, mem_max), mem_max),
+        max_execution_seconds=_clamp(
+            payload.get("max_execution_seconds", min(30, sec_max)),
+            min(30, sec_max), sec_max),
+        max_output_bytes=_clamp(
+            payload.get("max_output_bytes", min(10 * 1024 * 1024, out_max)),
+            min(10 * 1024 * 1024, out_max), out_max),
+    )
+
+
+def validate_wasm_module_bytes(wasm_bytes: bytes) -> None:
+    """Validate untrusted module bytes (magic + size) BEFORE the expensive compile.
+
+    Domain-04 MEDIUM: ``_run_wasm`` fed raw bytes to ``runtime.load`` skipping the
+    ``WASMModule`` checks, so a 500 MB blob was a compile-bomb before any limit binds.
+    Reuses ``WASMModule`` (magic-byte + size) which raises ValueError on a bad module.
+    """
+    from prsm.compute.wasm.models import WASMModule
+
+    max_size = _env_positive_int(
+        "PRSM_WASM_MAX_MODULE_BYTES", _WASM_MAX_MODULE_BYTES_DEFAULT)
+    # __post_init__ raises ValueError on bad magic or oversize.
+    WASMModule(
+        module_id="wasm-job", wasm_bytes=wasm_bytes,
+        entry_point="run", max_size=max_size)
+
+
 class JobType(str, Enum):
     INFERENCE = "inference"
     EMBEDDING = "embedding"
@@ -639,17 +714,16 @@ class ComputeProvider:
         """Execute a WASM module in a sandboxed runtime."""
         import base64
         from prsm.compute.wasm.runtime import WasmtimeRuntime
-        from prsm.compute.wasm.models import ResourceLimits
 
         payload = job.payload
         wasm_bytes = base64.b64decode(payload.get("wasm_bytes_b64", ""))
         input_data = base64.b64decode(payload.get("input_data_b64", ""))
 
-        limits = ResourceLimits(
-            max_memory_bytes=payload.get("max_memory_bytes", 256 * 1024 * 1024),
-            max_execution_seconds=payload.get("max_execution_seconds", 30),
-            max_output_bytes=payload.get("max_output_bytes", 10 * 1024 * 1024),
-        )
+        # sp1100 (Domain-04) — the requester is UNTRUSTED. Validate the module bytes
+        # (magic + size) before the expensive compile, and clamp the resource limits to
+        # operator ceilings so a single peer can't dictate the host's resource exposure.
+        validate_wasm_module_bytes(wasm_bytes)
+        limits = clamp_wasm_resource_limits(payload)
 
         runtime = WasmtimeRuntime()
         if not runtime.available:
