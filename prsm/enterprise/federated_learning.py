@@ -46,6 +46,7 @@ import logging
 import math
 import os
 import random
+import secrets
 import statistics
 import struct
 import time
@@ -830,7 +831,13 @@ class FederatedLearningOrchestrator:
             Path(persist_dir)
             if persist_dir is not None else None
         )
-        self._rng = rng if rng is not None else random.Random()
+        # sp1105 (Domain-08 review HIGH-3) — DP noise must come from a CSPRNG. The
+        # default was random.Random() (Mersenne Twister), which is reconstructible from
+        # ~624 outputs, so an observer of enough noised gradients could predict and
+        # partially subtract the noise → the advertised ε-guarantee degrades. Use
+        # secrets.SystemRandom (a random.Random subclass backed by os.urandom, so .gauss
+        # still works); the injectable rng remains for deterministic tests.
+        self._rng = rng if rng is not None else secrets.SystemRandom()
         if self._persist_dir is not None:
             self._persist_dir.mkdir(
                 parents=True, exist_ok=True,
