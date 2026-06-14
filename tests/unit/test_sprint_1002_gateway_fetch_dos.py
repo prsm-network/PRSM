@@ -86,12 +86,30 @@ class _FakeSession:
     def __init__(self, response):
         self._response = response
         self.captured_timeout = None
+        self.captured_allow_redirects = None
         self.get_calls = 0
 
-    def get(self, _url, timeout=None):
+    def get(self, _url, timeout=None, allow_redirects=None):
+        # sp1102 — the production fetch now passes allow_redirects=False (SSRF: a
+        # public URL must not 302 to an internal one). Mirror the real signature.
         self.get_calls += 1
         self.captured_timeout = timeout
+        self.captured_allow_redirects = allow_redirects
         return self._response
+
+    # sp1102 — the fetch now opens a per-request session via _open_gateway_session;
+    # the fake doubles as that async context manager.
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_a):
+        return False
+
+
+def _install_fake_session(provider, session):
+    """sp1102 — route _fetch_from_url's session through the fake (was p._http_session;
+    the SSRF fix opens a per-fetch pinned session via _open_gateway_session instead)."""
+    provider._open_gateway_session = lambda _pinned_ips: session
 
 
 @pytest.mark.asyncio
@@ -101,9 +119,10 @@ async def test_fetch_from_url_aborts_when_streamed_body_exceeds_cap():
     chunks = [b"x" * 50 for _ in range(20)]  # 1000 bytes total
     resp = _FakeResponse(status=200, headers={}, chunks=chunks)
     p = _make_provider()
-    p._http_session = _FakeSession(resp)
+    _install_fake_session(p, _FakeSession(resp))
 
-    out = await p._fetch_from_url("http://evil/gw", timeout=5.0, max_bytes=100)
+    # public numeric IP → passes the sp1102 SSRF guard, so the cap logic is exercised
+    out = await p._fetch_from_url("http://93.184.216.34/gw", timeout=5.0, max_bytes=100)
 
     assert out is None
 
@@ -118,9 +137,9 @@ async def test_fetch_from_url_rejects_oversized_content_length_early():
         chunks=[b"x" * 10],
     )
     p = _make_provider()
-    p._http_session = _FakeSession(resp)
+    _install_fake_session(p, _FakeSession(resp))
 
-    out = await p._fetch_from_url("http://evil/gw", timeout=5.0, max_bytes=1000)
+    out = await p._fetch_from_url("http://93.184.216.34/gw", timeout=5.0, max_bytes=1000)
 
     assert out is None
     # body must NOT have been streamed
@@ -137,9 +156,9 @@ async def test_fetch_from_url_returns_bytes_within_cap():
         chunks=[body],
     )
     p = _make_provider()
-    p._http_session = _FakeSession(resp)
+    _install_fake_session(p, _FakeSession(resp))
 
-    out = await p._fetch_from_url("http://gw/ok", timeout=5.0, max_bytes=10_000)
+    out = await p._fetch_from_url("http://93.184.216.34/ok", timeout=5.0, max_bytes=10_000)
 
     assert out == body
 
@@ -151,13 +170,15 @@ async def test_fetch_from_url_honors_caller_timeout_not_hardcoded_120():
     resp = _FakeResponse(status=200, headers={}, chunks=[b"ok"])
     sess = _FakeSession(resp)
     p = _make_provider()
-    p._http_session = sess
+    _install_fake_session(p, sess)
 
-    await p._fetch_from_url("http://gw/ok", timeout=7.0, max_bytes=10_000)
+    await p._fetch_from_url("http://93.184.216.34/ok", timeout=7.0, max_bytes=10_000)
 
     assert sess.captured_timeout is not None
     # aiohttp.ClientTimeout exposes .total
     assert getattr(sess.captured_timeout, "total", None) == pytest.approx(7.0)
+    # sp1102 — redirects must be disabled on the untrusted fetch
+    assert sess.captured_allow_redirects is False
 
 
 @pytest.mark.asyncio

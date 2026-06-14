@@ -107,6 +107,77 @@ def _gateway_fetch_hard_ceiling_bytes() -> int:
     return val if val > 0 else _DEFAULT_GATEWAY_FETCH_CEILING_BYTES
 
 
+def _classify_gateway_url(url: str, *, resolve=None):
+    """sp1102 (Domain-06 review HIGH) — SSRF guard for the peer-supplied GATEWAY URL.
+
+    A malicious provider can put any URL in a ContentResponseMessage. Before the
+    retriever fetches it, validate: (1) scheme is http(s); (2) the host resolves ONLY
+    to public IPs — reject any private / loopback / link-local / reserved / multicast /
+    unspecified address (the AWS-metadata 169.254.169.254, 127.0.0.1 admin/RPC, RFC1918,
+    etc.). Returns ``(safe: bool, reason: str, pinned_ips: list[str])``; the caller pins
+    the connection to ``pinned_ips`` so a host that resolves safe here can't rebind to an
+    internal address at connect time (DNS rebinding). ``resolve`` is injectable for tests.
+    """
+    import ipaddress
+    import socket as _socket
+    from urllib.parse import urlparse
+
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        return (False, "non-http-scheme", [])
+    try:
+        parsed = urlparse(url)
+    except Exception:  # noqa: BLE001
+        return (False, "unparseable", [])
+    host = parsed.hostname
+    if not host:
+        return (False, "no-host", [])
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    _resolve = resolve or _socket.getaddrinfo
+    try:
+        infos = _resolve(host, port, type=_socket.SOCK_STREAM)
+    except Exception:  # noqa: BLE001
+        return (False, "resolve-failed", [])
+    ips: List[str] = []
+    for info in infos:
+        try:
+            ip = info[4][0].split("%")[0]  # strip any IPv6 scope id
+            addr = ipaddress.ip_address(ip)
+        except (ValueError, IndexError, TypeError):
+            return (False, "bad-ip", [])
+        if (
+            addr.is_private or addr.is_loopback or addr.is_link_local
+            or addr.is_reserved or addr.is_multicast or addr.is_unspecified
+        ):
+            return (False, f"blocked-ip:{ip}", [])
+        ips.append(ip)
+    if not ips:
+        return (False, "no-ips", [])
+    return (True, "ok", ips)
+
+
+class _PinnedGatewayResolver:
+    """aiohttp resolver that returns ONLY the pre-validated IPs for the gateway host,
+    so the connection can't be rebound to an internal address between the safety check
+    and connect. SNI/TLS still validate against the original hostname (from the URL)."""
+
+    def __init__(self, ips: List[str]) -> None:
+        self._ips = ips
+
+    async def resolve(self, host: str, port: int = 0, family: int = 0):
+        import socket as _socket
+        out = []
+        for ip in self._ips:
+            fam = _socket.AF_INET6 if ":" in ip else _socket.AF_INET
+            out.append({
+                "hostname": host, "host": ip, "port": port,
+                "family": fam, "proto": _socket.IPPROTO_TCP, "flags": 0,
+            })
+        return out
+
+    async def close(self) -> None:
+        return None
+
+
 def _max_chunked_transfer_bytes() -> int:
     """sp1020 — upper bound (bytes) for CHUNKED P2P transfer, read at call time.
 
@@ -1262,6 +1333,16 @@ class ContentProvider:
             self._http_session = aiohttp.ClientSession()
         return self._http_session
 
+    def _open_gateway_session(self, pinned_ips: List[str]) -> Any:
+        """sp1102 — async-context-manager session for ONE untrusted gateway fetch,
+        pinned to the SSRF-validated IP(s) so the connection can't be rebound to an
+        internal address (DNS rebinding) between the safety check and connect. A one-off
+        session (not the shared pool) isolates untrusted fetches. Overridable in tests."""
+        import aiohttp
+        connector = aiohttp.TCPConnector(
+            resolver=_PinnedGatewayResolver(pinned_ips), ttl_dns_cache=0)
+        return aiohttp.ClientSession(connector=connector)
+
     async def _fetch_local(
         self, content_id: str,
         timeout: Optional[float] = None,
@@ -1405,17 +1486,26 @@ class ContentProvider:
           - ``timeout`` (finding 8): the HTTP fetch runs under the caller's
             remaining retrieve budget, not a fixed 120s outside it.
         """
-        if not gateway_url.startswith(("http://", "https://")):
-            logger.debug(f"Skipping non-HTTP gateway URL: {gateway_url}")
+        # sp1102 (Domain-06 review HIGH) — SSRF guard. The gateway_url is attacker-
+        # controllable (any peer can reply GATEWAY with an internal URL). Reject any
+        # host that resolves to a private/loopback/link-local/reserved address BEFORE
+        # issuing the request, pin the connection to the validated IP(s) (anti-rebinding),
+        # and disable redirects (so a public URL can't 302 to an internal one).
+        safe, reason, pinned_ips = _classify_gateway_url(gateway_url)
+        if not safe:
+            logger.warning(
+                "Refusing GATEWAY fetch to unsafe URL %s (%s) — SSRF guard",
+                gateway_url, reason,
+            )
             return None
         cap = max_bytes if (max_bytes and max_bytes > 0) else _gateway_fetch_hard_ceiling_bytes()
         eff_timeout = timeout if (timeout and timeout > 0) else self.default_timeout
         try:
             import aiohttp
-            session = await self._get_http_session()
-            async with session.get(
+            async with self._open_gateway_session(pinned_ips) as session, session.get(
                 gateway_url,
                 timeout=aiohttp.ClientTimeout(total=eff_timeout),
+                allow_redirects=False,
             ) as resp:
                 if resp.status != 200:
                     logger.debug(f"Gateway returned {resp.status} for {gateway_url}")
