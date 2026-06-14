@@ -65,11 +65,17 @@ class PartialCompletionInfo:
     timestamp: str  # ISO-8601 UTC, e.g. "2026-05-23T12:00:00Z"
 
     def to_dict(self) -> Dict[str, Any]:
+        # sp1098 (Domain-03 review F5) — coerce timestamp to str SYMMETRICALLY with
+        # from_dict. `timestamp` is a str field (ISO-8601 UTC), but if a non-str ever
+        # leaks in (e.g. a float epoch), to_dict-without-coercion + from_dict-with-coercion
+        # diverge → the canonical signing payload is NOT byte-stable across a
+        # to_dict→from_dict round-trip → an honest partial receipt falsely fails
+        # signature verification. Coercing here keeps both ends symmetric.
         return {
-            "reason": self.reason,
+            "reason": str(self.reason),
             "tokens_completed": int(self.tokens_completed),
             "tokens_requested": int(self.tokens_requested),
-            "timestamp": self.timestamp,
+            "timestamp": str(self.timestamp),
         }
 
     @classmethod

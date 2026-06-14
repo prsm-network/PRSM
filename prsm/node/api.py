@@ -13759,6 +13759,20 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 _topo = TopologyAssignment.from_dict(_topo)
             elif _topo is not None:
                 _topo = None
+            # sp1098 (Domain-03 review F5) — streamed_output + partial_completion ALSO
+            # fold into signing_payload() (Phase-3.x.8 + sprint-777), so dropping them on
+            # reconstruction made streamed / partial-completion receipts falsely fail
+            # verification — the same defect class as the sprint-900 fix above, left open
+            # for these two fields. Restore them so honest streamed/partial receipts verify.
+            _streamed = bool(receipt_payload.get("streamed_output", False))
+            _partial = receipt_payload.get("partial_completion")
+            if isinstance(_partial, dict):
+                from prsm.compute.inference.partial_completion import (
+                    PartialCompletionInfo,
+                )
+                _partial = PartialCompletionInfo.from_dict(_partial)
+            elif _partial is not None:
+                _partial = None
             receipt = InferenceReceipt(
                 job_id=receipt_payload["job_id"],
                 request_id=receipt_payload["request_id"],
@@ -13791,6 +13805,8 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 ),
                 activation_noise_trace=_ant,
                 topology_assignment=_topo,
+                streamed_output=_streamed,
+                partial_completion=_partial,
             )
         except (KeyError, ValueError, TypeError) as exc:
             raise HTTPException(

@@ -209,12 +209,21 @@ def build_local_inference_executor(
     node_id = node_identity.node_id
     num_layers = _KNOWN_MODELS.get(model_id, 12)
 
+    # sp1098 (Domain-03 review F3) — the local executor runs in pure software
+    # (TEEType.SOFTWARE), so it must NOT advertise a hardware tier. The prior hard-coded
+    # "tier-sgx" silently admitted privacy_tier up to MAXIMUM / Tier B/C confidential
+    # work and served it in software with no real confidentiality + no warning. Advertise
+    # the honest software tier (tier-none): the TierGateAdapter then refuses confidential
+    # tiers on this node. A single-node operator who explicitly wants to exercise the
+    # confidential code path in software uses PRSM_PARALLAX_TIER_GATE=advisory, which is
+    # the documented escape hatch that WARNS (sp702/sp1084) rather than silently downgrades.
+    from prsm.compute.parallax_scheduling.prsm_types import TIER_ATTESTATION_NONE
     gpu = ParallaxGPU(
         node_id=node_id,
         region="local-region",
         layer_capacity=max(num_layers, 16),  # holds the whole model on one node
         stake_amount=10**18,
-        tier_attestation="tier-sgx",  # admits NONE..MAXIMUM at the tier gate
+        tier_attestation=TIER_ATTESTATION_NONE,  # software runtime → no hardware tier
         tflops_fp16=100.0,
         memory_gb=80.0,
         memory_bandwidth_gbps=2000.0,
