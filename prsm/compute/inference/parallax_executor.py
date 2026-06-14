@@ -1096,6 +1096,14 @@ class ParallaxScheduledExecutor(InferenceExecutor):
         in the signed payload is authoritative.
         """
         output_hash = hashlib.sha256(outcome.output.encode("utf-8")).digest()
+        # Sprint 1099 (Domain-03 review F1, first brick) — bind the INPUT prompt
+        # into the signed receipt. Without it the receipt commits only to the
+        # output, so a head node could return a (cheaper / canned) answer
+        # computed for a DIFFERENT prompt and the receipt still verified. A
+        # caller recomputes sha256(their prompt) and confirms it matches.
+        prompt_hash = hashlib.sha256(
+            (getattr(request, "prompt", "") or "").encode("utf-8")
+        ).digest()
         prefix = "parallax-stream-job" if streamed else "parallax-job"
         # Sprint 413 — thread sprint-297 privacy fields from
         # the chain executor's outcome into the InferenceReceipt.
@@ -1132,5 +1140,6 @@ class ParallaxScheduledExecutor(InferenceExecutor):
             partial_completion=getattr(
                 outcome, "partial_completion", None,
             ),
+            prompt_hash=prompt_hash,
         )
         return sign_receipt(unsigned, self._identity)

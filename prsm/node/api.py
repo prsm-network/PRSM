@@ -13773,6 +13773,15 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 _partial = PartialCompletionInfo.from_dict(_partial)
             elif _partial is not None:
                 _partial = None
+            # sp1099 (Domain-03 review F1) — prompt_hash folds into
+            # signing_payload(); restore it on reconstruction or a prompt-bound
+            # receipt falsely fails verification (same defect class as the F5
+            # streamed/partial restoration above).
+            _prompt_hash = receipt_payload.get("prompt_hash")
+            if isinstance(_prompt_hash, str):
+                _prompt_hash = bytes.fromhex(_prompt_hash)
+            elif _prompt_hash is not None:
+                _prompt_hash = None
             receipt = InferenceReceipt(
                 job_id=receipt_payload["job_id"],
                 request_id=receipt_payload["request_id"],
@@ -13807,6 +13816,7 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 topology_assignment=_topo,
                 streamed_output=_streamed,
                 partial_completion=_partial,
+                prompt_hash=_prompt_hash,
             )
         except (KeyError, ValueError, TypeError) as exc:
             raise HTTPException(

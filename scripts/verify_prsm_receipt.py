@@ -113,6 +113,22 @@ def _build_signing_payload(receipt: dict) -> bytes:
     if topo is not None:
         topo_hash = _topology_stable_hash(topo["positions"])
         parts.append(f"topology_assignment:{topo_hash}")
+    # sprint 777 — partial_completion folds into the payload via a canonical
+    # sha256 over the sorted-key JSON of its dict (PartialCompletionInfo.
+    # stable_hash). Kept in sync here so the standalone verifier can validate
+    # partial-completion receipts (previously diverged → false-invalid).
+    partial = receipt.get("partial_completion")
+    if partial is not None:
+        partial_canon = json.dumps(partial, sort_keys=True)
+        partial_hash = hashlib.sha256(
+            partial_canon.encode("utf-8"),
+        ).hexdigest()
+        parts.append(f"partial_completion:{partial_hash}")
+    # sp1099 — prompt_hash binds the input prompt; trailing conditional append,
+    # already a hex string in the JSON.
+    prompt_hash = receipt.get("prompt_hash")
+    if prompt_hash is not None:
+        parts.append(f"prompt_hash:{prompt_hash}")
     return "\n".join(parts).encode("utf-8")
 
 

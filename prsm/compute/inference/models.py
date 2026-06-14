@@ -160,6 +160,17 @@ class InferenceReceipt:
     # None preserves byte-equivalence with pre-777 signed
     # receipts via conditional encoding in signing_payload.
     partial_completion: Optional[Any] = None
+    # Sprint 1099 (Domain-03 review F1, first brick) — sha256 of the INPUT
+    # prompt. The receipt already commits to output_hash (the OUTPUT) but
+    # nothing tied a signed receipt to the prompt the caller actually sent,
+    # so a head node could return a (cheaper / canned) answer computed for a
+    # DIFFERENT prompt and the receipt still verified. Binding prompt_hash
+    # lets a caller recompute sha256(their prompt) and confirm the receipt
+    # commits to THEIR request. Optional + default None preserves
+    # byte-equivalence with pre-1099 signed receipts (conditional encoding in
+    # signing_payload). (The deeper per-stage activation hash chain is a
+    # follow-on brick; this closes the prompt-substitution half of F1.)
+    prompt_hash: Optional[bytes] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
@@ -193,6 +204,9 @@ class InferenceReceipt:
             d["partial_completion"] = (
                 self.partial_completion.to_dict()
             )
+        # Sprint 1099 — omit when None for pre-1099 byte-equivalence.
+        if self.prompt_hash is not None:
+            d["prompt_hash"] = self.prompt_hash.hex()
         return d
 
     @classmethod
@@ -269,6 +283,9 @@ class InferenceReceipt:
                     d["partial_completion"],
                 )
             )
+        # Sprint 1099 — parse prompt_hash hex → bytes when present.
+        if "prompt_hash" in d and isinstance(d["prompt_hash"], str):
+            d["prompt_hash"] = bytes.fromhex(d["prompt_hash"])
         accepted = {f for f in cls.__dataclass_fields__}
         return cls(**{k: v for k, v in d.items() if k in accepted})
 
@@ -335,6 +352,12 @@ class InferenceReceipt:
                 f"partial_completion:"
                 f"{self.partial_completion.stable_hash()}"
             )
+        # Sprint 1099 — conditional append for prompt_hash. Binds the input
+        # prompt to the signature so a substituted prompt flips the bytes →
+        # signature fails. Absent (None) → nothing appended → byte-identical
+        # to a pre-1099 receipt (back-compat for legacy receipts + verifiers).
+        if self.prompt_hash is not None:
+            parts.append(f"prompt_hash:{self.prompt_hash.hex()}")
         return "\n".join(parts).encode("utf-8")
 
 
