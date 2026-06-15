@@ -13915,6 +13915,62 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             result_dict["stage_activation_chain"] = {"present": False}
         return result_dict
 
+    @app.post("/settlement/challenge/verify", tags=["settlement"])
+    async def settlement_challenge_verify(
+        body: Dict[str, Any] = {},
+    ) -> Dict[str, Any]:
+        """Sprint 1116 (challenge/dispute mechanism, brick 2) — off-chain dispute verdict
+        for a §7 inference receipt. A would-be challenger / auditor POSTs a receipt + the
+        settler's public key (+ optionally the per-stage node keys) and gets back a
+        structured verdict: is there PROVABLE fraud, on what grounds (invalid settler
+        signature / broken activation chain / topology lie / spliced chain), and which
+        grounds are on-chain-actionable (map to a BatchSettlementRegistry ReasonCode).
+        Read-only + pure (no broadcast). The receipt is the canonical
+        InferenceReceipt.to_dict() shape.
+        """
+        from prsm.compute.inference.models import InferenceReceipt
+        from prsm.settlement.challenge_verifier import (
+            verify_inference_receipt_for_challenge,
+        )
+
+        receipt_payload = body.get("receipt")
+        if not isinstance(receipt_payload, dict):
+            raise HTTPException(
+                status_code=422,
+                detail="missing required field: receipt (a JSON object)",
+            )
+        settler_key = body.get("settler_public_key_b64")
+        if not settler_key:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "missing required field: settler_public_key_b64 (base64 Ed25519 "
+                    "public key of the settler that signed the receipt)"
+                ),
+            )
+        stage_keys = body.get("stage_public_keys")
+        if stage_keys is not None and not isinstance(stage_keys, dict):
+            raise HTTPException(
+                status_code=422,
+                detail="stage_public_keys must be a {node_id: pubkey_b64} object",
+            )
+        try:
+            receipt = InferenceReceipt.from_dict(receipt_payload)
+        except (KeyError, ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=422, detail=f"malformed receipt: {exc}",
+            )
+        report = verify_inference_receipt_for_challenge(
+            receipt,
+            settler_public_key_b64=settler_key,
+            stage_public_keys=stage_keys,
+        )
+        out = report.to_dict()
+        out["on_chain_actionable"] = [
+            f.to_dict() for f in report.on_chain_actionable()
+        ]
+        return out
+
     # ── Sprint 287 — creator reputation operator surface ─
     # Per Vision §14 "Data quality and Sybil resistance"
     # mitigation item (1). Read paths surface aggregates
