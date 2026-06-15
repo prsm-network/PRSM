@@ -171,6 +171,16 @@ class InferenceReceipt:
     # signing_payload). (The deeper per-stage activation hash chain is a
     # follow-on brick; this closes the prompt-substitution half of F1.)
     prompt_hash: Optional[bytes] = None
+    # Sprint 1107 (Domain-03 review F1/F2, brick 1) — the per-stage SIGNED activation
+    # chain: an ordered set of StageActivationProof, each signed by the node that ran
+    # that layer slice, binding (request, stage, node_id, input_hash, output_hash).
+    # Carrying it in the receipt converts §7 from "the orchestrator asserts the
+    # topology + output" to "each stage cryptographically proves what it ran and what
+    # activations flowed through it". Optional + default None preserves byte-equivalence
+    # with pre-1107 signed receipts (conditional encoding in signing_payload). Brick 2
+    # has workers produce the proofs; brick 3 threads them; brick 4 verifies the
+    # signatures against the anchor + derives topology from the signed stages.
+    stage_activation_chain: Optional[Any] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
@@ -207,6 +217,9 @@ class InferenceReceipt:
         # Sprint 1099 — omit when None for pre-1099 byte-equivalence.
         if self.prompt_hash is not None:
             d["prompt_hash"] = self.prompt_hash.hex()
+        # Sprint 1107 — omit when None for pre-1107 byte-equivalence.
+        if self.stage_activation_chain is not None:
+            d["stage_activation_chain"] = self.stage_activation_chain.to_dict()
         return d
 
     @classmethod
@@ -286,6 +299,16 @@ class InferenceReceipt:
         # Sprint 1099 — parse prompt_hash hex → bytes when present.
         if "prompt_hash" in d and isinstance(d["prompt_hash"], str):
             d["prompt_hash"] = bytes.fromhex(d["prompt_hash"])
+        # Sprint 1107 — parse the stage activation chain when present.
+        if d.get("stage_activation_chain") is not None and isinstance(
+            d["stage_activation_chain"], dict,
+        ):
+            from prsm.compute.inference.stage_activation_proof import (
+                StageActivationChain,
+            )
+            d["stage_activation_chain"] = StageActivationChain.from_dict(
+                d["stage_activation_chain"],
+            )
         accepted = {f for f in cls.__dataclass_fields__}
         return cls(**{k: v for k, v in d.items() if k in accepted})
 
@@ -358,6 +381,16 @@ class InferenceReceipt:
         # to a pre-1099 receipt (back-compat for legacy receipts + verifiers).
         if self.prompt_hash is not None:
             parts.append(f"prompt_hash:{self.prompt_hash.hex()}")
+        # Sprint 1107 — conditional append for the per-stage signed activation chain.
+        # stable_hash() canonicalizes the stage-sorted proofs (incl. each signature), so
+        # tampering any link — a hash, a node_id, a signature, or the order — flips the
+        # receipt's signed bytes. Absent (None) → nothing appended → byte-identical to a
+        # pre-1107 receipt (back-compat for legacy receipts + verifiers).
+        if self.stage_activation_chain is not None:
+            parts.append(
+                f"stage_activation_chain:"
+                f"{self.stage_activation_chain.stable_hash()}"
+            )
         return "\n".join(parts).encode("utf-8")
 
 

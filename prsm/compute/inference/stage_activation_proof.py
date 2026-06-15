@@ -1,0 +1,170 @@
+"""Per-stage signed activation-hash chain for the production §7 inference receipt.
+
+Domain-03 review F1/F2: the production ``InferenceReceipt`` commits to the OUTPUT
+(output_hash), the INPUT prompt (prompt_hash, sp1099), and the orchestrator's UNSIGNED
+``topology_assignment`` — but NOT to a per-stage, per-node-signed record of which node
+ran which layer slice and what activations flowed through it. So in a multi-stage swarm a
+malicious head node can misattribute work (claim a different topology) or substitute the
+computation, and the receipt still verifies.
+
+This module is the primitive that closes that gap. Each worker, when it runs its layer
+slice, signs a compact ``StageActivationProof`` binding:
+
+    (request_id, stage_index, stage_node_id, input_activation_hash, output_activation_hash)
+
+Those signed proofs are collected by the orchestrator into a ``StageActivationChain`` that
+is carried in — and cryptographically bound into — the ``InferenceReceipt`` (brick 1 wires
+the receptacle; brick 2 has workers produce the proofs; brick 3 threads them; brick 4
+verifies the per-stage signatures + the chain against the on-chain anchor and DERIVES the
+topology from the signed stages instead of trusting the orchestrator's assertion).
+
+The chain's integrity is twofold:
+  * CONTINUITY (no anchor needed, ``verify_continuity`` here): stage 0's input hash is the
+    prompt hash, each stage's output hash is the next stage's input hash, and the last
+    stage's output hash is the receipt's output hash. A spliced/reordered/substituted
+    intermediate activation breaks the chain.
+  * AUTHENTICITY (needs the anchor, brick 4): each proof's signature verifies under the
+    claimed stage_node_id's published key — so the node_id in each link is PROVEN, and the
+    topology is derivable from the signed stages.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple
+
+# Domain separator + version for the per-stage signed payload. Bumping this is a
+# wire-format break — verifiers and signers must agree byte-for-byte.
+_STAGE_PROOF_DOMAIN = "prsm-stage-activation-proof-v1"
+
+
+@dataclass(frozen=True)
+class StageActivationProof:
+    """One worker's signed attestation that it ran ``stage_index`` for ``request_id``,
+    receiving an input whose sha256 is ``input_activation_hash`` and producing an output
+    whose sha256 is ``output_activation_hash``."""
+
+    stage_index: int
+    stage_node_id: str
+    input_activation_hash: str   # sha256 hex of the input activation to this stage
+    output_activation_hash: str  # sha256 hex of the output activation of this stage
+    stage_signature_b64: str = ""  # Ed25519 sig (by stage_node_id) over signing_bytes()
+
+    def signing_bytes(self, request_id: str) -> bytes:
+        """Canonical bytes the WORKER signs. Binds the stage to the specific request +
+        its node_id + its in/out activation hashes, so a signed proof cannot be replayed
+        onto a different request, stage, node, or activation pair. Excludes the signature
+        itself (would be circular). Field order is fixed; do not reorder without bumping
+        ``_STAGE_PROOF_DOMAIN``."""
+        parts = [
+            _STAGE_PROOF_DOMAIN,
+            str(request_id),
+            str(int(self.stage_index)),
+            str(self.stage_node_id),
+            str(self.input_activation_hash),
+            str(self.output_activation_hash),
+        ]
+        return "\n".join(parts).encode("utf-8")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "stage_index": int(self.stage_index),
+            "stage_node_id": str(self.stage_node_id),
+            "input_activation_hash": str(self.input_activation_hash),
+            "output_activation_hash": str(self.output_activation_hash),
+            "stage_signature_b64": str(self.stage_signature_b64),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "StageActivationProof":
+        return cls(
+            stage_index=int(d["stage_index"]),
+            stage_node_id=str(d["stage_node_id"]),
+            input_activation_hash=str(d["input_activation_hash"]),
+            output_activation_hash=str(d["output_activation_hash"]),
+            stage_signature_b64=str(d.get("stage_signature_b64", "")),
+        )
+
+
+@dataclass(frozen=True)
+class StageActivationChain:
+    """The ordered set of per-stage signed proofs for one inference, carried in the
+    ``InferenceReceipt``. Bound into the receipt's signing payload via ``stable_hash``."""
+
+    request_id: str
+    proofs: List[StageActivationProof]
+
+    def _sorted_proofs(self) -> List[StageActivationProof]:
+        return sorted(self.proofs, key=lambda p: int(p.stage_index))
+
+    def stable_hash(self) -> str:
+        """Canonical sha256 hex over the request_id + the stage-sorted proofs (incl. each
+        proof's signature). Bound into ``InferenceReceipt.signing_payload`` so tampering
+        any link — a hash, a node_id, a signature, or the stage order — flips the receipt
+        signature. Mirrors the sprint-297 topology/partial_completion encoding."""
+        canon = json.dumps(
+            {
+                "request_id": str(self.request_id),
+                "proofs": [p.to_dict() for p in self._sorted_proofs()],
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "request_id": str(self.request_id),
+            "proofs": [p.to_dict() for p in self._sorted_proofs()],
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "StageActivationChain":
+        return cls(
+            request_id=str(d.get("request_id", "")),
+            proofs=[
+                StageActivationProof.from_dict(p)
+                for p in d.get("proofs", [])
+            ],
+        )
+
+    def verify_continuity(
+        self, *, prompt_hash_hex: str, output_hash_hex: str,
+    ) -> Tuple[bool, str]:
+        """Pure (no-anchor) chain-continuity check:
+          1. >= 1 stage,
+          2. stage indices are 0..N-1 with no gaps/dupes,
+          3. stage 0's input hash == prompt_hash_hex,
+          4. each stage's output hash == the next stage's input hash,
+          5. the last stage's output hash == output_hash_hex.
+        Returns (ok, diagnostic). Per-stage SIGNATURE authenticity is verified separately
+        (it needs the anchor); this is the splice/reorder/substitution defense."""
+        stages = self._sorted_proofs()
+        if not stages:
+            return False, "empty activation chain"
+        for expected, p in enumerate(stages):
+            if int(p.stage_index) != expected:
+                return False, (
+                    f"stage indices not contiguous from 0 (got {p.stage_index} "
+                    f"at position {expected})"
+                )
+        if stages[0].input_activation_hash != prompt_hash_hex:
+            return False, "chain broken at prompt entry (stage 0 input != prompt_hash)"
+        for k in range(len(stages) - 1):
+            if stages[k].output_activation_hash != stages[k + 1].input_activation_hash:
+                return False, f"chain broken between stage {k} and {k + 1}"
+        if stages[-1].output_activation_hash != output_hash_hex:
+            return False, "chain broken at output exit (last stage output != output_hash)"
+        return True, "activation chain continuity intact"
+
+    def topology_node_ids(self) -> List[str]:
+        """The per-stage node_ids in stage order — the topology DERIVED from the signed
+        stages (brick 4 cross-checks this against the receipt's topology_assignment so the
+        orchestrator can't assert a topology the signed stages don't support)."""
+        return [p.stage_node_id for p in self._sorted_proofs()]
+
+
+def activation_hash(blob: bytes) -> str:
+    """The canonical sha256-hex of an activation blob, used on both the worker (when it
+    signs its proof) and the verifier. Centralized so the two never diverge."""
+    return hashlib.sha256(bytes(blob)).hexdigest()
