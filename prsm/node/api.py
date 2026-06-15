@@ -13806,6 +13806,18 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 _prompt_hash = bytes.fromhex(_prompt_hash)
             elif _prompt_hash is not None:
                 _prompt_hash = None
+            # sp1110 (Domain-03 F1/F2) — the per-stage signed activation chain folds into
+            # signing_payload(); restore it on reconstruction or a chain-bearing receipt
+            # falsely fails signature verification (same defect class as the sp1098/1099
+            # streamed/partial/prompt_hash restorations).
+            _stage_chain = receipt_payload.get("stage_activation_chain")
+            if isinstance(_stage_chain, dict):
+                from prsm.compute.inference.stage_activation_proof import (
+                    StageActivationChain,
+                )
+                _stage_chain = StageActivationChain.from_dict(_stage_chain)
+            elif _stage_chain is not None:
+                _stage_chain = None
             receipt = InferenceReceipt(
                 job_id=receipt_payload["job_id"],
                 request_id=receipt_payload["request_id"],
@@ -13841,6 +13853,7 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 streamed_output=_streamed,
                 partial_completion=_partial,
                 prompt_hash=_prompt_hash,
+                stage_activation_chain=_stage_chain,
             )
         except (KeyError, ValueError, TypeError) as exc:
             raise HTTPException(

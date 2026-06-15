@@ -129,6 +129,19 @@ def _build_signing_payload(receipt: dict) -> bytes:
     prompt_hash = receipt.get("prompt_hash")
     if prompt_hash is not None:
         parts.append(f"prompt_hash:{prompt_hash}")
+    # sp1110 — the per-stage signed activation chain. stable_hash = sha256 over the
+    # canonical {request_id, stage-sorted proofs} (mirrors StageActivationChain.
+    # stable_hash). Kept in sync so the standalone verifier validates chain-bearing
+    # receipts.
+    chain = receipt.get("stage_activation_chain")
+    if chain is not None:
+        proofs = sorted(
+            chain.get("proofs", []), key=lambda p: int(p.get("stage_index", 0)))
+        canon = json.dumps(
+            {"request_id": str(chain.get("request_id", "")), "proofs": proofs},
+            sort_keys=True)
+        chain_hash = hashlib.sha256(canon.encode("utf-8")).hexdigest()
+        parts.append(f"stage_activation_chain:{chain_hash}")
     return "\n".join(parts).encode("utf-8")
 
 

@@ -136,6 +136,10 @@ class ChainExecutionResult:
     # or runtime error). None by default; pre-778 executors that
     # don't populate it produce byte-identical signed receipts.
     partial_completion: Optional[Any] = None
+    # Sprint 1110 (Domain-03 F1/F2, brick 4) — the per-stage SIGNED activation chain
+    # (StageActivationChain) the chain executor assembled from each worker's proof, when
+    # every stage supplied one. Threaded into the receipt by _build_signed_receipt.
+    stage_activation_chain: Optional[Any] = None
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1141,5 +1145,11 @@ class ParallaxScheduledExecutor(InferenceExecutor):
                 outcome, "partial_completion", None,
             ),
             prompt_hash=prompt_hash,
+            # Sprint 1110 (Domain-03 F1/F2, brick 4) — carry the per-stage signed
+            # activation chain into the receipt (None for single-node/streaming paths
+            # that don't assemble one → byte-identical pre-1110 receipt).
+            stage_activation_chain=getattr(
+                outcome, "stage_activation_chain", None,
+            ),
         )
         return sign_receipt(unsigned, self._identity)

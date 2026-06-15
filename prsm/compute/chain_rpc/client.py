@@ -187,6 +187,13 @@ class StageOutcome:
     tee_attestation: bytes
     tee_type: TEEType
     epsilon_spent: float
+    # Sprint 1110 (Domain-03 F1/F2, brick 4) — the self-securing per-stage activation
+    # proof captured from the verified RunLayerSliceResponse (None on paths that don't
+    # emit it yet — streaming/decode). The orchestrator collects these into the
+    # receipt's StageActivationChain only when EVERY stage supplied one.
+    stage_input_activation_hash: Optional[str] = None
+    stage_output_activation_hash: Optional[str] = None
+    stage_activation_proof_b64: Optional[str] = None
 
 
 # ``ChainExecutionResult`` is shared with Phase 3.x.6's
@@ -204,6 +211,38 @@ class StageOutcome:
 #                      attestations; Task 5 will swap this for a
 #                      JSON-encoded list at the InferenceReceipt
 #                      layer.
+
+
+def _build_stage_activation_chain(request_id: str, outcomes: List["StageOutcome"]):
+    """sp1110 (Domain-03 F1/F2, brick 4) — assemble a StageActivationChain from the
+    per-stage proofs captured during execution. Returns the chain ONLY when every stage
+    supplied a complete, signed proof; otherwise None (the chain is all-or-nothing — a
+    partial chain would be worse than none, since a verifier must be able to trust that
+    an absent link means "not proven", not "silently dropped"). Stage indices come from
+    the proofs themselves (set by each worker from the settler-signed token)."""
+    from prsm.compute.inference.stage_activation_proof import (
+        StageActivationChain,
+        StageActivationProof,
+    )
+
+    if not outcomes:
+        return None
+    proofs = []
+    for o in outcomes:
+        if not (
+            o.stage_input_activation_hash
+            and o.stage_output_activation_hash
+            and o.stage_activation_proof_b64
+        ):
+            return None  # incomplete → omit the whole chain
+        proofs.append(StageActivationProof(
+            stage_index=int(o.stage_index),
+            stage_node_id=o.stage_node_id,
+            input_activation_hash=o.stage_input_activation_hash,
+            output_activation_hash=o.stage_output_activation_hash,
+            stage_signature_b64=o.stage_activation_proof_b64,
+        ))
+    return StageActivationChain(request_id=request_id, proofs=proofs)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -661,6 +700,13 @@ class RpcChainExecutor:
                 tee_attestation=response.tee_attestation,
                 tee_type=response.tee_type,
                 epsilon_spent=response.epsilon_spent,
+                # sp1110 brick 4 — capture the self-securing per-stage proof.
+                stage_input_activation_hash=getattr(
+                    response, "stage_input_activation_hash", None),
+                stage_output_activation_hash=getattr(
+                    response, "stage_output_activation_hash", None),
+                stage_activation_proof_b64=getattr(
+                    response, "stage_activation_proof_b64", None),
             ))
 
             # Sprint 418 — optional per-stage activation
@@ -704,12 +750,17 @@ class RpcChainExecutor:
             )
             for outcome in outcomes
         ]
+        # sp1110 brick 4 — assemble the per-stage SIGNED activation chain when EVERY
+        # stage supplied a proof (the unary path does; streaming/decode don't yet, so
+        # the chain is omitted there rather than reported partial → no false provenance).
+        stage_chain = _build_stage_activation_chain(request.request_id, outcomes)
         return ChainExecutionResult(
             output=output_text,
             duration_seconds=sum(s.duration_seconds for s in outcomes),
             tee_attestation=encode_multi_stage_attestation(stage_attestations),
             tee_type=worst_case_tee_type(stage_attestations),
             epsilon_spent=sum(s.epsilon_spent for s in outcomes),
+            stage_activation_chain=stage_chain,
         )
 
     # ── streaming-token API (Phase 3.x.8) ────────────────────────────
