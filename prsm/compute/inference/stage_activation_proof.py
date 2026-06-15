@@ -213,12 +213,23 @@ def verify_stage_proof(proof: "StageActivationProof", request_id: str, *, anchor
 def verify_stage_activation_chain(
     chain: "StageActivationChain", *,
     prompt_hash_hex: str, output_hash_hex: str, anchor: Any,
+    expected_request_id: Any = None,
 ) -> Tuple[bool, str]:
     """Full chain verification: CONTINUITY (the activations actually link prompt→output
     with no spliced intermediate) AND AUTHENTICITY (every stage's link is signed by the
-    node the anchor knows). Returns (ok, diagnostic). A True result means: the receipt's
-    prompt produced its output through exactly these stages, each run by the node that
-    cryptographically signed for it — the §7 promise, end to end."""
+    node the anchor knows). When ``expected_request_id`` is supplied, also binds the
+    chain to THAT request (rejecting a valid chain spliced in from a different inference).
+    Returns (ok, diagnostic). A True result means: the receipt's prompt produced its
+    output through exactly these stages, each run by the node that cryptographically
+    signed for it — the §7 promise, end to end."""
+    if (
+        expected_request_id is not None
+        and str(chain.request_id) != str(expected_request_id)
+    ):
+        return False, (
+            f"chain request_id {chain.request_id!r} does not match the receipt's "
+            f"{expected_request_id!r} (chain spliced from a different inference)"
+        )
     ok, why = chain.verify_continuity(
         prompt_hash_hex=prompt_hash_hex, output_hash_hex=output_hash_hex,
     )
@@ -249,13 +260,18 @@ def summarize_stage_activation_chain(
     chain: "StageActivationChain", *,
     stage_public_keys: Any = None,
     topology_assignment: Any = None,
+    expected_request_id: Any = None,
 ) -> Dict[str, Any]:
     """Build a JSON-able verification summary of a receipt's activation chain for the
     /compute/receipt/verify response. Always reports the internal-link structure +
     derived topology (no keys needed). When ``stage_public_keys`` ({node_id: b64}) is
     supplied, also verifies every per-stage signature (authenticity); when
-    ``topology_assignment`` is supplied, cross-checks it against the signed stages (F2).
-    Fail-closed: any signature that can't be verified makes signatures_valid False."""
+    ``topology_assignment`` is supplied, cross-checks it against the signed stages (F2);
+    when ``expected_request_id`` (the RECEIPT's request_id) is supplied, binds the chain
+    to THIS receipt — closing a cross-inference splice where a malicious head presents a
+    valid chain from a DIFFERENT inference (its per-stage signatures + internal links +
+    topology all verify, because they're genuine — for the OTHER request). Fail-closed:
+    any signature that can't be verified makes signatures_valid False."""
     links_ok, links_detail = chain.verify_internal_links()
     out: Dict[str, Any] = {
         "present": True,
@@ -264,6 +280,13 @@ def summarize_stage_activation_chain(
         "internal_links_ok": links_ok,
         "internal_links_detail": links_detail,
     }
+    if expected_request_id is not None:
+        # The proofs are each signed over chain.request_id; binding chain.request_id to
+        # the receipt's request_id is what ties those genuine signatures to THIS
+        # inference (without it, a valid chain from another request would pass).
+        out["request_id_bound"] = (
+            str(chain.request_id) == str(expected_request_id)
+        )
     if stage_public_keys:
         anchor = _DictAnchor(dict(stage_public_keys))
         all_ok = True

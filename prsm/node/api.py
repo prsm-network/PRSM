@@ -13886,6 +13886,7 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 receipt.stage_activation_chain,
                 stage_public_keys=body.get("stage_public_keys"),
                 topology_assignment=receipt.topology_assignment,
+                expected_request_id=receipt.request_id,
             )
         else:
             result_dict["stage_activation_chain"] = {"present": False}
