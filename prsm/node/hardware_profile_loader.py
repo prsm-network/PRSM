@@ -280,6 +280,50 @@ def _merge_operator_delegation(data: Dict[str, Any]) -> None:
     data["operator_delegation"] = blob
 
 
+def load_tee_attestation_blob() -> Optional[bytes]:
+    """Sprint 1114 — load THIS node's raw TEE attestation quote bytes from the operator's
+    environment, for the dispatch-time TEE-policy gate (api._enforce_tee_policy reads
+    node._tee_node_attestation_blob). Resolution order (first wins):
+      1. PRSM_TEE_ATTESTATION_B64  (the quote, base64-encoded)
+      2. PRSM_TEE_ATTESTATION_FILE (path to the raw binary quote)
+    Returns the raw bytes, or None when unset/unreadable/oversized (the node then stays
+    tier-none = ineligible for confidential work — the fail-safe default). Capped at 64
+    KiB (a genuine SGX/TDX/SEV quote is ≤ ~10 KB; mirrors the advertise cap +
+    trust_adapter._MAX_ATTESTATION_BYTES)."""
+    import base64
+    import os
+
+    _MAX = 64 * 1024
+    b64 = (os.environ.get("PRSM_TEE_ATTESTATION_B64") or "").strip()
+    if b64:
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PRSM_TEE_ATTESTATION_B64 is not valid base64 (%s); node "
+                           "stays tier-none.", exc)
+            return None
+        if len(raw) > _MAX:
+            logger.warning("PRSM_TEE_ATTESTATION_B64 is %d bytes (> %d cap) — not a real "
+                           "TEE quote; ignoring.", len(raw), _MAX)
+            return None
+        return raw
+    file_path = (os.environ.get("PRSM_TEE_ATTESTATION_FILE") or "").strip()
+    if file_path:
+        try:
+            from pathlib import Path
+            raw = Path(file_path).read_bytes()
+        except OSError as exc:
+            logger.debug("PRSM_TEE_ATTESTATION_FILE=%s unreadable (%s); skipping.",
+                         file_path, exc)
+            return None
+        if raw and len(raw) <= _MAX:
+            return raw
+        if raw:
+            logger.warning("PRSM_TEE_ATTESTATION_FILE is %d bytes (> %d cap) — ignoring.",
+                           len(raw), _MAX)
+    return None
+
+
 def _merge_attestation(data: Dict[str, Any]) -> None:
     """Sprint 1083 — merge this node's TEE attestation quote into the advertised
     hardware_profile so a consumer can CRYPTOGRAPHICALLY verify it (sp1083
@@ -296,37 +340,8 @@ def _merge_attestation(data: Dict[str, Any]) -> None:
     """
     import base64
 
-    # A genuine SGX/TDX/SEV quote is ≤ ~10 KB; cap what we'll advertise so a huge blob
-    # can't be relayed across the gossip network (review LOW DoS; mirrors the consumer
-    # cap in trust_adapter._MAX_ATTESTATION_BYTES).
-    _MAX = 64 * 1024
-
-    b64 = (os.environ.get("PRSM_TEE_ATTESTATION_B64") or "").strip()
-    if b64:
-        try:
-            raw = base64.b64decode(b64, validate=True)   # validate it's real base64
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("PRSM_TEE_ATTESTATION_B64 is not valid base64 (%s); node "
-                           "will not advertise an attestation (stays tier-none).", exc)
-            return
-        if len(raw) > _MAX:
-            logger.warning("PRSM_TEE_ATTESTATION_B64 is %d bytes (> %d cap) — not a real "
-                           "TEE quote; not advertising.", len(raw), _MAX)
-            return
-        data["attestation"] = b64
-        return
-
-    file_path = (os.environ.get("PRSM_TEE_ATTESTATION_FILE") or "").strip()
-    if file_path:
-        try:
-            from pathlib import Path
-            raw = Path(file_path).read_bytes()
-        except OSError as exc:
-            logger.debug("PRSM_TEE_ATTESTATION_FILE=%s unreadable (%s); skipping.",
-                         file_path, exc)
-            return
-        if raw and len(raw) <= _MAX:
-            data["attestation"] = base64.b64encode(raw).decode()
-        elif raw:
-            logger.warning("PRSM_TEE_ATTESTATION_FILE is %d bytes (> %d cap) — not "
-                           "advertising.", len(raw), _MAX)
+    # sp1114 — reuse the single loader so the advertised attestation and the
+    # dispatch-gate blob can never diverge (same source, caps, validation).
+    raw = load_tee_attestation_blob()
+    if raw:
+        data["attestation"] = base64.b64encode(raw).decode()

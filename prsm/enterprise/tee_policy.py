@@ -140,6 +140,77 @@ class TEEPolicy:
             ),
         )
 
+    def stricter_of(self, other: "TEEPolicy") -> "TEEPolicy":
+        """Sprint 1114 — combine two policies into the one that satisfies BOTH (used to
+        merge an operator-mandated floor with a requester's policy). The result requires:
+          - the HIGHER min_attestation_tier of the two,
+          - the INTERSECTION of the vendor allowlists (None ∩ S = S; both set →
+            intersection, which may be empty → admit nothing, the loud-misconfig guard),
+          - signature-chain if EITHER requires it.
+        Neither policy is weakened — the merge can only tighten."""
+        higher = (
+            self.min_attestation_tier
+            if tier_rank(self.min_attestation_tier)
+            >= tier_rank(other.min_attestation_tier)
+            else other.min_attestation_tier
+        )
+        if self.allowed_vendors is None:
+            vendors = other.allowed_vendors
+        elif other.allowed_vendors is None:
+            vendors = self.allowed_vendors
+        else:
+            vendors = self.allowed_vendors & other.allowed_vendors
+        return TEEPolicy(
+            min_attestation_tier=higher,
+            allowed_vendors=vendors,
+            require_signature_chain=(
+                self.require_signature_chain or other.require_signature_chain
+            ),
+        )
+
+
+def operator_floor_policy_from_env(env: Optional[Dict[str, str]] = None) -> Optional["TEEPolicy"]:
+    """Sprint 1114 — the OPERATOR-mandated TEE floor, read from the environment:
+      - PRSM_MIN_ATTESTATION_TIER (none|software|hardware_unverified|hardware_verified)
+      - PRSM_TEE_ALLOWED_VENDORS (comma-separated allowlist; optional)
+      - PRSM_TEE_REQUIRE_SIGNATURE_CHAIN (truthy → require the full crypto chain)
+    Returns None when the operator set no floor (preserving the prior requester-opt-in
+    behavior). A floor of tier 'none' with no other constraint also returns None (it
+    gates nothing). An unparseable tier is treated as no floor + is the caller's job to
+    surface; we fail SAFE toward not silently weakening (return None, the operator's
+    intent was a floor — so we log loudly at the call site)."""
+    import os
+
+    e = env if env is not None else os.environ
+    tier_raw = (e.get("PRSM_MIN_ATTESTATION_TIER") or "").strip().lower()
+    vendors_raw = (e.get("PRSM_TEE_ALLOWED_VENDORS") or "").strip()
+    require_chain = (e.get("PRSM_TEE_REQUIRE_SIGNATURE_CHAIN") or "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    if not tier_raw and not vendors_raw and not require_chain:
+        return None
+    tier = AttestationTier.NONE
+    if tier_raw:
+        try:
+            tier = AttestationTier(tier_raw)
+        except ValueError:
+            raise ValueError(
+                f"PRSM_MIN_ATTESTATION_TIER={tier_raw!r} is not a valid tier "
+                f"(none|software|hardware_unverified|hardware_verified)"
+            )
+    vendors = (
+        {v.strip() for v in vendors_raw.split(",") if v.strip()}
+        if vendors_raw else None
+    )
+    # A pure tier=none floor with no vendor/chain constraint gates nothing → None.
+    if tier == AttestationTier.NONE and vendors is None and not require_chain:
+        return None
+    return TEEPolicy(
+        min_attestation_tier=tier,
+        allowed_vendors=vendors,
+        require_signature_chain=require_chain,
+    )
+
 
 # ── PolicyResult ─────────────────────────────────────
 

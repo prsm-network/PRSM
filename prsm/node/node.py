@@ -1858,6 +1858,19 @@ class PRSMNode:
         except Exception:  # noqa: BLE001
             self._local_hardware_profile = None
 
+        # sp1114 (Domain-08 review MEDIUM-7) — load THIS node's raw TEE attestation quote
+        # so the dispatch-time TEE-policy gate (api._enforce_tee_policy) can actually
+        # admit confidential work when the node has real hardware. Was never populated in
+        # production → every hardware policy failed (fail-safe but unusable). None when
+        # the node has no quote (stays tier-none = ineligible for confidential work).
+        try:
+            from prsm.node.hardware_profile_loader import (
+                load_tee_attestation_blob,
+            )
+            self._tee_node_attestation_blob = load_tee_attestation_blob()
+        except Exception:  # noqa: BLE001
+            self._tee_node_attestation_blob = None
+
         if self.config.transport_backend == "libp2p":
             # sp1010 — the libp2p gossip/discovery path carries none of the
             # WebSocket stack's origin-auth (Residual A). Warn (or refuse, if

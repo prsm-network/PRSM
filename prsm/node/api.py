@@ -6233,27 +6233,50 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         for, then either reroutes to a compliant node or
         loosens the policy.
         """
-        raw_policy = body.get("tee_policy")
-        if raw_policy is None:
-            return
-        if not isinstance(raw_policy, dict):
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "tee_policy must be a JSON object with "
-                    "at least 'min_attestation_tier'"
-                ),
-            )
         from prsm.enterprise.tee_policy import (
             TEEPolicy, evaluate_attestation_blob,
+            operator_floor_policy_from_env,
         )
+        # sp1114 (Domain-08 review MEDIUM-7) — the OPERATOR-mandated TEE floor. The gate
+        # was requester-opt-in only (absent tee_policy → no gating), so an operator could
+        # not require "this node only serves >= hardware-verified work". The floor (from
+        # PRSM_MIN_ATTESTATION_TIER etc.) is now merged into EVERY request: a requester's
+        # policy can only TIGHTEN it, never weaken it. None floor + no requester policy →
+        # unchanged (no gating).
         try:
-            policy = TEEPolicy.from_dict(raw_policy)
+            floor = operator_floor_policy_from_env()
         except ValueError as e:
+            # Misconfigured floor must fail CLOSED, not silently disable the control.
             raise HTTPException(
-                status_code=422,
-                detail=f"invalid tee_policy: {e}",
+                status_code=412,
+                detail=f"node TEE floor misconfigured (refusing dispatch): {e}",
             )
+        raw_policy = body.get("tee_policy")
+        if raw_policy is None and floor is None:
+            return
+        policy: Optional[TEEPolicy] = None
+        if raw_policy is not None:
+            if not isinstance(raw_policy, dict):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "tee_policy must be a JSON object with "
+                        "at least 'min_attestation_tier'"
+                    ),
+                )
+            try:
+                policy = TEEPolicy.from_dict(raw_policy)
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"invalid tee_policy: {e}",
+                )
+        # Merge: the effective policy must satisfy BOTH the requester and the operator
+        # floor (stricter of the two on every dimension).
+        if policy is None:
+            policy = floor
+        elif floor is not None:
+            policy = policy.stricter_of(floor)
         blob = getattr(
             node, "_tee_node_attestation_blob", None,
         )
