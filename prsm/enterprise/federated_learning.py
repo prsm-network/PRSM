@@ -390,6 +390,14 @@ class FederatedJob:
     # X25519 pubkey before submitting. Orchestrator unseals
     # via PRSM_FEDERATED_ORCHESTRATOR_TRANSPORT_PRIVKEY env.
     transport_pubkey_b64: Optional[str] = None
+    # Sprint 1115 (Domain-08 review MEDIUM-7 follow-on) — TEE attestation policy for this
+    # job, stored as the enterprise.tee_policy.TEEPolicy.to_dict() shape (min_attestation
+    # _tier / allowed_vendors / require_signature_chain). When non-None,
+    # accept_gradient_update evaluates each worker's worker_attestation_b64 against it and
+    # REFUSES updates that don't satisfy it — closing the gap where the FL path checked
+    # signatures but never the attestation despite the module docstring's TEE-gating
+    # claim. None → no attestation gating (backwards-compatible).
+    tee_policy: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -418,6 +426,10 @@ class FederatedJob:
             ),
             "transport_pubkey_b64": (
                 self.transport_pubkey_b64
+            ),
+            "tee_policy": (
+                dict(self.tee_policy)
+                if self.tee_policy is not None else None
             ),
         }
 
@@ -456,6 +468,7 @@ class FederatedJob:
             transport_pubkey_b64=d.get(
                 "transport_pubkey_b64",
             ),
+            tee_policy=d.get("tee_policy"),
         )
 
 
@@ -890,6 +903,7 @@ class FederatedLearningOrchestrator:
         require_signed_updates: bool = False,
         dp_policy: Optional[DPPolicy] = None,
         transport_pubkey_b64: Optional[str] = None,
+        tee_policy: Optional[Dict[str, Any]] = None,
     ) -> FederatedJob:
         if not worker_pool:
             raise ValueError(
@@ -920,6 +934,14 @@ class FederatedLearningOrchestrator:
                 raise ValueError(
                     f"invalid transport_pubkey_b64: {e}"
                 )
+        # sp1115 — validate the TEE policy eagerly so propose-job fails loud on a
+        # malformed policy (rather than at the first gradient-update evaluation).
+        if tee_policy is not None:
+            from prsm.enterprise.tee_policy import TEEPolicy
+            try:
+                TEEPolicy.from_dict(tee_policy)
+            except ValueError as e:
+                raise ValueError(f"invalid tee_policy: {e}")
         job = FederatedJob(
             job_id=str(uuid.uuid4()),
             model_id=model_id,
@@ -937,6 +959,7 @@ class FederatedLearningOrchestrator:
             ),
             dp_policy=dp_policy,
             transport_pubkey_b64=transport_pubkey_b64,
+            tee_policy=tee_policy,
         )
         self._jobs[job.job_id] = job
         self._persist_job(job)
@@ -1084,6 +1107,33 @@ class FederatedLearningOrchestrator:
                     f"worker {update.worker_node_id!r} "
                     f"signature does not verify against "
                     f"the registered pubkey"
+                )
+        # Sprint 1115 (Domain-08 review MEDIUM-7 follow-on) — TEE attestation gate. When
+        # the job declares a tee_policy, every worker's attestation MUST satisfy it before
+        # its gradient is accepted into the round. This is what makes the module's
+        # TEE-gating claim real: a worker without a sufficient attestation (e.g. software
+        # tier when the job requires hardware-verified) is REFUSED, fail-closed.
+        if job.tee_policy is not None:
+            import base64 as _b64
+            from prsm.enterprise.tee_policy import (
+                TEEPolicy, evaluate_attestation_blob,
+            )
+            policy = TEEPolicy.from_dict(job.tee_policy)
+            blob: Optional[bytes] = None
+            if update.worker_attestation_b64:
+                try:
+                    blob = _b64.b64decode(
+                        update.worker_attestation_b64, validate=True,
+                    )
+                except Exception:  # noqa: BLE001 — bad b64 → no attestation → fail closed
+                    blob = None
+            result = evaluate_attestation_blob(blob, policy)
+            if result.status.value != "pass":
+                raise ValueError(
+                    f"worker {update.worker_node_id!r} attestation does not satisfy the "
+                    f"job's TEE policy: effective_tier={result.effective_tier.value}, "
+                    f"required={result.min_required_tier.value}, "
+                    f"vendor={result.vendor or '(none)'}. {result.diagnostic}"
                 )
         rnd.gradient_updates_received.append(update)
         if rnd.status == RoundStatus.ISSUED:
