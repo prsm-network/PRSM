@@ -13871,7 +13871,25 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             require_topology_rotation=require_topology,
             public_key_b64=public_key_b64,
         )
-        return result.to_dict()
+        result_dict = result.to_dict()
+        # sp1111 (Domain-03 F1/F2, brick 5) — surface the per-stage signed activation
+        # chain verification. The settler signature (checked above) already commits to
+        # the chain; this ADDS the independent per-stage view: internal links + derived
+        # topology (always), per-stage signatures (when the caller supplies
+        # stage_public_keys, mirroring the settler public_key_b64 it already supplies),
+        # and a topology cross-check (F2) against the receipt's topology_assignment.
+        if receipt.stage_activation_chain is not None:
+            from prsm.compute.inference.stage_activation_proof import (
+                summarize_stage_activation_chain,
+            )
+            result_dict["stage_activation_chain"] = summarize_stage_activation_chain(
+                receipt.stage_activation_chain,
+                stage_public_keys=body.get("stage_public_keys"),
+                topology_assignment=receipt.topology_assignment,
+            )
+        else:
+            result_dict["stage_activation_chain"] = {"present": False}
+        return result_dict
 
     # ── Sprint 287 — creator reputation operator surface ─
     # Per Vision §14 "Data quality and Sybil resistance"

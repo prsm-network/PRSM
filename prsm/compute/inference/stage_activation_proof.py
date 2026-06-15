@@ -128,17 +128,15 @@ class StageActivationChain:
             ],
         )
 
-    def verify_continuity(
-        self, *, prompt_hash_hex: str, output_hash_hex: str,
-    ) -> Tuple[bool, str]:
-        """Pure (no-anchor) chain-continuity check:
+    def verify_internal_links(self) -> Tuple[bool, str]:
+        """Pure (no-anchor, no-endpoint) check of the chain's INTERNAL structure:
           1. >= 1 stage,
           2. stage indices are 0..N-1 with no gaps/dupes,
-          3. stage 0's input hash == prompt_hash_hex,
-          4. each stage's output hash == the next stage's input hash,
-          5. the last stage's output hash == output_hash_hex.
-        Returns (ok, diagnostic). Per-stage SIGNATURE authenticity is verified separately
-        (it needs the anchor); this is the splice/reorder/substitution defense."""
+          3. each stage's output hash == the next stage's input hash.
+        This is the stage-to-stage splice/reorder/substitution defense — it needs neither
+        the anchor (signatures) nor the prompt/output endpoints (which involve the head's
+        prompt-encode / output-decode framing). The per-stage SIGNATURE authenticity and
+        the prompt/output endpoint tie are checked separately."""
         stages = self._sorted_proofs()
         if not stages:
             return False, "empty activation chain"
@@ -148,11 +146,26 @@ class StageActivationChain:
                     f"stage indices not contiguous from 0 (got {p.stage_index} "
                     f"at position {expected})"
                 )
-        if stages[0].input_activation_hash != prompt_hash_hex:
-            return False, "chain broken at prompt entry (stage 0 input != prompt_hash)"
         for k in range(len(stages) - 1):
             if stages[k].output_activation_hash != stages[k + 1].input_activation_hash:
                 return False, f"chain broken between stage {k} and {k + 1}"
+        return True, "internal activation links intact"
+
+    def verify_continuity(
+        self, *, prompt_hash_hex: str, output_hash_hex: str,
+    ) -> Tuple[bool, str]:
+        """Full continuity check: the internal links PLUS the prompt/output endpoints
+        (stage 0's input hash == prompt_hash_hex, last stage's output hash ==
+        output_hash_hex). Use this when the caller knows the chain-entry / chain-exit
+        ACTIVATION hashes (A0 / AN — what the orchestrator encoded the prompt to / the
+        final activation it decoded). For an endpoint-agnostic structural check use
+        verify_internal_links()."""
+        ok, why = self.verify_internal_links()
+        if not ok:
+            return False, why
+        stages = self._sorted_proofs()
+        if stages[0].input_activation_hash != prompt_hash_hex:
+            return False, "chain broken at prompt entry (stage 0 input != prompt_hash)"
         if stages[-1].output_activation_hash != output_hash_hex:
             return False, "chain broken at output exit (last stage output != output_hash)"
         return True, "activation chain continuity intact"
@@ -218,6 +231,55 @@ def verify_stage_activation_chain(
                 f"{p.stage_node_id}"
             )
     return True, "stage activation chain verified (continuity + per-stage signatures)"
+
+
+class _DictAnchor:
+    """Minimal anchor (``lookup(node_id) -> pubkey_b64``) backed by a caller-supplied
+    dict — lets the verify endpoint do per-stage signature checks self-contained (the
+    caller supplies the stage keys, mirroring how it supplies the settler public key)."""
+
+    def __init__(self, mapping: Dict[str, str]) -> None:
+        self._m = mapping or {}
+
+    def lookup(self, node_id: str) -> Any:
+        return self._m.get(node_id)
+
+
+def summarize_stage_activation_chain(
+    chain: "StageActivationChain", *,
+    stage_public_keys: Any = None,
+    topology_assignment: Any = None,
+) -> Dict[str, Any]:
+    """Build a JSON-able verification summary of a receipt's activation chain for the
+    /compute/receipt/verify response. Always reports the internal-link structure +
+    derived topology (no keys needed). When ``stage_public_keys`` ({node_id: b64}) is
+    supplied, also verifies every per-stage signature (authenticity); when
+    ``topology_assignment`` is supplied, cross-checks it against the signed stages (F2).
+    Fail-closed: any signature that can't be verified makes signatures_valid False."""
+    links_ok, links_detail = chain.verify_internal_links()
+    out: Dict[str, Any] = {
+        "present": True,
+        "stage_count": len(chain.proofs),
+        "node_ids": chain.topology_node_ids(),
+        "internal_links_ok": links_ok,
+        "internal_links_detail": links_detail,
+    }
+    if stage_public_keys:
+        anchor = _DictAnchor(dict(stage_public_keys))
+        all_ok = True
+        for p in chain.proofs:
+            if not verify_stage_proof(p, chain.request_id, anchor=anchor):
+                all_ok = False
+                break
+        out["signatures_checked"] = True
+        out["signatures_valid"] = all_ok
+    else:
+        out["signatures_checked"] = False
+    if topology_assignment is not None:
+        topo_ok, topo_detail = chain_supports_topology(chain, topology_assignment)
+        out["topology_consistent"] = topo_ok
+        out["topology_detail"] = topo_detail
+    return out
 
 
 def chain_supports_topology(
