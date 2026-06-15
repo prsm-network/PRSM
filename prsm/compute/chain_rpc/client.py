@@ -2146,6 +2146,10 @@ class RpcChainExecutor:
             chain_stage_index=stage_index,
             chain_total_stages=chain_total,
             deadline_unix=deadline_unix,
+            # sp1124 (Domain-03 F6) — bind the token to the exact slice + model it
+            # authorizes, so a relay can't reuse it for a different layer_range/model.
+            layer_range=tuple(layer_range),
+            model_id=request.model_id,
         )
 
         # Build the streaming RunLayerSliceRequest (streaming=True).
@@ -2526,6 +2530,10 @@ class RpcChainExecutor:
             chain_stage_index=stage_index,
             chain_total_stages=chain_total,
             deadline_unix=deadline_unix,
+            # sp1124 (Domain-03 F6) — bind the token to the exact slice + model it
+            # authorizes, so a relay can't reuse it for a different layer_range/model.
+            layer_range=tuple(layer_range),
+            model_id=request.model_id,
         )
 
         if should_chunk(blob, threshold=self._chunk_threshold_bytes):

@@ -1828,6 +1828,21 @@ class LayerStageServer:
                 f"{request.upstream_token.settler_node_id!r})",
             ))
 
+        # Step 2b (sp1124, Domain-03 review F6) — the settler token must BIND this
+        # request's layer_range + model_id, so a relay can't pair a valid token with a
+        # request that runs a different slice or model than the settler authorized.
+        # Enforce-when-present: legacy tokens without the binding still pass (back-compat).
+        if not request.upstream_token.binds_request(
+            layer_range=tuple(request.layer_range), model_id=request.model_id,
+        ):
+            return _GateResult(error=(
+                StageErrorCode.INVALID_TOKEN,
+                f"upstream_token does not authorize this request's layer_range "
+                f"{tuple(request.layer_range)} / model_id {request.model_id!r} "
+                f"(token binds {request.upstream_token.layer_range} / "
+                f"{request.upstream_token.model_id!r})",
+            ))
+
         # Step 3: deadline check.
         now = self._clock()
         if request.upstream_token.deadline_unix <= now:

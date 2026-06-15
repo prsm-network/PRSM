@@ -304,11 +304,37 @@ class HandoffToken:
     # relay adversary cannot substitute a different ephemeral
     # pubkey without invalidating the settler's signature.
     ephemeral_pubkey: Optional[bytes] = None
+    # Sprint 1124 (Domain-03 review F6) — bind the token to the SPECIFIC layer slice +
+    # model it authorizes. Without these, a settler token for "stage K of request R" did
+    # not constrain WHICH layers or model the worker runs, so a relay could pair a valid
+    # token with a request specifying a different layer_range / model_id. Both are
+    # committed in the signing payload (omit-when-None → byte-identical to pre-1124
+    # tokens). Optional for rolling-deploy back-compat; the worker enforces the binding
+    # WHEN PRESENT (binds_request), so every new token closes the gap.
+    layer_range: Optional[Tuple[int, int]] = None
+    model_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         _validate_str_field("request_id", self.request_id)
         _validate_str_field("settler_node_id", self.settler_node_id)
         _validate_str_field("signature_b64", self.signature_b64)
+        # sp1124 — layer_range shape (a [start, end) int pair) when set.
+        if self.layer_range is not None:
+            lr = self.layer_range
+            if (
+                not isinstance(lr, (tuple, list)) or len(lr) != 2
+                or any(isinstance(x, bool) or not isinstance(x, int) for x in lr)
+                or not (0 <= lr[0] < lr[1])
+            ):
+                raise ChainRpcMalformedError(
+                    f"layer_range must be a [start, end) int pair with 0<=start<end, "
+                    f"got {lr!r}"
+                )
+            object.__setattr__(self, "layer_range", (int(lr[0]), int(lr[1])))
+        if self.model_id is not None and not isinstance(self.model_id, str):
+            raise ChainRpcMalformedError(
+                f"model_id must be str, got {type(self.model_id).__name__}"
+            )
         # Phase 3.x.11.q.y' — ephemeral_pubkey shape validation.
         # Exactly 32 bytes when set (X25519 public key length per
         # RFC 7748). Bytes type only; defends against length
@@ -367,6 +393,8 @@ class HandoffToken:
         chain_total_stages: int,
         deadline_unix: float,
         ephemeral_pubkey: Optional[bytes] = None,
+        layer_range: Optional[Tuple[int, int]] = None,
+        model_id: Optional[str] = None,
     ) -> bytes:
         """Canonical bytes signed by the settler. Both signer and
         verifier MUST construct identical bytes from the same logical
@@ -389,6 +417,11 @@ class HandoffToken:
             payload["ephemeral_pubkey_hex"] = bytes(
                 ephemeral_pubkey,
             ).hex()
+        # sp1124 — omit-when-None for byte-equivalence with pre-1124 tokens.
+        if layer_range is not None:
+            payload["layer_range"] = [int(layer_range[0]), int(layer_range[1])]
+        if model_id is not None:
+            payload["model_id"] = str(model_id)
         return json.dumps(payload, sort_keys=True).encode("utf-8")
 
     @classmethod
@@ -400,8 +433,11 @@ class HandoffToken:
         chain_total_stages: int,
         deadline_unix: float,
         ephemeral_pubkey: Optional[bytes] = None,
+        layer_range: Optional[Tuple[int, int]] = None,
+        model_id: Optional[str] = None,
     ) -> "HandoffToken":
         """Mint + sign a fresh token under the settler ``identity``."""
+        _lr = (int(layer_range[0]), int(layer_range[1])) if layer_range is not None else None
         payload = cls.signing_payload(
             request_id,
             identity.node_id,
@@ -409,6 +445,8 @@ class HandoffToken:
             chain_total_stages,
             deadline_unix,
             ephemeral_pubkey,
+            _lr,
+            model_id,
         )
         sig = identity.sign(payload)
         return cls(
@@ -422,6 +460,8 @@ class HandoffToken:
                 bytes(ephemeral_pubkey)
                 if ephemeral_pubkey is not None else None
             ),
+            layer_range=_lr,
+            model_id=model_id,
         )
 
     def verify_with_anchor(self, anchor: Any) -> bool:
@@ -451,10 +491,26 @@ class HandoffToken:
             self.chain_total_stages,
             self.deadline_unix,
             self.ephemeral_pubkey,
+            self.layer_range,
+            self.model_id,
         )
         return verify_signature(
             settler_pubkey_b64, payload, self.signature_b64
         )
+
+    def binds_request(
+        self, *, layer_range: Tuple[int, int], model_id: str,
+    ) -> bool:
+        """sp1124 (Domain-03 F6) — True iff this token authorizes the given layer slice +
+        model. ENFORCE-WHEN-PRESENT: a token that carries the binding must match exactly;
+        a legacy token without it passes (rolling-deploy back-compat — that leaves only
+        the pre-existing pre-F6 gap, which closes as soon as settlers mint bound tokens).
+        The worker calls this AFTER anchor-verifying the signature."""
+        if self.layer_range is not None and tuple(self.layer_range) != tuple(layer_range):
+            return False
+        if self.model_id is not None and self.model_id != model_id:
+            return False
+        return True
 
     def to_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {
@@ -471,6 +527,11 @@ class HandoffToken:
             out["ephemeral_pubkey_hex"] = bytes(
                 self.ephemeral_pubkey,
             ).hex()
+        # sp1124 — omit-when-None for byte-equivalence with pre-1124 wire tokens.
+        if self.layer_range is not None:
+            out["layer_range"] = [int(self.layer_range[0]), int(self.layer_range[1])]
+        if self.model_id is not None:
+            out["model_id"] = str(self.model_id)
         return out
 
     @classmethod
@@ -497,6 +558,13 @@ class HandoffToken:
             deadline_unix=_required_number(data, "deadline_unix"),
             signature_b64=_required_str(data, "signature_b64"),
             ephemeral_pubkey=eph_bytes,
+            layer_range=(
+                tuple(data["layer_range"])
+                if isinstance(data.get("layer_range"), (list, tuple)) else None
+            ),
+            model_id=(
+                data["model_id"] if isinstance(data.get("model_id"), str) else None
+            ),
         )
 
 
