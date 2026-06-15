@@ -220,6 +220,21 @@ class KeyManager:
                 import base64
                 self.master_key = base64.b64decode(master_key_b64)
             else:
+                # sp1122 (Domain-08 review HIGH-4 remainder) — in PRODUCTION a missing
+                # PRSM_MASTER_KEY must FAIL CLOSED, not silently mint a per-process-random
+                # key. The random fallback makes every previously-stored encrypted key
+                # permanently undecryptable after a restart (silent data loss) and gives
+                # no real at-rest protection. Mirrors the schemas.py jwt-secret
+                # production gate (PRSM_ENV). Dev/test (the default env) keep the
+                # convenient ephemeral key + warning.
+                if os.getenv("PRSM_ENV", "development").lower() == "production":
+                    raise RuntimeError(
+                        "FATAL: PRSM_MASTER_KEY is required in production "
+                        "(PRSM_ENV=production) — refusing to start with a per-process "
+                        "random key that would make stored keys undecryptable after a "
+                        "restart. Set PRSM_MASTER_KEY to a stable Fernet key "
+                        "(Fernet.generate_key())."
+                    )
                 # Generate new master key (for development)
                 self.master_key = Fernet.generate_key()
                 logger.warning("Generated new master key - store securely in production")
