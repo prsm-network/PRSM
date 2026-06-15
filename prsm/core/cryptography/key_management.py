@@ -61,6 +61,37 @@ class SecureKeyStorage:
             self.generate_key_hash(key_data), str(expected_hex or ""),
         )
 
+    def pkcs8_passphrase(self) -> bytes:
+        """Sprint 1121 (Domain-08 review HIGH-4 remainder) — a passphrase for encrypting
+        stored private keys at the PKCS8 layer, DERIVED from the master key with a
+        DISTINCT domain label so it is NOT the same secret as the Fernet wrapper. This
+        gives real defense-in-depth: an attacker who defeats the Fernet layer still faces
+        a password-encrypted PKCS8 blob (whereas NoEncryption left plaintext key bytes)."""
+        import hmac as _hmac
+        return _hmac.new(
+            self.master_key, b"prsm-pkcs8-key-encryption-v1", hashlib.sha256,
+        ).digest()
+
+    def reveal_private_pem(self, pem_bytes: bytes) -> bytes:
+        """Transparently return the PLAINTEXT PKCS8 PEM for a stored private key, so
+        callers of get_key see the same plaintext PEM as before. Encrypted PKCS8 (new,
+        ``BEGIN ENCRYPTED PRIVATE KEY``) is decrypted with pkcs8_passphrase(); legacy
+        NoEncryption PEM and symmetric raw bytes pass through unchanged (back-compat)."""
+        try:
+            head = bytes(pem_bytes)[:64]
+        except Exception:  # noqa: BLE001
+            return pem_bytes
+        if b"ENCRYPTED PRIVATE KEY" not in head:
+            return pem_bytes  # legacy plaintext PEM or symmetric raw bytes
+        key = serialization.load_pem_private_key(
+            bytes(pem_bytes), password=self.pkcs8_passphrase(),
+        )
+        return key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+
 
 class KeyGenerator:
     """Cryptographic key generation utilities"""
@@ -358,10 +389,15 @@ class KeyManager:
                     session.commit()
                     return None
                 
+                # sp1121 — transparently decrypt the PKCS8 layer (if present) so callers
+                # receive the plaintext PEM exactly as before. Integrity was already
+                # verified above over the stored (encrypted) form.
+                key_material = self.storage.reveal_private_pem(key_material)
+
                 # Update usage tracking
                 db_key.last_used_at = datetime.now(timezone.utc)
                 session.commit()
-                
+
                 # Audit log key usage
                 logger.info("Key material accessed",
                           key_id=key_id,
@@ -586,10 +622,17 @@ class KeyManager:
         """Serialize key material for storage"""
         if key_type in [KeyType.RSA, KeyType.ECDSA, KeyType.ED25519]:
             # Asymmetric keys
+            # sp1121 (Domain-08 review HIGH-4 remainder) — encrypt the PKCS8 at rest with
+            # a master-key-DERIVED passphrase (BestAvailableEncryption) instead of
+            # NoEncryption. The Fernet wrapper still applies on top; this is the
+            # defense-in-depth layer so a Fernet-layer compromise doesn't expose plaintext
+            # private keys. get_key transparently reveals the plaintext PEM to callers.
             private_key_bytes = key_material.private_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption()
+                encryption_algorithm=serialization.BestAvailableEncryption(
+                    self.storage.pkcs8_passphrase(),
+                ),
             )
             public_key_bytes = key_material.public_key().public_bytes(
                 encoding=serialization.Encoding.PEM,
