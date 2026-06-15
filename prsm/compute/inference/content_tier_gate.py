@@ -26,6 +26,18 @@ about the context — but only because the gate is one layer in defense
 in depth. The TEE attestation itself is the primary defense; the gate
 is a fail-closed wrapper that surfaces violations as exceptions
 instead of silently leaking plaintext.
+
+WIRING STATUS (sp1126, Domain-03 review F4) — IMPORTANT: ``open_tier_a/b/c`` and
+``open_content`` below are NOT yet wired into any live inference execution path (the
+production executor currently serves Tier-A public content only; Tier B/C confidential
+decryption is intended §7 scaffolding awaiting the swarm-side decrypt integration). So
+this module currently enforces NOTHING at runtime — do NOT assume Tier B/C confidentiality
+is active because this gate exists. It is kept (not deleted) because it is the planned,
+already-fail-closed decrypt layer the executor will call once Tier B/C content dispatch
+lands; ``open_tier_b/c`` already refuse outside an attested TEEContext
+(``TEEContextRequiredError``), so wiring it cannot accidentally leak plaintext. When you
+wire it, call it from the executor's post-fetch path and pass the real attested
+``TEEContext``.
 """
 
 from __future__ import annotations
