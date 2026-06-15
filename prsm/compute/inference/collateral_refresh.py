@@ -45,6 +45,13 @@ _INTEL_TCB_INFO_ISSUER_HEADER = "TCB-Info-Issuer-Chain"
 INTEL_PCK_PLATFORM_CRL_FILE = "intel_pck_platform.crl.pem"
 INTEL_PCK_PROCESSOR_CRL_FILE = "intel_pck_processor.crl.pem"
 INTEL_QE_IDENTITY_FILE = "intel_qe_identity.json"
+# sp1125 (Domain-01 review B1) — the Intel Root-CA CRL. The root CA (self-signed anchor)
+# publishes this to REVOKE intermediate CAs (the PCK-CA / TCB-Signer-CA issuers that sign
+# the collateral). The collateral-refresh issuer-chain validation previously did NO
+# revocation check on its own issuer chain (require_crl=False, crls=None) — a revoked
+# intermediate would still validate. Fetching + caching this lets the chain check reject
+# a revoked intermediate.
+INTEL_ROOT_CA_CRL_FILE = "intel_root_ca.crl.pem"
 
 
 def intel_tcb_info_cache_file(fmspc: str) -> str:
@@ -104,6 +111,18 @@ def read_cached_intel_crls(environ=None) -> Optional[bytes]:
                        "revocation is NOT enforced for the missing CA until it refreshes",
                        len(parts), len(expected), ", ".join(missing))
     return b"\n".join(parts) if parts else None
+
+
+def read_cached_intel_root_ca_crl(environ=None) -> Optional[bytes]:
+    """sp1125 (Domain-01 review B1) — the cached Intel Root-CA CRL PEM (revokes
+    intermediate CAs), or None if the cache dir is unset / it hasn't been refreshed yet."""
+    cache = collateral_cache_dir(environ)
+    if cache is None:
+        return None
+    try:
+        return (cache / INTEL_ROOT_CA_CRL_FILE).read_bytes()
+    except OSError:
+        return None
 
 
 def read_cached_amd_crls(environ=None) -> Optional[bytes]:
@@ -463,6 +482,46 @@ class CollateralRefresher:
             pem = bundled_intel_sgx_root_ca()
         return x509.load_pem_x509_certificate(pem)
 
+    def _cached_intel_root_ca_crls(self) -> Optional[list]:
+        """sp1125 — the refresher's cached Intel Root-CA CRL as a [CRL] list for
+        verify_cert_chain, or None when not yet fetched (best-effort). verify_cert_chain
+        re-validates the CRL's signature + currency before trusting it."""
+        try:
+            blob = (self.cache_dir / INTEL_ROOT_CA_CRL_FILE).read_bytes()
+        except OSError:
+            return None
+        crl = _load_crl_any(blob)
+        return [crl] if crl is not None else None
+
+    async def refresh_intel_root_ca_crl(self) -> RefreshResult:
+        """sp1125 (Domain-01 review B1) — refresh the Intel Root-CA CRL (revokes
+        intermediate CAs). Unlike the collateral refreshes, this needs NO issuer chain:
+        the Root-CA CRL is signed by the self-signed root, so we validate it directly
+        under the bundled Intel root (signature + currency) and cache it. Subsequent
+        chain validations then revocation-check their intermediate against it."""
+        url = f"{self._intel_pcs_base}/rootcacrl?encoding=pem"
+        try:
+            body, _headers = await self._fetch(url)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Intel Root-CA CRL fetch failed (%s): %s — keeping cached copy",
+                           url, exc)
+            return RefreshResult(ok=False, cached=False, reason=f"fetch-failed: {exc}")
+
+        def validate(data: bytes) -> bool:
+            try:
+                root = self._intel_root()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Intel root unusable for Root-CA CRL refresh: %s", exc)
+                return False
+            if not crl_is_valid_and_current(data, root, self._now_fn()):
+                logger.warning("fetched Intel Root-CA CRL is not signature-valid under the "
+                               "bundled root or is expired — refusing to cache it")
+                return False
+            return True
+
+        return _cache_if_valid(body, validate,
+                               self.cache_dir / INTEL_ROOT_CA_CRL_FILE, label=url)
+
     async def _refresh_chain_validated(self, *, url: str, header_name: str,
                                        cache_name: str,
                                        validate_under_leaf) -> RefreshResult:
@@ -488,8 +547,15 @@ class CollateralRefresher:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Intel root unusable for collateral refresh: %s", exc)
                 return False
+            # sp1125 (Domain-01 review B1) — supply the cached Intel Root-CA CRL so the
+            # issuer chain's intermediate (issued by the root) is REVOCATION-checked, not
+            # just signature/expiry-validated. Best-effort (require_crl=False): when the
+            # root CRL is cached + valid a revoked intermediate is rejected; when it hasn't
+            # been fetched yet the chain still validates (no bootstrap deadlock — the root
+            # CRL fetch is itself a refresh that runs once the anchor is loaded).
+            root_crls = self._cached_intel_root_ca_crls()
             ok, err = verify_cert_chain(chain, root, now=self._now_fn(),
-                                        require_crl=False)
+                                        crls=root_crls, require_crl=False)
             if not ok:
                 logger.warning("issuer chain for %s does not chain to the Intel root: %s",
                                url, err)
@@ -620,6 +686,10 @@ class CollateralRefresher:
     async def refresh_all(self) -> dict:
         """Refresh every supported item; return {name: RefreshResult}. Never raises."""
         results: dict = {}
+        # sp1125 (Domain-01 review B1) — refresh the Intel Root-CA CRL FIRST so the
+        # chain-validated refreshes below revocation-check their intermediate against a
+        # fresh root CRL within this same cycle.
+        results["intel_root_ca_crl"] = await self.refresh_intel_root_ca_crl()
         for ca in ("platform", "processor"):
             results[f"intel_pck_{ca}_crl"] = await self.refresh_intel_pck_crl(ca)
         results["intel_qe_identity"] = await self.refresh_intel_qe_identity()
