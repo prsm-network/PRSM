@@ -320,12 +320,20 @@ class TestSecureKeyStorage:
             storage2.decrypt_key_material(encrypted)
 
     def test_generate_key_hash(self):
+        # sp1120 (Domain-08 MEDIUM-6) — generate_key_hash is now a KEYED HMAC under the
+        # master key (was an unkeyed, forgeable sha256). It must NOT equal the bare sha256,
+        # MUST equal HMAC(master_key, data), and must be keyed (different master → different
+        # tag).
+        import hmac
         from cryptography.fernet import Fernet
         master_key = Fernet.generate_key()
         storage = SecureKeyStorage(master_key)
         data = b"key data"
         h = storage.generate_key_hash(data)
-        assert h == hashlib.sha256(data).hexdigest()
+        assert h != hashlib.sha256(data).hexdigest()
+        assert h == hmac.new(master_key, data, hashlib.sha256).hexdigest()
+        other = SecureKeyStorage(Fernet.generate_key())
+        assert other.generate_key_hash(data) != h  # keyed: master key matters
 
 
 class TestKeyGenerator:

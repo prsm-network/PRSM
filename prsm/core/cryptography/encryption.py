@@ -283,9 +283,15 @@ class EncryptionService:
                 import gzip
                 decrypted_bytes = gzip.decompress(decrypted_bytes)
             
-            # Verify content integrity
+            # Verify content integrity. sp1120 (Domain-08 review MEDIUM-6) — constant-time
+            # compare of the digests (closes the timing side-channel of a plain ==). The
+            # AEAD tag on the ciphertext is the primary integrity protection; this
+            # checksum is defense-in-depth, compared in constant time here.
+            import hmac as _hmac
             computed_hash = hashlib.sha256(decrypted_bytes).hexdigest()
-            content_verified = computed_hash == encrypted_record.content_hash
+            content_verified = _hmac.compare_digest(
+                computed_hash, str(encrypted_record.content_hash or ""),
+            )
             
             if not content_verified:
                 logger.error("Content integrity verification failed",

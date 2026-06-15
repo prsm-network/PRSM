@@ -44,8 +44,22 @@ class SecureKeyStorage:
         return self.cipher.decrypt(encrypted_data)
     
     def generate_key_hash(self, key_data: bytes) -> str:
-        """Generate secure hash of key material"""
-        return hashlib.sha256(key_data).hexdigest()
+        """Sprint 1120 (Domain-08 review MEDIUM-6) — KEYED integrity tag over key
+        material, HMAC-SHA256 under the master key (was a bare unkeyed sha256). An unkeyed
+        hash is forgeable: an attacker with DB write could substitute key material AND
+        recompute its sha256, passing the integrity check — making the ``is_compromised``
+        signal meaningless. Keying it under the master key means a tamperer who doesn't
+        hold the master key cannot forge a matching tag."""
+        import hmac as _hmac
+        return _hmac.new(self.master_key, key_data, hashlib.sha256).hexdigest()
+
+    def verify_key_hash(self, key_data: bytes, expected_hex: str) -> bool:
+        """Constant-time verification of the keyed integrity tag (closes the timing
+        side-channel of a plain ``==`` on the hex digests)."""
+        import hmac as _hmac
+        return _hmac.compare_digest(
+            self.generate_key_hash(key_data), str(expected_hex or ""),
+        )
 
 
 class KeyGenerator:
@@ -334,9 +348,10 @@ class KeyManager:
                     logger.error("No key material found", key_id=key_id)
                     return None
                 
-                # Verify integrity
-                computed_hash = self.storage.generate_key_hash(key_material)
-                if computed_hash != db_key.key_material_hash:
+                # Verify integrity (sp1120 — keyed HMAC + constant-time compare).
+                if not self.storage.verify_key_hash(
+                    key_material, db_key.key_material_hash,
+                ):
                     logger.error("Key material integrity check failed", key_id=key_id)
                     # Mark key as compromised
                     db_key.is_compromised = True
