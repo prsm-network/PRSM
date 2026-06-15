@@ -168,3 +168,81 @@ def activation_hash(blob: bytes) -> str:
     """The canonical sha256-hex of an activation blob, used on both the worker (when it
     signs its proof) and the verifier. Centralized so the two never diverge."""
     return hashlib.sha256(bytes(blob)).hexdigest()
+
+
+# ── Verification (sp1108, brick 2) ────────────────────────────────────────────────
+# These are the AUTHENTICITY half of the chain (the CONTINUITY half is
+# StageActivationChain.verify_continuity above). They need the on-chain anchor to
+# resolve each stage node_id's published key, so they live as free functions rather than
+# methods (keeping the dataclasses dependency-light for models.py to import).
+
+
+def verify_stage_proof(proof: "StageActivationProof", request_id: str, *, anchor: Any) -> bool:
+    """True iff ``proof.stage_signature_b64`` is a valid Ed25519 signature, by the key the
+    anchor publishes for ``proof.stage_node_id``, over the proof's canonical signing bytes
+    for ``request_id``. Fail-closed: a missing key, empty signature, or any verification
+    error returns False."""
+    from prsm.node.identity import verify_signature
+
+    if not proof.stage_signature_b64:
+        return False
+    pubkey_b64 = anchor.lookup(proof.stage_node_id)
+    if not pubkey_b64:
+        return False
+    try:
+        return verify_signature(
+            pubkey_b64, proof.signing_bytes(request_id), proof.stage_signature_b64,
+        )
+    except Exception:  # noqa: BLE001 — verification must never raise into the caller
+        return False
+
+
+def verify_stage_activation_chain(
+    chain: "StageActivationChain", *,
+    prompt_hash_hex: str, output_hash_hex: str, anchor: Any,
+) -> Tuple[bool, str]:
+    """Full chain verification: CONTINUITY (the activations actually link prompt→output
+    with no spliced intermediate) AND AUTHENTICITY (every stage's link is signed by the
+    node the anchor knows). Returns (ok, diagnostic). A True result means: the receipt's
+    prompt produced its output through exactly these stages, each run by the node that
+    cryptographically signed for it — the §7 promise, end to end."""
+    ok, why = chain.verify_continuity(
+        prompt_hash_hex=prompt_hash_hex, output_hash_hex=output_hash_hex,
+    )
+    if not ok:
+        return False, why
+    for p in sorted(chain.proofs, key=lambda x: int(x.stage_index)):
+        if not verify_stage_proof(p, chain.request_id, anchor=anchor):
+            return False, (
+                f"stage {p.stage_index} signature invalid or unknown node "
+                f"{p.stage_node_id}"
+            )
+    return True, "stage activation chain verified (continuity + per-stage signatures)"
+
+
+def chain_supports_topology(
+    chain: "StageActivationChain", topology_assignment: Any,
+) -> Tuple[bool, str]:
+    """Cross-check that the orchestrator's asserted ``topology_assignment`` is CONSISTENT
+    with the cryptographically-proven stages (F2): for each stage, the node that signed
+    must be one the topology assigns to that stage. This is what lets a verifier stop
+    trusting the orchestrator's unsigned topology and instead derive it from the signed
+    stages. ``topology_assignment`` is the sprint-296 TopologyAssignment
+    (positions: {(stage_idx, slot_idx): node_id}); None means nothing to cross-check."""
+    if topology_assignment is None:
+        return True, "no topology to cross-check"
+    positions = getattr(topology_assignment, "positions", None)
+    if not isinstance(positions, dict):
+        return False, "topology_assignment has no positions mapping"
+    # node_ids the topology assigns to each stage (across all slots)
+    by_stage: Dict[int, set] = {}
+    for (stage_idx, _slot), node in positions.items():
+        by_stage.setdefault(int(stage_idx), set()).add(node)
+    for p in chain.proofs:
+        allowed = by_stage.get(int(p.stage_index))
+        if not allowed or p.stage_node_id not in allowed:
+            return False, (
+                f"stage {p.stage_index} was signed by {p.stage_node_id}, which the "
+                f"asserted topology does not assign to that stage"
+            )
+    return True, "topology is consistent with the signed stages"
