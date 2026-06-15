@@ -1071,6 +1071,7 @@ class RpcChainExecutor:
                 output_text="".join(output_text_parts),
                 per_iteration_outcomes=per_iteration_outcomes,
                 per_iteration_decode_modes=per_iteration_decode_modes,
+                request_id=request.request_id,
             )
         finally:
             # Broadcast eviction on EVERY exit path (terminal or
@@ -1553,6 +1554,7 @@ class RpcChainExecutor:
                 output_text="".join(output_text_parts),
                 per_iteration_outcomes=per_iteration_outcomes,
                 per_iteration_decode_modes=per_iteration_decode_modes,
+                request_id=request.request_id,
             )
         finally:
             # Eviction on every exit path — terminal, cancellation,
@@ -1887,6 +1889,7 @@ class RpcChainExecutor:
         output_text: str,
         per_iteration_outcomes: List[List[StageOutcome]],
         per_iteration_decode_modes: List[DecodeMode],
+        request_id: str = "",
     ) -> ChainExecutionResult:
         """Phase 3.x.11.x Task 2: build the terminal
         ``ChainExecutionResult`` for a sharded-decode stream.
@@ -1940,6 +1943,17 @@ class RpcChainExecutor:
                 total_duration += outcome.duration_seconds
                 total_epsilon += outcome.epsilon_spent
 
+        # sp1113 brick 7 — assemble a per-stage SIGNED activation chain for the streamed
+        # receipt from the LAST complete iteration's outcomes (a representative full
+        # stage pass; per-token tail signatures already cover generation, and brick 6
+        # binds this chain to request_id). All-or-nothing per _build_stage_activation_
+        # chain: omitted (None) if any stage in that iteration lacked a proof (e.g. a
+        # chunked-PREFILL iteration whose output rode out-of-band).
+        stage_chain = None
+        for outcomes in reversed(per_iteration_outcomes):
+            stage_chain = _build_stage_activation_chain(request_id, outcomes)
+            if stage_chain is not None:
+                break
         return ChainExecutionResult(
             output=output_text,
             duration_seconds=total_duration,
@@ -1950,6 +1964,7 @@ class RpcChainExecutor:
                 iteration_records,
             ),
             epsilon_spent=total_epsilon,
+            stage_activation_chain=stage_chain,
         )
 
     def _decode_token_to_text(self, token_id: int) -> str:

@@ -1070,6 +1070,12 @@ class LayerStageServer:
             verified_token_ids=getattr(result, "verified_token_ids", None),
             accepted_count=getattr(result, "accepted_count", None),
             input_commitment=response_input_commitment_for_request(request),
+            # sp1113 brick 7 — emit the self-securing per-stage activation proof on the
+            # sharded INCREMENTAL/VERIFY path too (symmetric with the unary _dispatch).
+            # output_blob is the real per-token output here (not the chunked-PREFILL
+            # manifest path), so input/output hashes are well-defined and chain.
+            stage_input_blob=request.activation_blob,
+            chain_stage_index=request.upstream_token.chain_stage_index,
         )
         return encode_message(response)
 
