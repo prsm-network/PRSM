@@ -1833,34 +1833,37 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
     # cross-origin requests; everything else gets blocked at the CORS
     # layer before reaching any endpoint.
     #
-    # Default behavior (env unset / whitespace-only): permissive `*`
-    # allowlist preserves v1 dev-friendly behavior bit-identically.
-    # Production deploys MUST set PRSM_ALLOWED_ORIGINS explicitly to
-    # restrict.
+    # sp1123 (Domain-08 review LOW — CORS): with an explicit PRSM_ALLOWED_ORIGINS the node
+    # restricts to that allowlist. With NONE set, the default is environment-aware: dev
+    # keeps the convenient permissive `*`, but PRODUCTION (PRSM_ENV=production) DEFAULT-
+    # DENIES cross-origin (empty allowlist) and warns — an operator must opt in by setting
+    # PRSM_ALLOWED_ORIGINS rather than silently shipping `*`. Mirrors the schemas.py CORS
+    # validator + the jwt/master-key production gates (same PRSM_ENV signal).
+    import logging as _logging
     from fastapi.middleware.cors import CORSMiddleware
     _origins_raw = os.getenv("PRSM_ALLOWED_ORIGINS", "").strip()
-    if _origins_raw:
-        _origins = [
-            o.strip() for o in _origins_raw.split(",") if o.strip()
-        ]
-        if _origins:
-            app.add_middleware(
-                CORSMiddleware,
-                allow_origins=_origins,
-                allow_credentials=True,
-                allow_methods=["*"],
-                allow_headers=["*"],
-            )
-        else:
-            # All-whitespace CSV → fall back to permissive default.
-            app.add_middleware(
-                CORSMiddleware,
-                allow_origins=["*"],
-                allow_methods=["*"],
-                allow_headers=["*"],
-            )
+    _origins = [o.strip() for o in _origins_raw.split(",") if o.strip()] if _origins_raw else []
+    if _origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=_origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+    elif os.getenv("PRSM_ENV", "development").lower() == "production":
+        _logging.getLogger("prsm.node.api").warning(
+            "PRSM_ALLOWED_ORIGINS is not set in production — CORS defaults to DENY all "
+            "cross-origin requests. Set PRSM_ALLOWED_ORIGINS to permit browser clients."
+        )
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=[],  # deny-all cross-origin (production fail-closed default)
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
     else:
-        # Env unset → permissive default for dev / local / unconfigured.
+        # Dev / local / unconfigured → permissive default (unchanged).
         app.add_middleware(
             CORSMiddleware,
             allow_origins=["*"],

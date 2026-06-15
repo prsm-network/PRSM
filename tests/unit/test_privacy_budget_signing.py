@@ -375,3 +375,34 @@ class TestIsSigned:
         confused = dataclasses.replace(signed_by_a, node_id=other_identity.node_id)
         assert is_signed(confused) is True   # fields populated
         assert verify_entry(confused, identity=identity) is False   # crypto fails
+
+
+class TestSprint1123KeyNodeIdBinding:
+    """Sprint 1123 (Domain-08 review LOW-10) — verify_entry binds the verifying key to
+    the entry's claimed node_id, so a caller can't be tricked into verifying an internally
+    consistent (pubkey, signature, node_id) triple signed by the WRONG key."""
+
+    def test_pubkey_not_matching_entry_node_id_rejected(self, identity, other_identity):
+        # entry genuinely signed by `identity` (entry.node_id == identity.node_id)
+        signed = sign_entry(_entry(), identity)
+        # an auditor who mistakenly supplies a DIFFERENT node's pubkey must get False
+        # (the key doesn't derive entry.node_id), not a silent accept of the wrong key.
+        assert verify_entry(signed, public_key_b64=other_identity.public_key_b64) is False
+
+    def test_internally_consistent_attacker_triple_rejected(self, identity, other_identity):
+        # Attacker signs an entry with THEIR key but stamps the victim's node_id claim.
+        forged = _entry(node_id="placeholder")
+        forged = dataclasses.replace(forged, node_id=identity.node_id)  # claim victim
+        # sign with the attacker's key over a payload claiming node_id=victim
+        import base64 as _b64
+        intermediate = dataclasses.replace(forged, node_id=identity.node_id)
+        sig_b64 = other_identity.sign(intermediate.signing_payload())
+        triple = dataclasses.replace(intermediate, signature=_b64.b64decode(sig_b64))
+        # The attacker presents their OWN pubkey (which signed it) — but it doesn't derive
+        # the claimed victim node_id, so the binding check rejects it.
+        assert verify_entry(triple, public_key_b64=other_identity.public_key_b64) is False
+
+    def test_correct_key_still_verifies(self, identity):
+        signed = sign_entry(_entry(), identity)
+        assert verify_entry(signed, public_key_b64=identity.public_key_b64) is True
+        assert verify_entry(signed, identity=identity) is True

@@ -93,6 +93,25 @@ def verify_entry(
     if public_key_b64 is None and identity is None:
         return False
 
+    # Sprint 1123 (Domain-08 review LOW-10) — BIND the verifying key to the entry's
+    # claimed node_id (node_id == hex(sha256(pubkey))[:32]). The signature already covers
+    # node_id, but without this check a caller that fetched the pubkey from the SAME
+    # untrusted source as the entry could verify an attacker's (pubkey, signature,
+    # node_id) triple that is internally consistent yet signed by the attacker's key.
+    # Asserting the key derives the claimed node_id makes that impossible — fail-closed.
+    from prsm.node.identity import node_id_for_public_key
+    try:
+        if identity is not None:
+            verifier_node_id = identity.node_id
+        else:
+            verifier_node_id = node_id_for_public_key(
+                base64.b64decode(public_key_b64),  # type: ignore[arg-type]
+            )
+    except Exception:  # noqa: BLE001 — malformed key → can't bind → fail closed
+        return False
+    if verifier_node_id != entry.node_id:
+        return False
+
     payload = entry.signing_payload()
     signature_b64 = base64.b64encode(entry.signature).decode()
 

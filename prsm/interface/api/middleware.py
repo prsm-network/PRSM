@@ -350,8 +350,13 @@ async def _extract_user_id_from_token(request: Request) -> str:
     try:
         # Import here to avoid circular imports
 
-        # Decode token without full verification (we just need the user ID)
-        # Full verification happens in auth middleware
+        # Sprint 1123 (Domain-08 review LOW-8) — VERIFY the signature before trusting the
+        # `sub` claim to key the per-user rate-limit bucket. The prior verify_signature=
+        # False let an attacker forge a `sub` to (a) evade their per-user limit and (b)
+        # grief a victim by exhausting the victim's per-user allowance with a forged token.
+        # Fail-safe: if verification fails for any reason (forged/unsigned token, or a
+        # token signed with a different key than this middleware sees), return None — the
+        # request then falls back to per-IP limiting, which always applies.
         import jwt
         from prsm.core.config import get_settings
         settings = get_settings()
@@ -360,9 +365,9 @@ async def _extract_user_id_from_token(request: Request) -> str:
             token,
             settings.secret_key if settings else "test-secret-key",
             algorithms=[settings.jwt_algorithm if settings else "HS256"],
-            options={"verify_signature": False, "verify_exp": False}
+            options={"verify_signature": True, "verify_exp": False}
         )
-        return payload.get("sub")  # User ID
+        return payload.get("sub")  # User ID (now from a signature-verified token)
     except Exception as e:
         logger.debug(f"Failed to extract user ID from token: {e}")
         return None
