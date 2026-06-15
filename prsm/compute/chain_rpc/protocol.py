@@ -1332,6 +1332,21 @@ class RunLayerSliceResponse:
     # encoding pattern).
     verified_token_ids: Optional[Tuple[int, ...]] = None
     accepted_count: Optional[int] = None
+    # Sprint 1108 (Domain-03 F1/F2, brick 3) — a compact, SELF-SECURING per-stage
+    # activation proof: the sha256 of the input activation this stage received, the
+    # sha256 of the output activation it produced, and an Ed25519 signature (by this
+    # stage's node) over StageActivationProof.signing_bytes(request_id) binding
+    # (request, stage_index, node_id, input_hash, output_hash). The orchestrator
+    # collects these into the receipt's StageActivationChain. They carry their OWN
+    # signature (verifiable independently of this response's stage_signature_b64), so
+    # they are NOT part of this response's signing_payload — a relay that strips them is
+    # detected by the orchestrator seeing an incomplete chain (it then omits the chain
+    # rather than reporting false provenance). Default None preserves byte-equivalence
+    # with pre-1108 responses. Populated on the unary path (brick 3); streaming/decode
+    # paths leave them None (a follow-on).
+    stage_input_activation_hash: Optional[str] = None
+    stage_output_activation_hash: Optional[str] = None
+    stage_activation_proof_b64: Optional[str] = None
     protocol_version: int = CHAIN_RPC_PROTOCOL_VERSION
 
     MESSAGE_TYPE: str = ChainRpcMessageType.RUN_LAYER_SLICE_RESPONSE.value
@@ -1625,6 +1640,8 @@ class RunLayerSliceResponse:
         verified_token_ids: Optional[Tuple[int, ...]] = None,
         accepted_count: Optional[int] = None,
         input_commitment: Optional[str] = None,
+        stage_input_blob: Optional[bytes] = None,
+        chain_stage_index: Optional[int] = None,
     ) -> "RunLayerSliceResponse":
         """Construct + sign a fresh response under the stage ``identity``.
 
@@ -1658,6 +1675,32 @@ class RunLayerSliceResponse:
             input_commitment=input_commitment,
         )
         sig = identity.sign(payload)
+        # sp1108 brick 3 — when the caller supplies the stage's INPUT blob + its chain
+        # stage index, also produce the compact self-securing activation proof. Only on
+        # the unary path (non-empty output activation_blob); streaming/decode leave it
+        # None. The proof signs StageActivationProof.signing_bytes(request_id), binding
+        # this stage to the request + its in/out activation hashes.
+        _in_hash: Optional[str] = None
+        _out_hash: Optional[str] = None
+        _proof_sig: Optional[str] = None
+        if (
+            stage_input_blob is not None
+            and chain_stage_index is not None
+            and activation_blob
+        ):
+            from prsm.compute.inference.stage_activation_proof import (
+                StageActivationProof,
+                activation_hash,
+            )
+            _in_hash = activation_hash(stage_input_blob)
+            _out_hash = activation_hash(activation_blob)
+            _proof = StageActivationProof(
+                stage_index=int(chain_stage_index),
+                stage_node_id=identity.node_id,
+                input_activation_hash=_in_hash,
+                output_activation_hash=_out_hash,
+            )
+            _proof_sig = identity.sign(_proof.signing_bytes(request_id))
         return cls(
             request_id=request_id,
             activation_blob=bytes(activation_blob),
@@ -1677,6 +1720,9 @@ class RunLayerSliceResponse:
                 if verified_token_ids is not None else None
             ),
             accepted_count=accepted_count,
+            stage_input_activation_hash=_in_hash,
+            stage_output_activation_hash=_out_hash,
+            stage_activation_proof_b64=_proof_sig,
         )
 
     def verify_with_anchor(
@@ -1793,6 +1839,13 @@ class RunLayerSliceResponse:
                 int(t) for t in self.verified_token_ids
             ]
             out["accepted_count"] = int(self.accepted_count)
+        # Sprint 1108 — omit-when-None canonical encoding (byte-identical pre-1108).
+        if self.stage_input_activation_hash is not None:
+            out["stage_input_activation_hash"] = self.stage_input_activation_hash
+        if self.stage_output_activation_hash is not None:
+            out["stage_output_activation_hash"] = self.stage_output_activation_hash
+        if self.stage_activation_proof_b64 is not None:
+            out["stage_activation_proof_b64"] = self.stage_activation_proof_b64
         return out
 
     @classmethod
@@ -1882,6 +1935,17 @@ class RunLayerSliceResponse:
                     f"{type(accepted_raw).__name__}"
                 )
             accepted_count = int(accepted_raw)
+        # Sprint 1108 — parse the optional self-securing activation-proof fields.
+        # Type-checked str-or-absent; a hostile peer sending a non-str is rejected.
+        def _opt_str(key: str) -> Optional[str]:
+            v = data.get(key)
+            if v is None:
+                return None
+            if not isinstance(v, str):
+                raise ChainRpcMalformedError(
+                    f"{key} must be str, got {type(v).__name__}"
+                )
+            return v
         return cls(
             request_id=_required_str(data, "request_id"),
             activation_blob=blob_bytes,
@@ -1898,6 +1962,9 @@ class RunLayerSliceResponse:
             is_terminal=is_terminal_raw,
             verified_token_ids=verified_token_ids,
             accepted_count=accepted_count,
+            stage_input_activation_hash=_opt_str("stage_input_activation_hash"),
+            stage_output_activation_hash=_opt_str("stage_output_activation_hash"),
+            stage_activation_proof_b64=_opt_str("stage_activation_proof_b64"),
             protocol_version=_required_int(data, "protocol_version"),
         )
 

@@ -805,6 +805,13 @@ class LayerStageServer:
             )
 
         # Step 8: sign and return.
+        # sp1108 brick 3 — also emit the self-securing per-stage activation proof:
+        # hash the INPUT activation this stage received (request.activation_blob, the
+        # wire bytes the orchestrator forwarded from the previous stage) and the OUTPUT
+        # (output_blob), and sign over (request, stage_index, node, in_hash, out_hash).
+        # The orchestrator forwards stage K's output verbatim as stage K+1's input, so
+        # adjacent hashes chain. stage_index comes from the settler-signed upstream
+        # token (already verified above), not a self-claim.
         response = RunLayerSliceResponse.sign(
             identity=self._identity,
             request_id=request.request_id,
@@ -816,6 +823,8 @@ class LayerStageServer:
             tee_type=result.tee_type,
             epsilon_spent=result.epsilon_spent,
             input_commitment=response_input_commitment_for_request(request),
+            stage_input_blob=request.activation_blob,
+            chain_stage_index=request.upstream_token.chain_stage_index,
         )
         return encode_message(response)
 
