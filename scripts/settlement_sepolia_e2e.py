@@ -65,6 +65,72 @@ def _default_state_file() -> str:
     return str(Path.home() / ".prsm" / "settlement_e2e_state.json")
 
 
+# sp1128 — honest fallback when the just-committed batch is STILL invisible after
+# the bounded lag poll. Never asserts finalizability; points at --phase finalize.
+_LAG_FALLBACK_ETA = (
+    "the challenge window (~24h; replica lag, re-check with --phase finalize)"
+)
+
+
+async def _resolve_finalizable_eta(
+    contract,
+    batch_id: bytes,
+    *,
+    retries: int = 6,
+    interval_s: float = 15.0,
+    sleep=asyncio.sleep,
+) -> str:
+    """sp1128 — LAG-RESILIENT finalize-countdown ETA for the phase-1 summary.
+
+    The phase-1 summary used to trust ``seconds_until_finalizable`` alone:
+    ``secs <= 0 -> "now"``. But the public Base-Sepolia RPC is load-balanced; the
+    view call fired right after the commit tx can land on a REPLICA THAT HASN'T YET
+    SEEN the just-committed batch. For a batch the registry does not yet know about
+    (status=0 NONEXISTENT) the contract returns ``isFinalizable=False`` AND
+    ``secondsUntilFinalizable=0`` — indistinguishable, on ``secs`` alone, from a
+    genuinely-elapsed window. The old logic then printed a FALSE "now", nudging the
+    operator toward a pointless early finalize.
+
+    The three states to disambiguate (and how this helper handles each):
+      - Not-yet-visible / nonexistent (LAG): status=0, isFinalizable=False, secs=0
+        -> keep polling past replica lag (mirrors the sp1047/1048 deposit lag-poll).
+      - Pending, window ACTIVE:             status=1, isFinalizable=False, secs>0
+        -> return the real countdown ``~{h}h (at {secs}s)``.
+      - Genuinely finalizable (elapsed):    status=1, isFinalizable=True,  secs=0
+        -> return "now" (ONLY when is_finalizable() is True).
+
+    ``is_finalizable()`` is the source of truth for whether the window has genuinely
+    elapsed; ``secs`` alone is never trusted to claim "now". If the batch is STILL
+    not visible after the bounded retries (extreme lag), return an HONEST fallback
+    that does not assert finalizability. Any RPC error yields the same honest
+    fallback (no crash) — preserving the prior except-branch behaviour.
+
+    ``retries`` / ``interval_s`` / ``sleep`` are injectable so tests don't wait.
+    """
+    last_secs = None
+    for attempt in range(max(1, retries)):
+        try:
+            finalizable = await contract.is_finalizable(batch_id)
+            secs = await contract.seconds_until_finalizable(batch_id)
+        except Exception:  # noqa: BLE001 - RPC error: honest fallback, never crash
+            return _LAG_FALLBACK_ETA
+        if finalizable:
+            # Window genuinely elapsed — the only path that may say "now".
+            return "now"
+        if secs > 0:
+            # Visibly PENDING with an active window — the real countdown.
+            return f"~{secs/3600:.1f}h (at {secs}s)"
+        # secs == 0 AND not finalizable -> not-yet-visible (replica lag). Keep
+        # polling; the batch was just committed so it WILL become visible.
+        last_secs = secs
+        if attempt < retries - 1 and interval_s > 0:
+            await sleep(interval_s)
+    # Exhausted the bounded retries and the batch is still invisible (extreme lag).
+    # Do NOT claim "now"; return the honest, non-finalizability-asserting fallback.
+    _ = last_secs
+    return _LAG_FALLBACK_ETA
+
+
 async def _amain(args) -> int:
     from prsm.config.networks import resolve_endpoints
     from prsm.economy.web3.escrow_pool_client import EscrowPoolClient
@@ -220,11 +286,16 @@ async def _amain(args) -> int:
         if args.phase == "deposit-commit":
             # sp1043 — print the REAL countdown read from chain (the window is
             # snapshotted per-batch; don't hardcode a guess).
-            try:
-                secs = await contract.seconds_until_finalizable(batch_id)
-                eta = "now" if secs <= 0 else f"~{secs/3600:.1f}h (at {secs}s)"
-            except Exception:  # noqa: BLE001
-                eta = "the challenge window"
+            # sp1128 — but resolve it LAG-RESILIENTLY: the public RPC is
+            # load-balanced and a read fired right after the commit can hit a
+            # replica that hasn't seen the batch yet (status=0 -> secs=0), which
+            # the old `secs<=0 -> "now"` shape mis-reported as immediately
+            # finalizable. _resolve_finalizable_eta polls past that lag and only
+            # says "now" when is_finalizable() is actually True.
+            eta = await _resolve_finalizable_eta(
+                contract, batch_id,
+                retries=6, interval_s=float(args.poll_interval_s),
+            )
             print(f"PHASE 1 done. Batch finalizable in {eta}. Re-run with "
                   f"--phase finalize then (same machine / --state-file), or "
                   f"--phase finalize --batch-id {report['batch_id']} from anywhere.")
