@@ -127,3 +127,69 @@ def test_price_over_max_spend_aborts():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ── sp1127 — cross-chain EIP-712 domain binding (the Sepolia signer-mismatch fix) ──
+
+def test_cross_chain_roundtrip_sepolia_chainid_passes():
+    """Sign + verify under the live Base-Sepolia chainId 84532 must recover the requester
+    (not a signer-mismatch). Pre-fix, the script signed @8453 but verified @84532 → the
+    domains diverged and recovery returned a wrong address."""
+    from prsm.settlement.payment_authorization import (
+        verify_payment_authorization_signature,
+    )
+    auth = build_payment_authorization(
+        requester_key=REQUESTER_KEY, provider_address=PROVIDER,
+        max_spend_ftns=1.0, expiry_unix=2_000_000_000, chain_id=84532, **_REQ)
+    recovered = verify_payment_authorization_signature(
+        auth["payload"], auth["signature"], chain_id=84532)
+    assert recovered.lower() == REQUESTER.lower()
+
+
+def test_cross_chain_chainid_mismatch_recovers_wrong_signer():
+    """Sign @84532 then verify @8453 must recover a DIFFERENT address — proving the
+    domain is chain-locked (this divergence is exactly what produced the live
+    AuthorizationRejected: signer-mismatch)."""
+    from prsm.settlement.payment_authorization import (
+        verify_payment_authorization_signature,
+    )
+    auth = build_payment_authorization(
+        requester_key=REQUESTER_KEY, provider_address=PROVIDER,
+        max_spend_ftns=1.0, expiry_unix=2_000_000_000, chain_id=84532, **_REQ)
+    recovered = verify_payment_authorization_signature(
+        auth["payload"], auth["signature"], chain_id=8453)  # wrong chain
+    assert recovered.lower() != REQUESTER.lower()
+
+
+def test_two_party_e2e_passes_when_both_sides_use_sepolia_chainid():
+    """End-to-end (mirrors the FIXED script wiring): auth signed @84532 + verifier @84532
+    → run_two_party_deposit_and_commit succeeds, naming A->B. This is what the live
+    Sepolia run does after sp1127."""
+    auth = build_payment_authorization(
+        requester_key=REQUESTER_KEY, provider_address=PROVIDER,
+        max_spend_ftns=1.0, expiry_unix=2_000_000_000, chain_id=84532, **_REQ)
+    verifier = PaymentAuthorizationVerifier(
+        provider_address=PROVIDER, nonce_store=InMemoryNonceStore(),
+        chain_id=84532, now=lambda: 1_000_000_000.0)
+    report = _run(_call(payment_authorization=auth, verifier=verifier))
+    assert report["requester_address"].lower() == REQUESTER.lower()
+    assert report["provider_address"].lower() == PROVIDER.lower()
+
+
+def test_two_party_e2e_rejects_chainid_mismatch():
+    """The live failure reproduced: auth signed @8453 (the old default) + verifier @84532
+    → signer-mismatch, and crucially NO deposit and NO commit happen."""
+    settlement = _settlement_client()
+    escrow = _escrow_client()
+    auth_8453 = build_payment_authorization(
+        requester_key=REQUESTER_KEY, provider_address=PROVIDER,
+        max_spend_ftns=1.0, expiry_unix=2_000_000_000, chain_id=8453, **_REQ)
+    verifier_84532 = PaymentAuthorizationVerifier(
+        provider_address=PROVIDER, nonce_store=InMemoryNonceStore(),
+        chain_id=84532, now=lambda: 1_000_000_000.0)
+    with pytest.raises(AuthorizationRejected) as ei:
+        _run(_call(payment_authorization=auth_8453, verifier=verifier_84532,
+                   settlement_client=settlement, escrow_client=escrow))
+    assert ei.value.reason == "signer-mismatch"
+    settlement.commit_ready_batches.assert_not_awaited()
+    escrow.deposit.assert_not_awaited()

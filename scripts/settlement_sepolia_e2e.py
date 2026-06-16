@@ -176,10 +176,16 @@ async def _amain(args) -> int:
             request_fields = inference_request_fields(
                 model_id="gpt2", prompt=f"two-party-proof-{job_id}", max_tokens=16,
                 privacy_tier="standard", content_tier="A")
+            # sp1127 — bind the EIP-712 domain to the LIVE chainId (84532 on Sepolia,
+            # 8453 on mainnet) so the requester signs over the SAME domain the verifier
+            # recovers under. Without this, build_payment_authorization defaulted to
+            # chainId 8453 while the verifier used the live chainId — the signed domain
+            # diverged and ecrecover returned a wrong address (AuthorizationRejected:
+            # signer-mismatch) on every non-mainnet run.
             auth = build_payment_authorization(
                 requester_key=requester_key, provider_address=signer,
                 max_spend_ftns=args.amount_ftns, expiry_unix=int(time.time()) + 86400,
-                **request_fields)
+                chain_id=chain_id, **request_fields)
             verifier = PaymentAuthorizationVerifier(
                 provider_address=signer, nonce_store=InMemoryNonceStore(),
                 chain_id=chain_id, balance_reader=None)
