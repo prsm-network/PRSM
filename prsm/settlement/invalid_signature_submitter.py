@@ -1,8 +1,18 @@
-"""On-chain broadcast of an INVALID_SIGNATURE challenge (challenge/dispute brick 4).
+"""On-chain broadcast of an assembled challenge (challenge/dispute bricks 4 + 8).
 
-Brick 3 (challenge_assembler) produces an ``InvalidSignatureChallenge`` (leaf + merkle
-proof + auxData). This module broadcasts it to ``BatchSettlementRegistry.challengeReceipt``
-to invalidate the fraudulent receipt's value and slash the provider's bond.
+Originally the brick-4 INVALID_SIGNATURE submitter; sprint 1132 GENERALIZED it (in place —
+filename kept to preserve imports/history) into the reason-agnostic ``ChallengeSubmitter``
+that broadcasts ANY assembled challenge whose ``to_call_args()`` matches the single
+``challengeReceipt`` ABI. ``InvalidSignatureChallengeSubmitter`` remains as a backward-compat
+alias of the same class object.
+
+Brick 3 / brick 7 (challenge_assembler / double_spend_assembler) produce an
+``InvalidSignatureChallenge`` / ``DoubleSpendChallenge`` (leaf + merkle proof + auxData,
+identical shape). This module broadcasts either to
+``BatchSettlementRegistry.challengeReceipt`` to invalidate the fraudulent receipt's value
+and slash the provider's bond. It accepts the reason codes in
+``SUPPORTED_CHALLENGE_REASONS`` (INVALID_SIGNATURE=1, DOUBLE_SPEND=0) and uniformly rejects
+any other reason (e.g. NO_ESCROW=2) without raising or broadcasting.
 
 It is INERT by default — broadcasting is a USER-GATED action (it spends gas and slashes a
 provider's staked bond; per the standing rule the assistant assembles + verifies
@@ -21,7 +31,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, Union
 
 try:
     from web3 import Web3
@@ -42,8 +52,24 @@ from prsm.settlement.challenge_assembler import (
     REASON_INVALID_SIGNATURE,
     InvalidSignatureChallenge,
 )
+from prsm.settlement.double_spend_assembler import (
+    REASON_DOUBLE_SPEND,
+    DoubleSpendChallenge,
+)
 
 logger = logging.getLogger(__name__)
+
+# Reason codes this generic submitter will broadcast. Both challenge types expose the
+# identical reason-agnostic ``to_call_args()`` shape (batch_id, leaf_tuple, merkle_proof,
+# reason_code, aux_data), so one ChallengeSubmitter serves both. Any reason code NOT in
+# this set (e.g. NO_ESCROW=2) is rejected uniformly — never broadcast, never raised.
+SUPPORTED_CHALLENGE_REASONS = frozenset(
+    {REASON_INVALID_SIGNATURE, REASON_DOUBLE_SPEND}
+)
+
+# An assembled challenge accepted by this submitter — either fraud-class dataclass. Both
+# satisfy the structural contract (``.reason_code`` + ``.to_call_args()``).
+AssembledChallenge = Union[InvalidSignatureChallenge, DoubleSpendChallenge]
 
 # Same floor as the consensus submitter — the registry requires
 # gasleft() >= MIN_SLASH_GAS before the slash try/catch; 1M leaves headroom
@@ -96,10 +122,16 @@ class DryRunResult:
     revert_reason: Optional[str] = None
 
 
-class InvalidSignatureChallengeSubmitter:
-    """Sync Web3 client for INVALID_SIGNATURE challenges. One instance per challenger
-    keypair (the one-keypair-per-process invariant). ``registry``/``account``/``web3`` can
-    be injected for tests; otherwise built from rpc_url/registry_address/private_key."""
+class ChallengeSubmitter:
+    """Sync Web3 client for assembled challenges — broadcasts ANY challenge whose
+    ``to_call_args()`` matches the ``challengeReceipt`` ABI. Accepts the reason codes in
+    ``SUPPORTED_CHALLENGE_REASONS`` (INVALID_SIGNATURE=1, DOUBLE_SPEND=0) and uniformly
+    rejects any other. One instance per challenger keypair (the one-keypair-per-process
+    invariant). ``registry``/``account``/``web3`` can be injected for tests; otherwise
+    built from rpc_url/registry_address/private_key.
+
+    (Historically ``InvalidSignatureChallengeSubmitter`` — that name remains a
+    backward-compat alias of this class, defined at module bottom.)"""
 
     def __init__(
         self,
@@ -143,15 +175,16 @@ class InvalidSignatureChallengeSubmitter:
 
     # ── read-only pre-flight (NOT a broadcast) ─────────────────────────────────────
 
-    def dry_run(self, challenge: InvalidSignatureChallenge) -> DryRunResult:
+    def dry_run(self, challenge: AssembledChallenge) -> DryRunResult:
         """Static eth_call of challengeReceipt against current chain state — no tx, no
         gas, no state change. Returns whether the challenge WOULD succeed. The
         assistant/auditor runs this before the user broadcasts."""
-        if int(challenge.reason_code) != REASON_INVALID_SIGNATURE:
+        if int(challenge.reason_code) not in SUPPORTED_CHALLENGE_REASONS:
             return DryRunResult(
                 would_succeed=False,
-                revert_reason=f"not an INVALID_SIGNATURE challenge "
-                              f"(reason={challenge.reason_code})",
+                revert_reason=f"unsupported challenge reason "
+                              f"(reason={challenge.reason_code}; supported="
+                              f"{sorted(SUPPORTED_CHALLENGE_REASONS)})",
             )
         try:
             self.registry.functions.challengeReceipt(
@@ -163,15 +196,16 @@ class InvalidSignatureChallengeSubmitter:
 
     # ── broadcast (USER-GATED) ─────────────────────────────────────────────────────
 
-    def submit(self, challenge: InvalidSignatureChallenge) -> ChallengeResult:
+    def submit(self, challenge: AssembledChallenge) -> ChallengeResult:
         """Sign + broadcast the challengeReceipt transaction. USER-GATED (spends gas +
         slashes a provider bond). Never raises — returns a uniform ChallengeResult."""
-        if int(challenge.reason_code) != REASON_INVALID_SIGNATURE:
+        if int(challenge.reason_code) not in SUPPORTED_CHALLENGE_REASONS:
             return ChallengeResult(
                 success=False, tx_hash_hex=None,
                 error_type="ValueError",
-                error_message=f"reason_code {challenge.reason_code} is not "
-                              f"INVALID_SIGNATURE ({REASON_INVALID_SIGNATURE})",
+                error_message=f"reason_code {challenge.reason_code} is not a supported "
+                              f"challenge reason (supported="
+                              f"{sorted(SUPPORTED_CHALLENGE_REASONS)})",
             )
         try:
             with self._tx_lock:
@@ -186,8 +220,8 @@ class InvalidSignatureChallengeSubmitter:
         except (BroadcastFailedError, OnChainPendingError,
                 OnChainRevertedError) as exc:
             logger.warning(
-                "invalid-signature challenge failed: %s: %s",
-                type(exc).__name__, exc,
+                "challenge (reason=%s) failed: %s: %s",
+                getattr(challenge, "reason_code", "?"), type(exc).__name__, exc,
             )
             return ChallengeResult(
                 success=False,
@@ -197,8 +231,8 @@ class InvalidSignatureChallengeSubmitter:
             )
         except Exception as exc:  # noqa: BLE001 — uniform result; log loudly
             logger.error(
-                "invalid-signature challenge raised unexpected %s: %s",
-                type(exc).__name__, exc,
+                "challenge (reason=%s) raised unexpected %s: %s",
+                getattr(challenge, "reason_code", "?"), type(exc).__name__, exc,
             )
             return ChallengeResult(
                 success=False, tx_hash_hex=None,
@@ -239,3 +273,10 @@ class InvalidSignatureChallengeSubmitter:
         if receipt.status != 1:
             raise OnChainRevertedError(f"challenge tx reverted: {tx_hash_hex}")
         return tx_hash_hex, TransferStatus.CONFIRMED
+
+
+# ── backward-compat alias ───────────────────────────────────────────────────────────
+# Pre-sprint-1132 this module exposed only ``InvalidSignatureChallengeSubmitter``. The
+# class was generalized in place (brick 8); existing imports/tests keep working unchanged
+# because the old name is the SAME class object as the generic ``ChallengeSubmitter``.
+InvalidSignatureChallengeSubmitter = ChallengeSubmitter
