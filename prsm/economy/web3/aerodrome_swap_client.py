@@ -30,6 +30,7 @@ import asyncio
 import logging
 import os
 import threading
+from dataclasses import dataclass
 from typing import Optional
 
 try:
@@ -64,6 +65,18 @@ AERODROME_ROUTER_ABI = [
          {"name": "to", "type": "address"},
          {"name": "deadline", "type": "uint256"}],
      "outputs": [{"name": "amounts", "type": "uint256[]"}]},
+    # sp1151 — VIEW used ONLY by the read-only dry-run to verify pool liquidity +
+    # quote the expected FTNS out before any broadcast. Never written to.
+    {"type": "function", "name": "getAmountsOut",
+     "stateMutability": "view",
+     "inputs": [
+         {"name": "amountIn", "type": "uint256"},
+         {"name": "routes", "type": "tuple[]", "components": [
+             {"name": "from", "type": "address"},
+             {"name": "to", "type": "address"},
+             {"name": "stable", "type": "bool"},
+             {"name": "factory", "type": "address"}]}],
+     "outputs": [{"name": "amounts", "type": "uint256[]"}]},
 ]
 _ERC20_ABI = [
     {"type": "function", "name": "approve", "stateMutability": "nonpayable",
@@ -84,6 +97,53 @@ _RECEIPT_TIMEOUT_SECONDS = 180
 # that hasn't seen the just-set approve. Generous; only gasUsed is charged.
 _APPROVE_GAS = 100_000
 _SWAP_GAS = 400_000   # a single-hop router swap; generous headroom
+
+
+@dataclass(frozen=True)
+class AerodromeSwapDryRun:
+    """sp1151 — verdict of a READ-ONLY swap pre-flight. Mirrors the challenge
+    submitters' ``DryRunResult`` shape: a verdict object the operator inspects
+    BEFORE broadcasting, never an exception.
+
+    ``would_succeed`` is the bottom line: liquidity_ok AND sufficient_balance AND
+    slippage_ok. A short allowance is NOT a hard fail — ``_swap_sync`` auto-approves —
+    so ``approve_needed`` is reported but does not by itself flip ``would_succeed``.
+    """
+    would_succeed: bool
+    amount_in: int
+    amount_out_min: int
+    expected_out: Optional[int] = None
+    sufficient_balance: Optional[bool] = None
+    sufficient_allowance: Optional[bool] = None
+    approve_needed: bool = False
+    revert_reason: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "would_succeed": self.would_succeed,
+            "amount_in": self.amount_in,
+            "amount_out_min": self.amount_out_min,
+            "expected_out": self.expected_out,
+            "sufficient_balance": self.sufficient_balance,
+            "sufficient_allowance": self.sufficient_allowance,
+            "approve_needed": self.approve_needed,
+            "revert_reason": self.revert_reason,
+        }
+
+    def render(self) -> str:
+        verdict = "WOULD SUCCEED" if self.would_succeed else "WOULD REVERT"
+        lines = [
+            f"swap dry-run: {verdict}",
+            f"  amount_in (USDC units):   {self.amount_in}",
+            f"  amount_out_min (FTNS):    {self.amount_out_min}",
+            f"  expected_out (FTNS):      {self.expected_out}",
+            f"  sufficient_balance:       {self.sufficient_balance}",
+            f"  sufficient_allowance:     {self.sufficient_allowance}",
+            f"  approve_needed:           {self.approve_needed}",
+        ]
+        if self.revert_reason:
+            lines.append(f"  reason:                   {self.revert_reason}")
+        return "\n".join(lines)
 
 
 class AerodromeSwapClient:
@@ -156,6 +216,120 @@ class AerodromeSwapClient:
         addr = Web3.to_checksum_address(account)
         return await asyncio.to_thread(
             lambda: int(self.usdc.functions.balanceOf(addr).call()))
+
+    # ── read-only pre-flight (NOT a broadcast — sp1151) ───────────────────────
+
+    async def dry_run_swap_usdc_for_ftns(
+        self,
+        amount_in: int,
+        amount_out_min: int,
+        *,
+        owner: Optional[str] = None,
+    ) -> AerodromeSwapDryRun:
+        """READ-ONLY verify-before-broadcast: would a USDC→FTNS swap of ``amount_in``
+        units (slippage floor ``amount_out_min``) succeed against current chain state?
+
+        Mirrors the challenge submitters' ``dry_run`` (static ``.call()`` + a verdict
+        object, a revert → ``would_succeed=False`` rather than a propagated exception)
+        and the three-tier checks of ``_swap_sync`` — but NEVER builds/signs/sends a tx
+        and NEVER approves. All chain reads go through ``asyncio.to_thread(... .call())``.
+
+        Checks, in order:
+          (a) ``getAmountsOut(amount_in, [route])`` → ``expected_out`` (= amounts[-1])
+              and proves the pool has LIQUIDITY. A revert here (e.g. pre-seeding, no
+              pool) is caught → ``would_succeed=False`` + a clear liquidity reason.
+          (b) ``balanceOf(owner) >= amount_in`` → ``sufficient_balance`` (a HARD fail).
+          (c) ``allowance(owner, router) >= amount_in`` → ``sufficient_allowance`` /
+              ``approve_needed`` (NOT a hard fail — the real swap auto-approves).
+          (d) SLIPPAGE: ``expected_out >= amount_out_min`` (a HARD fail).
+
+        ``owner`` defaults to the signer address (``self.address``). With neither a
+        signer nor an ``owner`` the balance/allowance checks are skipped (liquidity +
+        slippage stay verifiable) and noted in ``revert_reason`` — never raised.
+        Raises ``ValueError`` on ``amount_in <= 0`` / ``amount_out_min < 0`` (mirrors
+        ``_swap_sync``).
+        """
+        amount_in = int(amount_in)
+        amount_out_min = int(amount_out_min)
+        if amount_in <= 0:
+            raise ValueError(f"amount_in must be positive (got {amount_in})")
+        if amount_out_min < 0:
+            raise ValueError(f"amount_out_min must be >= 0 (got {amount_out_min})")
+
+        route = (self.usdc_address, self.ftns_address, self._stable,
+                 self.factory_address)
+
+        # (a) Liquidity + quote. A revert here is the pre-seeding "no pool" case —
+        # caught, NOT propagated. READ-ONLY: a VIEW .call(), never a broadcast.
+        try:
+            amounts = await asyncio.to_thread(
+                lambda: self.router.functions.getAmountsOut(
+                    amount_in, [route]).call())
+            expected_out = int(amounts[-1])
+        except Exception as exc:  # noqa: BLE001 — surface as a verdict, don't raise
+            return AerodromeSwapDryRun(
+                would_succeed=False,
+                amount_in=amount_in,
+                amount_out_min=amount_out_min,
+                expected_out=None,
+                revert_reason=(
+                    "insufficient liquidity / no pool (getAmountsOut reverted: "
+                    f"{exc})"),
+            )
+
+        # Resolve the owner whose balance/allowance we'd spend.
+        resolved_owner = owner or self.address
+        sufficient_balance: Optional[bool] = None
+        sufficient_allowance: Optional[bool] = None
+        approve_needed = False
+        owner_note: Optional[str] = None
+
+        if resolved_owner is not None:
+            addr = Web3.to_checksum_address(resolved_owner)
+            # (b) balance — READ-ONLY .call().
+            usdc_bal = await asyncio.to_thread(
+                lambda: int(self.usdc.functions.balanceOf(addr).call()))
+            sufficient_balance = usdc_bal >= amount_in
+            # (c) allowance — READ-ONLY .call(). Short allowance is NOT a hard fail.
+            allowance = await asyncio.to_thread(
+                lambda: int(self.usdc.functions.allowance(
+                    addr, self.router_address).call()))
+            sufficient_allowance = allowance >= amount_in
+            approve_needed = not sufficient_allowance
+        else:
+            owner_note = ("no signer and no owner supplied — balance/allowance not "
+                          "checked (liquidity + slippage verified)")
+
+        # (d) slippage.
+        slippage_ok = expected_out >= amount_out_min
+
+        would_succeed = (
+            slippage_ok
+            and (sufficient_balance is not False)
+        )
+
+        revert_reason: Optional[str] = None
+        if not slippage_ok:
+            revert_reason = (
+                f"slippage: expected_out {expected_out} < amount_out_min "
+                f"{amount_out_min} (would revert on the router's slippage check)")
+        elif sufficient_balance is False:
+            revert_reason = (
+                f"insufficient USDC balance for owner {resolved_owner}: "
+                f"< amount_in {amount_in}")
+        elif owner_note is not None:
+            revert_reason = owner_note
+
+        return AerodromeSwapDryRun(
+            would_succeed=would_succeed,
+            amount_in=amount_in,
+            amount_out_min=amount_out_min,
+            expected_out=expected_out,
+            sufficient_balance=sufficient_balance,
+            sufficient_allowance=sufficient_allowance,
+            approve_needed=approve_needed,
+            revert_reason=revert_reason,
+        )
 
     async def swap_usdc_for_ftns(
         self,
