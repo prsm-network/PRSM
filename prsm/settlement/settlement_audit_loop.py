@@ -51,6 +51,7 @@ from typing import Any, List, Optional, Protocol
 
 from prsm.settlement.receipt_set_blob import deserialize_enriched_receipt_set
 from prsm.settlement.settlement_audit_engine import (
+    ConsensusMismatchAuditFinding,
     DoubleSpendAuditFinding,
     InferenceReceiptAuditFinding,
     InvalidSignatureAuditFinding,
@@ -106,6 +107,14 @@ class AuditRunResult:
         default_factory=list
     )
     inference_receipt_finding_count: int = 0
+    # sp1145 — CONSENSUS_MISMATCH findings from scan_consensus_mismatches (co-group provider
+    # disagreement: same non-zero group, same job+shard, different providers, different
+    # outputs — across root-verified batches). ``consensus_mismatch_finding_count`` mirrors
+    # ``len(consensus_mismatch_findings)`` as the observability counter for this scan.
+    consensus_mismatch_findings: List[ConsensusMismatchAuditFinding] = field(
+        default_factory=list
+    )
+    consensus_mismatch_finding_count: int = 0
 
 
 # ── the loop ──────────────────────────────────────────────────────────
@@ -217,6 +226,10 @@ class SettlementAuditLoop:
         # sp1143 — §7 compute-integrity scan: bind-then-verify the retained §7 receipts of
         # root-verified batches (NEVER broadcasts; fail-closed per item; key-bound only).
         inference_receipt_findings = list(self._engine.scan_inference_receipts())
+        # sp1145 — CONSENSUS_MISMATCH scan: co-group provider disagreement over root-verified
+        # batches (NEVER broadcasts; assemble + optional read-only dry-run only; the actual
+        # broadcast stays the separate user-gated submitter/queue path).
+        consensus_mismatch_findings = list(self._engine.scan_consensus_mismatches())
 
         return AuditRunResult(
             enumerated=enumerated,
@@ -229,4 +242,6 @@ class SettlementAuditLoop:
             invalid_sig_findings=list(invalid_sig_findings),
             inference_receipt_findings=inference_receipt_findings,
             inference_receipt_finding_count=len(inference_receipt_findings),
+            consensus_mismatch_findings=consensus_mismatch_findings,
+            consensus_mismatch_finding_count=len(consensus_mismatch_findings),
         )

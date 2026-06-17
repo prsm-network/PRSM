@@ -62,6 +62,7 @@ from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tupl
 
 from eth_utils import keccak
 
+from prsm.marketplace.consensus_submitter import ChallengeAttempt, ReceiptLeafFields
 from prsm.settlement.accumulator import BatchedReceipt
 from prsm.settlement.challenge_assembler import assemble_invalid_signature_challenge
 from prsm.settlement.challenge_verifier import (
@@ -69,13 +70,22 @@ from prsm.settlement.challenge_verifier import (
     verify_inference_receipt_for_challenge,
 )
 from prsm.settlement.client import CommittedBatch
+from prsm.settlement.consensus_mismatch_detector import (
+    ConsensusMismatchFinding,
+    DetectorBatch,
+    detect_consensus_mismatches,
+)
 from prsm.settlement.double_spend_assembler import assemble_double_spend_challenge
 from prsm.settlement.double_spend_detector import (
     DoubleSpendFinding,
     detect_double_spends,
 )
 from prsm.settlement.inference_receipt_store import RetainedInferenceReceipt
-from prsm.settlement.merkle import batched_receipt_to_leaf, hash_leaf
+from prsm.settlement.merkle import (
+    batched_receipt_to_leaf,
+    build_merkle_proof,
+    hash_leaf,
+)
 from prsm.settlement.published_batch_store import PublishedBatch
 from prsm.settlement.receipt_set_blob import verify_receipt_set_against_root
 
@@ -194,6 +204,13 @@ class VerifiedBatchCache:
         self._inference_receipts: "OrderedDict[str, Dict[bytes, RetainedInferenceReceipt]]" = (
             OrderedDict()
         )
+        # sp1145 — batch_id_hex -> observed.consensus_group_id (32 bytes). ADDITIVE: the
+        # ``CommittedBatch`` record the double-spend detector consumes carries no group_id,
+        # so the CONSENSUS_MISMATCH detector needs this retained separately to group co-group
+        # batches by (group_id, job, shard) across providers. Defaults to the zero-group id
+        # when an observed batch carries none, so a zero-group batch is never co-grouped.
+        # Evicted in lockstep with ``_entries`` (same key).
+        self._consensus_group_ids: "OrderedDict[str, bytes]" = OrderedDict()
 
     def ingest(
         self,
@@ -251,7 +268,10 @@ class VerifiedBatchCache:
         if key in self._entries:
             del self._entries[key]
             self._inference_receipts.pop(key, None)
+            self._consensus_group_ids.pop(key, None)
         self._entries[key] = (committed, receipts)
+        # sp1145 — retain the chain-anchored consensus_group_id for co-group detection.
+        self._consensus_group_ids[key] = bytes(observed.consensus_group_id)
 
         # Retain the §7 map ONLY for leaves that are actually in this verified batch's
         # leaf set (an entry keyed by an unknown leaf can never bind to a committed leaf,
@@ -269,6 +289,7 @@ class VerifiedBatchCache:
         while len(self._entries) > self._max_batches:
             evicted, _ = self._entries.popitem(last=False)
             self._inference_receipts.pop(evicted, None)
+            self._consensus_group_ids.pop(evicted, None)
             logger.debug(
                 "VerifiedBatchCache: evicted oldest batch %s (over max_batches=%d)",
                 evicted, self._max_batches,
@@ -291,6 +312,12 @@ class VerifiedBatchCache:
         conflicting-batch proof), or None if not cached."""
         entry = self._entries.get(bytes(batch_id).hex())
         return entry[0].leaf_hashes if entry is not None else None
+
+    def consensus_group_id_for(self, batch_id: bytes) -> Optional[bytes]:
+        """The chain-anchored ``consensus_group_id`` for a verified batch (sp1145), or
+        None if the batch is not cached. Used by ``scan_consensus_mismatches`` to group
+        co-group batches across providers."""
+        return self._consensus_group_ids.get(bytes(batch_id).hex())
 
     def inference_receipts_for(
         self, batch_id: bytes,
@@ -351,6 +378,21 @@ class InferenceReceiptAuditFinding:
     reason: Optional[ChallengeReason] = None
     on_chain_reason: Optional[int] = None
     detail: Optional[str] = None
+    dry_run_ok: Optional[bool] = None
+    dry_run_reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ConsensusMismatchAuditFinding:
+    """An actionable co-group disagreement (sp1145) from the verified cache. Wraps the pure
+    ``ConsensusMismatchFinding`` with the assembled (never-broadcast) ``ChallengeAttempt``
+    (reusing ``marketplace.consensus_submitter``: minority leaf+proof from the challenged
+    batch, majority leaf+proof from the conflicting batch) and the optional read-only dry-run
+    verdict (``dry_run_ok``: True/False if a dry-run client was injected AND assembly
+    succeeded, else None)."""
+
+    finding: ConsensusMismatchFinding
+    attempt: Optional[ChallengeAttempt] = None
     dry_run_ok: Optional[bool] = None
     dry_run_reason: Optional[str] = None
 
@@ -472,6 +514,108 @@ class SettlementAuditEngine:
                     batch_id=cb.batch_id, receipt_index=idx,
                     dry_run_ok=dry_ok, dry_run_reason=dry_reason))
         return out
+
+    def scan_consensus_mismatches(self) -> List[ConsensusMismatchAuditFinding]:
+        """Detect co-group provider DISAGREEMENT across the VERIFIED cache (sp1145 — the
+        3rd on-chain-actionable fraud class). Builds the detector input from ONLY the
+        root-verified batches (their retained ``consensus_group_id`` + provider + receipts),
+        runs ``detect_consensus_mismatches`` (which matches the on-chain
+        ``_handleConsensusMismatch`` reject-set EXACTLY), and for each finding assembles a
+        ``ChallengeAttempt`` (reusing ``marketplace.consensus_submitter``
+        ``ReceiptLeafFields`` + merkle proofs from the verified batches: minority leaf+proof
+        from the challenged batch, majority leaf+proof from the conflicting batch). If a
+        dry-run client is injected AND assembly succeeded, dry-run it (read-only) and attach
+        ``dry_run_ok``.
+
+        FAIL-CLOSED: a detector blowup returns ``[]`` (a non-actionable scan); a per-finding
+        assembly/dry-run error leaves ``attempt``/``dry_run_ok`` unknown but STILL surfaces
+        the finding so the (now manual-review) disagreement is not silently dropped. NEVER
+        calls ``submit_one``/broadcast — assembly + optional read-only dry-run only; the
+        actual broadcast stays the separate user-gated submitter/queue path."""
+        try:
+            detector_batches = self._build_consensus_detector_input()
+            raw_findings = detect_consensus_mismatches(detector_batches)
+        except Exception as exc:  # noqa: BLE001 — fail-closed: a build/detector blowup is not actionable
+            logger.error(
+                "scan_consensus_mismatches: build/detector raised (%s); returning []", exc
+            )
+            return []
+
+        out: List[ConsensusMismatchAuditFinding] = []
+        for finding in raw_findings:
+            attempt = self._try_assemble_consensus_mismatch(finding)
+            dry_ok: Optional[bool] = None
+            dry_reason: Optional[str] = None
+            if attempt is not None and self._dry_run_client is not None:
+                dry_ok, dry_reason = self._dry_run(attempt)
+            out.append(ConsensusMismatchAuditFinding(
+                finding=finding, attempt=attempt,
+                dry_run_ok=dry_ok, dry_run_reason=dry_reason))
+        return out
+
+    def _build_consensus_detector_input(self) -> List[DetectorBatch]:
+        """Build the ``detect_consensus_mismatches`` input from the VERIFIED cache: one
+        ``DetectorBatch`` per root-verified batch carrying its retained
+        ``consensus_group_id`` (zero-group when none) + provider + order-preserved receipts.
+        A batch with missing receipts is skipped (it can't carry a leaf to compare)."""
+        batches: List[DetectorBatch] = []
+        for cb in self._cache.verified_batches():
+            receipts = self._cache.receipts_for(cb.batch_id)
+            if not receipts:
+                continue
+            group_id = self._cache.consensus_group_id_for(cb.batch_id)
+            if group_id is None:
+                group_id = b"\x00" * 32
+            batches.append(DetectorBatch(
+                batch_id=bytes(cb.batch_id),
+                provider_address=cb.provider_address,
+                consensus_group_id=bytes(group_id),
+                receipts=receipts,
+            ))
+        return batches
+
+    def _try_assemble_consensus_mismatch(
+        self, finding: ConsensusMismatchFinding,
+    ) -> Optional[ChallengeAttempt]:
+        """Assemble the CONSENSUS_MISMATCH ``ChallengeAttempt`` for one finding, reusing
+        ``marketplace.consensus_submitter`` ``ReceiptLeafFields`` + merkle proofs from the
+        verified batches. The minority leaf+proof come from the CHALLENGED (minority) batch;
+        the majority leaf+proof come from the CONFLICTING (majority) batch. Returns the
+        attempt, or None if it can't be assembled (missing cache data or an encoding
+        fail-fast). Never raises out — assembly failure leaves the finding surfaced without
+        a dry-run verdict."""
+        try:
+            minority_receipts = self._cache.receipts_for(finding.minority_batch_id)
+            majority_receipts = self._cache.receipts_for(finding.majority_batch_id)
+            minority_leaves = self._cache.leaf_hashes_for(finding.minority_batch_id)
+            majority_leaves = self._cache.leaf_hashes_for(finding.majority_batch_id)
+            if (minority_receipts is None or majority_receipts is None
+                    or minority_leaves is None or majority_leaves is None):
+                return None
+
+            min_idx = finding.minority_leaf_index
+            maj_idx = finding.majority_leaf_index
+            minority_leaf = ReceiptLeafFields.from_python_receipt(
+                minority_receipts[min_idx].receipt,
+                value_ftns_wei=int(minority_receipts[min_idx].value_ftns),
+            )
+            majority_leaf = ReceiptLeafFields.from_python_receipt(
+                majority_receipts[maj_idx].receipt,
+                value_ftns_wei=int(majority_receipts[maj_idx].value_ftns),
+            )
+            minority_proof = build_merkle_proof(list(minority_leaves), min_idx)
+            majority_proof = build_merkle_proof(list(majority_leaves), maj_idx)
+            return ChallengeAttempt(
+                minority_batch_id=bytes(finding.minority_batch_id),
+                minority_leaf=minority_leaf,
+                minority_proof=minority_proof,
+                majority_batch_id=bytes(finding.majority_batch_id),
+                majority_leaf=majority_leaf,
+                majority_proof=majority_proof,
+            )
+        except Exception as exc:  # noqa: BLE001 — assembly fail-fast/error → no attempt, still surfaced
+            logger.debug("consensus-mismatch assembly skipped (%s)", exc)
+            return None
 
     def scan_inference_receipts(self) -> List[InferenceReceiptAuditFinding]:
         """Run the §7 (compute-integrity) challenge verifier over the §7 receipts retained
