@@ -3,8 +3,8 @@ settlement class, completing DOUBLE_SPEND=0 / INVALID_SIGNATURE=1 / NO_ESCROW=2 
 EXPIRED=3 / CONSENSUS_MISMATCH=5).
 
 THE CONDITION. EXPIRED is protocol HYGIENE, not malice: a committed leaf whose
-``executed_at_unix`` is OLDER than the batch's per-batch lookback window should not be paid
-from escrow. On-chain ``challengeReceipt(..., ReasonCode.EXPIRED, ...)`` ->
+``executed_at_unix`` is OLDER than the batch's per-batch lookback window must not be paid
+out of escrow. On-chain ``challengeReceipt(..., ReasonCode.EXPIRED, ...)`` ->
 ``_handleExpired(leaf, b.lookbackWindowSecondsAtCommit)`` (BatchSettlementRegistry.sol
 840-850) is a PURE time check:
 
