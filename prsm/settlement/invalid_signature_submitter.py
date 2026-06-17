@@ -60,6 +60,10 @@ from prsm.settlement.no_escrow_assembler import (
     REASON_NO_ESCROW,
     NoEscrowChallenge,
 )
+from prsm.settlement.expired_assembler import (
+    REASON_EXPIRED,
+    ExpiredChallenge,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,16 +75,20 @@ logger = logging.getLogger(__name__)
 #     with the REQUESTER's key (on chain _handleNoEscrow requires msg.sender ==
 #     b.requester). Broadcast mechanics/gas/nonce/error-classification are UNCHANGED;
 #     only the reason-set membership widened.
-# Any reason code NOT in this set (e.g. EXPIRED=3) is rejected uniformly — never
+#   - EXPIRED=3 (sprint 1148): protocol-hygiene — a stale leaf (age > per-batch lookback).
+#     ANY observer may submit (on chain _handleExpired has no msg.sender restriction);
+#     EXPIRED does NOT slash. Broadcast mechanics/gas/nonce/error-classification UNCHANGED.
+# Any reason code NOT in this set (e.g. CONSENSUS_MISMATCH=5, which has its OWN
+# consensus_submitter because its auxData is complex) is rejected uniformly — never
 # broadcast, never raised.
 SUPPORTED_CHALLENGE_REASONS = frozenset(
-    {REASON_INVALID_SIGNATURE, REASON_DOUBLE_SPEND, REASON_NO_ESCROW}
+    {REASON_INVALID_SIGNATURE, REASON_DOUBLE_SPEND, REASON_NO_ESCROW, REASON_EXPIRED}
 )
 
-# An assembled challenge accepted by this submitter — any fraud/self-dispute dataclass.
-# All satisfy the structural contract (``.reason_code`` + ``.to_call_args()``).
+# An assembled challenge accepted by this submitter — any fraud/self-dispute/hygiene
+# dataclass. All satisfy the structural contract (``.reason_code`` + ``.to_call_args()``).
 AssembledChallenge = Union[
-    InvalidSignatureChallenge, DoubleSpendChallenge, NoEscrowChallenge
+    InvalidSignatureChallenge, DoubleSpendChallenge, NoEscrowChallenge, ExpiredChallenge
 ]
 
 # Same floor as the consensus submitter — the registry requires

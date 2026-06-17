@@ -317,7 +317,8 @@ class Web3SettlementContractClient:
         recovery scan respects), optionally filtered to one ``provider`` (an indexed
         topic). For each distinct ``batchId`` it reads the on-chain ``Batch`` struct
         (``batches(batch_id).call()``) for requester (idx 1) / merkleRoot (idx 2) /
-        consensus_group_id (idx 9) and builds an ``ObservedBatch`` — the TRUSTED anchor
+        consensus_group_id (idx 9) / lookbackWindowSecondsAtCommit (idx 10) and builds an
+        ``ObservedBatch`` — the TRUSTED anchor
         the observer cross-checks fetched receipt sets against.
 
         ``cid`` is left None (the loop fills it from the untrusted ad index). This is
@@ -368,6 +369,9 @@ class Web3SettlementContractClient:
                 requester_address=b[1],
                 merkle_root=bytes(b[2]),
                 consensus_group_id=bytes(b[9]),
+                # sp1148 — struct idx 10 is lookbackWindowSecondsAtCommit. Already reading
+                # the struct (idx 1/2/9), so this is one more index read, NO extra RPC call.
+                lookback_window_seconds=int(b[10]),
                 cid=None,
             ))
         return observed

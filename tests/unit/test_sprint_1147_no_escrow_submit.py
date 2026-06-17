@@ -308,17 +308,20 @@ def test_dry_run_accepts_no_escrow():
     assert h.built_overrides is None  # read-only — never built/broadcast
 
 
-def test_submit_still_rejects_expired_reason():
+def test_submit_still_rejects_consensus_mismatch_reason():
+    # Sprint 1148 added EXPIRED=3 to the generic supported set, so CONSENSUS_MISMATCH=5 —
+    # which has its OWN consensus_submitter (complex auxData) — is the unsupported exemplar
+    # for the generic submitter. The rejection contract is unchanged.
     h = _Harness()
     ch = _no_escrow_challenge()
-    expired = NoEscrowChallenge(
+    unsupported = NoEscrowChallenge(
         batch_id=ch.batch_id, leaf=ch.leaf, merkle_proof=ch.merkle_proof,
-        reason_code=3, aux_data=ch.aux_data)  # 3 = EXPIRED, unsupported
-    result = h.submitter().submit(expired)
+        reason_code=5, aux_data=ch.aux_data)  # 5 = CONSENSUS_MISMATCH, unsupported here
+    result = h.submitter().submit(unsupported)
     assert result.success is False
     assert h.call_args is None  # never reached the contract
     # dry_run rejects it too
-    assert h.submitter().dry_run(expired).would_succeed is False
+    assert h.submitter().dry_run(unsupported).would_succeed is False
 
 
 # ── (d) NO-AUTO-SUBMIT + fail-closed ────────────────────────────────────────────────

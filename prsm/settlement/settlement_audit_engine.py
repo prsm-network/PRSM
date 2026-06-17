@@ -80,6 +80,11 @@ from prsm.settlement.double_spend_detector import (
     DoubleSpendFinding,
     detect_double_spends,
 )
+from prsm.settlement.expired_assembler import assemble_expired_challenge
+from prsm.settlement.expired_receipt_detector import (
+    ExpiredReceiptFinding,
+    detect_expired_receipts,
+)
 from prsm.settlement.inference_receipt_store import RetainedInferenceReceipt
 from prsm.settlement.merkle import (
     batched_receipt_to_leaf,
@@ -115,6 +120,12 @@ class ObservedBatch:
     merkle_root: bytes
     consensus_group_id: bytes = _ZERO_GROUP_ID
     cid: Optional[str] = None
+    # sp1148 — the chain-anchored ``lookbackWindowSecondsAtCommit`` (Batch struct idx 10) the
+    # EXPIRED detector time-checks against. ADDITIVE default (0 == unknown) so every existing
+    # ObservedBatch constructor still works; 0/unknown is treated FAIL-CLOSED by the detector
+    # (never flagged), so an old call site that doesn't supply it can never produce a false
+    # EXPIRED finding.
+    lookback_window_seconds: int = 0
 
 
 # ── selectors ─────────────────────────────────────────────────────────
@@ -211,6 +222,13 @@ class VerifiedBatchCache:
         # when an observed batch carries none, so a zero-group batch is never co-grouped.
         # Evicted in lockstep with ``_entries`` (same key).
         self._consensus_group_ids: "OrderedDict[str, bytes]" = OrderedDict()
+        # sp1148 — batch_id_hex -> observed.lookback_window_seconds (the chain-anchored
+        # ``lookbackWindowSecondsAtCommit``). ADDITIVE, mirrors ``_consensus_group_ids``: the
+        # ``CommittedBatch`` record the detectors consume carries no lookback, so the EXPIRED
+        # detector needs this retained separately to time-check each leaf against the EXACT
+        # per-batch on-chain window. Defaults to 0 (unknown) when an observed batch carries
+        # none — and 0 is FAIL-CLOSED in the detector (never flagged). Evicted in lockstep.
+        self._lookback_window_seconds: "OrderedDict[str, int]" = OrderedDict()
 
     def ingest(
         self,
@@ -269,9 +287,14 @@ class VerifiedBatchCache:
             del self._entries[key]
             self._inference_receipts.pop(key, None)
             self._consensus_group_ids.pop(key, None)
+            self._lookback_window_seconds.pop(key, None)
         self._entries[key] = (committed, receipts)
         # sp1145 — retain the chain-anchored consensus_group_id for co-group detection.
         self._consensus_group_ids[key] = bytes(observed.consensus_group_id)
+        # sp1148 — retain the chain-anchored per-batch lookback window for EXPIRED detection.
+        self._lookback_window_seconds[key] = int(
+            getattr(observed, "lookback_window_seconds", 0) or 0
+        )
 
         # Retain the §7 map ONLY for leaves that are actually in this verified batch's
         # leaf set (an entry keyed by an unknown leaf can never bind to a committed leaf,
@@ -290,6 +313,7 @@ class VerifiedBatchCache:
             evicted, _ = self._entries.popitem(last=False)
             self._inference_receipts.pop(evicted, None)
             self._consensus_group_ids.pop(evicted, None)
+            self._lookback_window_seconds.pop(evicted, None)
             logger.debug(
                 "VerifiedBatchCache: evicted oldest batch %s (over max_batches=%d)",
                 evicted, self._max_batches,
@@ -319,6 +343,12 @@ class VerifiedBatchCache:
         co-group batches across providers."""
         return self._consensus_group_ids.get(bytes(batch_id).hex())
 
+    def lookback_window_seconds_for(self, batch_id: bytes) -> Optional[int]:
+        """The chain-anchored ``lookbackWindowSecondsAtCommit`` for a verified batch
+        (sp1148), or None if the batch is not cached. Used by ``scan_expired_receipts`` to
+        time-check each leaf against the EXACT per-batch on-chain window."""
+        return self._lookback_window_seconds.get(bytes(batch_id).hex())
+
     def inference_receipts_for(
         self, batch_id: bytes,
     ) -> Dict[bytes, RetainedInferenceReceipt]:
@@ -326,6 +356,19 @@ class VerifiedBatchCache:
         verified batch, or an empty dict if the batch is not cached / carried no §7
         section. (sp1143 — returns a copy so a caller can't mutate the cache.)"""
         return dict(self._inference_receipts.get(bytes(batch_id).hex(), {}))
+
+
+# ── EXPIRED detector input (sp1148) ───────────────────────────────────
+
+
+@dataclass(frozen=True)
+class _ExpiredDetectorBatch:
+    """One root-verified batch fed to ``detect_expired_receipts``: order-preserved receipts +
+    the chain-anchored per-batch ``lookback_window_seconds`` (0/unknown -> fail-closed)."""
+
+    batch_id: bytes
+    receipts: List[BatchedReceipt]
+    lookback_window_seconds: int
 
 
 # ── findings ──────────────────────────────────────────────────────────
@@ -393,6 +436,20 @@ class ConsensusMismatchAuditFinding:
 
     finding: ConsensusMismatchFinding
     attempt: Optional[ChallengeAttempt] = None
+    dry_run_ok: Optional[bool] = None
+    dry_run_reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ExpiredReceiptAuditFinding:
+    """An actionable EXPIRED finding (sp1148 — the 5th + FINAL on-chain reason) from the
+    verified cache. Wraps the pure ``ExpiredReceiptFinding`` with the assembled
+    (never-broadcast) ``ExpiredChallenge`` and the optional read-only dry-run verdict
+    (``dry_run_ok``: True/False if a dry-run client was injected AND assembly succeeded, else
+    None). EXPIRED is hygiene, not malice — this never slashes."""
+
+    finding: ExpiredReceiptFinding
+    challenge: Any = None
     dry_run_ok: Optional[bool] = None
     dry_run_reason: Optional[str] = None
 
@@ -615,6 +672,93 @@ class SettlementAuditEngine:
             )
         except Exception as exc:  # noqa: BLE001 — assembly fail-fast/error → no attempt, still surfaced
             logger.debug("consensus-mismatch assembly skipped (%s)", exc)
+            return None
+
+    def scan_expired_receipts(
+        self, *, now: int, safety_margin_seconds: int = 60,
+    ) -> List[ExpiredReceiptAuditFinding]:
+        """Detect STALE (EXPIRED) leaves across the VERIFIED cache (sp1148 — the 5th + FINAL
+        on-chain-actionable reason). Builds the detector input from ONLY the root-verified
+        batches (their order-preserved receipts + the retained chain-anchored per-batch
+        ``lookback_window_seconds``), runs ``detect_expired_receipts`` (which matches the
+        on-chain ``_handleExpired`` ``age > lookback`` STRICTLY and is FAIL-CLOSED on a
+        non-positive/unknown lookback + per-receipt errors), and for each finding assembles
+        an ``ExpiredChallenge`` from the cached receipts. If a dry-run client is injected AND
+        assembly succeeded, dry-run it (read-only) and attach ``dry_run_ok``.
+
+        ``safety_margin_seconds`` (default 60) is a CONSERVATIVE cushion: the detector flags
+        only ``age > lookback + margin`` so a leaf flagged at scan time stays expired at the
+        (later) submit time despite clock skew between this process and ``block.timestamp`` —
+        age only grows, so the only risk a margin guards against is flagging a leaf RIGHT at
+        the boundary. The assembler then re-checks STRICTLY (``age > lookback``, no margin)
+        against the same ``now`` and the dry-run gate confirms against the real chain.
+
+        FAIL-CLOSED: a detector/build blowup returns ``[]`` (a non-actionable scan); a
+        per-finding assembly/dry-run error leaves ``challenge``/``dry_run_ok`` unknown but
+        STILL surfaces the finding. NEVER broadcasts — assembly + optional read-only dry-run
+        only; the irreversible tx stays the separate USER-GATED submitter path (any observer
+        key — EXPIRED has no on-chain msg.sender restriction)."""
+        try:
+            detector_batches = self._build_expired_detector_input()
+            raw_findings = detect_expired_receipts(
+                detector_batches, now=int(now),
+                safety_margin_seconds=int(safety_margin_seconds),
+            )
+        except Exception as exc:  # noqa: BLE001 — fail-closed: a build/detector blowup is not actionable
+            logger.error(
+                "scan_expired_receipts: build/detector raised (%s); returning []", exc
+            )
+            return []
+
+        out: List[ExpiredReceiptAuditFinding] = []
+        for finding in raw_findings:
+            challenge = self._try_assemble_expired(finding, now=int(now))
+            dry_ok: Optional[bool] = None
+            dry_reason: Optional[str] = None
+            if challenge is not None and self._dry_run_client is not None:
+                dry_ok, dry_reason = self._dry_run(challenge)
+            out.append(ExpiredReceiptAuditFinding(
+                finding=finding, challenge=challenge,
+                dry_run_ok=dry_ok, dry_run_reason=dry_reason))
+        return out
+
+    def _build_expired_detector_input(self) -> List["_ExpiredDetectorBatch"]:
+        """Build the ``detect_expired_receipts`` input from the VERIFIED cache: one batch per
+        root-verified batch carrying its order-preserved receipts + the retained chain-anchored
+        ``lookback_window_seconds`` (0/unknown when none — the detector is FAIL-CLOSED on it).
+        A batch with missing receipts is skipped (no leaf to time-check)."""
+        batches: List[_ExpiredDetectorBatch] = []
+        for cb in self._cache.verified_batches():
+            receipts = self._cache.receipts_for(cb.batch_id)
+            if not receipts:
+                continue
+            lookback = self._cache.lookback_window_seconds_for(cb.batch_id)
+            batches.append(_ExpiredDetectorBatch(
+                batch_id=bytes(cb.batch_id),
+                receipts=receipts,
+                lookback_window_seconds=int(lookback) if lookback is not None else 0,
+            ))
+        return batches
+
+    def _try_assemble_expired(self, finding: ExpiredReceiptFinding, *, now: int):
+        """Assemble the EXPIRED ``ExpiredChallenge`` for one finding from the cached receipts.
+        Re-checks STRICTLY via ``assemble_expired_challenge`` (which fail-fasts unless ``age >
+        lookback``), so a finding that is no longer provably expired never yields a challenge.
+        Returns the challenge, or None on missing cache data / a fail-fast / an error (never
+        raises out — assembly failure leaves the finding surfaced without a dry-run verdict)."""
+        try:
+            receipts = self._cache.receipts_for(finding.batch_id)
+            if not receipts:
+                return None
+            return assemble_expired_challenge(
+                batch_id=bytes(finding.batch_id),
+                batch_receipts=receipts,
+                target_index=finding.target_index,
+                now=int(now),
+                lookback_window_seconds=int(finding.lookback),
+            )
+        except Exception as exc:  # noqa: BLE001 — assembly fail-fast/error → no dry-run, still surfaced
+            logger.debug("expired assembly skipped (%s)", exc)
             return None
 
     def scan_inference_receipts(self) -> List[InferenceReceiptAuditFinding]:

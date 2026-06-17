@@ -46,6 +46,7 @@ running node is a separate, gated brick.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field, replace
 from typing import Any, List, Optional, Protocol
 
@@ -53,6 +54,7 @@ from prsm.settlement.receipt_set_blob import deserialize_enriched_receipt_set
 from prsm.settlement.settlement_audit_engine import (
     ConsensusMismatchAuditFinding,
     DoubleSpendAuditFinding,
+    ExpiredReceiptAuditFinding,
     InferenceReceiptAuditFinding,
     InvalidSignatureAuditFinding,
     ObservedBatch,
@@ -115,6 +117,11 @@ class AuditRunResult:
         default_factory=list
     )
     consensus_mismatch_finding_count: int = 0
+    # sp1148 — EXPIRED findings from scan_expired_receipts (stale leaves: age > the per-batch
+    # lookback, across root-verified batches; STRICT on-chain match; never broadcasts).
+    # ``expired_finding_count`` mirrors ``len(expired_findings)`` as the observability counter.
+    expired_findings: List[ExpiredReceiptAuditFinding] = field(default_factory=list)
+    expired_finding_count: int = 0
 
 
 # ── the loop ──────────────────────────────────────────────────────────
@@ -230,6 +237,12 @@ class SettlementAuditLoop:
         # batches (NEVER broadcasts; assemble + optional read-only dry-run only; the actual
         # broadcast stays the separate user-gated submitter/queue path).
         consensus_mismatch_findings = list(self._engine.scan_consensus_mismatches())
+        # sp1148 — EXPIRED scan: stale leaves (age > the per-batch chain-anchored lookback) over
+        # root-verified batches. STRICT on-chain match + fail-closed on unknown lookback +
+        # conservative safety margin; NEVER broadcasts (assemble + optional read-only dry-run
+        # only — the irreversible tx stays the separate user-gated submitter path). ``now`` is
+        # the observer's wall clock; the dry-run gate confirms against the real block.timestamp.
+        expired_findings = list(self._engine.scan_expired_receipts(now=int(time.time())))
 
         return AuditRunResult(
             enumerated=enumerated,
@@ -244,4 +257,6 @@ class SettlementAuditLoop:
             inference_receipt_finding_count=len(inference_receipt_findings),
             consensus_mismatch_findings=consensus_mismatch_findings,
             consensus_mismatch_finding_count=len(consensus_mismatch_findings),
+            expired_findings=expired_findings,
+            expired_finding_count=len(expired_findings),
         )
