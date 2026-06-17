@@ -157,7 +157,79 @@ class LocalHuggingFaceChainExecutor:
         yield self._terminal(full, time.monotonic() - t0)
 
 
-def _model_info_for(model_id: str) -> ModelInfo:
+def _first_attr(config: Any, *names: str) -> Any:
+    """Return the first present, non-None attribute among ``names`` (or None).
+
+    PretrainedConfig families spell the same field differently (gpt2: ``n_layer``;
+    modern Llama/Mistral/Qwen: ``num_hidden_layers``), so derivation must probe
+    several aliases per logical field.
+    """
+    for name in names:
+        value = getattr(config, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _derive_model_info(config: Any, model_id: str) -> ModelInfo:
+    """Map a HF-config-like object (anything exposing the attributes) to a
+    ``ModelInfo`` for the allocator catalog (which drives chain-stage layer
+    slicing).
+
+    Handles BOTH naming schemes via cross-aliased ``getattr``:
+      * gpt2-style: ``n_layer`` / ``n_embd`` / ``n_head`` / ``n_inner`` / ``vocab_size``
+        (gpt2 is MHA, so it carries no kv-head field).
+      * modern (Llama/Mistral/Qwen): ``num_hidden_layers`` / ``hidden_size`` /
+        ``num_attention_heads`` / ``num_key_value_heads`` / ``intermediate_size`` /
+        ``vocab_size`` (GQA: kv-heads may be < attention-heads).
+
+    Derivation rules:
+      * num_kv_heads defaults to num_attention_heads when ``num_key_value_heads``
+        is absent (pure MHA).
+      * head_size uses an explicit ``head_dim`` when present, else
+        hidden_dim // num_attention_heads (768 // 12 == 64 for gpt2).
+      * intermediate_dim falls back to 4 * hidden_dim when ``n_inner`` /
+        ``intermediate_size`` is absent/None (the standard transformer ratio).
+
+    This is the pure, network-free core: ``_model_info_for`` is the thin loader
+    that obtains ``config`` from ``AutoConfig`` (and falls back to the gpt2
+    hardcode on any load failure).
+    """
+    _n_layers = _first_attr(config, "num_hidden_layers", "n_layer")
+    num_layers = int(_n_layers) if _n_layers is not None else 12
+    hidden_dim = int(_first_attr(config, "hidden_size", "n_embd"))
+    num_attention_heads = int(_first_attr(config, "num_attention_heads", "n_head"))
+    num_kv_heads = _first_attr(config, "num_key_value_heads", "num_kv_heads")
+    num_kv_heads = int(num_kv_heads) if num_kv_heads is not None else num_attention_heads
+
+    explicit_head_dim = _first_attr(config, "head_dim", "head_size")
+    head_size = (
+        int(explicit_head_dim)
+        if explicit_head_dim is not None
+        else hidden_dim // num_attention_heads
+    )
+
+    intermediate = _first_attr(config, "intermediate_size", "n_inner")
+    intermediate_dim = int(intermediate) if intermediate is not None else 4 * hidden_dim
+
+    vocab_size = int(_first_attr(config, "vocab_size"))
+
+    return ModelInfo(
+        model_name=model_id,
+        mlx_model_name=model_id + "-mlx",
+        head_size=head_size,
+        hidden_dim=hidden_dim,
+        intermediate_dim=intermediate_dim,
+        num_attention_heads=num_attention_heads,
+        num_kv_heads=num_kv_heads,
+        vocab_size=vocab_size,
+        num_layers=num_layers,
+    )
+
+
+def _gpt2_hardcode_model_info(model_id: str) -> ModelInfo:
+    """The proven, in-production gpt2-family ModelInfo — the resilient fallback
+    when ``AutoConfig`` cannot load (offline / uncached / no ``transformers``)."""
     num_layers = _KNOWN_MODELS.get(model_id, 12)
     return ModelInfo(
         model_name=model_id,
@@ -165,6 +237,25 @@ def _model_info_for(model_id: str) -> ModelInfo:
         num_layers=num_layers,
         **_GPT2_FAMILY_DIMS,
     )
+
+
+def _model_info_for(model_id: str) -> ModelInfo:
+    """Build the allocator-catalog ``ModelInfo`` for ``model_id`` from its real
+    HF config so layer slicing is correct for ANY model (not just gpt2).
+
+    Tries ``AutoConfig.from_pretrained(model_id, local_files_only=True)`` and
+    delegates to ``_derive_model_info``. On ANY load failure (offline, uncached,
+    missing ``transformers``, or a config missing a required field) it falls back
+    to the proven gpt2 hardcode path — preserving the executor's current
+    resilience and keeping gpt2/distilgpt2 byte-identical to today.
+    """
+    try:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(model_id, local_files_only=True)
+        return _derive_model_info(config, model_id)
+    except Exception:  # noqa: BLE001 — any failure -> resilient gpt2 fallback
+        return _gpt2_hardcode_model_info(model_id)
 
 
 class _SelfAnchor:
@@ -207,7 +298,11 @@ def build_local_inference_executor(
             "build_local_inference_executor requires a NodeIdentity (.node_id)"
         )
     node_id = node_identity.node_id
-    num_layers = _KNOWN_MODELS.get(model_id, 12)
+    # Derive ModelInfo ONCE from the real config (sp1133) so the layer count that
+    # sizes the node's layer_capacity matches the catalog entry that drives slicing —
+    # no second gpt2-default lurking here.
+    model_info = _model_info_for(model_id)
+    num_layers = model_info.num_layers
 
     # sp1098 (Domain-03 review F3) — the local executor runs in pure software
     # (TEEType.SOFTWARE), so it must NOT advertise a hardware tier. The prior hard-coded
@@ -249,7 +344,7 @@ def build_local_inference_executor(
         consensus_hook=ConsensusMismatchHook(submitter=_NoopSubmitter(), sample_rate=0.0),
     )
 
-    catalog: Dict[str, ModelInfo] = {model_id: _model_info_for(model_id)}
+    catalog: Dict[str, ModelInfo] = {model_id: model_info}
 
     def _provider() -> List[ParallaxGPU]:
         return list(pool)
