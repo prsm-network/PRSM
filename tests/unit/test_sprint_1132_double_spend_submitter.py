@@ -182,15 +182,19 @@ def test_submit_double_spend_forwards_reason_zero_and_succeeds():
 
 
 def test_unsupported_reason_rejected_by_dry_run_and_submit():
-    """(c) NO_ESCROW (reason 2) is NOT in the supported set → BOTH dry_run and submit
-    reject it uniformly, never raise, never reach the contract / broadcast."""
+    """(c) EXPIRED (reason 3) is NOT in the supported set → BOTH dry_run and submit
+    reject it uniformly, never raise, never reach the contract / broadcast.
+
+    (Sprint 1147 added NO_ESCROW=2 to the supported set — the requester self-dispute —
+    so EXPIRED=3 is now the unsupported-reason exemplar. The rejection contract is
+    unchanged: any reason outside SUPPORTED_CHALLENGE_REASONS is uniformly refused.)"""
     h = _Harness(tx_status=1)
     sub = h.submitter()
-    bogus = _double_spend_challenge(reason_code=2)  # NO_ESCROW — unsupported
+    bogus = _double_spend_challenge(reason_code=3)  # EXPIRED — unsupported
 
     dr = sub.dry_run(bogus)
     assert dr.would_succeed is False
-    assert dr.revert_reason and "2" in dr.revert_reason
+    assert dr.revert_reason and "3" in dr.revert_reason
     assert h.call_args is None  # dry_run never reached the contract
 
     res = sub.submit(bogus)

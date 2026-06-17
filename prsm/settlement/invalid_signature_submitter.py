@@ -9,10 +9,10 @@ alias of the same class object.
 Brick 3 / brick 7 (challenge_assembler / double_spend_assembler) produce an
 ``InvalidSignatureChallenge`` / ``DoubleSpendChallenge`` (leaf + merkle proof + auxData,
 identical shape). This module broadcasts either to
-``BatchSettlementRegistry.challengeReceipt`` to invalidate the fraudulent receipt's value
-and slash the provider's bond. It accepts the reason codes in
-``SUPPORTED_CHALLENGE_REASONS`` (INVALID_SIGNATURE=1, DOUBLE_SPEND=0) and uniformly rejects
-any other reason (e.g. NO_ESCROW=2) without raising or broadcasting.
+``BatchSettlementRegistry.challengeReceipt``. It accepts the reason codes in
+``SUPPORTED_CHALLENGE_REASONS`` (INVALID_SIGNATURE=1, DOUBLE_SPEND=0, NO_ESCROW=2 — the
+sprint-1147 requester self-dispute, run with the REQUESTER key) and uniformly rejects any
+other reason (e.g. EXPIRED=3) without raising or broadcasting.
 
 It is INERT by default — broadcasting is a USER-GATED action (it spends gas and slashes a
 provider's staked bond; per the standing rule the assistant assembles + verifies
@@ -56,20 +56,32 @@ from prsm.settlement.double_spend_assembler import (
     REASON_DOUBLE_SPEND,
     DoubleSpendChallenge,
 )
+from prsm.settlement.no_escrow_assembler import (
+    REASON_NO_ESCROW,
+    NoEscrowChallenge,
+)
 
 logger = logging.getLogger(__name__)
 
-# Reason codes this generic submitter will broadcast. Both challenge types expose the
-# identical reason-agnostic ``to_call_args()`` shape (batch_id, leaf_tuple, merkle_proof,
-# reason_code, aux_data), so one ChallengeSubmitter serves both. Any reason code NOT in
-# this set (e.g. NO_ESCROW=2) is rejected uniformly — never broadcast, never raised.
+# Reason codes this generic submitter will broadcast. Every accepted challenge type
+# exposes the identical reason-agnostic ``to_call_args()`` shape (batch_id, leaf_tuple,
+# merkle_proof, reason_code, aux_data), so one ChallengeSubmitter serves them all:
+#   - INVALID_SIGNATURE=1 / DOUBLE_SPEND=0: third-party fraud disputes (challenger key);
+#   - NO_ESCROW=2 (sprint 1147): the REQUESTER self-dispute — the submitter must be run
+#     with the REQUESTER's key (on chain _handleNoEscrow requires msg.sender ==
+#     b.requester). Broadcast mechanics/gas/nonce/error-classification are UNCHANGED;
+#     only the reason-set membership widened.
+# Any reason code NOT in this set (e.g. EXPIRED=3) is rejected uniformly — never
+# broadcast, never raised.
 SUPPORTED_CHALLENGE_REASONS = frozenset(
-    {REASON_INVALID_SIGNATURE, REASON_DOUBLE_SPEND}
+    {REASON_INVALID_SIGNATURE, REASON_DOUBLE_SPEND, REASON_NO_ESCROW}
 )
 
-# An assembled challenge accepted by this submitter — either fraud-class dataclass. Both
-# satisfy the structural contract (``.reason_code`` + ``.to_call_args()``).
-AssembledChallenge = Union[InvalidSignatureChallenge, DoubleSpendChallenge]
+# An assembled challenge accepted by this submitter — any fraud/self-dispute dataclass.
+# All satisfy the structural contract (``.reason_code`` + ``.to_call_args()``).
+AssembledChallenge = Union[
+    InvalidSignatureChallenge, DoubleSpendChallenge, NoEscrowChallenge
+]
 
 # Same floor as the consensus submitter — the registry requires
 # gasleft() >= MIN_SLASH_GAS before the slash try/catch; 1M leaves headroom
