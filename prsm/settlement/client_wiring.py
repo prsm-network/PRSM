@@ -168,6 +168,7 @@ async def accumulate_settled_inference_receipt(
     requester_address: Optional[str] = None,
     executed_at_unix: Optional[int] = None,
     max_spend_wei: Optional[int] = None,
+    inference_receipt_store: Any = None,
 ) -> str:
     """Sprint 1037 (brick 1.5) — feed a just-settled InferenceReceipt into the
     on-chain settlement accumulator.
@@ -226,12 +227,22 @@ async def accumulate_settled_inference_receipt(
             import time as _time
             executed_at_unix = int(_time.time())
 
-        from prsm.settlement.inference_adapter import (
-            inference_receipt_to_batched_receipt,
+        # §7-Brick-1 (sp1141): ADDITIVE + opt-in. When an InferenceReceiptStore is
+        # provided (default None => behavior byte-for-byte unchanged), retain the ORIGINAL
+        # §7 InferenceReceipt keyed by the produced batch's leaf hash
+        # (hash_leaf(batched_receipt_to_leaf(batched)) — IDENTICAL to what the committed
+        # batch carries), so an observer holding a committed batch leaf can look the §7
+        # receipt up to drive verify_inference_receipt_for_challenge. The retention is
+        # wrapped (in adapt_and_retain_inference_receipt) so a §7 retention failure NEVER
+        # unwinds the produced BatchedReceipt — the money path is sacred + the adapter math
+        # is unchanged.
+        from prsm.settlement.inference_receipt_store import (
+            adapt_and_retain_inference_receipt,
         )
-        batched = inference_receipt_to_batched_receipt(
+        batched = adapt_and_retain_inference_receipt(
             receipt=receipt,
             identity=identity,
+            store=inference_receipt_store,
             requester_address=requester_address or provider_address,
             provider_address=provider_address,
             value_ftns=value_wei,
