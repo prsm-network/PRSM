@@ -40,6 +40,15 @@ from prsm.settlement.state_store import SettlementStateStore
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "AuditFindingRecord",
+    "AuditFindingsSummary",
+    "SettlementAuditFindingsStore",
+    "finding_key",
+    "summarize_audit_result",
+    "summarize_records",
+]
+
 _REPORT_VERSION = 1
 
 # The five operator-visible reason tags (stable; mirror the detectors' tags).
@@ -348,6 +357,17 @@ def _inference_receipt_record(af) -> Optional[AuditFindingRecord]:
         dry_run_reason=af.dry_run_reason,
         detail=detail,
     )
+
+
+def summarize_records(records: List[AuditFindingRecord]) -> AuditFindingsSummary:
+    """PURE wrap of an EXISTING list of records (fresh-built OR persisted) into a summary.
+
+    ``SettlementAuditFindingsStore.all_findings()`` already returns ``AuditFindingRecord``
+    objects; this lets an operator surface them via the SAME per-class counts + ``render()``
+    so persisted findings render IDENTICALLY to a fresh ``AuditRunResult``. It NEITHER scans
+    NOR maps raw findings (that is ``summarize_audit_result``) and NEVER broadcasts/signs —
+    it only re-wraps already-built records. A ``None`` is treated as the empty list."""
+    return AuditFindingsSummary(records=list(records or []))
 
 
 def summarize_audit_result(result: Any) -> AuditFindingsSummary:
