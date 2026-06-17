@@ -222,6 +222,14 @@ GOSSIP_BITTORRENT_WITHDRAW = "bittorrent_withdraw"
 GOSSIP_BITTORRENT_STATS = "bittorrent_stats"
 GOSSIP_BITTORRENT_REQUEST = "bittorrent_request"
 
+# sp1137 — settlement-receipt data plane BRICK C. A producer ANNOUNCES that a
+# committed batch's ordered receipt set is available + where to fetch it (a tiny
+# untrusted pointer: batch_id, provider, merkle_root, CID, optional leaf_hashes).
+# Observers index the pointer (pull-on-demand, NOT flood) and verify the fetched
+# blob LATER against the on-chain root (Brick B/D). Origin-auth (sp934) only proves
+# WHO gossiped it — for spam/replay accounting + dedup — not that the ad is correct.
+GOSSIP_SETTLEMENT_BATCH_AVAILABLE = "settlement_batch_available"
+
 # Retention configuration per gossip subtype (in seconds)
 # Messages older than these values are pruned from the gossip log
 GOSSIP_RETENTION_SECONDS: Dict[str, float] = {
@@ -265,6 +273,10 @@ GOSSIP_RETENTION_SECONDS: Dict[str, float] = {
     "bittorrent_withdraw": 3600,
     "bittorrent_stats": 1800,      # 30 minutes — stats decay quickly
     "bittorrent_request": 300,     # 5 minutes — short-lived requests
+    # sp1137 — settlement batch-availability ad: retain past the dispute challenge
+    # window + a margin so a late-joining observer can still learn a batch exists in
+    # time to fetch + cross-check it before finalization closes the dispute window.
+    "settlement_batch_available": 2 * 86400,  # 48h (challenge window + margin)
     # Heartbeat: very short retention (not stored anyway)
     "heartbeat": 60,
     # Digest exchange: not stored
