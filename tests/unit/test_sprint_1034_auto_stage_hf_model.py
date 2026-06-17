@@ -142,9 +142,18 @@ def _write_catalog(path, models):
     path.write_text(json.dumps({"schema_version": "v1", "models": models}))
 
 
-def test_bool_num_layers_rejected(tmp_path):
+def test_bool_num_layers_rejected(tmp_path, monkeypatch):
     """isinstance(True, int) is True in Python — a JSON boolean must NOT pass as
-    a layer count (it would silently stage layer_range=(0,1))."""
+    a layer count (it would silently stage layer_range=(0,1)). sp1134 added an
+    HF-config fallback on a catalog miss; isolate the CATALOG bool-rejection here
+    by making the config unavailable, so this still proves the bool never passes
+    as a layer count (it falls through to skip rather than (0,1))."""
+    import transformers
+
+    def _no_config(*a, **k):
+        raise OSError("config not cached (isolating the catalog path)")
+
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", _no_config)
     from prsm.node.inference_wiring import ensure_hf_model_staged
     cat = tmp_path / "boolcat.json"
     _write_catalog(cat, {"gpt2": {"num_layers": True}})
@@ -152,6 +161,28 @@ def test_bool_num_layers_rejected(tmp_path):
         _ident(), env=_env(tmp_path, PRSM_PARALLAX_MODEL_CATALOG_FILE=str(cat)),
     )
     assert s.startswith("skipped:no-num-layers")
+
+
+def test_bool_catalog_falls_back_to_hf_config(tmp_path, monkeypatch):
+    """sp1134 — a malformed/absent catalog entry is rescued by the model's own HF
+    config: the bool is still rejected as a layer count (never yields (0,1)), but
+    the AUTHORITATIVE config value (here 12) is used, so the model stages correctly
+    instead of skipping. (Catalog is now an optional hint; the config is the truth.)"""
+    import transformers
+    from types import SimpleNamespace
+    monkeypatch.setattr(
+        transformers.AutoConfig, "from_pretrained",
+        lambda *a, **k: SimpleNamespace(num_hidden_layers=12),
+    )
+    from prsm.node.inference_wiring import ensure_hf_model_staged
+    from prsm.compute.model_registry.registry import FilesystemModelRegistry
+    cat = tmp_path / "boolcat.json"
+    _write_catalog(cat, {"gpt2": {"num_layers": True}})
+    assert ensure_hf_model_staged(
+        _ident(), env=_env(tmp_path, PRSM_PARALLAX_MODEL_CATALOG_FILE=str(cat)),
+    ) == "registered"
+    loaded = FilesystemModelRegistry(root=tmp_path).get("gpt2")
+    assert tuple(loaded.shards[0].layer_range) == (0, 12)
 
 
 def test_invalid_model_id_skipped_before_path_join(tmp_path):

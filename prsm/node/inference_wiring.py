@@ -1041,6 +1041,31 @@ def _resolve_num_layers_from_catalog(model_id: str, catalog_path: str):
     return n
 
 
+def _resolve_num_layers_from_hf_config(model_id: str):
+    """sp1134 — authoritative num_layers from the model's own locally-cached HF
+    config (AutoConfig), the fallback when the parallax catalog lacks the model so
+    an operator can serve ANY cached production model without hand-editing the
+    catalog (the sp1034 "last manual step", generalized). The HF runner loads these
+    same weights at inference, so the config is local. Returns None on any failure
+    or if the config declares no usable layer count — NEVER guesses (preserves the
+    never-defaulted staging invariant; a None here means staging is skipped, not
+    registered with a wrong layer_range). Mirrors sp1133's config-derivation but is
+    stricter: no 12-layer default."""
+    try:
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(model_id, local_files_only=True)
+    except Exception:  # noqa: BLE001 — offline / uncached / missing dep → no guess
+        return None
+    for attr in ("num_hidden_layers", "n_layer"):
+        v = getattr(cfg, attr, None)
+        # bool is an int subclass — exclude True/False so a stray flag can't pose
+        # as a layer count.
+        if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+            continue
+        return v
+    return None
+
+
 def ensure_hf_model_staged(identity, env=None) -> str:
     """Sprint 1034 — auto-stage the configured HF model into the local
     FilesystemModelRegistry at daemon startup so an operator no longer has to run
@@ -1096,6 +1121,12 @@ def ensure_hf_model_staged(identity, env=None) -> str:
                 / "config" / "parallax" / "model_catalog.json"
             )
         num_layers = _resolve_num_layers_from_catalog(model_id, catalog_path)
+        if num_layers is None:
+            # sp1134 — catalog miss: derive authoritatively from the model's own
+            # locally-cached HF config so any configured model auto-stages without
+            # a manual catalog edit. Still never guesses — a derivation failure
+            # falls through to the skip below (no wrong layer_range registered).
+            num_layers = _resolve_num_layers_from_hf_config(model_id)
         if num_layers is None:
             return f"skipped:no-num-layers:{model_id}"
 
