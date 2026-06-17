@@ -52,6 +52,7 @@ from prsm.settlement.settlement_audit_engine import (
     VerifiedBatchCache,
 )
 from prsm.settlement.settlement_audit_loop import SettlementAuditLoop
+from prsm.settlement.settlement_audit_report import summarize_audit_result
 from prsm.settlement.settlement_gossip import (
     SettlementBatchAdIndex,
     SettlementBatchAnnouncer,
@@ -218,6 +219,8 @@ def build_settlement_audit_components(
     interval_s: float = 600.0,
     max_fetches_per_run: int = 256,
     max_cached_batches: int = 10_000,
+    findings_store: Any = None,
+    on_findings: Optional[Callable[[Any], None]] = None,
 ) -> Optional[SettlementAuditBundle]:
     """Assemble the audit bundle, or None when ``enabled`` is False.
 
@@ -275,6 +278,10 @@ def build_settlement_audit_components(
         chain_head_fn if chain_head_fn is not None else _null_chain_head,
         cursor=cursor,
         interval_s=interval_s,
+        # sp1149 — ADDITIVE operator surface; both default None => WARNING-log-only (no
+        # persist, no callback), preserving the prior behavior when unwired.
+        findings_store=findings_store,
+        on_findings=on_findings,
     )
 
     return SettlementAuditBundle(
@@ -322,6 +329,8 @@ class SettlementAuditScheduler:
         interval_s: float,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         start_block: Optional[int] = None,
+        findings_store: Any = None,
+        on_findings: Optional[Callable[[Any], None]] = None,
     ):
         self._audit_loop = audit_loop
         self._chain_head_fn = chain_head_fn
@@ -329,6 +338,11 @@ class SettlementAuditScheduler:
         self._interval_s = max(0.0, float(interval_s))
         self._sleep = sleep
         self._start_block = start_block
+        # sp1149 — OPTIONAL, ADDITIVE operator-facing findings surface. Both default None =>
+        # only the WARNING log fires on a finding; no persist, no callback (byte-for-byte the
+        # prior idle behavior on a no-finding tick). NEITHER ever broadcasts/signs.
+        self._findings_store = findings_store
+        self._on_findings = on_findings
 
     async def run_once_tick(self) -> None:
         """One scan iteration. Never raises (fail-closed)."""
@@ -374,12 +388,43 @@ class SettlementAuditScheduler:
             )
             return
 
-        # SUCCESS — advance the cursor so the next tick is contiguous.
+        # SUCCESS — advance the cursor so the next tick is contiguous. (Advance FIRST: the
+        # operator surface below is best-effort and must NEVER block or undo the advance.)
         self._cursor.save(to_block)
-        logger.debug(
-            "SettlementAuditScheduler: scanned [%d, %d] ok (%s); cursor -> %d",
-            from_block, to_block, result, to_block,
-        )
+
+        # sp1149 — surface any actionable dispute candidates to the operator. On a tick WITH
+        # findings: WARNING log (operator-visible) + best-effort persist + optional callback.
+        # On a no-finding tick: keep the EXISTING debug idle behavior (byte-for-byte). All of
+        # this is READ-ONLY — it NEVER broadcasts/signs; the user-gated submit path is
+        # untouched. A persist/callback failure NEVER breaks the loop or undoes the cursor.
+        summary = summarize_audit_result(result)
+        if summary.total > 0:
+            logger.warning(
+                "SettlementAuditScheduler: settlement audit found %d dispute candidate(s) "
+                "in window [%d, %d]\n%s",
+                summary.total, from_block, to_block, summary.render(),
+            )
+            if self._findings_store is not None:
+                try:
+                    self._findings_store.record_summary(summary)
+                except Exception as exc:  # noqa: BLE001 — best-effort; never break the loop
+                    logger.warning(
+                        "SettlementAuditScheduler: persisting audit findings failed (%s); "
+                        "WARNING log above is authoritative this run", exc,
+                    )
+            if self._on_findings is not None:
+                try:
+                    self._on_findings(summary)
+                except Exception as exc:  # noqa: BLE001 — best-effort; never break the loop
+                    logger.warning(
+                        "SettlementAuditScheduler: on_findings callback raised (%s); "
+                        "ignored", exc,
+                    )
+        else:
+            logger.debug(
+                "SettlementAuditScheduler: scanned [%d, %d] ok (%s); cursor -> %d",
+                from_block, to_block, result, to_block,
+            )
 
     async def run_forever(self) -> None:
         """Daemon loop: tick → sleep, forever. Per-iteration errors are swallowed by

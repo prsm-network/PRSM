@@ -5853,6 +5853,29 @@ class PRSMNode:
         except (TypeError, ValueError):
             interval = 600.0
 
+        # sp1149 — OPTIONAL operator-facing findings surface. When
+        # ``PRSM_SETTLEMENT_AUDIT_FINDINGS_FILE`` is set, construct a bounded/atomic/
+        # never-raising store so detected dispute candidates are PERSISTED + reviewable (in
+        # addition to the always-on WARNING log). Unset => None => WARNING-log-only (no
+        # behavior change). The store is READ-ONLY; it never broadcasts/signs.
+        findings_store = None
+        findings_path = _os.environ.get(
+            "PRSM_SETTLEMENT_AUDIT_FINDINGS_FILE", "",
+        ).strip()
+        if findings_path:
+            try:
+                from prsm.settlement.settlement_audit_report import (
+                    SettlementAuditFindingsStore,
+                )
+
+                findings_store = SettlementAuditFindingsStore(findings_path)
+            except Exception as exc:  # noqa: BLE001 — best-effort; never block startup
+                logger.warning(
+                    "sp1149 audit findings store at %s unavailable (%s); "
+                    "WARNING-log-only surface this run", findings_path, exc,
+                )
+                findings_store = None
+
         bundle = build_settlement_audit_components(
             enabled=True,
             gossip=self.gossip,
@@ -5872,6 +5895,7 @@ class PRSMNode:
             ),
             chain_head_fn=_chain_head,
             interval_s=max(5.0, interval),
+            findings_store=findings_store,
         )
         if bundle is None:
             return
