@@ -219,6 +219,7 @@ def _verify_swap_path(
     probe_usdc_units: int,
     ftns_address: str,
     slippage_bps: int,
+    swap_client: Any = None,
 ) -> tuple[List[GoLiveFinding], Optional[Dict[str, Any]]]:
     findings: List[GoLiveFinding] = []
 
@@ -286,7 +287,106 @@ def _verify_swap_path(
             "READY_FOR_SUBMISSION — the pool isn't seeded/quotable yet.",
         ))
         envelope = None
+
+    # sp1152 — EXECUTION-path dry-run. The quote/envelope above use the
+    # QUOTE client; this exercises the REAL swap route/router via the
+    # sp1151 read-only static-call dry-run (getAmountsOut liquidity +
+    # slippage on the actual execution path), catching a quote-vs-
+    # execution divergence the gate previously missed. READ-ONLY: only
+    # ``dry_run_swap_usdc_for_ftns`` (static .call(), never a broadcast).
+    findings.append(_swap_dry_run_finding(
+        swap_client,
+        envelope=envelope,
+        probe_usdc_units=probe_usdc_units,
+        quote=quote,
+        slippage_bps=slippage_bps,
+    ))
     return findings, envelope
+
+
+def _swap_dry_run_finding(
+    swap_client: Any,
+    *,
+    envelope: Optional[Dict[str, Any]],
+    probe_usdc_units: int,
+    quote: Any,
+    slippage_bps: int,
+) -> GoLiveFinding:
+    """sp1152 — run the sp1151 execution-client dry-run as a go-live
+    check. No client → advisory WARN (never blocks). Client present →
+    PASS/FAIL from ``would_succeed`` + ``revert_reason``. The async dry-
+    run is invoked from this SYNC gate via a guarded ``asyncio.run`` — a
+    running loop or ANY error degrades to a non-blocking WARN so the dry-
+    run can never crash the whole go-live report."""
+    if swap_client is None:
+        return GoLiveFinding(
+            "swap_dry_run", "WARN",
+            "execution-path dry-run skipped: no swap client configured; "
+            "verify the real AerodromeSwapClient path before going live.",
+        )
+
+    # Slippage floor for the dry-run: prefer the envelope's
+    # amountOutMin (the exact floor the orchestrator computed); fall
+    # back to a slippage_bps-derived floor from the quote when the
+    # envelope is unavailable.
+    amount_out_min: int = 0
+    if (
+        envelope is not None
+        and isinstance(envelope.get("args"), dict)
+        and envelope["args"].get("amountOutMin") is not None
+    ):
+        amount_out_min = int(envelope["args"]["amountOutMin"])
+    elif quote is not None and getattr(quote, "amount_out", 0) > 0:
+        _slip = max(0, min(int(slippage_bps), 9999))
+        amount_out_min = (quote.amount_out * (10_000 - _slip)) // 10_000
+        if amount_out_min < 1:
+            amount_out_min = 1
+
+    import asyncio
+
+    try:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass  # no running loop — safe to asyncio.run below
+        else:
+            return GoLiveFinding(
+                "swap_dry_run", "WARN",
+                "execution-path dry-run skipped: a running event loop was "
+                "detected (cannot asyncio.run the async dry-run from here); "
+                "run the AerodromeSwapClient dry-run out-of-band before "
+                "going live.",
+            )
+        verdict = asyncio.run(swap_client.dry_run_swap_usdc_for_ftns(
+            amount_in=probe_usdc_units,
+            amount_out_min=amount_out_min,
+            owner=None,  # read-only: no signer → liquidity + slippage only
+        ))
+    except Exception as exc:  # noqa: BLE001 — never crash the report
+        logger.warning("go-live: swap dry-run raised: %s", exc)
+        return GoLiveFinding(
+            "swap_dry_run", "WARN",
+            f"execution-path dry-run could not run (error: {exc}); verify "
+            "the real AerodromeSwapClient path before going live.",
+        )
+
+    if getattr(verdict, "would_succeed", False):
+        approve_note = (
+            " (approve_needed — the swap auto-approves at execution)"
+            if getattr(verdict, "approve_needed", False) else ""
+        )
+        return GoLiveFinding(
+            "swap_dry_run", "PASS",
+            f"execution-path dry-run would succeed: expected_out="
+            f"{getattr(verdict, 'expected_out', None)} FTNS units, "
+            f"amount_out_min={amount_out_min}{approve_note}.",
+        )
+    return GoLiveFinding(
+        "swap_dry_run", "FAIL",
+        "execution-path dry-run would REVERT (the real swap route/router "
+        "fails where the quote did not): "
+        f"{getattr(verdict, 'revert_reason', None) or 'unknown reason'}.",
+    )
 
 
 def run_go_live_verification(
@@ -298,11 +398,29 @@ def run_go_live_verification(
     expected_usdc_units: Optional[int] = None,
     expected_ftns_units: Optional[int] = None,
     slippage_bps: int = 100,
+    swap_client: Any = None,
 ) -> GoLiveReport:
     """Run the full pool go-live verification + prepare the first-swap
     envelope. ``network`` is a CeremonyNetworkConfig (MAINNET_CONFIG /
     SEPOLIA_CONFIG). Returns a GoLiveReport; ``report.go`` is the
-    operator's launch gate."""
+    operator's launch gate.
+
+    ``swap_client`` (sp1152, optional) is an ``AerodromeSwapClient`` used
+    for the read-only EXECUTION-path dry-run. When None, this falls back
+    to ``AerodromeSwapClient.from_env()`` (lazy import, try/except →
+    None); an unconfigured execution client yields an advisory WARN, not
+    a FAIL — it must not block go-live in a test/dev env."""
+    if swap_client is None:
+        try:
+            from prsm.economy.web3.aerodrome_swap_client import (
+                AerodromeSwapClient,
+            )
+            swap_client = AerodromeSwapClient.from_env()
+        except Exception as exc:  # noqa: BLE001 — construction error → WARN
+            logger.warning(
+                "go-live: AerodromeSwapClient.from_env() raised: %s", exc)
+            swap_client = None
+
     report = GoLiveReport()
     report.findings.extend(_verify_pool(
         client, network,
@@ -323,6 +441,7 @@ def run_go_live_verification(
             probe_usdc_units=probe_usdc_units,
             ftns_address=ftns_address or network.ftns_address,
             slippage_bps=slippage_bps,
+            swap_client=swap_client,
         )
         report.findings.extend(swap_findings)
         report.prepared_envelope = envelope
