@@ -39,9 +39,13 @@ genuinely committed by the producer recomputes to the on-chain root bit-for-bit.
 from __future__ import annotations
 
 import json
-from typing import Sequence
+from typing import Dict, Optional, Sequence, Tuple
 
 from prsm.core.torrent_infohash import compute_v1_infohash_single_file
+from prsm.settlement.inference_receipt_store import (
+    InferenceReceiptStore,
+    RetainedInferenceReceipt,
+)
 from prsm.settlement.merkle import (
     batched_receipt_to_leaf,
     build_tree_and_proofs,
@@ -60,6 +64,18 @@ RECEIPT_SET_CONTENT_NAME = "receipt-set"
 # it hands bytes to json.loads. A real batch is ~1000 receipts (~few hundred KB);
 # 32 MiB is a generous ceiling that still rejects an adversarial multi-GB blob.
 MAX_BLOB_BYTES = 32 * 1024 * 1024
+
+# The OPTIONAL §7 (compute-integrity) section key in the canonical blob dict (sp1142,
+# §7-Brick-2). An enriched blob carries this key mapping leaf_hash hex ->
+# RetainedInferenceReceipt.to_dict(); a plain blob (no §7 receipts) OMITS it entirely so
+# the bytes stay byte-identical to serialize_receipt_set (backward-compat).
+INFERENCE_RECEIPTS_KEY = "inference_receipts"
+
+# Defensive cap on the §7 section ENTRY COUNT (JSON-bomb / oversized-section defense).
+# The §7 section carries at most one receipt per committed leaf, and a real batch is
+# ~1000 receipts; 200_000 matches the producer store's per-batch receipt cap — a generous
+# ceiling that still rejects an adversarial map before reconstruction.
+_MAX_INFERENCE_RECEIPTS = 200_000
 
 
 def serialize_receipt_set(pb: PublishedBatch) -> bytes:
@@ -181,3 +197,129 @@ def verify_leaf_hashes_against_root(
     if not leaf_hashes:
         return False
     return build_tree_and_proofs(list(leaf_hashes)).root == bytes(expected_root)
+
+
+# ── §7-Brick-2 (sp1142): PUBLISH §7 InferenceReceipts in the SAME blob ──────
+#
+# The §7 receipts ride in the SAME canonical blob as the BatchedReceipts (one fetch), as
+# an OPTIONAL section keyed by leaf hash. TRUST MODEL (why the UNTRUSTED §7 section is
+# safe): the BatchedReceipt set is root-anchored by the UNCHANGED cross-check above; a §7
+# receipt is matched to a leaf by hash but NOT trusted by inclusion — its content is
+# RE-VERIFIED on use by ``challenge_verifier.verify_inference_receipt_for_challenge``
+# (settler signature over the signing_payload + activation-chain checks). A forged §7
+# receipt either fails that re-check OR (if the settler signed a fraudulent chain) is
+# itself the provable fraud the verifier surfaces. So the §7 section is untrusted-but-safe:
+# include it, re-verify on use. It does NOT enter the merkle-root cross-check (the §7
+# settler signature binds a DIFFERENT preimage than the on-chain leaf — the sp1141/sp1035
+# adapter re-signs the shard payload).
+
+
+def serialize_enriched_receipt_set(
+    pb: PublishedBatch,
+    inference_receipts: Optional[Dict[bytes, RetainedInferenceReceipt]] = None,
+) -> bytes:
+    """Canonical, DETERMINISTIC bytes for a ``PublishedBatch`` PLUS an OPTIONAL §7
+    section mapping leaf_hash hex -> ``RetainedInferenceReceipt.to_dict()``.
+
+    BACKWARD-COMPAT (hard constraint): when ``inference_receipts`` is None/empty, the
+    blob is BYTE-IDENTICAL to ``serialize_receipt_set(pb)`` — the ``inference_receipts``
+    key is NOT emitted at all, so an old observer / old blob is unaffected. When present,
+    the §7 section is keyed by ``leaf_hash.hex()`` (so the keys collide with the committed
+    batch leaf hashes an observer derives) and dumped with the SAME canonical discipline
+    (sort_keys=True + compact separators) so the output stays byte-identical for identical
+    input — a hard requirement for a stable content CID.
+    """
+    obj = pb.to_dict()
+    if inference_receipts:
+        obj[INFERENCE_RECEIPTS_KEY] = {
+            bytes(leaf_hash).hex(): rec.to_dict()
+            for leaf_hash, rec in inference_receipts.items()
+        }
+    return json.dumps(
+        obj,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def deserialize_enriched_receipt_set(
+    blob: bytes,
+) -> Tuple[PublishedBatch, Dict[bytes, RetainedInferenceReceipt]]:
+    """Inverse of ``serialize_enriched_receipt_set``: bytes -> (``PublishedBatch``,
+    {leaf_hash bytes -> ``RetainedInferenceReceipt``}).
+
+    The ``PublishedBatch`` is recovered EXACTLY as ``deserialize_receipt_set`` does (same
+    bounded blob parse). The §7 section is OPTIONAL: an empty dict is returned when it is
+    absent (so this reader works on a plain Brick-B blob too). Bounded parse for untrusted
+    input — the overall blob size cap (``MAX_BLOB_BYTES``) plus a §7 ENTRY-COUNT cap
+    (``_MAX_INFERENCE_RECEIPTS``); a malformed / oversized / wrong-typed §7 section raises
+    ``ValueError`` (never a silent mis-parse, never lets a non-ValueError escape).
+    """
+    # Reuse the exact bounded parse + PublishedBatch reconstruction (size cap, UTF-8/JSON
+    # validation, structural validation all live there).
+    pb = deserialize_receipt_set(blob)
+
+    # Re-decode just the §7 section. ``deserialize_receipt_set`` already proved the blob is
+    # bytes <= MAX_BLOB_BYTES and valid JSON object, so this re-parse is bounded + safe.
+    obj = json.loads(bytes(blob).decode("utf-8"))
+    section = obj.get(INFERENCE_RECEIPTS_KEY)
+    if section is None:
+        return pb, {}
+    if not isinstance(section, dict):
+        raise ValueError(
+            f"§7 inference_receipts section must be an object, got "
+            f"{type(section).__name__}"
+        )
+    if len(section) > _MAX_INFERENCE_RECEIPTS:
+        raise ValueError(
+            f"§7 inference_receipts count {len(section)} exceeds cap "
+            f"{_MAX_INFERENCE_RECEIPTS}"
+        )
+
+    out: Dict[bytes, RetainedInferenceReceipt] = {}
+    for key_hex, entry in section.items():
+        try:
+            leaf_hash = bytes.fromhex(key_hex)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"§7 inference_receipts key is not valid hex: {key_hex!r}"
+            ) from exc
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"§7 inference_receipts entry for {key_hex!r} must be an object, "
+                f"got {type(entry).__name__}"
+            )
+        try:
+            rec = RetainedInferenceReceipt.from_dict(entry)
+        except ValueError:
+            raise
+        except (KeyError, TypeError, AttributeError) as exc:
+            # Normalize any structural shortfall into the contract's ValueError.
+            raise ValueError(
+                f"§7 inference_receipts entry for {key_hex!r} is not a valid "
+                f"RetainedInferenceReceipt: {exc}"
+            ) from exc
+        out[leaf_hash] = rec
+    return pb, out
+
+
+def enrich_from_store(
+    pb: PublishedBatch, store: InferenceReceiptStore,
+) -> Dict[bytes, RetainedInferenceReceipt]:
+    """Producer-side helper: for each ``BatchedReceipt`` in ``pb.receipts`` compute its
+    committed leaf hash (``hash_leaf(batched_receipt_to_leaf(br))``, the SAME key the §7-1
+    store retains under) and collect the present ``RetainedInferenceReceipt`` from
+    ``store``. Returns the §7 map (leaf_hash bytes -> record) for the leaves that HAVE a
+    retained §7 receipt; leaves with no §7 receipt are simply absent.
+
+    The caller passes this map to ``serialize_enriched_receipt_set`` to publish the §7
+    receipts alongside the settlement leaves in one blob.
+    """
+    out: Dict[bytes, RetainedInferenceReceipt] = {}
+    for br in pb.receipts:
+        leaf_hash = hash_leaf(batched_receipt_to_leaf(br))
+        rec = store.get(leaf_hash)
+        if rec is not None:
+            out[leaf_hash] = rec
+    return out
