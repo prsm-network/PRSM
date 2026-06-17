@@ -59,8 +59,15 @@ def build_onchain_settlement_client_or_none(
     *,
     provider_address: Optional[str],
     env: Optional[dict] = None,
+    published_batch_store: Optional[Any] = None,
 ) -> Optional[Any]:
-    """Return a ``BatchSettlementClient`` or ``None`` (see module docstring)."""
+    """Return a ``BatchSettlementClient`` or ``None`` (see module docstring).
+
+    ``published_batch_store`` (sp1140 Brick E.2) is OPT-IN: passed only when the audit
+    data plane is enabled (``PRSM_SETTLEMENT_AUDIT``). When None (the default) the client
+    is constructed exactly as before — the retention put on the commit-success path is a
+    strict no-op (``client.py`` only puts when a store was injected), so default-off
+    behavior is byte-for-byte unchanged."""
     try:
         environ = env if env is not None else os.environ
         if (environ.get("PRSM_ONCHAIN_SETTLEMENT", "") or "").strip().lower() \
@@ -129,6 +136,7 @@ def build_onchain_settlement_client_or_none(
             contract_client=contract_client,
             provider_address=provider_address,
             state_store=state_store,
+            published_batch_store=published_batch_store,
         )
     except SettlementStateCorruptError as exc:
         # A corrupt money-state file: refuse to start settlement with empty state

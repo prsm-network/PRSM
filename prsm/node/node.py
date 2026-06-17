@@ -371,6 +371,25 @@ def _build_arbitration_proposal_sink_or_none():
         return None
 
 
+class _ContentProviderBlobFetcher:
+    """Sprint 1140 (Brick E.2) — adapts ``ContentProvider.request_content`` to the audit
+    loop's ``BlobFetcher`` protocol (``async fetch(cid) -> bytes``). ``request_content``
+    returns ``Optional[bytes]`` (None on a miss/timeout); this fetcher RAISES on None so
+    the loop's per-batch fail-closed path treats a missing blob as a rejection rather than
+    feeding ``deserialize_receipt_set(None)``."""
+
+    def __init__(self, content_provider: Optional[Any]):
+        self._cp = content_provider
+
+    async def fetch(self, cid: str) -> bytes:
+        if self._cp is None:
+            raise RuntimeError("content_provider unavailable for audit fetch")
+        blob = await self._cp.request_content(cid)
+        if blob is None:
+            raise RuntimeError(f"content {cid} not found")
+        return bytes(blob)
+
+
 class _FailClosedAnchor:
     """Pre-T3c stub: every lookup returns None, so cross-node manifest
     verification refuses to trust. Used when no production
@@ -2254,6 +2273,8 @@ class PRSMNode:
         # Tasks created on start() — None until then.
         self._compensation_scheduler_task = None
         self._settlement_poll_task = None  # sp1038 brick 2
+        self._settlement_audit_task = None  # sp1140 brick E.2 (opt-in audit loop)
+        self._settlement_audit_bundle = None  # sp1140 — None unless PRSM_SETTLEMENT_AUDIT
         self._collateral_refresh_task = None  # sp1081 — attestation collateral refresh
         self._heartbeat_scheduler_task = None
         self._key_distribution_watcher_task = None
@@ -4166,9 +4187,34 @@ class PRSMNode:
             from prsm.settlement.client_wiring import (
                 build_onchain_settlement_client_or_none,
             )
+            # sp1140 (Brick E.2) — OPT-IN producer receipt retention. Only when
+            # PRSM_SETTLEMENT_AUDIT is set do we build a PublishedBatchStore and hand
+            # it to the client; OFF (the default) leaves published_batch_store=None so
+            # the commit path's retention put is a strict no-op (byte-for-byte unchanged).
+            _published_batch_store = None
+            try:
+                from prsm.settlement.settlement_audit_wiring import audit_enabled
+                if audit_enabled():
+                    from pathlib import Path as _Path
+                    from prsm.settlement.published_batch_store import (
+                        PublishedBatchStore,
+                    )
+                    _audit_store_path = (
+                        os.environ.get("PRSM_SETTLEMENT_AUDIT_STORE_FILE", "").strip()
+                        or str(_Path.home() / ".prsm" / "published_batches.json")
+                    )
+                    _published_batch_store = PublishedBatchStore(_audit_store_path)
+            except Exception as _audit_store_exc:  # noqa: BLE001 — never crash startup
+                logger.warning(
+                    "Settlement audit retention store build failed (audit OFF for "
+                    "retention): %s", _audit_store_exc,
+                )
+                _published_batch_store = None
+            self._settlement_published_batch_store = _published_batch_store
             self._onchain_settlement_client = (
                 build_onchain_settlement_client_or_none(
                     provider_address=self._operator_address,
+                    published_batch_store=_published_batch_store,
                 )
             )
             if self._onchain_settlement_client is not None:
@@ -5106,6 +5152,25 @@ class PRSMNode:
                 "inert until a funded settler key is provisioned)."
             )
 
+        # Sprint 1140 (Brick E.2) — OPT-IN settlement-receipt audit loop. Gated by
+        # PRSM_SETTLEMENT_AUDIT (default OFF). Builds the audit bundle (ad-index +
+        # composite selector + verified-cache + dry-run-gated engine + observe loop +
+        # announcer + block-cursor scheduler) and launches the scheduler. Read-only +
+        # NEVER broadcasts (the engine only dry-runs); fail-closed (a tick never crashes
+        # the daemon). OFF => none of this runs, no task, no gossip subscription.
+        try:
+            from prsm.settlement.settlement_audit_wiring import audit_enabled
+            if (
+                audit_enabled()
+                and getattr(self, "_onchain_settlement_client", None) is not None
+            ):
+                self._launch_settlement_audit_loop()
+        except Exception as _audit_launch_exc:  # noqa: BLE001 — never crash startup
+            logger.warning(
+                "Sprint 1140 settlement audit loop launch failed (audit OFF): %s",
+                _audit_launch_exc,
+            )
+
         # Sprint 1081 — attestation collateral (Intel PCK CRL + QE-Identity) auto
         # refresh. Opt-in via PRSM_COLLATERAL_AUTO_REFRESH so a long-running node keeps
         # revocation enforcement current instead of silently lapsing when a static CRL
@@ -5693,6 +5758,24 @@ class PRSMNode:
                     self._onchain_settlement_client,
                 )
                 logger.debug("Sprint 1038 settlement poll cycle: %s", results)
+                # sp1140 (Brick E.2) — best-effort announce-after-commit. Only when
+                # the audit data plane is opted in AND an announcer exists; never
+                # raises, never broadcasts (gossips an UNTRUSTED availability ad only).
+                bundle = getattr(self, "_settlement_audit_bundle", None)
+                if bundle is not None and getattr(bundle, "announcer", None) is not None:
+                    try:
+                        from prsm.settlement.settlement_audit_wiring import (
+                            announce_committed_batches,
+                        )
+                        store = getattr(
+                            self, "_settlement_published_batch_store", None,
+                        )
+                        retained = store.all_batches() if store is not None else []
+                        await announce_committed_batches(bundle.announcer, retained)
+                    except Exception as _ann_exc:  # noqa: BLE001 — best-effort
+                        logger.debug(
+                            "sp1140 announce-after-commit skipped (%s)", _ann_exc,
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 — keep the loop alive
@@ -5700,6 +5783,81 @@ class PRSMNode:
                     "Sprint 1038 settlement poll iteration error: %s", exc,
                 )
             await asyncio.sleep(interval)
+
+    def _launch_settlement_audit_loop(self) -> None:
+        """Sprint 1140 (Brick E.2) — build + launch the OPT-IN settlement-receipt audit
+        loop. Caller has already checked ``audit_enabled()`` + a settlement client exists.
+
+        Assembles the audit bundle via the (fully-unit-tested) factory:
+          - fetcher = a thin wrapper over ``content_provider.request_content`` (raises on
+            a None/miss so the loop fails closed per batch);
+          - chain_head_fn = ``w3.eth.block_number`` off the settlement contract client's
+            web3 (read-only);
+          - dry_run_client = the settlement client (read-only dry-run path; the engine
+            NEVER broadcasts);
+          - my_address = the node's settler/operator address; group_ids default empty.
+        Then creates the scheduler task (added to the shutdown drain list). Never raises."""
+        import os as _os
+        from prsm.settlement.settlement_audit_wiring import (
+            BlockCursor,
+            build_settlement_audit_components,
+        )
+
+        client = self._onchain_settlement_client
+        contract_client = getattr(client, "_contract_client", None) or getattr(
+            client, "contract_client", None,
+        )
+        if contract_client is None:
+            logger.warning(
+                "sp1140 audit loop: no contract client on settlement client; OFF.",
+            )
+            return
+
+        content_provider = getattr(self, "content_provider", None)
+        fetcher = _ContentProviderBlobFetcher(content_provider)
+
+        async def _chain_head() -> int:
+            web3 = getattr(contract_client, "web3", None)
+            if web3 is None:
+                raise RuntimeError("no web3 on contract client for chain head")
+            import asyncio as _asyncio
+            return int(await _asyncio.to_thread(lambda: web3.eth.block_number))
+
+        cursor_path = (
+            _os.environ.get("PRSM_SETTLEMENT_AUDIT_CURSOR_FILE", "").strip()
+            or str(Path.home() / ".prsm" / "settlement_audit_cursor.json")
+        )
+        try:
+            interval = float(
+                _os.environ.get("PRSM_SETTLEMENT_AUDIT_INTERVAL_S", "600"),
+            )
+        except (TypeError, ValueError):
+            interval = 600.0
+
+        bundle = build_settlement_audit_components(
+            enabled=True,
+            gossip=self.gossip,
+            fetcher=fetcher,
+            contract_client=contract_client,
+            my_address=self._operator_address,
+            group_ids=set(),
+            dry_run_client=client,
+            cursor=BlockCursor(path=cursor_path),
+            store=getattr(self, "_settlement_published_batch_store", None),
+            chain_head_fn=_chain_head,
+            interval_s=max(5.0, interval),
+        )
+        if bundle is None:
+            return
+        self._settlement_audit_bundle = bundle
+        self._settlement_audit_task = asyncio.create_task(
+            bundle.scheduler.run_forever(),
+        )
+        logger.info(
+            "Sprint 1140 settlement-receipt audit loop launched (read-only, "
+            "never-broadcast; cursor=%s, interval=%.0fs).",
+            cursor_path, max(5.0, interval),
+        )
 
     async def _collateral_refresh_loop(self) -> None:
         """Sprint 1081 — periodically refresh the Intel SGX attestation collateral
@@ -5848,6 +6006,7 @@ class PRSMNode:
             "_compensation_distributor_watcher_task",
             "_pending_withdraw_reconciler_task",  # sp916
             "_settlement_poll_task",  # sp1038
+            "_settlement_audit_task",  # sp1140 (Brick E.2)
             "_collateral_refresh_task",  # sp1081
         ):
             task = getattr(self, task_attr, None)
