@@ -212,6 +212,8 @@ def build_settlement_audit_components(
     cursor: BlockCursor,
     content_provider: Any = None,  # accepted for symmetry; fetcher is pre-wrapped
     store: Any = None,
+    content_publisher: Any = None,
+    inference_receipt_store: Any = None,
     chain_head_fn: Optional[Callable[[], Awaitable[int]]] = None,
     interval_s: float = 600.0,
     max_fetches_per_run: int = 256,
@@ -252,8 +254,20 @@ def build_settlement_audit_components(
         max_fetches_per_run=max_fetches_per_run,
     )
 
+    # sp1144 (§7 producer wiring): when a content publisher is wired the announcer
+    # PUBLISHES the receipt-set blob (so the announced CID resolves, ad-cid ==
+    # published-content-cid) and, when an InferenceReceiptStore is wired, ENRICHES the blob
+    # with the retained §7 receipts. Both default None => the legacy plain-blob /
+    # legacy-cid announcer (byte-for-byte the prior behavior).
     announcer = (
-        SettlementBatchAnnouncer(store, gossip) if store is not None else None
+        SettlementBatchAnnouncer(
+            store,
+            gossip,
+            content_publisher=content_publisher,
+            inference_receipt_store=inference_receipt_store,
+        )
+        if store is not None
+        else None
     )
 
     scheduler = SettlementAuditScheduler(

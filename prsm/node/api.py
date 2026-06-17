@@ -348,6 +348,10 @@ async def _settle_streaming_escrow(
                     job_id=job_id,
                     requester_address=(_paid or {}).get("requester"),
                     max_spend_wei=(_paid or {}).get("max_spend_wei"),
+                    # sp1144 — opt-in §7 retention (default None when audit OFF).
+                    inference_receipt_store=getattr(
+                        node, "_settlement_inference_receipt_store", None,
+                    ),
                 )
                 if _acc != "skipped:no-client":
                     logger.info(
@@ -8455,6 +8459,12 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                                 job_id=job_id,
                                 requester_address=(_paid or {}).get("requester"),
                                 max_spend_wei=(_paid or {}).get("max_spend_wei"),
+                                # sp1144 — opt-in §7 retention (None when audit OFF).
+                                inference_receipt_store=getattr(
+                                    node,
+                                    "_settlement_inference_receipt_store",
+                                    None,
+                                ),
                             )
                             if _acc != "skipped:no-client":
                                 logger.info(

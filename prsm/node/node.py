@@ -4192,6 +4192,13 @@ class PRSMNode:
             # it to the client; OFF (the default) leaves published_batch_store=None so
             # the commit path's retention put is a strict no-op (byte-for-byte unchanged).
             _published_batch_store = None
+            # sp1144 (§7 producer wiring) — the §7 InferenceReceipt retention store, built
+            # under the SAME audit gate. When set it is threaded into the accumulate adapter
+            # (so the original §7 receipt is retained keyed by the committed leaf hash) and
+            # into the announcer (so the published blob is ENRICHED with the §7 receipts).
+            # OFF (the default) leaves it None => no §7 retention, plain published blob,
+            # money path byte-for-byte unchanged.
+            _inference_receipt_store = None
             try:
                 from prsm.settlement.settlement_audit_wiring import audit_enabled
                 if audit_enabled():
@@ -4199,18 +4206,30 @@ class PRSMNode:
                     from prsm.settlement.published_batch_store import (
                         PublishedBatchStore,
                     )
+                    from prsm.settlement.inference_receipt_store import (
+                        InferenceReceiptStore,
+                    )
                     _audit_store_path = (
                         os.environ.get("PRSM_SETTLEMENT_AUDIT_STORE_FILE", "").strip()
                         or str(_Path.home() / ".prsm" / "published_batches.json")
                     )
                     _published_batch_store = PublishedBatchStore(_audit_store_path)
+                    _ir_store_path = (
+                        os.environ.get(
+                            "PRSM_SETTLEMENT_INFERENCE_RECEIPT_STORE_FILE", "",
+                        ).strip()
+                        or str(_Path.home() / ".prsm" / "inference_receipts.json")
+                    )
+                    _inference_receipt_store = InferenceReceiptStore(_ir_store_path)
             except Exception as _audit_store_exc:  # noqa: BLE001 — never crash startup
                 logger.warning(
                     "Settlement audit retention store build failed (audit OFF for "
                     "retention): %s", _audit_store_exc,
                 )
                 _published_batch_store = None
+                _inference_receipt_store = None
             self._settlement_published_batch_store = _published_batch_store
+            self._settlement_inference_receipt_store = _inference_receipt_store
             self._onchain_settlement_client = (
                 build_onchain_settlement_client_or_none(
                     provider_address=self._operator_address,
@@ -5844,6 +5863,13 @@ class PRSMNode:
             dry_run_client=client,
             cursor=BlockCursor(path=cursor_path),
             store=getattr(self, "_settlement_published_batch_store", None),
+            # sp1144 (§7 producer wiring) — publish the receipt-set blob (so the announced
+            # CID resolves) and enrich it with the retained §7 receipts. Both gated by the
+            # same audit flag; default-off leaves them None (legacy plain-blob announcer).
+            content_publisher=getattr(self, "content_publisher", None),
+            inference_receipt_store=getattr(
+                self, "_settlement_inference_receipt_store", None,
+            ),
             chain_head_fn=_chain_head,
             interval_s=max(5.0, interval),
         )

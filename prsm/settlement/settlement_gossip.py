@@ -51,7 +51,13 @@ from typing import Any, Callable, Dict, List, Optional
 from prsm.node.gossip import GOSSIP_SETTLEMENT_BATCH_AVAILABLE
 from prsm.settlement.merkle import batched_receipt_to_leaf, hash_leaf
 from prsm.settlement.published_batch_store import PublishedBatch
-from prsm.settlement.receipt_set_blob import receipt_set_cid, serialize_receipt_set
+from prsm.settlement.receipt_set_blob import (
+    RECEIPT_SET_CONTENT_NAME,
+    enrich_from_store,
+    receipt_set_cid,
+    serialize_enriched_receipt_set,
+    serialize_receipt_set,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -150,8 +156,24 @@ class SettlementBatchAnnouncer:
     double-spend path for free), embeds the announcer's gossip node_id, and gossips it
     on ``GOSSIP_SETTLEMENT_BATCH_AVAILABLE``.
 
+    §7 PRODUCER WIRING (sp1144, ADDITIVE + opt-in):
+      - ``content_publisher`` (default None): when set, the serialized blob is PUBLISHED
+        via ``content_publisher.publish(blob, ...)`` so the announced CID actually RESOLVES
+        for an observer (closing the dangling-CID gap). Crucially, the AD CID is the
+        PUBLISHER-RETURNED infohash (``torrent_infohash``) — NOT a separately-computed
+        ``receipt_set_cid`` — because the v1 infohash depends on the staged content NAME,
+        so using the publisher result GUARANTEES ad-cid == published-content-cid. When None
+        (the default) the legacy ``cid_fn`` (``receipt_set_cid``) is used and the blob is
+        NOT published (byte-for-byte the prior behavior; the CID may dangle without a
+        publisher — exactly as before).
+      - ``inference_receipt_store`` (default None): when set, the §7 ``InferenceReceipts``
+        retained for this batch's leaves are folded in via ``enrich_from_store`` and the
+        blob is serialized with ``serialize_enriched_receipt_set`` (the §7 receipts ride in
+        the SAME published blob). When None (the default) the plain ``serialize_receipt_set``
+        is used (no §7 section, byte-identical to before).
+
     BEST-EFFORT: only does anything when explicitly called; a missing batch is a
-    no-op; a serialize/publish error is logged and NEVER raised into the caller (so a
+    no-op; a serialize/enrich/publish error is logged and NEVER raised into the caller (so a
     money-path caller that fires-and-forgets an announce can't be broken by it).
     """
 
@@ -162,11 +184,15 @@ class SettlementBatchAnnouncer:
         *,
         cid_fn: Callable[[bytes], str] = receipt_set_cid,
         inline_leaf_hashes: bool = True,
+        content_publisher: Any = None,
+        inference_receipt_store: Any = None,
     ):
         self._store = store
         self._gossip = gossip
         self._cid_fn = cid_fn
         self._inline_leaf_hashes = inline_leaf_hashes
+        self._content_publisher = content_publisher
+        self._inference_receipt_store = inference_receipt_store
 
     def _announcer_id(self) -> Optional[str]:
         """The producer's own gossip node_id (bound into the ad as announcer_id so an
@@ -176,6 +202,20 @@ class SettlementBatchAnnouncer:
             return self._gossip.transport.identity.node_id
         except Exception:
             return None
+
+    async def _publish_blob(self, blob: bytes, pb: PublishedBatch) -> str:
+        """Publish ``blob`` via the wired content publisher and return its CID (the
+        publisher-returned ``torrent_infohash`` — so the ad CID == the published content
+        CID, guaranteeing an observer fetch resolves). The provenance id ties the staged
+        content back to the batch for operator traceability; ``name`` requests the canonical
+        receipt-set content name (publishers that derive the name from the bytes ignore it,
+        which is fine — the ad CID is taken from the publisher result regardless)."""
+        result = await self._content_publisher.publish(
+            blob,
+            provenance_id=f"settlement-receipt-set:{bytes(pb.batch_id).hex()}",
+            name=RECEIPT_SET_CONTENT_NAME,
+        )
+        return result.torrent_infohash
 
     async def announce(self, batch_id: bytes) -> bool:
         """Publish ONE availability ad for ``batch_id``. Returns True iff an ad was
@@ -189,8 +229,23 @@ class SettlementBatchAnnouncer:
                 )
                 return False
 
-            blob = serialize_receipt_set(pb)
-            cid = self._cid_fn(blob)
+            # §7 ENRICHMENT (sp1144): fold the retained §7 InferenceReceipts for this
+            # batch's leaves into the SAME blob when an InferenceReceiptStore is wired;
+            # else serialize plain (byte-identical to the prior behavior).
+            if self._inference_receipt_store is not None:
+                s7_map = enrich_from_store(pb, self._inference_receipt_store)
+                blob = serialize_enriched_receipt_set(pb, s7_map)
+            else:
+                blob = serialize_receipt_set(pb)
+
+            # CID RESOLUTION (sp1144): if a content publisher is wired, PUBLISH the blob so
+            # the announced CID resolves, and use the PUBLISHER-RETURNED infohash as the ad
+            # CID (guaranteeing ad-cid == published-content-cid). Else fall back to the
+            # legacy cid_fn (receipt_set_cid) — the blob is NOT published (prior behavior).
+            if self._content_publisher is not None:
+                cid = await self._publish_blob(blob, pb)
+            else:
+                cid = self._cid_fn(blob)
             leaf_hashes = (
                 [hash_leaf(batched_receipt_to_leaf(br)) for br in pb.receipts]
                 if self._inline_leaf_hashes
