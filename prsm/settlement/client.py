@@ -26,7 +26,7 @@ import asyncio
 import functools
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Protocol, Tuple
+from typing import Dict, List, Optional, Protocol, Tuple, TYPE_CHECKING
 
 from prsm.settlement.accumulator import (
     BatchedReceipt,
@@ -43,6 +43,11 @@ from prsm.settlement.state_store import (
     SettlementStateCorruptError,
     SettlementStateStore,
 )
+# sp1135 — type-only import for the OPTIONAL retention store hook. Guarded under
+# TYPE_CHECKING so the client carries no hard dependency on the data-plane store
+# (a None default => the store is never imported/constructed at runtime).
+if TYPE_CHECKING:  # pragma: no cover - import for typing only
+    from prsm.settlement.published_batch_store import PublishedBatchStore
 # BroadcastFailedError's class is defined unconditionally (its module guards the
 # web3 import), so this adds no hard web3 dependency — and a module-level import
 # (vs a lazy one that could swallow to False) removes the sp1052-review footgun
@@ -224,10 +229,20 @@ class BatchSettlementClient:
         contract_client: SettlementContractClient,
         provider_address: str,
         state_store: Optional[SettlementStateStore] = None,
+        published_batch_store: Optional["PublishedBatchStore"] = None,
     ):
         self._accumulator = accumulator
         self._contract = contract_client
         self._provider = provider_address
+        # sp1135 (settlement data-plane Brick A) — OPTIONAL producer retention
+        # store. None => behavior BYTE-FOR-BYTE unchanged (no filesystem touch,
+        # no retention). When set, the ordered receipt set of each successfully
+        # committed batch is retained here (best-effort, OUTSIDE the money path)
+        # so the node can later self-verify its own committed roots and (future
+        # bricks) publish them for cross-node auditing. A write failure here can
+        # NEVER break a commit — retention is best-effort, the money path is
+        # sacred. See docs/2026-06-16-settlement-receipt-data-plane-design.md.
+        self._published_batch_store = published_batch_store
         self._tracked: Dict[bytes, CommittedBatch] = {}
         self._finalized_ids: set = set()
         # sp1022 — commits broadcast but unconfirmed, keyed by tx_hash. Quarantined
@@ -365,6 +380,26 @@ class BatchSettlementClient:
             self._tracked[record.batch_id] = record
             self._committing.pop(intent_key, None)
             self._persist()
+            # sp1135 (data-plane Brick A) — best-effort retention of the ordered
+            # receipt set for this committed batch. STRICTLY ADDITIVE: only runs
+            # if a store was injected, only on the commit-success path (after the
+            # batch is already tracked + persisted above), and is wrapped so a
+            # store failure logs + continues — it can NEVER break a commit. The
+            # money-path state (tracked/persisted record) is already final here.
+            if self._published_batch_store is not None:
+                try:
+                    self._published_batch_store.put(
+                        record.batch_id,
+                        ready.batch.receipts,
+                        record.merkle_root,
+                        record.commit_timestamp,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "published_batch_store.put failed for batch %s (%s); "
+                        "retention skipped — commit unaffected",
+                        record.batch_id.hex(), exc,
+                    )
             committed.append(record)
 
         return committed
