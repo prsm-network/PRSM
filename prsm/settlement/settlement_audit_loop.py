@@ -49,9 +49,10 @@ import logging
 from dataclasses import dataclass, field, replace
 from typing import Any, List, Optional, Protocol
 
-from prsm.settlement.receipt_set_blob import deserialize_receipt_set
+from prsm.settlement.receipt_set_blob import deserialize_enriched_receipt_set
 from prsm.settlement.settlement_audit_engine import (
     DoubleSpendAuditFinding,
+    InferenceReceiptAuditFinding,
     InvalidSignatureAuditFinding,
     ObservedBatch,
 )
@@ -98,6 +99,13 @@ class AuditRunResult:
     skipped_no_cid: int = 0
     double_spend_findings: List[DoubleSpendAuditFinding] = field(default_factory=list)
     invalid_sig_findings: List[InvalidSignatureAuditFinding] = field(default_factory=list)
+    # sp1143 — §7 compute-integrity findings from scan_inference_receipts (bound+verified
+    # §7 receipts of root-verified batches). ``inference_receipt_finding_count`` mirrors
+    # ``len(inference_receipt_findings)`` as the observability counter for this scan.
+    inference_receipt_findings: List[InferenceReceiptAuditFinding] = field(
+        default_factory=list
+    )
+    inference_receipt_finding_count: int = 0
 
 
 # ── the loop ──────────────────────────────────────────────────────────
@@ -173,12 +181,17 @@ class SettlementAuditLoop:
             fetched += 1
             try:
                 blob = await self._fetcher.fetch(cid)
-                pb = deserialize_receipt_set(blob)
+                # Brick-2 enriched parse: (PublishedBatch, {leaf_hash -> §7 receipt}). A
+                # plain (no-§7) blob yields an empty §7 map — fully back-compatible.
+                pb, section7_map = deserialize_enriched_receipt_set(blob)
                 # Fill the (untrusted) cid into the observed metadata so the cached
                 # record knows where it came from. The trust gate is cache.ingest, which
-                # cross-checks pb against the TRUSTED on-chain merkle_root FIRST.
+                # cross-checks pb against the TRUSTED on-chain merkle_root FIRST and only
+                # retains the §7 map (for THIS batch's leaves) once that cross-check passes.
                 observed_with_cid = replace(b, cid=cid)
-                ok = self._cache.ingest(observed_with_cid, pb)
+                ok = self._cache.ingest(
+                    observed_with_cid, pb, inference_receipts=section7_map
+                )
             except Exception as exc:  # noqa: BLE001 — fail-closed per batch; never abort the run
                 rejected += 1
                 logger.warning(
@@ -201,6 +214,9 @@ class SettlementAuditLoop:
         # Drive the dry-run-gated detectors over the VERIFIED cache only. NEVER broadcasts.
         double_spend_findings = self._engine.scan_double_spends()
         invalid_sig_findings = self._engine.scan_invalid_signatures()
+        # sp1143 — §7 compute-integrity scan: bind-then-verify the retained §7 receipts of
+        # root-verified batches (NEVER broadcasts; fail-closed per item; key-bound only).
+        inference_receipt_findings = list(self._engine.scan_inference_receipts())
 
         return AuditRunResult(
             enumerated=enumerated,
@@ -211,4 +227,6 @@ class SettlementAuditLoop:
             skipped_no_cid=skipped_no_cid,
             double_spend_findings=list(double_spend_findings),
             invalid_sig_findings=list(invalid_sig_findings),
+            inference_receipt_findings=inference_receipt_findings,
+            inference_receipt_finding_count=len(inference_receipt_findings),
         )

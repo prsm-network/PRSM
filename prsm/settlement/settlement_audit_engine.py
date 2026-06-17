@@ -55,18 +55,26 @@ InferenceReceipt retention (analogous to Brick A for shard receipts).
 from __future__ import annotations
 
 import logging
+from base64 import b64decode
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
+from eth_utils import keccak
+
 from prsm.settlement.accumulator import BatchedReceipt
 from prsm.settlement.challenge_assembler import assemble_invalid_signature_challenge
+from prsm.settlement.challenge_verifier import (
+    ChallengeReason,
+    verify_inference_receipt_for_challenge,
+)
 from prsm.settlement.client import CommittedBatch
 from prsm.settlement.double_spend_assembler import assemble_double_spend_challenge
 from prsm.settlement.double_spend_detector import (
     DoubleSpendFinding,
     detect_double_spends,
 )
+from prsm.settlement.inference_receipt_store import RetainedInferenceReceipt
 from prsm.settlement.merkle import batched_receipt_to_leaf, hash_leaf
 from prsm.settlement.published_batch_store import PublishedBatch
 from prsm.settlement.receipt_set_blob import verify_receipt_set_against_root
@@ -180,12 +188,31 @@ class VerifiedBatchCache:
         self._entries: "OrderedDict[str, Tuple[CommittedBatch, List[BatchedReceipt]]]" = (
             OrderedDict()
         )
+        # batch_id_hex -> {leaf_hash bytes -> RetainedInferenceReceipt}. The OPTIONAL §7
+        # (sp1143) section retained ONLY for leaves of a ROOT-VERIFIED batch. Evicted in
+        # lockstep with ``_entries`` (same key), so a §7 map never outlives its batch.
+        self._inference_receipts: "OrderedDict[str, Dict[bytes, RetainedInferenceReceipt]]" = (
+            OrderedDict()
+        )
 
-    def ingest(self, observed: ObservedBatch, fetched: PublishedBatch) -> bool:
+    def ingest(
+        self,
+        observed: ObservedBatch,
+        fetched: PublishedBatch,
+        inference_receipts: Optional[Dict[bytes, RetainedInferenceReceipt]] = None,
+    ) -> bool:
         """VERIFY FIRST, then cache. Recompute the merkle root from ``fetched.receipts``
         via the producer pipeline and compare to the TRUSTED ``observed.merkle_root``. On
         pass: build + cache the ``CommittedBatch`` record + keep the receipts, return True.
         On FAIL (forged / altered / reordered / wrong-root): cache NOTHING, return False.
+
+        ``inference_receipts`` (sp1143, OPTIONAL/back-compat — None leaves behaviour
+        UNCHANGED) is the §7 map {leaf_hash bytes -> RetainedInferenceReceipt} that rode in
+        the SAME blob (Brick-2). On a VERIFIED ingest it is retained, but ONLY for the
+        leaf_hashes that are actually in THIS batch's leaf set — a §7 entry keyed by an
+        unknown leaf is dropped (it cannot be bound to a committed leaf). The §7 map is
+        ONLY retained AFTER the root cross-check passes, so §7 receipts reach detection
+        only behind the trust gate.
 
         Never raises on a bad fetched set — a verify error is treated as a rejection
         (fail-closed) so a single malformed fetch can't break the ingest loop."""
@@ -223,9 +250,25 @@ class VerifiedBatchCache:
         key = committed.batch_id.hex()
         if key in self._entries:
             del self._entries[key]
+            self._inference_receipts.pop(key, None)
         self._entries[key] = (committed, receipts)
+
+        # Retain the §7 map ONLY for leaves that are actually in this verified batch's
+        # leaf set (an entry keyed by an unknown leaf can never bind to a committed leaf,
+        # so it is dropped here). Always set a (possibly empty) map so the eviction key set
+        # stays in lockstep with ``_entries``.
+        batch_leaf_set = set(leaf_hashes)
+        retained_s7: Dict[bytes, RetainedInferenceReceipt] = {}
+        if inference_receipts:
+            for lh, rec in inference_receipts.items():
+                lh_b = bytes(lh)
+                if lh_b in batch_leaf_set:
+                    retained_s7[lh_b] = rec
+        self._inference_receipts[key] = retained_s7
+
         while len(self._entries) > self._max_batches:
             evicted, _ = self._entries.popitem(last=False)
+            self._inference_receipts.pop(evicted, None)
             logger.debug(
                 "VerifiedBatchCache: evicted oldest batch %s (over max_batches=%d)",
                 evicted, self._max_batches,
@@ -248,6 +291,14 @@ class VerifiedBatchCache:
         conflicting-batch proof), or None if not cached."""
         entry = self._entries.get(bytes(batch_id).hex())
         return entry[0].leaf_hashes if entry is not None else None
+
+    def inference_receipts_for(
+        self, batch_id: bytes,
+    ) -> Dict[bytes, RetainedInferenceReceipt]:
+        """The retained §7 receipts ({leaf_hash bytes -> RetainedInferenceReceipt}) for a
+        verified batch, or an empty dict if the batch is not cached / carried no §7
+        section. (sp1143 — returns a copy so a caller can't mutate the cache.)"""
+        return dict(self._inference_receipts.get(bytes(batch_id).hex(), {}))
 
 
 # ── findings ──────────────────────────────────────────────────────────
@@ -272,6 +323,34 @@ class InvalidSignatureAuditFinding:
 
     batch_id: bytes
     receipt_index: int
+    dry_run_ok: Optional[bool] = None
+    dry_run_reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class InferenceReceiptAuditFinding:
+    """A §7 compute-integrity audit record (sp1143) for ONE retained §7 InferenceReceipt
+    matched to a verified-batch leaf.
+
+    ``bound`` — whether the §7 receipt's ``settler_public_key_b64`` BOUND to the
+    root-verified leaf (``keccak(b64decode(pubkey)) == leaf.provider_pubkey_hash``, the
+    same hash merkle builds). An UNBOUND record (``bound=False``, ``proven=False``,
+    ``reason=None``) is NOT trusted: its verdict is never run/surfaced (the ATTACK-A
+    defence — a producer cannot mask/fabricate fraud via a substituted key).
+
+    For a BOUND receipt, one finding is emitted per CHALLENGE GROUND the §7 verifier
+    checked; ``proven`` is True iff that ground was cryptographically demonstrated, and
+    ``on_chain_reason`` carries the BatchSettlementRegistry ReasonCode when the ground is
+    on-chain-actionable (INVALID_SETTLER_SIGNATURE -> 1; activation-chain grounds None).
+    ``dry_run_ok`` is the optional read-only verdict for an on-chain-actionable ground."""
+
+    batch_id: bytes
+    leaf_hash: bytes
+    bound: bool
+    proven: bool = False
+    reason: Optional[ChallengeReason] = None
+    on_chain_reason: Optional[int] = None
+    detail: Optional[str] = None
     dry_run_ok: Optional[bool] = None
     dry_run_reason: Optional[str] = None
 
@@ -393,3 +472,165 @@ class SettlementAuditEngine:
                     batch_id=cb.batch_id, receipt_index=idx,
                     dry_run_ok=dry_ok, dry_run_reason=dry_reason))
         return out
+
+    def scan_inference_receipts(self) -> List[InferenceReceiptAuditFinding]:
+        """Run the §7 (compute-integrity) challenge verifier over the §7 receipts retained
+        for each VERIFIED batch (sp1143). NEVER broadcasts; FAIL-CLOSED per item.
+
+        ATTACK-A defence — KEY BINDING FIRST. The §7 receipt's ``settler_public_key_b64``
+        comes from the UNTRUSTED blob; ``verify_inference_receipt_for_challenge`` only
+        attests self-consistency under WHATEVER key it is given. So before trusting any
+        verdict, this BINDS the key to a chain-anchored source: it finds the verified
+        ``BatchedReceipt`` for the leaf, computes that leaf's ``provider_pubkey_hash`` via
+        ``batched_receipt_to_leaf`` (the SAME ``keccak(b64decode(pubkey))`` merkle commits),
+        and requires it EQUALS ``keccak(b64decode(settler_public_key_b64))``. (The adapter
+        re-signs the shard payload with the settler identity, so the committed leaf
+        provider_pubkey_hash IS keccak(the settler pubkey).) If the binding FAILS, the
+        record is surfaced UNBOUND (``bound=False``, no verdict) and the verifier is NOT
+        run — an attacker cannot mask/fabricate fraud via a substituted key.
+
+        For a BOUND receipt: run the verifier; emit one finding per PROVEN ground (carrying
+        ``on_chain_reason``); for an on-chain-actionable INVALID_SETTLER_SIGNATURE ground,
+        if a dry-run client is set, reuse the ``scan_invalid_signatures`` assemble+dry-run
+        path on that leaf (read-only) to attach ``dry_run_ok``. If the verifier reports a
+        clean receipt (no proven ground), emit a single clean record (``bound=True``,
+        ``proven=False``). A raising bind/verify is recorded (``bound=False`` /
+        ``proven=False``) and skipped — never aborts the scan, never raises out, NEVER
+        broadcasts."""
+        out: List[InferenceReceiptAuditFinding] = []
+        for cb in self._cache.verified_batches():
+            s7_map = self._cache.inference_receipts_for(cb.batch_id)
+            if not s7_map:
+                continue
+            receipts = self._cache.receipts_for(cb.batch_id) or []
+            # Map leaf_hash -> (receipt, index) for the binding lookup.
+            leaf_to_receipt: Dict[bytes, Tuple[BatchedReceipt, int]] = {}
+            for idx, br in enumerate(receipts):
+                try:
+                    lh = hash_leaf(batched_receipt_to_leaf(br))
+                except Exception as exc:  # noqa: BLE001 — a bad receipt can't bind anything
+                    logger.warning(
+                        "scan_inference_receipts: leaf recompute failed for batch %s "
+                        "idx %d (%s); skipping receipt", cb.batch_id.hex(), idx, exc,
+                    )
+                    continue
+                leaf_to_receipt[lh] = (br, idx)
+
+            for leaf_hash, rec in s7_map.items():
+                try:
+                    self._scan_one_inference_receipt(
+                        out, cb.batch_id, leaf_hash, rec, leaf_to_receipt,
+                    )
+                except Exception as exc:  # noqa: BLE001 — fail-closed per item; never abort
+                    logger.warning(
+                        "scan_inference_receipts: item raised for batch %s leaf %s "
+                        "(%s); recording unbound+skipped",
+                        cb.batch_id.hex(), bytes(leaf_hash).hex(), exc,
+                    )
+                    out.append(InferenceReceiptAuditFinding(
+                        batch_id=bytes(cb.batch_id), leaf_hash=bytes(leaf_hash),
+                        bound=False, proven=False,
+                        detail=f"audit raised: {type(exc).__name__}: {exc}",
+                    ))
+        return out
+
+    def _scan_one_inference_receipt(
+        self,
+        out: List[InferenceReceiptAuditFinding],
+        batch_id: bytes,
+        leaf_hash: bytes,
+        rec: RetainedInferenceReceipt,
+        leaf_to_receipt: Dict[bytes, Tuple[BatchedReceipt, int]],
+    ) -> None:
+        """Bind-then-verify ONE retained §7 receipt; append its finding(s) to ``out``.
+        Raising is caught by the caller (fail-closed per item)."""
+        lh = bytes(leaf_hash)
+        pair = leaf_to_receipt.get(lh)
+        if pair is None:
+            # No verified BatchedReceipt for this leaf -> cannot bind. UNBOUND.
+            out.append(InferenceReceiptAuditFinding(
+                batch_id=bytes(batch_id), leaf_hash=lh, bound=False, proven=False,
+                detail="no verified leaf to bind the §7 settler key to",
+            ))
+            return
+        br, idx = pair
+
+        # ── ATTACK-A KEY BINDING: keccak(b64decode(settler_pubkey)) == committed leaf
+        #    provider_pubkey_hash (the SAME hash merkle.batched_receipt_to_leaf commits).
+        leaf = batched_receipt_to_leaf(br)
+        settler_pubkey_b64 = rec.settler_public_key_b64
+        bound = False
+        try:
+            settler_hash = keccak(b64decode(settler_pubkey_b64))
+            bound = settler_hash == leaf.provider_pubkey_hash
+        except Exception as exc:  # noqa: BLE001 — a malformed key cannot bind
+            logger.debug(
+                "scan_inference_receipts: settler key hash failed for batch %s leaf %s "
+                "(%s); unbound", bytes(batch_id).hex(), lh.hex(), exc,
+            )
+            bound = False
+
+        if not bound:
+            # NOT bound to the committed provider — do NOT run/trust the verdict.
+            out.append(InferenceReceiptAuditFinding(
+                batch_id=bytes(batch_id), leaf_hash=lh, bound=False, proven=False,
+                detail=(
+                    "settler_public_key_b64 does not hash to the committed leaf "
+                    "provider_pubkey_hash (unbound — verdict not trusted)"
+                ),
+            ))
+            return
+
+        # ── BOUND: run the §7 verifier (re-verify on use). ──
+        report = verify_inference_receipt_for_challenge(
+            rec.inference_receipt,
+            settler_public_key_b64=settler_pubkey_b64,
+            stage_public_keys=rec.stage_public_keys,
+        )
+        proven = report.proven_findings()
+        if not proven:
+            # Bound + clean — surface a single clean record (no fraud trusted-but-clean).
+            out.append(InferenceReceiptAuditFinding(
+                batch_id=bytes(batch_id), leaf_hash=lh, bound=True, proven=False,
+                detail="bound §7 receipt verifies (no proven ground)",
+            ))
+            return
+
+        for f in proven:
+            dry_ok: Optional[bool] = None
+            dry_reason: Optional[str] = None
+            # On-chain-actionable INVALID_SETTLER_SIGNATURE -> reuse the invalid-signature
+            # assemble + dry-run path on this leaf (read-only). NEVER broadcasts.
+            if (
+                self._dry_run_client is not None
+                and f.on_chain_reason is not None
+                and f.reason == ChallengeReason.INVALID_SETTLER_SIGNATURE
+            ):
+                challenge = self._try_assemble_invalid_signature(batch_id, idx)
+                if challenge is not None:
+                    dry_ok, dry_reason = self._dry_run(challenge)
+            out.append(InferenceReceiptAuditFinding(
+                batch_id=bytes(batch_id), leaf_hash=lh, bound=True, proven=True,
+                reason=f.reason, on_chain_reason=f.on_chain_reason, detail=f.detail,
+                dry_run_ok=dry_ok, dry_run_reason=dry_reason,
+            ))
+
+    def _try_assemble_invalid_signature(self, batch_id: bytes, idx: int):
+        """Assemble the INVALID_SIGNATURE challenge for the leaf at ``idx`` in
+        ``batch_id`` from the verified cache (the SAME path scan_invalid_signatures uses).
+        Returns the challenge, or None on a fail-fast/missing-data/error (never raises)."""
+        try:
+            receipts = self._cache.receipts_for(batch_id)
+            if not receipts:
+                return None
+            return assemble_invalid_signature_challenge(
+                batch_id=bytes(batch_id),
+                batch_receipts=receipts,
+                target_index=idx,
+            )
+        except Exception as exc:  # noqa: BLE001 — assembly fail-fast/error → no dry-run
+            logger.debug(
+                "scan_inference_receipts: invalid-sig assembly skipped for batch %s "
+                "idx %d (%s)", bytes(batch_id).hex(), idx, exc,
+            )
+            return None
