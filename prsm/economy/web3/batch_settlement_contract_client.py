@@ -308,6 +308,70 @@ class Web3SettlementContractClient:
         (batch_id, commit_ts), = matches.items()
         return batch_id, commit_ts
 
+    async def enumerate_committed_batches(
+        self, from_block: int, to_block: int, *, provider: Optional[str] = None,
+    ) -> "list":
+        """sp1139 (Brick E.1) — READ-ONLY enumerate the committed-batch worklist an
+        observer audits. Scans ``BatchCommitted`` logs over [from_block, to_block] in
+        ``_SCAN_MAX_WINDOW``-block windows (the same Base public-RPC getLogs cap the
+        recovery scan respects), optionally filtered to one ``provider`` (an indexed
+        topic). For each distinct ``batchId`` it reads the on-chain ``Batch`` struct
+        (``batches(batch_id).call()``) for requester (idx 1) / merkleRoot (idx 2) /
+        consensus_group_id (idx 9) and builds an ``ObservedBatch`` — the TRUSTED anchor
+        the observer cross-checks fetched receipt sets against.
+
+        ``cid`` is left None (the loop fills it from the untrusted ad index). This is
+        pure-read: no tx, no signing, no state change. The blocking web3 calls run in
+        ``asyncio.to_thread`` like the sibling read methods."""
+        return await asyncio.to_thread(
+            self._enumerate_committed_batches_sync, int(from_block), int(to_block),
+            provider,
+        )
+
+    def _enumerate_committed_batches_sync(
+        self, from_block: int, to_block: int, provider: Optional[str],
+    ) -> "list":
+        # Imported here (not at module top) to keep this client importable in the
+        # pure/offline test path where settlement_audit_engine's deps may differ.
+        from prsm.settlement.settlement_audit_engine import ObservedBatch
+
+        provider_cs = Web3.to_checksum_address(provider) if provider else None
+        argument_filters = {"provider": provider_cs} if provider_cs else None
+
+        # Distinct batchId -> (provider from the log topic). Dedup so a batch that emits
+        # twice (it won't, but defensively) is read once.
+        seen: "dict[bytes, str]" = {}
+        event = self.contract.events.BatchCommitted()
+        start = int(from_block)
+        end_bound = int(to_block)
+        while start <= end_bound:
+            end = min(start + _SCAN_MAX_WINDOW - 1, end_bound)
+            flt = event.create_filter(
+                from_block=start, to_block=end,
+                argument_filters=argument_filters,
+            )
+            for e in flt.get_all_entries():
+                args = e["args"]
+                bid = bytes(args["batchId"])
+                if bid not in seen:
+                    seen[bid] = args["provider"]
+            if end == end_bound:
+                break
+            start = end + 1
+
+        observed = []
+        for bid, log_provider in seen.items():
+            b = self.contract.functions.batches(bid).call()
+            observed.append(ObservedBatch(
+                batch_id=bid,
+                provider_address=b[0] if b[0] else log_provider,
+                requester_address=b[1],
+                merkle_root=bytes(b[2]),
+                consensus_group_id=bytes(b[9]),
+                cid=None,
+            ))
+        return observed
+
     def _get_committed_batch_for_tx_sync(self, tx_hash: str) -> Optional[Tuple[bytes, int]]:
         """Recover (batch_id, commit_timestamp) from a commitBatch tx by parsing the
         BatchCommitted log in its receipt. Returns None when the tx is unknown / not
