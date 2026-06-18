@@ -42,6 +42,57 @@ def build_receipt_signing_payload(
     return keccak(raw)
 
 
+def settlement_job_id(request_id: str, *, streamed: bool) -> str:
+    """Deterministic settlement ``job_id`` for an inference, derived purely from
+    its ``request_id``.
+
+    Sprint 1157 (on-chain per-stage payee, brick 2.5). The settlement leaf binds
+    ``job_id`` into ``build_receipt_signing_payload``; for a worker to sign its
+    own per-stage settlement leaf at STAGE-execution time it must be able to
+    derive the SAME ``job_id`` the receipt will carry. Previously the receipt
+    minted ``job_id`` POST-HOC as ``f"{prefix}-{uuid4().hex[:12]}"`` (random) at
+    receipt-build time — the worker, which knows only ``request.request_id`` when
+    it executes its stage, could not reproduce it, so any leaf it signed over
+    ``request_id`` would mismatch the splitter's rebuild over ``receipt.job_id``
+    and be wrongly slashed on challenge. This helper closes that gap.
+
+    Contract:
+      * PURE + deterministic — same ``(request_id, streamed)`` -> same ``job_id``.
+      * worker-derivable — depends ONLY on ``request_id`` (the inference identity,
+        ``InferenceRequest.request_id``) + the ``streamed`` flag, both of which the
+        worker/orchestrator has at stage-execution time.
+      * uniqueness == ``request_id`` uniqueness — distinct ``request_id`` ->
+        distinct ``job_id`` (``request_id`` is already the system's unique
+        per-inference correlation key; we do not weaken that invariant).
+      * prefix-preserving — ``parallax-job-`` (unary) / ``parallax-stream-job-``
+        (streamed), so existing ``job_id.startswith("parallax-job-")`` audit
+        filters / tests hold and a relay can't silently swap streamed<->unary.
+
+    Form: the DIRECT form ``f"{prefix}-{request_id}"``. ``request_id`` defaults to
+    ``infer-{uuid4().hex[:12]}`` (``InferenceRequest.request_id``) — bounded + URL
+    safe — and the e2e path already uses exactly this direct form
+    (``parallax-job-{request_id}``), so the direct form matches the established
+    precedent and keeps the ``job_id`` human-traceable back to its inference.
+    ``request_id`` is bound into the keccak signing preimage by value, so even an
+    atypical (longer / punctuation-bearing) caller-supplied ``request_id`` stays
+    deterministic + collision-free (keccak accepts any bytes and the preimage is
+    1:1 with the unique ``request_id``); a hash form would only obscure the
+    traceability without adding safety, so the direct form is preferred.
+
+    Raises ``ValueError`` on an empty/``None`` (or non-``str``) ``request_id`` —
+    a settlement leaf must never bind an empty job identity.
+    """
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError(
+            "request_id must be a non-empty string: the settlement job_id is "
+            "derived deterministically from it so the worker (which knows only "
+            "request_id) and the receipt agree on the same challenge-defensible "
+            f"leaf; got {request_id!r}."
+        )
+    prefix = "parallax-stream-job" if streamed else "parallax-job"
+    return f"{prefix}-{request_id}"
+
+
 def _derive_node_id_from_pubkey_b64(pubkey_b64: str) -> Optional[str]:
     """Recompute NodeIdentity.node_id from an advertised pubkey.
 

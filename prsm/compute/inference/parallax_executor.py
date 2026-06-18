@@ -39,7 +39,6 @@ import asyncio
 import hashlib
 import logging
 import time
-import uuid
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import (
@@ -65,6 +64,7 @@ from prsm.compute.inference.models import (
     InferenceResult,
 )
 from prsm.compute.inference.receipt import sign_receipt
+from prsm.compute.shard_receipt import settlement_job_id
 from prsm.compute.parallax_scheduling.model_info import ModelInfo
 from prsm.compute.parallax_scheduling.prsm_request_router import (
     BudgetExceededError,
@@ -1117,7 +1117,12 @@ class ParallaxScheduledExecutor(InferenceExecutor):
         prompt_hash = hashlib.sha256(
             (getattr(request, "prompt", "") or "").encode("utf-8")
         ).digest()
-        prefix = "parallax-stream-job" if streamed else "parallax-job"
+        # Sprint 1157 (on-chain per-stage payee, brick 2.5) — mint the settlement
+        # job_id DETERMINISTICALLY from request.request_id (was a POST-HOC random
+        # uuid4) so the worker, which knows only request_id at stage-execution
+        # time, can derive the IDENTICAL job_id and sign a challenge-defensible
+        # per-stage settlement leaf. Shared pure helper → worker + receipt agree.
+        job_id = settlement_job_id(request.request_id, streamed=streamed)
         # Sprint 413 — thread sprint-297 privacy fields from
         # the chain executor's outcome into the InferenceReceipt.
         # When the chain executor doesn't populate them
@@ -1126,7 +1131,7 @@ class ParallaxScheduledExecutor(InferenceExecutor):
         # signing-payload is byte-identical to pre-sprint-413
         # receipts (sprint 297 conditional encoding handles this).
         unsigned = InferenceReceipt(
-            job_id=f"{prefix}-{uuid.uuid4().hex[:12]}",
+            job_id=job_id,
             request_id=request.request_id,
             model_id=request.model_id,
             content_tier=request.content_tier,
