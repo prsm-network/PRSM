@@ -1415,6 +1415,23 @@ class RunLayerSliceResponse:
     stage_input_activation_hash: Optional[str] = None
     stage_output_activation_hash: Optional[str] = None
     stage_activation_proof_b64: Optional[str] = None
+    # Sprint 1156 (on-chain per-stage payee arc, brick 2) — the CHALLENGE-DEFENSIBLE
+    # settlement leaf signature. The activation-proof sig above signs a VARIABLE-LENGTH
+    # payload (StageActivationProof.signing_bytes) so it is NOT a valid on-chain leaf
+    # signature (the contract Ed25519 verifier checks a sig over the 32-byte leaf
+    # signingMessageHash). So this stage ALSO signs build_receipt_signing_payload(
+    # settlement_job_id, settlement_stage_index, stage_output_activation_hash,
+    # executed_at) — a 32-byte keccak that IS the leaf signingMessageHash — and emits
+    # the sig + its pubkey + the executed_at it signed. The orchestrator collects these
+    # into per-node NodeSignatureMaterial (brick 1's input) so each topology node's
+    # share-batch leaf is challenge-defensible. This is a SEPARATE self-securing
+    # artifact: it is NOT part of signing_payload, so it cannot change the existing
+    # stage signature bytes. Default None → omit-when-default (byte-identical to a
+    # worker that doesn't opt in / a pre-1156 response). Populated on the unary path
+    # only (it reuses stage_output_activation_hash, which the unary path produces).
+    stage_settlement_signature_b64: Optional[str] = None
+    stage_settlement_pubkey_b64: Optional[str] = None
+    stage_settlement_executed_at_unix: Optional[int] = None
     protocol_version: int = CHAIN_RPC_PROTOCOL_VERSION
 
     MESSAGE_TYPE: str = ChainRpcMessageType.RUN_LAYER_SLICE_RESPONSE.value
@@ -1578,6 +1595,36 @@ class RunLayerSliceResponse:
                     f"accepted_count {self.accepted_count} exceeds "
                     f"max {max_accepted} (K = len(verified)-1)"
                 )
+        # Sprint 1156 — settlement-leaf-signature field shapes. Type-check a
+        # hostile peer's non-str sig/pubkey + non-int executed_at. Reject bool
+        # for executed_at (isinstance(True, int) is True).
+        if self.stage_settlement_signature_b64 is not None and not isinstance(
+            self.stage_settlement_signature_b64, str
+        ):
+            raise ChainRpcMalformedError(
+                f"stage_settlement_signature_b64 must be str, got "
+                f"{type(self.stage_settlement_signature_b64).__name__}"
+            )
+        if self.stage_settlement_pubkey_b64 is not None and not isinstance(
+            self.stage_settlement_pubkey_b64, str
+        ):
+            raise ChainRpcMalformedError(
+                f"stage_settlement_pubkey_b64 must be str, got "
+                f"{type(self.stage_settlement_pubkey_b64).__name__}"
+            )
+        if self.stage_settlement_executed_at_unix is not None:
+            if isinstance(self.stage_settlement_executed_at_unix, bool) or (
+                not isinstance(self.stage_settlement_executed_at_unix, int)
+            ):
+                raise ChainRpcMalformedError(
+                    f"stage_settlement_executed_at_unix must be int, got "
+                    f"{type(self.stage_settlement_executed_at_unix).__name__}"
+                )
+            if self.stage_settlement_executed_at_unix < 0:
+                raise ChainRpcMalformedError(
+                    f"stage_settlement_executed_at_unix must be non-negative, "
+                    f"got {self.stage_settlement_executed_at_unix}"
+                )
 
     @staticmethod
     def signing_payload(
@@ -1710,6 +1757,9 @@ class RunLayerSliceResponse:
         input_commitment: Optional[str] = None,
         stage_input_blob: Optional[bytes] = None,
         chain_stage_index: Optional[int] = None,
+        settlement_job_id: Optional[str] = None,
+        settlement_stage_index: Optional[int] = None,
+        settlement_executed_at_unix: Optional[int] = None,
     ) -> "RunLayerSliceResponse":
         """Construct + sign a fresh response under the stage ``identity``.
 
@@ -1769,6 +1819,53 @@ class RunLayerSliceResponse:
                 output_activation_hash=_out_hash,
             )
             _proof_sig = identity.sign(_proof.signing_bytes(request_id))
+        # sp1156 brick 2 — ALSO emit the challenge-defensible settlement leaf
+        # signature when the worker supplies its settlement context (job_id +
+        # its stage_index + the time it executed) AND there is an output
+        # activation to hash. The leaf output_hash is the sha256-hex of the
+        # output activation (== stage_output_activation_hash); the worker signs
+        # build_receipt_signing_payload(job_id, stage_index, output_hash,
+        # executed_at) — the 32-byte keccak that IS the on-chain leaf
+        # signingMessageHash. Omit-when-default: a worker WITHOUT this context
+        # (or pre-1156) leaves all three fields None → byte-identical signed
+        # bytes + response shape. This sig is OUTSIDE signing_payload (it does
+        # not touch ``sig`` above), so the stage signature is unchanged.
+        _settle_sig: Optional[str] = None
+        _settle_pubkey: Optional[str] = None
+        _settle_executed_at: Optional[int] = None
+        if (
+            settlement_job_id is not None
+            and settlement_stage_index is not None
+            and settlement_executed_at_unix is not None
+            and activation_blob
+        ):
+            from prsm.compute.shard_receipt import build_receipt_signing_payload
+            from prsm.compute.inference.stage_activation_proof import (
+                activation_hash,
+            )
+            # Reuse the activation-proof output hash when it was computed; else
+            # compute the canonical sha256-hex of the output activation. Both
+            # are identical (activation_hash is deterministic), so the leaf the
+            # orchestrator builds binds the SAME output digest either way.
+            _leaf_output_hash = (
+                _out_hash
+                if _out_hash is not None
+                else activation_hash(activation_blob)
+            )
+            _settle_payload = build_receipt_signing_payload(
+                job_id=str(settlement_job_id),
+                shard_index=int(settlement_stage_index),
+                output_hash=_leaf_output_hash,
+                executed_at_unix=int(settlement_executed_at_unix),
+            )
+            _settle_sig = identity.sign(_settle_payload)
+            _settle_pubkey = identity.public_key_b64
+            _settle_executed_at = int(settlement_executed_at_unix)
+            # Ensure the response carries the output hash the settlement sig
+            # commits to (so the orchestrator can rebuild the exact leaf even
+            # on a path that didn't populate the activation-proof hash).
+            if _out_hash is None:
+                _out_hash = _leaf_output_hash
         return cls(
             request_id=request_id,
             activation_blob=bytes(activation_blob),
@@ -1791,6 +1888,9 @@ class RunLayerSliceResponse:
             stage_input_activation_hash=_in_hash,
             stage_output_activation_hash=_out_hash,
             stage_activation_proof_b64=_proof_sig,
+            stage_settlement_signature_b64=_settle_sig,
+            stage_settlement_pubkey_b64=_settle_pubkey,
+            stage_settlement_executed_at_unix=_settle_executed_at,
         )
 
     def verify_with_anchor(
@@ -1914,6 +2014,16 @@ class RunLayerSliceResponse:
             out["stage_output_activation_hash"] = self.stage_output_activation_hash
         if self.stage_activation_proof_b64 is not None:
             out["stage_activation_proof_b64"] = self.stage_activation_proof_b64
+        # Sprint 1156 — omit-when-None canonical encoding (byte-identical to a
+        # worker that doesn't opt into the settlement-leaf signature / pre-1156).
+        if self.stage_settlement_signature_b64 is not None:
+            out["stage_settlement_signature_b64"] = self.stage_settlement_signature_b64
+        if self.stage_settlement_pubkey_b64 is not None:
+            out["stage_settlement_pubkey_b64"] = self.stage_settlement_pubkey_b64
+        if self.stage_settlement_executed_at_unix is not None:
+            out["stage_settlement_executed_at_unix"] = int(
+                self.stage_settlement_executed_at_unix
+            )
         return out
 
     @classmethod
@@ -2014,6 +2124,16 @@ class RunLayerSliceResponse:
                     f"{key} must be str, got {type(v).__name__}"
                 )
             return v
+        # Sprint 1156 — parse the optional settlement-leaf-signature fields.
+        def _opt_int(key: str) -> Optional[int]:
+            v = data.get(key)
+            if v is None:
+                return None
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise ChainRpcMalformedError(
+                    f"{key} must be int, got {type(v).__name__}"
+                )
+            return int(v)
         return cls(
             request_id=_required_str(data, "request_id"),
             activation_blob=blob_bytes,
@@ -2033,6 +2153,11 @@ class RunLayerSliceResponse:
             stage_input_activation_hash=_opt_str("stage_input_activation_hash"),
             stage_output_activation_hash=_opt_str("stage_output_activation_hash"),
             stage_activation_proof_b64=_opt_str("stage_activation_proof_b64"),
+            stage_settlement_signature_b64=_opt_str(
+                "stage_settlement_signature_b64"),
+            stage_settlement_pubkey_b64=_opt_str("stage_settlement_pubkey_b64"),
+            stage_settlement_executed_at_unix=_opt_int(
+                "stage_settlement_executed_at_unix"),
             protocol_version=_required_int(data, "protocol_version"),
         )
 

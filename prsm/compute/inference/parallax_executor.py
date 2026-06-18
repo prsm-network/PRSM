@@ -140,6 +140,15 @@ class ChainExecutionResult:
     # (StageActivationChain) the chain executor assembled from each worker's proof, when
     # every stage supplied one. Threaded into the receipt by _build_signed_receipt.
     stage_activation_chain: Optional[Any] = None
+    # Sprint 1156 (on-chain per-stage payee arc, brick 2) — the per-node
+    # NodeSignatureMaterial dict (keyed by node_id) the chain executor assembled from
+    # each worker's emitted challenge-defensible settlement leaf signature, when EVERY
+    # stage supplied one (else None → single-payee fallback). This is the INPUT brick 1's
+    # per_stage_settlement_split.split_receipt_to_per_node_batched_receipts consumes; it
+    # is carried OUT-OF-BAND (each per-node sig is self-securing, so it need NOT be in the
+    # signed receipt payload). Brick 4 (per-node commit) is the runtime/multi-node
+    # follow-on that calls the splitter with this material; it is NOT wired here.
+    per_stage_settlement_signatures: Optional[Any] = None
 
 
 # ──────────────────────────────────────────────────────────────────────────

@@ -194,6 +194,14 @@ class StageOutcome:
     stage_input_activation_hash: Optional[str] = None
     stage_output_activation_hash: Optional[str] = None
     stage_activation_proof_b64: Optional[str] = None
+    # Sprint 1156 (on-chain per-stage payee arc, brick 2) — the challenge-defensible
+    # settlement leaf signature captured from the verified RunLayerSliceResponse (None on
+    # paths that don't emit it / a worker that didn't opt in). The orchestrator collects
+    # these into the per-node NodeSignatureMaterial (brick 1's input) only when EVERY
+    # stage supplied one — else single-payee fallback (mirror _build_stage_activation_chain).
+    stage_settlement_signature_b64: Optional[str] = None
+    stage_settlement_pubkey_b64: Optional[str] = None
+    stage_settlement_executed_at_unix: Optional[int] = None
 
 
 # ``ChainExecutionResult`` is shared with Phase 3.x.6's
@@ -243,6 +251,47 @@ def _build_stage_activation_chain(request_id: str, outcomes: List["StageOutcome"
             stage_signature_b64=o.stage_activation_proof_b64,
         ))
     return StageActivationChain(request_id=request_id, proofs=proofs)
+
+
+def _assemble_per_node_settlement_signatures(outcomes: List["StageOutcome"]):
+    """sp1156 (on-chain per-stage payee arc, brick 2) — assemble the per-node
+    ``NodeSignatureMaterial`` dict (brick 1's input) from each stage's emitted
+    challenge-defensible settlement leaf signature.
+
+    Returns ``dict[node_id -> NodeSignatureMaterial]`` ONLY when EVERY stage
+    supplied a complete settlement-sig set (pubkey + signature + output hash +
+    executed_at); otherwise ``None`` — the all-or-nothing, fail-closed gate
+    that keeps the single-payee settlement path intact (mirrors
+    ``_build_stage_activation_chain``). The splitter (brick 1) is itself
+    fail-closed, but returning ``None`` here lets callers skip the per-node
+    split entirely when no worker opted in.
+
+    Each material is built from the WORKER's own emitted fields — the
+    orchestrator never signs (it holds no worker keys). The output_hash is the
+    stage's ``stage_output_activation_hash`` (the sha256-hex the worker signed
+    into ``build_receipt_signing_payload`` for its stage), so the leaf the
+    splitter builds binds the exact digest the worker committed to.
+    """
+    from prsm.settlement.per_stage_settlement_split import NodeSignatureMaterial
+
+    if not outcomes:
+        return None
+    materials = {}
+    for o in outcomes:
+        sig = o.stage_settlement_signature_b64
+        pub = o.stage_settlement_pubkey_b64
+        out_hash = o.stage_output_activation_hash
+        executed_at = o.stage_settlement_executed_at_unix
+        if not (sig and pub and out_hash and executed_at is not None):
+            return None  # incomplete → fail-closed to single-payee
+        materials[o.stage_node_id] = NodeSignatureMaterial(
+            pubkey_b64=pub,
+            signature=sig,
+            stage_index=int(o.stage_index),
+            output_hash=out_hash,
+            executed_at_unix=int(executed_at),
+        )
+    return materials
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -707,6 +756,13 @@ class RpcChainExecutor:
                     response, "stage_output_activation_hash", None),
                 stage_activation_proof_b64=getattr(
                     response, "stage_activation_proof_b64", None),
+                # sp1156 brick 2 — capture the settlement leaf signature.
+                stage_settlement_signature_b64=getattr(
+                    response, "stage_settlement_signature_b64", None),
+                stage_settlement_pubkey_b64=getattr(
+                    response, "stage_settlement_pubkey_b64", None),
+                stage_settlement_executed_at_unix=getattr(
+                    response, "stage_settlement_executed_at_unix", None),
             ))
 
             # Sprint 418 — optional per-stage activation
@@ -754,6 +810,13 @@ class RpcChainExecutor:
         # stage supplied a proof (the unary path does; streaming/decode don't yet, so
         # the chain is omitted there rather than reported partial → no false provenance).
         stage_chain = _build_stage_activation_chain(request.request_id, outcomes)
+        # sp1156 brick 2 — assemble the per-node settlement-signature material
+        # when EVERY stage emitted a settlement leaf sig (else None → single-payee
+        # fallback). Carried out-of-band on the result (self-securing); brick 4
+        # consumes it via the brick-1 splitter (runtime/multi-node follow-on).
+        per_stage_settlement_signatures = (
+            _assemble_per_node_settlement_signatures(outcomes)
+        )
         return ChainExecutionResult(
             output=output_text,
             duration_seconds=sum(s.duration_seconds for s in outcomes),
@@ -761,6 +824,7 @@ class RpcChainExecutor:
             tee_type=worst_case_tee_type(stage_attestations),
             epsilon_spent=sum(s.epsilon_spent for s in outcomes),
             stage_activation_chain=stage_chain,
+            per_stage_settlement_signatures=per_stage_settlement_signatures,
         )
 
     # ── streaming-token API (Phase 3.x.8) ────────────────────────────
