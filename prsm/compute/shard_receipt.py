@@ -93,6 +93,32 @@ def settlement_job_id(request_id: str, *, streamed: bool) -> str:
     return f"{prefix}-{request_id}"
 
 
+def per_stage_leaf_job_id(request_id: str) -> str:
+    """Sprint 1158 (on-chain per-stage payee, brick 2 completion) — the
+    STREAMED-AGNOSTIC settlement leaf ``job_id`` that BOTH the worker (at stage-
+    execution time) AND the per-node splitter (``per_stage_settlement_split``)
+    bind into ``build_receipt_signing_payload`` so the worker signs EXACTLY the
+    leaf the splitter rebuilds.
+
+    Single source of truth. A multi-stage worker, at the moment it executes its
+    stage, has ``request.request_id`` + ``request.chain_stage_index`` but CANNOT
+    reliably know the receipt's eventual OUTPUT ``streamed`` flag (that is set
+    post-hoc by the orchestrator on the assembled receipt, and the worker's
+    transfer streamed-ness — inline blob vs chunked manifest — is a DIFFERENT
+    bit). If the per-node leaf bound the streamed-PREFIXED ``settlement_job_id``,
+    the worker could pick the wrong prefix and its emitted signature would
+    mismatch the splitter's rebuild → a wrongly-slashable leaf. So the per-node
+    settlement leaf uses a settlement-INTERNAL, streamed-agnostic id derived from
+    ``request_id`` ALONE — ``settlement_job_id(request_id, streamed=False)``.
+
+    This is INTENTIONALLY distinct from the receipt's DISPLAY ``job_id`` (the
+    streamed-prefixed sp1157 id the receipt carries and the single-payee adapter
+    binds via ``receipt.job_id``). The per-node split and the single-payee path
+    never coexist for one inference, so the two ids never collide on one leaf.
+    """
+    return settlement_job_id(request_id, streamed=False)
+
+
 def _derive_node_id_from_pubkey_b64(pubkey_b64: str) -> Optional[str]:
     """Recompute NodeIdentity.node_id from an advertised pubkey.
 

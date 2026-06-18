@@ -41,7 +41,10 @@ from decimal import Decimal
 
 import pytest
 
-from prsm.compute.shard_receipt import build_receipt_signing_payload
+from prsm.compute.shard_receipt import (
+    build_receipt_signing_payload,
+    per_stage_leaf_job_id,
+)
 from prsm.compute.inference.topology_rotation import TopologyAssignment
 from prsm.node.identity import generate_node_identity, verify_signature
 from prsm.settlement.merkle import batched_receipt_to_leaf
@@ -179,11 +182,11 @@ def test_splits_two_distinct_nodes_into_defensible_leaves():
     executed = 1_700_000_000
     node_sigs = {
         id_a.node_id: _sig_material_for(
-            id_a, job_id=ir.job_id, stage_index=0,
+            id_a, job_id=per_stage_leaf_job_id(ir.request_id), stage_index=0,
             output_hash_hex=output_hex, executed_at_unix=executed,
         ),
         id_b.node_id: _sig_material_for(
-            id_b, job_id=ir.job_id, stage_index=1,
+            id_b, job_id=per_stage_leaf_job_id(ir.request_id), stage_index=1,
             output_hash_hex=output_hex, executed_at_unix=executed,
         ),
     }
@@ -216,9 +219,14 @@ def test_splits_two_distinct_nodes_into_defensible_leaves():
         assert br.value_ftns == share.share_wei
         # (b) CHALLENGE-DEFENSIBILITY: rebuild the leaf, verify the node sig
         # over leaf.signing_message_hash == build_receipt_signing_payload.
+        # sp1158 — the per-node leaf binds the STREAMED-AGNOSTIC
+        # per_stage_leaf_job_id(request_id), NOT the receipt display job_id, so
+        # the worker (which knows only request_id) signs exactly this leaf.
+        assert br.receipt.job_id == per_stage_leaf_job_id(ir.request_id)
+        assert br.receipt.job_id != ir.job_id  # NOT the display job_id
         leaf = batched_receipt_to_leaf(br)
         expected = build_receipt_signing_payload(
-            job_id=ir.job_id,
+            job_id=per_stage_leaf_job_id(ir.request_id),
             shard_index=br.receipt.shard_index,
             output_hash=br.receipt.output_hash,
             executed_at_unix=br.receipt.executed_at_unix,
@@ -243,10 +251,10 @@ def test_distinct_shard_indices_per_node():
     output_hex = ir.output_hash.hex()
     node_sigs = {
         id_a.node_id: _sig_material_for(
-            id_a, job_id=ir.job_id, stage_index=0,
+            id_a, job_id=per_stage_leaf_job_id(ir.request_id), stage_index=0,
             output_hash_hex=output_hex, executed_at_unix=42),
         id_b.node_id: _sig_material_for(
-            id_b, job_id=ir.job_id, stage_index=1,
+            id_b, job_id=per_stage_leaf_job_id(ir.request_id), stage_index=1,
             output_hash_hex=output_hex, executed_at_unix=42),
     }
     shares = split_receipt_to_per_node_batched_receipts(
@@ -264,10 +272,10 @@ def _full_sigs(ir, id_a, id_b):
     output_hex = ir.output_hash.hex()
     return {
         id_a.node_id: _sig_material_for(
-            id_a, job_id=ir.job_id, stage_index=0,
+            id_a, job_id=per_stage_leaf_job_id(ir.request_id), stage_index=0,
             output_hash_hex=output_hex, executed_at_unix=7),
         id_b.node_id: _sig_material_for(
-            id_b, job_id=ir.job_id, stage_index=1,
+            id_b, job_id=per_stage_leaf_job_id(ir.request_id), stage_index=1,
             output_hash_hex=output_hex, executed_at_unix=7),
     }
 
@@ -294,7 +302,7 @@ def test_fail_closed_single_node_topology():
                   topology_assignment=only)
     output_hex = ir.output_hash.hex()
     sigs = {id_a.node_id: _sig_material_for(
-        id_a, job_id=ir.job_id, stage_index=0,
+        id_a, job_id=per_stage_leaf_job_id(ir.request_id), stage_index=0,
         output_hash_hex=output_hex, executed_at_unix=7)}
     assert split_receipt_to_per_node_batched_receipts(
         receipt=ir, total_value_wei=_WEI, node_signatures=sigs,
@@ -336,7 +344,7 @@ def test_fail_closed_missing_node_signature():
     # only node A's signature present; B's missing -> NEVER a partial payee set
     partial = {
         id_a.node_id: _sig_material_for(
-            id_a, job_id=ir.job_id, stage_index=0,
+            id_a, job_id=per_stage_leaf_job_id(ir.request_id), stage_index=0,
             output_hash_hex=output_hex, executed_at_unix=7),
     }
     assert split_receipt_to_per_node_batched_receipts(

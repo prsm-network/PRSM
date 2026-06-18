@@ -70,6 +70,7 @@ from prsm.compute.chain_rpc.protocol import (
     parse_message,
 )
 from prsm.node.shard_streaming import ShardChunk
+from prsm.compute.shard_receipt import per_stage_leaf_job_id
 from prsm.compute.tee.models import HARDWARE_TEE_TYPES, PrivacyLevel, TEEType
 from prsm.node.identity import NodeIdentity
 
@@ -825,6 +826,17 @@ class LayerStageServer:
             input_commitment=response_input_commitment_for_request(request),
             stage_input_blob=request.activation_blob,
             chain_stage_index=request.upstream_token.chain_stage_index,
+            # sp1158 (brick 2 completion) — emit the challenge-defensible per-node
+            # settlement leaf signature. The leaf job_id is the STREAMED-AGNOSTIC
+            # per_stage_leaf_job_id(request_id): the worker knows request_id but not
+            # the receipt's eventual output streamed flag, so it derives the same id
+            # the splitter rebuilds. stage_index is the settler-signed token index;
+            # executed_at is this worker's real stage-execution time (used by the
+            # on-chain EXPIRED challenge's age check). This sig is OUTSIDE the stage
+            # signing_payload, so the stage signature stays byte-identical.
+            settlement_job_id=per_stage_leaf_job_id(request.request_id),
+            settlement_stage_index=request.upstream_token.chain_stage_index,
+            settlement_executed_at_unix=int(time.time()),
         )
         return encode_message(response)
 
@@ -1076,6 +1088,11 @@ class LayerStageServer:
             # manifest path), so input/output hashes are well-defined and chain.
             stage_input_blob=request.activation_blob,
             chain_stage_index=request.upstream_token.chain_stage_index,
+            # sp1158 — per-node settlement leaf (streamed-agnostic job_id). See
+            # the unary _dispatch site for the rationale.
+            settlement_job_id=per_stage_leaf_job_id(request.request_id),
+            settlement_stage_index=request.upstream_token.chain_stage_index,
+            settlement_executed_at_unix=int(time.time()),
         )
         return encode_message(response)
 
@@ -1215,6 +1232,15 @@ class LayerStageServer:
             epsilon_spent=result.epsilon_spent,
             activation_manifest=chunked_out.manifest,
             input_commitment=response_input_commitment_for_request(request),
+            # sp1158 — pass the streamed-agnostic settlement context. The
+            # settlement block in sign() only emits when there is a non-empty
+            # output activation_blob to hash; this streamed-manifest path carries
+            # an empty blob (bytes ride out-of-band), so no leaf is emitted here
+            # (a follow-on can hash the assembled payload). Wiring it keeps all
+            # six sign sites consistent + ready.
+            settlement_job_id=per_stage_leaf_job_id(request.request_id),
+            settlement_stage_index=request.upstream_token.chain_stage_index,
+            settlement_executed_at_unix=int(time.time()),
         )
         response_manifest_bytes = encode_message(response)
 
@@ -1435,6 +1461,11 @@ class LayerStageServer:
             next_token_id=result.next_token_id,
             is_terminal=result.is_terminal,
             input_commitment=response_input_commitment_for_request(request),
+            # sp1158 — streamed-agnostic settlement context (empty output blob
+            # here → no leaf emitted; see the _dispatch_streamed site).
+            settlement_job_id=per_stage_leaf_job_id(request.request_id),
+            settlement_stage_index=request.upstream_token.chain_stage_index,
+            settlement_executed_at_unix=int(time.time()),
         )
         response_manifest_bytes = encode_message(response)
 
@@ -1722,6 +1753,7 @@ class LayerStageServer:
                     yield self._build_stream_final_frame(
                         request_id=request.request_id,
                         chunk=chunk,
+                        chain_stage_index=request.upstream_token.chain_stage_index,
                     )
                     return
         except TimeoutError as exc:
@@ -1783,6 +1815,7 @@ class LayerStageServer:
         *,
         request_id: str,
         chunk: Any,  # StreamingChunk — lazy-typed to avoid circular import
+        chain_stage_index: Optional[int] = None,
     ) -> bytes:
         """Encode the signed terminal frame for a token stream.
 
@@ -1808,6 +1841,12 @@ class LayerStageServer:
             tee_attestation=chunk.tee_attestation,  # type: ignore[arg-type]
             tee_type=chunk.tee_type,  # type: ignore[arg-type]
             epsilon_spent=chunk.epsilon_spent,  # type: ignore[arg-type]
+            # sp1158 — the streaming-token tail emits its per-node settlement
+            # leaf too (joined_bytes is a non-empty output, so the leaf is built).
+            # Streamed-agnostic job_id: the tail derives it from request_id alone.
+            settlement_job_id=per_stage_leaf_job_id(request_id),
+            settlement_stage_index=chain_stage_index,
+            settlement_executed_at_unix=int(time.time()),
         )
         return encode_message(StreamFinalFrame(response=response))
 
@@ -2069,6 +2108,11 @@ class LayerStageServer:
             tee_type=result.tee_type,
             epsilon_spent=result.epsilon_spent,
             input_commitment=response_input_commitment_for_request(request),
+            # sp1158 — per-node settlement leaf (streamed-agnostic job_id) on the
+            # unary INCREMENTAL path; mirrors the PREFILL _dispatch site.
+            settlement_job_id=per_stage_leaf_job_id(request.request_id),
+            settlement_stage_index=request.upstream_token.chain_stage_index,
+            settlement_executed_at_unix=int(time.time()),
         )
         return encode_message(response)
 

@@ -63,6 +63,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from prsm.compute.shard_receipt import (
     ShardExecutionReceipt,
     build_receipt_signing_payload,
+    per_stage_leaf_job_id,
 )
 from prsm.settlement.accumulator import BatchedReceipt
 
@@ -238,8 +239,10 @@ def split_receipt_to_per_node_batched_receipts(
     ``StageSettlementShare``.
 
     Args:
-      receipt: a parallax ``InferenceReceipt`` carrying ``job_id`` and a
-        ``topology_assignment`` whose ``positions`` map (stage, slot) → node_id.
+      receipt: a parallax ``InferenceReceipt`` carrying ``request_id`` (the
+        per-node settlement leaf job_id is derived from it via the streamed-
+        agnostic ``per_stage_leaf_job_id``) and a ``topology_assignment`` whose
+        ``positions`` map (stage, slot) → node_id.
       total_value_wei: the whole-inference settled amount in wei (the sum the
         shares conserve). Validated to a non-negative uint128 int.
       node_signatures: node_id → ``NodeSignatureMaterial``. Each entry is that
@@ -288,9 +291,18 @@ def split_receipt_to_per_node_batched_receipts(
         if derived != node_id:
             return None
 
-    job_id = getattr(receipt, "job_id", None)
-    if not isinstance(job_id, str) or not job_id:
+    # sp1158 — the per-node settlement leaf binds the STREAMED-AGNOSTIC
+    # settlement job_id derived from request_id ALONE (NOT the receipt's
+    # streamed-prefixed DISPLAY job_id). This is THE id the worker — which at
+    # stage-execution time knows only request_id, not the receipt's eventual
+    # output streamed flag — also binds when it emits its per-node signature, so
+    # the worker signs EXACTLY the leaf this splitter rebuilds (a single source
+    # of truth via per_stage_leaf_job_id). The receipt's own display job_id +
+    # the single-payee adapter (inference_adapter, receipt.job_id) are unchanged.
+    request_id = getattr(receipt, "request_id", None)
+    if not isinstance(request_id, str) or not request_id:
         return None
+    job_id = per_stage_leaf_job_id(request_id)
 
     node_ids = [node_id for node_id, _stage in distinct]
     # compute_per_stage_shares validates + raises on a bad total; that is a

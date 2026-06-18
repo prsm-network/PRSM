@@ -51,7 +51,10 @@ from decimal import Decimal
 
 import pytest
 
-from prsm.compute.shard_receipt import build_receipt_signing_payload
+from prsm.compute.shard_receipt import (
+    build_receipt_signing_payload,
+    per_stage_leaf_job_id,
+)
 from prsm.compute.inference.stage_activation_proof import activation_hash
 from prsm.compute.inference.topology_rotation import TopologyAssignment
 from prsm.node.identity import generate_node_identity, verify_signature
@@ -240,7 +243,11 @@ def test_settlement_signature_verifies_over_receipt_payload():
 def test_assembled_material_feeds_brick1_to_a_defensible_leaf():
     node_a = generate_node_identity("A")
     node_b = generate_node_identity("B")
-    job_id = "job-1156"
+    # sp1158 — the per-node settlement leaf binds the STREAMED-AGNOSTIC
+    # per_stage_leaf_job_id(request_id), so the worker signs over THAT (it knows
+    # request_id, not the receipt's eventual streamed flag). The receipt below
+    # uses request_id="req-1156"; the splitter rebuilds over the same id.
+    job_id = per_stage_leaf_job_id("req-1156")
     blob_a = b"stage-0-output"
     blob_b = b"stage-1-output"
     resp_a = RunLayerSliceResponse.sign(
@@ -387,7 +394,9 @@ def test_e2e_two_stages_to_conserving_defensible_per_node_receipts():
     )
     node_a = generate_node_identity("A")
     node_b = generate_node_identity("B")
-    job_id = "job-1156-e2e"
+    # sp1158 — workers sign over the streamed-agnostic per_stage_leaf_job_id of
+    # the inference's request_id (the receipt below uses request_id="req-1156").
+    job_id = per_stage_leaf_job_id("req-1156")
     total = 7 * _WEI + 3  # non-divisible → exercises remainder conservation
 
     # workers sign their stages, emitting settlement sigs
