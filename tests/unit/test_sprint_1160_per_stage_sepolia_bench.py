@@ -205,9 +205,11 @@ def test_phase1_echoes_address_not_key(monkeypatch, capsys, tmp_path):
     signer ADDRESS and NEVER prints any private key."""
     import scripts.per_stage_sepolia_bench as mod
 
-    # Mocked escrow + per-node clients so no chain is touched.
+    # Mocked escrow + per-node clients so no chain is touched. sp1161: the default
+    # phase-1 deposit is now ADDITIVE (no skip), so model an empty escrow that, after
+    # the deposit, reflects the +1 FTNS top-up the bench funds for its OWN claims.
     escrow = AsyncMock()
-    escrow.balance_of.return_value = 30 * ONE_FTNS + 1
+    escrow.balance_of.side_effect = [0] + [ONE_FTNS] * 6  # pre-deposit, then post
     escrow.deposit.return_value = "0xdeposit"
     monkeypatch.setattr(mod, "EscrowPoolClient" if hasattr(mod, "EscrowPoolClient") else "_unused",
                         escrow, raising=False)
@@ -262,6 +264,8 @@ def test_phase1_echoes_address_not_key(monkeypatch, capsys, tmp_path):
     rc = asyncio.run(mod._run_phase1(args, _EP(), BASE_SEPOLIA_CHAIN_ID))
     out = capsys.readouterr().out
     assert rc == 0
+    # sp1161: the default funds its OWN claims — deposit the per-stage total (1 FTNS).
+    escrow.deposit.assert_awaited_once_with(ONE_FTNS)
 
     # The requester + every node ADDRESS is echoed.
     assert _REQUESTER_ADDR in out

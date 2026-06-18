@@ -413,25 +413,47 @@ async def _run_phase1(args, endpoints, chain_id) -> int:
     for nid in assembly.node_ids:
         print(f"  node {assembly.node_eth[nid]} share={assembly.expected_share_by_node[nid]} wei")
 
-    # ── requester deposits the TOTAL into its OWN escrow (idempotent, lag-tolerant) ─
+    # ── requester FUNDS ITS OWN claims into its escrow (idempotent, lag-tolerant) ──
+    # sp1161 — the SHARED-ESCROW under-funding fix. EscrowPool.balanceOf is a SHARED
+    # POOL per requester: a pre-existing balance may back OTHER pending batches (e.g.
+    # a separate two-party batch), so a "skip if balance >= amount" deposit SILENTLY
+    # UNDER-FUNDS — the per-stage finalize then reverts on insufficient escrow. By
+    # DEFAULT we therefore deposit the per-stage total ADDITIVELY (fund our OWN
+    # claims regardless of any pre-existing balance). The phase-1 commit-idempotency
+    # guard above already refuses a re-deposit on a re-run, so a first-run additive
+    # deposit is safe. --assume-dedicated-escrow opts back into the old skip-if-
+    # sufficient behavior (ONLY safe for a KNOWN-dedicated escrow). NEVER silently
+    # under-fund.
     escrow = EscrowPoolClient(
         rpc_url=endpoints.rpc_url, escrow_pool_address=endpoints.escrow_pool,
         ftns_token_address=endpoints.ftns_token, private_key=requester_key)
-    escrow_balance = int(await escrow.balance_of(requester_addr))
-    if escrow_balance >= total_wei:
-        print(f"escrow already funded ({escrow_balance} wei >= {total_wei}); skipping deposit")
+    pre_balance = int(await escrow.balance_of(requester_addr))
+    if args.assume_dedicated_escrow and pre_balance >= total_wei:
+        print(f"escrow already funded ({pre_balance} wei >= {total_wei}); skipping "
+              f"deposit (--assume-dedicated-escrow: treating this escrow as dedicated "
+              f"to this per-stage run)")
+        escrow_balance = pre_balance
     else:
-        print(f"requester depositing {total_wei} wei into its escrow …")
+        if pre_balance > 0:
+            print(f"WARNING: escrow already holds {pre_balance} wei which may back "
+                  f"OTHER pending batches (the EscrowPool balance is a SHARED pool "
+                  f"per requester); depositing the per-stage total ({total_wei} wei) "
+                  f"ADDITIVELY so this bench funds its OWN claims — pass "
+                  f"--assume-dedicated-escrow to skip if this escrow is dedicated.")
+        target = pre_balance + total_wei  # additive: fund OUR claims on top.
+        print(f"requester depositing {total_wei} wei additively into its escrow "
+              f"(pre={pre_balance} -> target>={target}) …")
         deposit_tx = await escrow.deposit(total_wei)
         print(f"  deposit_tx={deposit_tx}")
+        escrow_balance = pre_balance
         for _ in range(6):
             escrow_balance = int(await escrow.balance_of(requester_addr))
-            if escrow_balance >= total_wei:
+            if escrow_balance >= target:
                 break
             await asyncio.sleep(args.poll_interval_s)
-        if escrow_balance < total_wei:
-            print(f"ERROR: escrow underfunded after deposit ({escrow_balance} < "
-                  f"{total_wei}) even after polling past RPC lag; check the deposit "
+        if escrow_balance < target:
+            print(f"ERROR: escrow underfunded after additive deposit ({escrow_balance} "
+                  f"< {target}) even after polling past RPC lag; check the deposit "
                   f"tx on-chain before retrying", file=sys.stderr)
             return 1
     print(f"  escrow_balance={escrow_balance} wei")
@@ -570,10 +592,12 @@ async def _run_verify(args, endpoints, chain_id) -> int:
         private_key=None)
 
     requester = state.get("requester_address")
+    escrow_balance = (
+        int(await escrow.balance_of(requester)) if requester else None)
     if requester:
-        print(f"requester escrow balance: "
-              f"{int(await escrow.balance_of(requester))} wei")
+        print(f"requester escrow balance: {escrow_balance} wei")
     total_share = 0
+    bench_known_claims = 0  # sum of on-chain PENDING values of the bench-tracked batches
     all_final = True
     for nid, rec in state["committed"].items():
         committer = Web3.to_checksum_address(rec["committer_address"])
@@ -581,14 +605,82 @@ async def _run_verify(args, endpoints, chain_id) -> int:
         status = int(await contract.get_batch_status(batch_id))
         finalizable = bool(await contract.is_finalizable(batch_id)) if status == 1 else False
         wallet = int(await escrow.ftns_balance_of(committer))
+        # The on-chain PENDING value still drawing on the shared escrow at finalize.
+        on_chain_pending = 0
+        try:
+            b = await contract.get_batch(batch_id)
+            if int(b.get("status", status)) == 1:  # PENDING
+                on_chain_pending = int(b.get("total_value_ftns", 0))
+        except Exception as exc:  # noqa: BLE001
+            print(f"    (could not read on-chain batch value: {exc})")
+        bench_known_claims += on_chain_pending
         print(f"  node {committer}: batch {batch_id.hex()[:12]}… status={status} "
               f"finalizable={finalizable} expected_share={rec['share_wei']} "
-              f"wallet_ftns={wallet}")
+              f"on_chain_pending={on_chain_pending} wallet_ftns={wallet}")
         total_share += int(rec["share_wei"])
         all_final = all_final and (status == 2)
     print(f"sum of expected shares = {total_share} wei (== total {state.get('total_wei')}): "
           f"{total_share == state.get('total_wei')}")
     print(f"all batches FINALIZED: {all_final}")
+
+    # ── sp1161 SHARED-ESCROW SUFFICIENCY DIAGNOSTIC (the bug-catcher) ─────────────
+    # Sum the bench-tracked per-stage batches' on-chain PENDING values and compare
+    # to the requester's escrow balance. This is the read-only check that would have
+    # caught the live under-funding bug immediately.
+    if requester and escrow_balance is not None:
+        verdict = "SUFFICIENT" if escrow_balance >= bench_known_claims else "SHORT"
+        print(f"escrow sufficiency (bench-known): escrow_balance={escrow_balance} wei "
+              f"vs bench_known_claims={bench_known_claims} wei => {verdict}")
+        print("NOTE: the EscrowPool balance is a SHARED pool per requester. EXTERNAL "
+              "pending batches committed OUTSIDE this bench (e.g. a separate two-party "
+              "batch) ALSO draw on this SAME escrow and are NOT counted above — the "
+              "escrow must cover ALL of the requester's pending batches, not just the "
+              "bench-tracked ones. (Enumerating arbitrary external batches needs "
+              "event-scanning by a non-indexed requester field and is out of scope; "
+              "this NOTE is the honest surface.)")
+    return 0
+
+
+async def _run_deposit_topup(args, endpoints, chain_id) -> int:
+    """sp1161 — STANDALONE additive top-up deposit by the requester. A clean
+    operator surface to add escrow (e.g. to cover a pre-existing pending batch
+    that shares the requester's escrow) instead of an ad-hoc one-liner. Key-gated
+    (PRSM_REQUESTER_KEY); echoes the requester ADDRESS + the deposited amount + the
+    resulting escrow balance — NEVER the key. Always deposits ADDITIVELY (it never
+    skips): this is purpose-built to add escrow on top of whatever is there."""
+    from eth_account import Account
+    from web3 import Web3
+    from prsm.economy.web3.escrow_pool_client import EscrowPoolClient
+
+    requester_key = read_requester_key()  # SystemExit(2) if unset (key-gated)
+    requester_addr = Web3.to_checksum_address(Account.from_key(requester_key).address)
+    print(f"requester(A)={requester_addr}")  # ADDRESS, never the key
+
+    topup_wei = _amount_to_wei(args.amount_ftns)
+    if topup_wei <= 0:
+        print("ERROR: --amount-ftns must be positive", file=sys.stderr)
+        return 2
+
+    escrow = EscrowPoolClient(
+        rpc_url=endpoints.rpc_url, escrow_pool_address=endpoints.escrow_pool,
+        ftns_token_address=endpoints.ftns_token, private_key=requester_key)
+    pre_balance = int(await escrow.balance_of(requester_addr))
+    target = pre_balance + topup_wei
+    print(f"depositing {topup_wei} wei additively (pre={pre_balance} -> target>={target}) …")
+    deposit_tx = await escrow.deposit(topup_wei)
+    print(f"  deposit_tx={deposit_tx}")
+    escrow_balance = pre_balance
+    for _ in range(6):
+        escrow_balance = int(await escrow.balance_of(requester_addr))
+        if escrow_balance >= target:
+            break
+        await asyncio.sleep(args.poll_interval_s)
+    print(f"requester {requester_addr} deposited {topup_wei} wei; "
+          f"escrow_balance={escrow_balance} wei")
+    if escrow_balance < target:
+        print(f"WARNING: escrow balance {escrow_balance} < target {target} even after "
+              f"polling past RPC lag; check the deposit tx on-chain.", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -619,6 +711,8 @@ async def _amain(args) -> int:
         return await _run_phase2(args, endpoints, chain_id)
     if args.phase == "verify":
         return await _run_verify(args, endpoints, chain_id)
+    if args.phase == "deposit-topup":
+        return await _run_deposit_topup(args, endpoints, chain_id)
     print(f"ERROR: unknown phase {args.phase!r}", file=sys.stderr)
     return 2
 
@@ -626,15 +720,27 @@ async def _amain(args) -> int:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--phase", choices=("deposit-commit", "finalize", "verify"),
+    parser.add_argument("--phase",
+                        choices=("deposit-commit", "finalize", "verify", "deposit-topup"),
                         default="verify",
                         help="deposit-commit (phase 1: deposit + per-node commit), "
                              "finalize (phase 2: per-node finalize after the window), "
-                             "or verify (read-only; resolves addresses + reads batch "
-                             "state; NO keys). Default: verify (the safe default).")
+                             "verify (read-only; resolves addresses + reads batch "
+                             "state + reports escrow-vs-claims sufficiency; NO keys), "
+                             "or deposit-topup (standalone additive requester deposit "
+                             "of --amount-ftns). Default: verify (the safe default).")
     parser.add_argument("--amount-ftns", type=float, default=1.0,
                         help="[deposit-commit] TOTAL FTNS the requester deposits + the "
-                             "nodes split (default 1.0)")
+                             "nodes split; [deposit-topup] FTNS to add to escrow "
+                             "(default 1.0)")
+    parser.add_argument("--assume-dedicated-escrow", action="store_true",
+                        help="[deposit-commit] DANGER: skip the deposit when the escrow "
+                             "already holds >= --amount-ftns (old behavior). ONLY safe "
+                             "if this requester's escrow is DEDICATED to this per-stage "
+                             "run. By DEFAULT the bench deposits the per-stage total "
+                             "ADDITIVELY because EscrowPool balance is a SHARED pool "
+                             "that may back OTHER pending batches — skipping would "
+                             "silently under-fund and the finalize would revert.")
     parser.add_argument("--state-file", default=_default_state_file(),
                         help="durable state file bridging the two phases (the committed "
                              "batch_ids + committer addresses)")
