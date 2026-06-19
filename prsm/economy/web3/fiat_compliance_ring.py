@@ -86,6 +86,111 @@ class FiatComplianceEntry:
         )
 
 
+class RedisRollingTotal:
+    """Sp1179 — a SHARED (cross-replica) backend for the fiat AML
+    rolling total, so a multi-replica deployment ENFORCES the per-user
+    tier limit GLOBALLY instead of per-pod (the sp1175 gap — where the
+    in-memory ring let a user fanned across N replicas transact N×).
+    Opt-in: constructed only when PRSM_FIAT_TIER_LIMIT_MODE=shared_redis
+    and a Redis URL is configured.
+
+    Faithfully mirrors FiatComplianceRing.total_usd_for_user's
+    semantics on a Redis sorted-set per user: each settled/reserved
+    fiat-USD event is a member scored by its event timestamp; the query
+    dedups by intent_id (taking the latest-timestamp event per intent —
+    the sp968 in-memory dedup) and sums over the rolling window. A
+    differential test asserts byte-equal totals vs the in-memory ring
+    for identical event sequences (incl. PENDING→CONFIRMED→EXPIRED
+    supersession + window expiry).
+
+    Read errors PROPAGATE so the caller (the tier check) fails CLOSED —
+    deny rather than under-enforce when the shared store is unreachable.
+    Write errors are logged loudly but do NOT raise (record() is
+    best-effort; a lost write under-counts, surfaced by the loud log)."""
+
+    _SEP = "\x1f"  # unit separator — won't appear in intent/entry ids.
+
+    def __init__(
+        self,
+        redis_client: Any,
+        *,
+        window_sec: int = 86400,
+        key_prefix: str = "prsm:fiat:roll:",
+    ) -> None:
+        self._redis = redis_client
+        self._window_sec = int(window_sec)
+        self._prefix = key_prefix
+
+    def _key(self, user_id: str) -> str:
+        return f"{self._prefix}{user_id}"
+
+    def record(
+        self,
+        *,
+        user_id: str,
+        dedup_key: str,
+        entry_id: str,
+        usd_amount: float,
+        timestamp: float,
+    ) -> None:
+        """Append an event (best-effort; logs but never raises)."""
+        if not user_id:
+            return
+        key = self._key(user_id)
+        # member = dedup_key | entry_id | amount. The entry_id keeps
+        # distinct events for the SAME intent as distinct members (so
+        # the query can dedup by intent taking the latest score); the
+        # amount rides in the member so the read needs no second lookup.
+        member = (
+            f"{dedup_key}{self._SEP}{entry_id}{self._SEP}"
+            f"{repr(float(usd_amount))}"
+        )
+        try:
+            self._redis.zadd(key, {member: float(timestamp)})
+            # TTL so an inactive user's key self-expires (bounded mem).
+            self._redis.expire(key, self._window_sec * 2 + 3600)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "sp1179: shared rolling-total WRITE failed for user %s "
+                "(the AML rolling total may UNDER-count until the next "
+                "successful write — investigate Redis): %s",
+                user_id, exc,
+            )
+
+    def total_usd_for_user(
+        self, user_id: str, *, window_sec: int, now: float,
+    ) -> float:
+        """Sum the windowed, intent-deduped rolling total. RAISES on a
+        Redis error so the tier check fails closed."""
+        if not user_id:
+            return 0.0
+        key = self._key(user_id)
+        cutoff = now - window_sec
+        # Best-effort prune of events older than the window.
+        try:
+            self._redis.zremrangebyscore(key, "-inf", f"({cutoff}")
+        except Exception:  # noqa: BLE001
+            pass  # the windowed read below still excludes stale events
+        # ts >= cutoff (inclusive) — matches in-memory `ts < cutoff` skip.
+        rows = self._redis.zrangebyscore(
+            key, cutoff, "+inf", withscores=True,
+        )
+        latest_by_dedup: Dict[str, Any] = {}  # dedup_key -> (score, amt)
+        for member, score in rows:
+            parts = str(member).split(self._SEP)
+            if len(parts) != 3:
+                continue
+            dk, _entry, amount_str = parts
+            try:
+                amount = float(amount_str)
+            except (ValueError, TypeError):
+                continue
+            prev = latest_by_dedup.get(dk)
+            if prev is None or score >= prev[0]:
+                latest_by_dedup[dk] = (score, amount)
+        return sum(amt for _s, amt in latest_by_dedup.values())
+
+
 class FiatComplianceRing:
     def __init__(
         self,
@@ -93,6 +198,7 @@ class FiatComplianceRing:
         *,
         persist_dir: Optional[Path] = None,
         default_jurisdiction: Optional[str] = None,
+        shared_total: Optional[RedisRollingTotal] = None,
     ) -> None:
         if not isinstance(max_entries, int) or max_entries <= 0:
             raise ValueError(
@@ -117,6 +223,11 @@ class FiatComplianceRing:
             Path(persist_dir) if persist_dir is not None else None
         )
         self._default_jurisdiction = default_jurisdiction
+        # Sp1179 — optional SHARED cross-replica rolling-total backend
+        # (Redis). When present, total_usd_for_user reads from it (the
+        # AML limit is enforced globally) and record() mirrors writes to
+        # it. None → process-local in-memory (the default).
+        self._shared_total: Optional[RedisRollingTotal] = shared_total
         if self._persist_dir is not None:
             self._persist_dir.mkdir(parents=True, exist_ok=True)
             self._load_from_disk()
@@ -130,10 +241,52 @@ class FiatComplianceRing:
         jurisdiction = (
             os.environ.get("PRSM_OPERATOR_JURISDICTION") or None
         )
+        # Sp1179 — wire the shared Redis rolling total ONLY when the
+        # operator opts into shared_redis mode AND a Redis URL resolves.
+        # Construction failure (no URL / redis import / connect) leaves
+        # shared_total=None; the tier check then FAILS CLOSED in
+        # shared_redis mode rather than silently under-enforcing.
+        shared_total = None
+        mode = (
+            os.environ.get("PRSM_FIAT_TIER_LIMIT_MODE", "process_local")
+            .strip()
+            .lower()
+        )
+        if mode == "shared_redis":
+            shared_total = cls._build_shared_total_from_env()
         return cls(
             persist_dir=persist_dir,
             default_jurisdiction=jurisdiction,
+            shared_total=shared_total,
         )
+
+    @staticmethod
+    def _build_shared_total_from_env() -> Optional["RedisRollingTotal"]:
+        url = (
+            os.environ.get("PRSM_FIAT_COMPLIANCE_REDIS_URL")
+            or os.environ.get("PRSM_REDIS_URL")
+            or os.environ.get("REDIS_URL")
+        )
+        if not url:
+            logger.warning(
+                "sp1179: PRSM_FIAT_TIER_LIMIT_MODE=shared_redis but no "
+                "Redis URL (PRSM_FIAT_COMPLIANCE_REDIS_URL / "
+                "PRSM_REDIS_URL / REDIS_URL) — the tier check will FAIL "
+                "CLOSED (deny fiat) until a shared backend is configured."
+            )
+            return None
+        try:
+            import redis as _redis  # sync client; the ring is sync
+
+            client = _redis.Redis.from_url(url, decode_responses=True)
+            return RedisRollingTotal(client)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "sp1179: shared Redis rolling-total construction failed "
+                "(%s) — the tier check will FAIL CLOSED until Redis is "
+                "reachable.", exc,
+            )
+            return None
 
     def record(
         self,
@@ -206,6 +359,27 @@ class FiatComplianceRing:
         # file (entry_id.json), so it can't race another writer, and
         # keeping I/O out of the mutex avoids serializing the hot path.
         self._write_to_disk(entry)
+        # Sp1179 — mirror fiat-USD events to the SHARED rolling-total
+        # backend so a multi-replica deployment enforces the AML limit
+        # globally. Only the kinds that burn the limit (executes) +
+        # identified users; dedup_key = intent_id (PENDING→CONFIRMED→
+        # EXPIRED supersede) else the unique entry_id (offramp/legacy
+        # each count individually) — matching total_usd_for_user.
+        if (
+            self._shared_total is not None
+            and kind in self._FIAT_USD_KINDS
+            and entry.user_id
+        ):
+            self._shared_total.record(
+                user_id=entry.user_id,
+                dedup_key=str(
+                    (entry.metadata or {}).get("intent_id")
+                    or entry.entry_id
+                ),
+                entry_id=entry.entry_id,
+                usd_amount=entry.usd_amount,
+                timestamp=entry.timestamp,
+            )
         return entry
 
     def get(
@@ -278,6 +452,14 @@ class FiatComplianceRing:
         — there's no stable identity to aggregate against)."""
         if not user_id:
             return 0.0
+        # Sp1179 — in shared_redis mode, read the GLOBAL (cross-replica)
+        # total from the shared backend. Errors PROPAGATE so the tier
+        # check fails CLOSED (deny) rather than silently under-enforcing
+        # off a stale per-pod view.
+        if self._shared_total is not None:
+            return self._shared_total.total_usd_for_user(
+                user_id, window_sec=window_sec, now=time.time(),
+            )
         cutoff = time.time() - window_sec
         with self._lock:  # Sp896 — snapshot, then sum lock-free.
             snap = list(self._entries)

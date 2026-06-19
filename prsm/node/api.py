@@ -4764,6 +4764,7 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         limit_usd = _tier_limit_for_level(level)
         ring = getattr(node, "_fiat_compliance_ring", None)
         rolling = 0.0
+        rolling_failed = False
         if ring is not None:
             try:
                 rolling = float(
@@ -4775,6 +4776,10 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                     exc,
                 )
                 rolling = 0.0
+                # Sp1179 — a read failure means the rolling total is
+                # UNKNOWN. In shared_redis mode that must FAIL CLOSED
+                # (deny) rather than treat 0.0 as "under the limit".
+                rolling_failed = True
         remaining = max(0.0, limit_usd - rolling)
         exceeded = (rolling + float(requested_usd)) > limit_usd
         out["tier_level"] = level
@@ -4808,6 +4813,21 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         if mode == "strict_shared":
             out["tier_limit_exceeded"] = True
             out["tier_limit_strict_block"] = True
+        elif mode == "shared_redis":
+            # Sp1179 — the rolling total above came from the SHARED
+            # cross-replica backend (the ring's _shared_total), so the
+            # limit is enforced GLOBALLY: `exceeded` is already correct.
+            # But if the shared store is unreachable (rolling_failed) OR
+            # it wasn't wired (misconfig: mode set but no backend), we
+            # CANNOT guarantee the limit → FAIL CLOSED, exactly like
+            # strict_shared, rather than under-enforce off a 0.0 total.
+            _shared = getattr(ring, "_shared_total", None) if ring else None
+            if rolling_failed or _shared is None:
+                out["tier_limit_exceeded"] = True
+                out["tier_limit_strict_block"] = True
+                out["tier_limit_scope"] = "shared_redis_unavailable"
+            else:
+                out["tier_limit_scope"] = "shared_redis"
         return out
 
     # ── Sprint 282 — Fiat compliance audit ring ───────────
