@@ -177,6 +177,86 @@ class TestDoubleSpendPrevention:
                 description="Test with version mismatch"
             )
 
+    # ── sp1173: transfer_tokens_atomic must apply the SAME OCC guard as deduct ──
+    # (a stale version on either UPDATE -> roll the WHOLE transfer back; never commit a
+    # partial transfer that destroys/duplicates value + writes a false 'completed' tx row).
+
+    def _transfer_rows(self, from_user, to_user):
+        sender = _make_mock_row(
+            user_id=from_user, balance=Decimal("500.0"),
+            locked_balance=Decimal("0"), version=1)
+        receiver = _make_mock_row(
+            user_id=to_user, balance=Decimal("100.0"),
+            locked_balance=Decimal("0"), version=1)
+        idem = MagicMock(); idem.fetchone = MagicMock(return_value=None)
+        lock = MagicMock(); lock.fetchall = MagicMock(return_value=[sender, receiver])
+        return idem, lock
+
+    @pytest.mark.asyncio
+    async def test_transfer_receiver_version_mismatch_rolls_back_no_partial_commit(self):
+        from_user, to_user = str(uuid4()), str(uuid4())
+        mock_session = _build_mock_session()
+        service = _build_service_with_session(mock_session)
+        service.ensure_account_exists = AsyncMock()  # no-op: don't consume the mocked executes
+        idem, lock = self._transfer_rows(from_user, to_user)
+        sender_upd = MagicMock(); sender_upd.rowcount = 1   # sender debited
+        receiver_upd = MagicMock(); receiver_upd.rowcount = 0  # OCC MISS on the receiver
+        mock_session.execute = AsyncMock(side_effect=[idem, lock, sender_upd, receiver_upd])
+
+        result = await service.transfer_tokens_atomic(
+            from_user_id=from_user, to_user_id=to_user, amount=Decimal("100.0"),
+            idempotency_key=str(uuid4()), description="occ receiver miss")
+
+        assert result.success is False                       # fail-closed (no silent success)
+        assert mock_session.rollback.await_count >= 1        # rolled back
+        mock_session.commit.assert_not_awaited()             # NEVER committed a partial transfer
+        # never reached the INSERT (no false 'completed' ledger row): idempotency, lock,
+        # sender UPDATE, receiver UPDATE = 4 executes, then the guard raised.
+        assert mock_session.execute.await_count == 4
+
+    @pytest.mark.asyncio
+    async def test_transfer_sender_version_mismatch_rolls_back(self):
+        from_user, to_user = str(uuid4()), str(uuid4())
+        mock_session = _build_mock_session()
+        service = _build_service_with_session(mock_session)
+        service.ensure_account_exists = AsyncMock()  # no-op: don't consume the mocked executes
+        idem, lock = self._transfer_rows(from_user, to_user)
+        sender_upd = MagicMock(); sender_upd.rowcount = 0   # OCC MISS on the sender
+        mock_session.execute = AsyncMock(side_effect=[idem, lock, sender_upd])
+
+        result = await service.transfer_tokens_atomic(
+            from_user_id=from_user, to_user_id=to_user, amount=Decimal("100.0"),
+            idempotency_key=str(uuid4()), description="occ sender miss")
+
+        assert result.success is False
+        assert mock_session.rollback.await_count >= 1
+        mock_session.commit.assert_not_awaited()
+        # stopped at the sender UPDATE — never even ran the receiver UPDATE.
+        assert mock_session.execute.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_transfer_happy_path_commits_when_both_updates_land(self):
+        # control: both UPDATEs match (rowcount=1) -> the transfer commits successfully.
+        from_user, to_user = str(uuid4()), str(uuid4())
+        mock_session = _build_mock_session()
+        service = _build_service_with_session(mock_session)
+        service.ensure_account_exists = AsyncMock()  # no-op: don't consume the mocked executes
+        idem, lock = self._transfer_rows(from_user, to_user)
+        sender_upd = MagicMock(); sender_upd.rowcount = 1
+        receiver_upd = MagicMock(); receiver_upd.rowcount = 1
+        insert_res = MagicMock()
+        idem_insert_res = MagicMock()
+        mock_session.execute = AsyncMock(side_effect=[
+            idem, lock, sender_upd, receiver_upd, insert_res, idem_insert_res])
+
+        result = await service.transfer_tokens_atomic(
+            from_user_id=from_user, to_user_id=to_user, amount=Decimal("100.0"),
+            idempotency_key=str(uuid4()), description="happy")
+
+        assert result.success is True
+        mock_session.commit.assert_awaited()                 # committed
+        assert mock_session.execute.await_count >= 5         # reached the INSERT tx row
+
     @pytest.mark.asyncio
     async def test_insufficient_balance_check_within_transaction(self):
         """Verify balance check happens within the transaction and returns failure."""

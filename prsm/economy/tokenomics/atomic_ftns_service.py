@@ -565,8 +565,13 @@ class AtomicFTNSService:
 
                 transaction_id = f"ftns_{uuid4().hex[:12]}"
 
-                # Update sender
-                await session.execute(text("""
+                # Update sender. sp1173 OCC GUARD (money-safety): the optimistic-concurrency
+                # WHERE version=:version matches 0 rows iff a concurrent committed write staled
+                # our captured version (reachable on SQLite/non-Postgres, where the locked SELECT
+                # degrades to a plain SELECT). Mirror deduct_tokens_atomic: rowcount==0 ->
+                # rollback + raise, so we NEVER commit a partial/incorrect transfer (which would
+                # destroy or duplicate value + write a false 'completed' ledger row).
+                sender_result = await session.execute(text("""
                     UPDATE ftns_balances
                     SET balance = balance - :amount,
                         total_spent = total_spent + :amount,
@@ -578,9 +583,17 @@ class AtomicFTNSService:
                     "user_id": from_user_id,
                     "version": sender.version
                 })
+                if sender_result.rowcount == 0:
+                    await session.rollback()
+                    raise ConcurrentModificationError(
+                        "Sender balance was modified by another transaction "
+                        "(transfer aborted — no debit, no credit)"
+                    )
 
-                # Update receiver
-                await session.execute(text("""
+                # Update receiver (same OCC guard — both UPDATEs must land or the transfer
+                # rolls back atomically; a 0-row receiver UPDATE would otherwise debit the
+                # sender while never crediting the receiver = value destroyed).
+                receiver_result = await session.execute(text("""
                     UPDATE ftns_balances
                     SET balance = balance + :amount,
                         total_earned = total_earned + :amount,
@@ -592,6 +605,12 @@ class AtomicFTNSService:
                     "user_id": to_user_id,
                     "version": receiver.version
                 })
+                if receiver_result.rowcount == 0:
+                    await session.rollback()
+                    raise ConcurrentModificationError(
+                        "Receiver balance was modified by another transaction "
+                        "(transfer aborted — no debit, no credit)"
+                    )
 
                 # Record transaction
                 await session.execute(text("""
