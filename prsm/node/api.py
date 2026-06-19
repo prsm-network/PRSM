@@ -6677,6 +6677,56 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             hasattr(node, "_job_history") and node._job_history is not None
         )
 
+        # Sp1180 — CROSS-REPLICA idempotency claim (opt-in). sp1177
+        # closed the same-replica double-charge (the common keepalive/
+        # affinity retry), but on a multi-replica deployment two same-key
+        # requests routed to DIFFERENT replicas each miss the other's
+        # in-memory JobHistoryStore index and both lock an escrow (an
+        # un-refunded double-charge for a single logical request). When a
+        # shared claim store is wired (node._forge_idempotency_redis,
+        # from PRSM_FORGE_IDEMPOTENCY_REDIS_URL), atomically claim the key
+        # ACROSS replicas via SETNX BEFORE any local state / escrow: if
+        # another replica already owns it, 409 (no second escrow). This
+        # runs first so a cross-replica duplicate can't pollute the local
+        # index. Fail-OPEN to the sp1177 in-process guarantee on a claim-
+        # store error (a Redis outage must not break forge entirely; the
+        # double-charge guard is a UX/refundable concern, unlike the AML
+        # limit which fails closed).
+        _idem_redis = getattr(node, "_forge_idempotency_redis", None)
+        if idempotency_key and _idem_redis is not None:
+            try:
+                _claim_key = f"prsm:forge:idem:{idempotency_key}"
+                _claimed = _idem_redis.set(
+                    _claim_key, job_id, nx=True, ex=900,
+                )
+                if not _claimed:
+                    _owner = None
+                    try:
+                        _owner = _idem_redis.get(_claim_key)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "idempotency_key_in_progress",
+                            "owner_job_id": _owner,
+                            "message": (
+                                "A request with this Idempotency-Key is "
+                                "already in progress on another node; "
+                                "retry to fetch the result. No new escrow "
+                                "locked."
+                            ),
+                        },
+                    )
+            except HTTPException:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "sp1180: cross-replica forge idempotency claim "
+                    "raised; proceeding with the sp1177 in-process "
+                    "guarantee only: %s", exc,
+                )
+
         # Sp1177 — close the Idempotency-Key double-charge TOCTOU. The
         # top-of-handler lookup (~6403) is an UNLOCKED fast-replay
         # optimization: two concurrent requests with the SAME key both

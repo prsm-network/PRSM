@@ -3091,6 +3091,39 @@ class PRSMNode:
             )
             self._fiat_compliance_ring = None
 
+        # Sp1180 — optional SHARED (cross-replica) idempotency claim
+        # store for /compute/forge. When PRSM_FORGE_IDEMPOTENCY_REDIS_URL
+        # (or PRSM_REDIS_URL / REDIS_URL) is set, the forge endpoint
+        # atomically claims each Idempotency-Key via SETNX across
+        # replicas so a same-key request landing on a DIFFERENT replica
+        # can't lock a second escrow (the sp1177 fix only covered the
+        # same-replica window). Default None → in-process guarantee only.
+        self._forge_idempotency_redis = None
+        _forge_idem_url = (
+            os.environ.get("PRSM_FORGE_IDEMPOTENCY_REDIS_URL")
+            or os.environ.get("PRSM_REDIS_URL")
+            or os.environ.get("REDIS_URL")
+        )
+        if _forge_idem_url:
+            try:
+                import redis as _redis_sync
+
+                self._forge_idempotency_redis = _redis_sync.Redis.from_url(
+                    _forge_idem_url, decode_responses=True,
+                )
+                logger.info(
+                    "Sp1180 — cross-replica forge idempotency claim "
+                    "store wired (SETNX); same-key requests are deduped "
+                    "across replicas."
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Sp1180 — forge idempotency Redis construction "
+                    "failed (%s); /compute/forge falls back to the "
+                    "sp1177 in-process idempotency guarantee.", exc,
+                )
+                self._forge_idempotency_redis = None
+
         # Sprint 284 — webhook replay defense ring. Bounded set of
         # recently-seen signatures; second occurrence of the same
         # signature → 409.

@@ -17,6 +17,7 @@ import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
@@ -314,3 +315,151 @@ class TestConcurrentIdempotency:
         assert len(locked) == 2, (
             f"distinct keys must each lock an escrow; got {locked}"
         )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Sp1180 — CROSS-replica idempotency claim (shared Redis SETNX)
+# ──────────────────────────────────────────────────────────────────────
+
+
+class _FakeClaimRedis:
+    """Minimal sync fake of the SETNX-claim commands sp1180 uses
+    (set with nx/ex, get). Shared between two app instances simulates
+    two replicas sharing one Redis."""
+
+    def __init__(self):
+        self._d = {}
+        self.fail = False
+
+    def set(self, key, val, nx=False, ex=None):
+        if self.fail:
+            raise RuntimeError("simulated claim-redis down")
+        if nx and key in self._d:
+            return None  # redis returns None when NX and key exists
+        self._d[key] = val
+        return True
+
+    def get(self, key):
+        if self.fail:
+            raise RuntimeError("simulated claim-redis down")
+        return self._d.get(key)
+
+
+def _forge_node(*, claim_redis, locked_sink):
+    """A node that reaches create_escrow (counted into locked_sink) then
+    halts in run() — so we assert the escrow-lock COUNT."""
+    node = MagicMock()
+    node.identity.node_id = "test-node"
+    node._job_history = JobHistoryStore()  # SEPARATE per node (per-replica)
+    node.agent_forge = MagicMock(spec=["run"])
+    node.agent_forge.run = AsyncMock(
+        side_effect=RuntimeError("halt after escrow (test)"),
+    )
+    node._forge_rate_limiter = None
+    node._forge_idempotency_redis = claim_redis
+
+    async def _create_escrow(*, job_id, amount, requester_id):
+        locked_sink.append(job_id)
+        e = MagicMock()
+        e.escrow_id = "esc-" + job_id
+        return e
+
+    node._payment_escrow = MagicMock()
+    node._payment_escrow.create_escrow = _create_escrow
+    node._payment_escrow.refund_escrow = AsyncMock(return_value=True)
+    return node
+
+
+class TestCrossReplicaIdempotency:
+    async def test_cross_replica_same_key_locks_escrow_once(self):
+        """Two REPLICAS (separate apps + separate JobHistoryStores)
+        sharing ONE claim store: the first claims the key + proceeds;
+        the second sees it claimed → 409, NO second escrow."""
+        shared_claim = _FakeClaimRedis()
+        locked = []
+        appA = create_api_app(
+            _forge_node(claim_redis=shared_claim, locked_sink=locked),
+            enable_security=False,
+        )
+        appB = create_api_app(
+            _forge_node(claim_redis=shared_claim, locked_sink=locked),
+            enable_security=False,
+        )
+        body = {"query": "q", "budget_ftns": 10.0}
+
+        # Replica A claims + proceeds to escrow, then run() halts (500).
+        with pytest.raises(HTTPException) as eA:
+            await _forge_endpoint(appA)(
+                request=_make_forge_request(), body=body,
+                idempotency_key="dup-key",
+            )
+        assert eA.value.status_code == 500  # proceeded past escrow
+
+        # Replica B: same key → claim fails (A owns it) → 409, no escrow.
+        with pytest.raises(HTTPException) as eB:
+            await _forge_endpoint(appB)(
+                request=_make_forge_request(), body=body,
+                idempotency_key="dup-key",
+            )
+        assert eB.value.status_code == 409
+        assert eB.value.detail["error"] == "idempotency_key_in_progress"
+
+        assert len(locked) == 1, (
+            f"cross-replica double-charge: {len(locked)} escrows locked "
+            f"for one logical request: {locked}"
+        )
+
+    async def test_claim_store_error_fails_open_to_in_process(self):
+        """A claim-store error must NOT 409 or 500-on-claim — it falls
+        back to the sp1177 in-process guarantee (proceeds normally)."""
+        claim = _FakeClaimRedis()
+        claim.fail = True
+        locked = []
+        app = create_api_app(
+            _forge_node(claim_redis=claim, locked_sink=locked),
+            enable_security=False,
+        )
+        with pytest.raises(HTTPException) as e:
+            await _forge_endpoint(app)(
+                request=_make_forge_request(),
+                body={"query": "q", "budget_ftns": 10.0},
+                idempotency_key="k",
+            )
+        # 500 = proceeded to escrow + halted in run() (fail-open), NOT
+        # 409 (which would mean the claim wrongly blocked it).
+        assert e.value.status_code == 500
+        assert len(locked) == 1
+
+    async def test_single_request_with_claim_proceeds(self):
+        """A lone request with the claim store wired claims + proceeds
+        (the claim must not block the first/only caller)."""
+        locked = []
+        app = create_api_app(
+            _forge_node(claim_redis=_FakeClaimRedis(), locked_sink=locked),
+            enable_security=False,
+        )
+        with pytest.raises(HTTPException) as e:
+            await _forge_endpoint(app)(
+                request=_make_forge_request(),
+                body={"query": "q", "budget_ftns": 10.0},
+                idempotency_key="k",
+            )
+        assert e.value.status_code == 500  # proceeded past escrow
+        assert len(locked) == 1
+
+    async def test_no_claim_store_is_in_process_only(self):
+        """Without a claim store wired (default), behavior is the
+        sp1177 in-process path (no 409, proceeds)."""
+        locked = []
+        app = create_api_app(
+            _forge_node(claim_redis=None, locked_sink=locked),
+            enable_security=False,
+        )
+        with pytest.raises(HTTPException) as e:
+            await _forge_endpoint(app)(
+                request=_make_forge_request(),
+                body={"query": "q", "budget_ftns": 10.0},
+                idempotency_key="k",
+            )
+        assert e.value.status_code == 500
+        assert len(locked) == 1
