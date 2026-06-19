@@ -5892,6 +5892,43 @@ class PRSMNode:
                 )
                 findings_store = None
 
+        # sp1171 — the audit engine's dry_run_client must implement READ-ONLY dry_run(challenge).
+        # Previously this passed the BatchSettlementClient (commit client), which has NO dry_run
+        # at all, so EVERY surfaced finding's dry-run verdict was a silent no-op (dry_run_ok
+        # unknown). Build a KEYLESS ChallengeSubmitter (static eth_call needs only a FROM address,
+        # not a key) so the in-daemon pre-flight is real for the four challengeReceipt reasons
+        # (invalid_signature/double_spend/no_escrow/expired). (The consensus_mismatch engine path
+        # passes a ChallengeAttempt, not a to_call_args challenge, so its in-daemon dry-run stays
+        # advisory-None — the operator's prepare CLI does the real consensus dry-run; findings are
+        # surfaced regardless. NEVER broadcasts — no key is held.)
+        dry_run_client = client
+        try:
+            from web3 import Web3 as _Web3
+
+            from prsm.settlement.invalid_signature_submitter import (
+                CHALLENGE_RECEIPT_ABI as _CR_ABI,
+            )
+            from prsm.settlement.invalid_signature_submitter import (
+                ChallengeSubmitter as _ChallengeSubmitter,
+            )
+            _w3 = getattr(contract_client, "web3", None)
+            _reg_addr = getattr(contract_client, "contract_address", None)
+            if _w3 is not None and _reg_addr and self._operator_address:
+                _reg = _w3.eth.contract(
+                    address=_Web3.to_checksum_address(_reg_addr), abi=_CR_ABI)
+
+                class _FromOnly:
+                    address = _Web3.to_checksum_address(self._operator_address)
+
+                dry_run_client = _ChallengeSubmitter(
+                    web3=_w3, registry=_reg, account=_FromOnly())
+        except Exception as _dr_exc:  # noqa: BLE001 — best-effort; fall back to advisory-None
+            logger.warning(
+                "sp1171 keyless audit dry-run client unavailable (%s); dry-run verdicts "
+                "advisory-only this run", _dr_exc,
+            )
+            dry_run_client = client
+
         bundle = build_settlement_audit_components(
             enabled=True,
             gossip=self.gossip,
@@ -5899,7 +5936,7 @@ class PRSMNode:
             contract_client=contract_client,
             my_address=self._operator_address,
             group_ids=set(),
-            dry_run_client=client,
+            dry_run_client=dry_run_client,
             cursor=BlockCursor(path=cursor_path),
             store=getattr(self, "_settlement_published_batch_store", None),
             # sp1144 (§7 producer wiring) — publish the receipt-set blob (so the announced

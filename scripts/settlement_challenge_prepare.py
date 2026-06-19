@@ -17,10 +17,12 @@ Broadcasting a prepared challenge is a SEPARATE, USER-GATED action the operator 
 their OWN key via the challenge submitter, after reviewing the printed call args + dry-run
 verdict. This script reaches NO ``submit`` / sign / broadcast path.
 
-Reasons it prepares (== ChallengeSubmitter.SUPPORTED_CHALLENGE_REASONS): invalid_signature(1),
-double_spend(0), no_escrow(2), expired(3). It does NOT prepare consensus_mismatch (its own
-consensus_submitter) or §7 inference_receipt (off-chain reputation, no clean on-chain reason)
-— those are skipped with a clear message.
+Reasons it prepares: invalid_signature(1), double_spend(0), no_escrow(2), expired(3), and
+consensus_mismatch(5) (assembled here since sp1165; its dry-run/broadcast goes through the
+dedicated ConsensusChallengeSubmitter — sp1171 routes the dry-run client accordingly). A
+consensus_mismatch finding that is AMBIGUOUS (no strict-majority output — a tie/split) is
+refused (manual-review-only; sp1170). It does NOT prepare §7 inference_receipt (off-chain
+reputation, no clean on-chain reason) — that is skipped with a clear message.
 
 RECEIPT SOURCE: a persisted finding carries only hashes/ids/indices (no receipt preimages),
 so the assemblers' ordered receipt set is re-sourced from TWO PublishedBatchStore files,
@@ -117,31 +119,44 @@ def _select(records, args):
     return out
 
 
-def _build_keyless_dry_run_client(rpc_url: str, registry_address: str, from_address: str):
-    """A KEYLESS read-only dry-run client: a static eth_call needs only a ``from`` address,
-    not a private key. Reuses ChallengeSubmitter.dry_run via its (web3, registry, account)
-    injection seam — ``account`` is a from-address-only stub, so NO key is ever needed/held
-    and NO broadcast/sign path is reachable."""
+def _build_keyless_dry_run_client(reason, rpc_url: str, registry_address: str,
+                                  from_address: str):
+    """A KEYLESS read-only dry-run client for the given on-chain ``reason``. A static eth_call
+    needs only a ``from`` ADDRESS, not a private key, so we use the submitters' (web3, registry,
+    account) injection seam with a from-address-only stub — NO key is ever held + NO
+    broadcast/sign path is reachable. Reason 5 (CONSENSUS_MISMATCH) routes to
+    ConsensusChallengeSubmitter (the generalized ChallengeSubmitter rejects reason 5 — sp1171
+    fix); reasons 0-3 use the generalized ChallengeSubmitter. Both expose ``dry_run`` over a
+    prepared challenge's ``to_call_args()`` (the challengeReceipt ABI is identical)."""
     from web3 import Web3
+
+    from prsm.settlement.consensus_mismatch_assembler import REASON_CONSENSUS_MISMATCH
+
+    class _FromOnly:
+        address = Web3.to_checksum_address(from_address)
+
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    if int(reason) == REASON_CONSENSUS_MISMATCH:
+        from prsm.marketplace.consensus_submitter import ConsensusChallengeSubmitter
+        registry = w3.eth.contract(
+            address=Web3.to_checksum_address(registry_address),
+            abi=ConsensusChallengeSubmitter.CHALLENGE_RECEIPT_ABI)
+        return ConsensusChallengeSubmitter(web3=w3, registry=registry, account=_FromOnly())
 
     from prsm.settlement.invalid_signature_submitter import (
         CHALLENGE_RECEIPT_ABI,
         ChallengeSubmitter,
     )
-
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
     registry = w3.eth.contract(
         address=Web3.to_checksum_address(registry_address), abi=CHALLENGE_RECEIPT_ABI)
-
-    class _FromOnly:
-        address = Web3.to_checksum_address(from_address)
-
     return ChallengeSubmitter(web3=w3, registry=registry, account=_FromOnly())
 
 
 def _maybe_dry_run(prepared_list, args):
     """If --dry-run, read-only pre-flight each prepared challenge. Returns
-    {batch_id_hex+idx -> verdict-dict}. Requires --rpc-url/--registry-address/--from-address."""
+    {batch_id_hex+idx -> verdict-dict}. Requires --rpc-url/--registry-address/--from-address.
+    Builds the keyless dry-run client PER prepared challenge, routed by its on_chain_reason
+    (consensus_mismatch needs the ConsensusChallengeSubmitter — sp1171)."""
     if not args.dry_run:
         return {}
     missing = [n for n, v in (
@@ -150,10 +165,10 @@ def _maybe_dry_run(prepared_list, args):
     if missing:
         raise SystemExit(
             f"--dry-run requires {', '.join(missing)} (read-only; a from-address, not a key)")
-    client = _build_keyless_dry_run_client(
-        args.rpc_url, args.registry_address, args.from_address)
     verdicts = {}
     for p in prepared_list:
+        client = _build_keyless_dry_run_client(
+            p.on_chain_reason, args.rpc_url, args.registry_address, args.from_address)
         v = dry_run_prepared(p, client)  # READ-ONLY static call; never submit
         verdicts[(p.batch_id_hex, p.target_index)] = {
             "would_succeed": bool(getattr(v, "would_succeed", False)),
@@ -230,7 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="prepare only findings for this batch id (hex, 0x optional)")
     p.add_argument("--reason", default=None,
                    help="prepare only findings with this reason tag "
-                        "(invalid_signature/double_spend/no_escrow/expired)")
+                        "(invalid_signature/double_spend/no_escrow/expired/consensus_mismatch)")
     p.add_argument("--target-index", type=int, default=None,
                    help="prepare only the finding at this leaf/receipt index")
     p.add_argument("--dry-run", action="store_true",
