@@ -6652,6 +6652,69 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
 
         # Lock escrow if budget > 0
         job_id = "forge-" + _uuid.uuid4().hex[:12]
+        _job_started_at = _time_for_history.time()
+        _have_history = (
+            hasattr(node, "_job_history") and node._job_history is not None
+        )
+
+        # Sp1177 — close the Idempotency-Key double-charge TOCTOU. The
+        # top-of-handler lookup (~6403) is an UNLOCKED fast-replay
+        # optimization: two concurrent requests with the SAME key both
+        # miss it (neither has registered the key yet) and both fall
+        # through to the `await create_escrow` below — locking TWO
+        # escrows and running the pipeline twice for one logical
+        # request (a 2x charge; the pre-fix register-on-write happened
+        # only AFTER create_escrow). Close the window with a re-lookup +
+        # reserve performed SYNCHRONOUSLY here, immediately before the
+        # escrow-locking await: there is no `await` between the
+        # re-lookup and the put, so the single-threaded event loop
+        # cannot interleave another forge coroutine in this window — the
+        # reserve is atomic without a lock. A concurrent duplicate, when
+        # it next runs, sees the reserved key (here or at the top
+        # lookup) and replays instead of locking a second escrow.
+        _idem_reserved = False
+        if idempotency_key and _have_history:
+            from prsm.node.job_history import (
+                JobHistoryRecord as _JobRec,
+                JobStatus as _JobStat,
+            )
+            try:
+                _dup_job_id = node._job_history.lookup_by_idempotency_key(
+                    idempotency_key,
+                )
+                if _dup_job_id:
+                    _dup_rec = node._job_history.get(_dup_job_id)
+                    if _dup_rec is not None:
+                        return {
+                            "status": "idempotent_replay",
+                            "job_id": _dup_job_id,
+                            "history": _dup_rec.to_dict(),
+                            "note": (
+                                "Returning the cached result from a "
+                                "concurrent request with the same "
+                                "Idempotency-Key. No new escrow locked; "
+                                "no compute re-run."
+                            ),
+                        }
+                # MISS → reserve the key NOW (synchronously, before the
+                # create_escrow await) so a concurrent duplicate replays.
+                node._job_history.put_with_idempotency(
+                    _JobRec(
+                        job_id=job_id,
+                        query=query,
+                        status=_JobStat.IN_PROGRESS,
+                        started_at=_job_started_at,
+                    ),
+                    idempotency_key=idempotency_key,
+                )
+                _idem_reserved = True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Idempotency reserve raised; proceeding with a "
+                    "fresh forge (a concurrent duplicate may "
+                    "double-charge): %s", exc,
+                )
+
         escrow_entry = None
         if budget_ftns > 0 and hasattr(node, '_payment_escrow') and node._payment_escrow:
             escrow_entry = await node._payment_escrow.create_escrow(
@@ -6663,11 +6726,12 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         # B8 async-dispatch follow-on: record IN_PROGRESS to
         # JobHistoryStore so /compute/status/{job_id} can surface
         # richer state than the escrow lifecycle alone. Best-effort —
-        # store may be None on operators that haven't wired it.
-        # When Idempotency-Key header is present, also register the
-        # key → job_id mapping so retries hit the cache path above.
-        _job_started_at = _time_for_history.time()
-        if hasattr(node, "_job_history") and node._job_history is not None:
+        # store may be None on operators that haven't wired it. When the
+        # sp1177 reserve above already registered the IN_PROGRESS record
+        # + key, skip this (a re-put would be a redundant disk write);
+        # this still runs for the no-key path and the reserve-failed
+        # fallback.
+        if not _idem_reserved and _have_history:
             try:
                 from prsm.node.job_history import (
                     JobHistoryRecord as _JobRec,
