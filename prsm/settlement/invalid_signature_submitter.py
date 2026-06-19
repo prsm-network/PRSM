@@ -11,8 +11,9 @@ Brick 3 / brick 7 (challenge_assembler / double_spend_assembler) produce an
 identical shape). This module broadcasts either to
 ``BatchSettlementRegistry.challengeReceipt``. It accepts the reason codes in
 ``SUPPORTED_CHALLENGE_REASONS`` (INVALID_SIGNATURE=1, DOUBLE_SPEND=0, NO_ESCROW=2 — the
-sprint-1147 requester self-dispute, run with the REQUESTER key) and uniformly rejects any
-other reason (e.g. EXPIRED=3) without raising or broadcasting.
+sprint-1147 requester self-dispute, run with the REQUESTER key, and EXPIRED=3, the
+sprint-1148 protocol-hygiene class) and uniformly rejects any other reason (e.g.
+CONSENSUS_MISMATCH=5, which has its own consensus_submitter) without raising or broadcasting.
 
 It is INERT by default — broadcasting is a USER-GATED action (it spends gas and slashes a
 provider's staked bond; per the standing rule the assistant assembles + verifies
