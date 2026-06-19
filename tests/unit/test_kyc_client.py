@@ -153,6 +153,53 @@ def test_verified_user_can_upgrade_level():
     assert fake.initiated[-1] == ("alice", "a@x.io", "enhanced")
 
 
+class _DistinctRefBackend:
+    """Backend that returns a DISTINCT vendor_ref per inquiry (real Persona behavior — each
+    inquiry has its own id), unlike FakeVendorBackend which keys only by user_id."""
+
+    def __init__(self):
+        self.n = 0
+
+    def initiate_session(self, user_id, email, level):
+        self.n += 1
+        return {
+            "vendor_ref": f"inq-{self.n}-{level}",
+            "session_url": f"https://persona.example/{user_id}",
+            "status": KYC_STATUS_INITIATED,
+        }
+
+
+def test_stale_inquiry_approval_does_not_verify_reinitiated_higher_tier():
+    """sp1174 COMPLIANCE — a DELAYED / out-of-order approval webhook for a SUPERSEDED inquiry
+    must NOT verify the current re-initiated record (which would grant the higher AML tier on
+    the OLD lower-tier inquiry's checks). Provenance guard: update_status ignores a VERIFIED
+    whose vendor_ref != the record's current vendor_ref."""
+    c = KYCClient(vendor="persona", api_key="k", backend=_DistinctRefBackend())
+
+    rec_basic = c.initiate(user_id="alice", email="a@x.io", level=KYC_LEVEL_BASIC)
+    basic_ref = rec_basic.vendor_ref
+    # the BASIC inquiry is approved (vendor_ref matches the live record) -> verified basic.
+    c.update_status("alice", KYC_STATUS_VERIFIED, vendor_ref_update=basic_ref)
+    assert c.is_verified("alice")
+
+    # the user re-initiates at ENHANCED -> a NEW inquiry; record is enhanced/INITIATED.
+    rec_enh = c.initiate(user_id="alice", email="a@x.io", level=KYC_LEVEL_ENHANCED)
+    enhanced_ref = rec_enh.vendor_ref
+    assert enhanced_ref != basic_ref
+    assert not c.is_verified("alice")
+
+    # a DELAYED approval for the OLD basic inquiry lands -> MUST be ignored (stale provenance).
+    c.update_status("alice", KYC_STATUS_VERIFIED, vendor_ref_update=basic_ref)
+    assert not c.is_verified("alice"), (
+        "a stale basic-inquiry approval must NOT verify the re-initiated enhanced record"
+    )
+
+    # the LEGITIMATE enhanced-inquiry approval (matching vendor_ref) DOES verify.
+    c.update_status("alice", KYC_STATUS_VERIFIED, vendor_ref_update=enhanced_ref)
+    assert c.is_verified("alice")
+    assert c.get_status("alice").level == KYC_LEVEL_ENHANCED
+
+
 def test_verified_user_same_level_still_idempotent():
     """A VERIFIED user re-requesting the SAME level stays idempotent (no new
     vendor session, record unchanged) — only a level change re-initiates."""
@@ -238,14 +285,19 @@ def test_get_status_returns_none_for_unknown():
 def test_update_status_happy_path():
     fake = FakeVendorBackend()
     c = KYCClient(vendor="persona", api_key="k", backend=fake)
-    c.initiate(user_id="alice", email="a@x.io", level="basic")
+    rec = c.initiate(user_id="alice", email="a@x.io", level="basic")
+    # sp1174 — the real Persona inquiry.approved webhook carries the INQUIRY id as vendor_ref
+    # (kyc_webhook_normalizer: vendor_ref = data.id), which equals the live record's vendor_ref
+    # for the SAME inquiry. (Pre-sp1174 this test passed a FABRICATED, mismatched ref
+    # 'persona-final-ref' and asserted it verified + overwrote vendor_ref — that was the exact
+    # stale-inquiry-verifies hole the provenance guard now closes.)
     updated = c.update_status(
         "alice", KYC_STATUS_VERIFIED,
-        vendor_ref_update="persona-final-ref",
+        vendor_ref_update=rec.vendor_ref,
     )
     assert updated is not None
     assert updated.status == KYC_STATUS_VERIFIED
-    assert updated.vendor_ref == "persona-final-ref"
+    assert updated.vendor_ref == rec.vendor_ref
     assert updated.verified_at > 0
 
 

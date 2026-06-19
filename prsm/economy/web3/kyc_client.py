@@ -308,6 +308,28 @@ class KYCClient:
         old = self._records.get(user_id)
         if old is None:
             return None
+        # sp1174 COMPLIANCE-SAFETY (provenance guard): a VERIFIED transition MUST reference the
+        # CURRENT inquiry. A vendor webhook carrying a vendor_ref that does NOT match the record's
+        # current vendor_ref is a STALE/superseded approval — e.g. a delayed, out-of-order
+        # inquiry.approved for a BASIC inquiry that lands AFTER the user re-initiated at the
+        # ENHANCED level. Applying it would VERIFY the record at the current (higher) level + tier
+        # limit on the strength of the OLD (lower-tier) inquiry's checks — a real AML-tier
+        # escalation. Reject it: the stale approval is ignored; only a webhook whose vendor_ref
+        # matches the live inquiry (or one with no vendor_ref, e.g. an operator EXPIRED job) applies.
+        if (
+            new_status == KYC_STATUS_VERIFIED
+            and vendor_ref_update is not None
+            and old.vendor_ref is not None
+            and str(vendor_ref_update) != str(old.vendor_ref)
+        ):
+            logger.warning(
+                "KYC VERIFIED webhook for user %s references a STALE inquiry "
+                "(webhook vendor_ref=%s != current record vendor_ref=%s); IGNORING — a "
+                "superseded inquiry's approval cannot verify the current re-initiated "
+                "record/level (sp1174 provenance guard)",
+                user_id, vendor_ref_update, old.vendor_ref,
+            )
+            return old  # unchanged: the stale approval is NOT applied
         verified_at = (
             time.time()
             if new_status == KYC_STATUS_VERIFIED

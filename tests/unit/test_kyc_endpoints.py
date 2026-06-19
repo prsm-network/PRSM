@@ -283,13 +283,18 @@ def test_webhook_422_missing_user_id():
 
 def test_webhook_with_vendor_ref_update():
     kyc = _commissioned_kyc()
-    kyc.initiate(user_id="alice", email="a@x.io", level="basic")
+    rec = kyc.initiate(user_id="alice", email="a@x.io", level="basic")
+    # sp1174 — a real Persona inquiry.approved webhook carries the SAME inquiry's id as
+    # vendor_ref (== the live record's), so it verifies the record (vendor_ref unchanged).
+    # (Pre-sp1174 this posted a FABRICATED mismatched ref 'persona-final-ref' + asserted it
+    # overwrote vendor_ref — exactly the stale-inquiry-verifies hole the guard now closes.)
     resp = _client(kyc).post(
         "/wallet/kyc/webhook/persona",
         json={
             "user_id": "alice", "status": "VERIFIED",
-            "vendor_ref": "persona-final-ref",
+            "vendor_ref": rec.vendor_ref,
         },
     )
     body = resp.json()
-    assert body["vendor_ref"] == "persona-final-ref"
+    assert body["vendor_ref"] == rec.vendor_ref
+    assert kyc.is_verified("alice")
