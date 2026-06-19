@@ -47,6 +47,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from prsm.settlement.accumulator import BatchedReceipt
 from prsm.settlement.challenge_assembler import assemble_invalid_signature_challenge
+from prsm.settlement.consensus_mismatch_assembler import (
+    REASON_CONSENSUS_MISMATCH,
+    assemble_consensus_mismatch_challenge,
+)
 from prsm.settlement.double_spend_assembler import assemble_double_spend_challenge
 from prsm.settlement.expired_assembler import assemble_expired_challenge
 from prsm.settlement.invalid_signature_submitter import (
@@ -55,6 +59,11 @@ from prsm.settlement.invalid_signature_submitter import (
 )
 from prsm.settlement.merkle import batched_receipt_to_leaf, hash_leaf
 from prsm.settlement.no_escrow_assembler import assemble_no_escrow_challenge
+
+# Reasons this bridge can PREPARE: the generalized submitter's four (challengeReceipt ABI) PLUS
+# CONSENSUS_MISMATCH (sp1165 — assembled here, dry-run/broadcast via the dedicated
+# ConsensusChallengeSubmitter; same challengeReceipt ABI, distinct auxData layout).
+_PREPARABLE_REASONS = frozenset(SUPPORTED_CHALLENGE_REASONS | {REASON_CONSENSUS_MISMATCH})
 
 __all__ = [
     "ReceiptLookup",
@@ -250,6 +259,35 @@ def _prepare_double_spend(record: Any, receipt_lookup: ReceiptLookup):
     return challenge, target_leaf
 
 
+def _prepare_consensus_mismatch(record: Any, receipt_lookup: ReceiptLookup):
+    """Assemble a CONSENSUS_MISMATCH challenge from the finding's minority+majority coordinates
+    (settlement_audit_report._consensus_mismatch_record's detail shape) + both batches' receipts.
+    Fail-closed (ValueError) on missing/malformed detail so prepare_findings partitions it."""
+    d = record.detail or {}
+    min_bid = d.get("minority_batch_id")
+    maj_bid = d.get("majority_batch_id")
+    if not min_bid or not maj_bid:
+        raise ValueError(
+            "consensus_mismatch finding detail lacks minority_batch_id / majority_batch_id — "
+            "cannot identify the minority (challenged) + majority (conflicting) batches"
+        )
+    try:
+        min_idx = int(d["minority_leaf_index"])
+        maj_idx = int(d["majority_leaf_index"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"consensus_mismatch finding detail has malformed leaf indices ({exc})"
+        ) from exc
+    min_id, min_receipts = _require_receipts(receipt_lookup, min_bid)
+    maj_id, maj_receipts = _require_receipts(receipt_lookup, maj_bid)
+    challenge = assemble_consensus_mismatch_challenge(
+        minority_batch_id=min_id, minority_receipts=min_receipts, minority_index=min_idx,
+        majority_batch_id=maj_id, majority_receipts=maj_receipts, majority_index=maj_idx,
+    )
+    # effective target index = the minority (challenged) leaf index.
+    return challenge, min_idx
+
+
 def prepare_challenge_from_finding(
     *,
     record: Any,
@@ -280,11 +318,9 @@ def prepare_challenge_from_finding(
     elif reason == _REASON_NO_ESCROW:
         challenge, eff_target_index = _prepare_no_escrow(record, receipt_lookup)
     elif reason == _REASON_CONSENSUS_MISMATCH:
-        raise UnsupportedChallengeReason(
-            "consensus_mismatch (on-chain reason 5) is assembled + broadcast via the "
-            "dedicated marketplace consensus_submitter (its auxData layout differs from the "
-            "generalized challengeReceipt reasons); this bridge does not prepare it"
-        )
+        # sp1165 — assembled here (challengeReceipt ABI, reason 5, consensus auxData); the
+        # dry-run/broadcast goes through the dedicated ConsensusChallengeSubmitter.
+        challenge, eff_target_index = _prepare_consensus_mismatch(record, receipt_lookup)
     elif reason == _REASON_INFERENCE_RECEIPT:
         raise UnsupportedChallengeReason(
             "§7 inference_receipt grounds are off-chain reputation signals (no single clean "
@@ -293,13 +329,13 @@ def prepare_challenge_from_finding(
     else:
         raise UnsupportedChallengeReason(f"unknown finding reason {reason!r}")
 
-    # Belt-and-suspenders: never hand back a challenge the submitter would reject. (The
-    # dispatch above already maps to exactly the supported reasons; this guards a future
-    # assembler drift.)
-    if int(challenge.reason_code) not in SUPPORTED_CHALLENGE_REASONS:
+    # Belt-and-suspenders: never hand back a challenge no submitter accepts. (The dispatch
+    # above already maps to exactly the preparable reasons; this guards a future assembler
+    # drift.) _PREPARABLE_REASONS = the generalized submitter's four + CONSENSUS_MISMATCH.
+    if int(challenge.reason_code) not in _PREPARABLE_REASONS:
         raise UnsupportedChallengeReason(
-            f"assembled reason {challenge.reason_code} is not in the submitter's supported "
-            f"set {sorted(SUPPORTED_CHALLENGE_REASONS)}"
+            f"assembled reason {challenge.reason_code} is not preparable "
+            f"(supported={sorted(_PREPARABLE_REASONS)})"
         )
     return PreparedChallenge(
         reason=str(reason),

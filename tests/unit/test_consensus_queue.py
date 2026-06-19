@@ -6,6 +6,7 @@ submitter entirely.
 """
 from __future__ import annotations
 
+import base64
 import time
 from unittest.mock import MagicMock
 
@@ -32,14 +33,18 @@ from prsm.marketplace.consensus_submitter import (
 def _receipt(provider_id: str, output_hash_hex: str = None) -> ShardExecutionReceipt:
     if output_hash_hex is None:
         output_hash_hex = ("aa" * 32) if provider_id.startswith("maj") else ("bb" * 32)
+    # Real receipts carry BASE64 pubkey/signature; the committed-leaf convention
+    # (merkle.batched_receipt_to_leaf, sp1165) b64-decodes them before hashing, so use valid
+    # base64 here (still per-provider-distinct).
     return ShardExecutionReceipt(
         job_id="job-phase7.1x",
         shard_index=0,
         provider_id=provider_id,
-        provider_pubkey_b64=f"PUBKEY_{provider_id}",
+        provider_pubkey_b64=base64.b64encode(
+            f"PUBKEY_{provider_id}".encode()).decode("ascii"),
         output_hash=output_hash_hex,
         executed_at_unix=1_700_000_000,
-        signature=f"SIG_{provider_id}",
+        signature=base64.b64encode(f"SIG_{provider_id}".encode()).decode("ascii"),
     )
 
 

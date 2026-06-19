@@ -2,7 +2,8 @@
 
 Mocks web3 entirely. Verifies:
   - ReceiptLeafFields conversion from Python ShardExecutionReceipt
-    matches the contract's expected hash-of-utf8 convention.
+    matches the CANONICAL committed-leaf convention (merkle.batched_receipt_to_leaf):
+    job_id/provider_id via keccak(utf8), pubkey/signature via keccak(b64decode).
   - auxData encoding matches _handleConsensusMismatch's abi.decode layout.
   - submit_one returns success/failure uniformly, never raises.
   - submit_batch runs through all attempts even when some fail.
@@ -10,6 +11,7 @@ Mocks web3 entirely. Verifies:
 """
 from __future__ import annotations
 
+import base64
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -28,6 +30,15 @@ from prsm.economy.web3.stake_manager import ReasonCode
 # ── Helpers ──────────────────────────────────────────────────────────
 
 
+# Real receipts carry BASE64 pubkey/signature (32-byte ed25519 key, 64-byte sig), which is why
+# the committed-leaf convention (merkle.batched_receipt_to_leaf) b64-decodes them before
+# hashing. Use valid base64 here so from_python_receipt's keccak(b64decode(...)) matches.
+_PUBKEY_RAW = b"provider-ed25519-pubkey-32 bytes"   # any bytes; b64-roundtripped below
+_SIG_RAW = b"ed25519-signature-placeholder-bytes"   # any bytes; b64-roundtripped below
+_PUBKEY_B64 = base64.b64encode(_PUBKEY_RAW).decode("ascii")
+_SIG_B64 = base64.b64encode(_SIG_RAW).decode("ascii")
+
+
 def _make_receipt(
     provider_id: str = "provA",
     output_hash: bytes = b"\x01" * 32,
@@ -36,10 +47,10 @@ def _make_receipt(
         job_id="job-phase7.1",
         shard_index=0,
         provider_id=provider_id,
-        provider_pubkey_b64="PUBKEY",
+        provider_pubkey_b64=_PUBKEY_B64,
         output_hash=output_hash.hex(),
         executed_at_unix=1_700_000_000,
-        signature="SIG",
+        signature=_SIG_B64,
     )
 
 
@@ -134,9 +145,13 @@ def _stub_happy_send(w3, contract):
 
 
 def test_receipt_leaf_fields_from_python_receipt_hashes_correctly():
-    """The contract expects keccak256 of the utf-8 bytes of the string
-    fields (job_id, provider_id, pubkey_b64, signature). output_hash
-    is a raw 32-byte hex string (NOT re-hashed)."""
+    """Must match the CANONICAL committed-leaf convention (merkle.batched_receipt_to_leaf),
+    which is what the on-chain merkleRoot is folded over: job_id + provider_id are keccak256
+    of their UTF-8 bytes, but pubkey + signature are keccak256 of their BASE64-DECODED bytes
+    (NOT the utf8 of the base64 string). output_hash is a raw 32-byte hex (NOT re-hashed).
+
+    sp1165 fix: pre-fix this hashed keccak(utf8(b64)) for pubkey/sig, diverging from the
+    committed convention -> every consensus challenge reverted InvalidMerkleProof on-chain."""
     from eth_utils import keccak
 
     receipt = _make_receipt(output_hash=b"\xde\xad\xbe\xef" + b"\x00" * 28)
@@ -145,9 +160,12 @@ def test_receipt_leaf_fields_from_python_receipt_hashes_correctly():
     )
     assert fields.job_id_hash == keccak(b"job-phase7.1")
     assert fields.provider_id_hash == keccak(b"provA")
-    assert fields.provider_pubkey_hash == keccak(b"PUBKEY")
+    # pubkey + signature hash the BASE64-DECODED bytes (committed convention)
+    assert fields.provider_pubkey_hash == keccak(base64.b64decode(_PUBKEY_B64))
+    assert fields.provider_pubkey_hash == keccak(_PUBKEY_RAW)
     assert fields.output_hash == b"\xde\xad\xbe\xef" + b"\x00" * 28
-    assert fields.signature_hash == keccak(b"SIG")
+    assert fields.signature_hash == keccak(base64.b64decode(_SIG_B64))
+    assert fields.signature_hash == keccak(_SIG_RAW)
     assert fields.value_ftns_wei == 5 * 10**18
     assert fields.shard_index == 0
     assert fields.executed_at_unix == 1_700_000_000

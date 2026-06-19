@@ -43,6 +43,8 @@ import threading
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+from base64 import b64decode
+
 try:
     from web3 import Web3
     from eth_abi import encode as abi_encode
@@ -112,20 +114,29 @@ class ReceiptLeafFields:
         """Convert a Python `ShardExecutionReceipt` into the on-chain
         ReceiptLeaf fields.
 
-        Hashing rules match what the Phase 7.1 E2E test uses (so the
-        contract-side `_hashLeaf` + `_handleConsensusMismatch`
-        comparisons work byte-for-byte):
+        Hashing rules MUST match the CANONICAL committed-leaf convention in
+        ``prsm.settlement.merkle.batched_receipt_to_leaf`` (which is what the
+        production batch-commit path folds the on-chain merkleRoot over), so a
+        challenge leaf re-hashes to a value that is actually in the committed
+        tree:
 
           - job_id_hash = keccak256(job_id.utf8)
           - provider_id_hash = keccak256(provider_id.utf8)
-          - provider_pubkey_hash = keccak256(provider_pubkey_b64.utf8)
+          - provider_pubkey_hash = keccak256(b64decode(provider_pubkey_b64))
           - output_hash = bytes.fromhex(receipt.output_hash)  (hex str → 32 bytes)
-          - signature_hash = keccak256(signature.utf8)
+          - signature_hash = keccak256(b64decode(signature))
           - signing_message_hash = keccak256(signing_message.utf8)
             where signing_message is the canonical signing-payload
             (build_receipt_signing_payload). The receipt itself
             doesn't carry the message — we reconstruct it from
             (job_id, shard_index, output_hash, executed_at_unix).
+
+        sp1165 FIX: provider_pubkey_hash + signature_hash previously hashed the
+        base64 STRING bytes (keccak(utf8(b64))) — diverging from the committed
+        convention (keccak(b64decode(...))), so a CONSENSUS_MISMATCH challenge
+        hard-reverted ``InvalidMerkleProof`` against any real committed batch
+        (the contract verifies the proof on the re-hashed leaf BEFORE the reason
+        dispatch). Now aligned with merkle.batched_receipt_to_leaf.
 
         `value_ftns_wei` comes from the orchestrator's per-provider
         escrow amount; the receipt itself doesn't carry a price.
@@ -147,12 +158,12 @@ class ReceiptLeafFields:
             shard_index=receipt.shard_index,
             provider_id_hash=bytes(keccak(receipt.provider_id.encode("utf-8"))),
             provider_pubkey_hash=bytes(
-                keccak(receipt.provider_pubkey_b64.encode("utf-8"))
+                keccak(b64decode(receipt.provider_pubkey_b64))
             ),
             output_hash=output_bytes,
             executed_at_unix=receipt.executed_at_unix,
             value_ftns_wei=value_ftns_wei,
-            signature_hash=bytes(keccak(receipt.signature.encode("utf-8"))),
+            signature_hash=bytes(keccak(b64decode(receipt.signature))),
             signing_message_hash=bytes(keccak(signing_payload)),
         )
 
@@ -190,6 +201,35 @@ class ChallengeResult:
     tx_hash_hex: Optional[str]
     error_type: Optional[str]   # exception class name, None on success
     error_message: Optional[str]
+
+
+@dataclass(frozen=True)
+class ConsensusDryRunResult:
+    """Read-only pre-flight verdict — would the CONSENSUS_MISMATCH challenge succeed if
+    broadcast? Mirrors invalid_signature_submitter.DryRunResult (duck-typed: would_succeed +
+    revert_reason) without a marketplace->settlement import."""
+    would_succeed: bool
+    revert_reason: Optional[str] = None
+
+
+def encode_consensus_mismatch_aux(
+    *, majority_batch_id: bytes, majority_proof: List[bytes], majority_leaf_tuple: Tuple,
+) -> bytes:
+    """The CONSENSUS_MISMATCH ``auxData`` the on-chain ``_handleConsensusMismatch`` decodes:
+       abi.encode(bytes32 conflictingBatchId, bytes32[] majorityProof, ReceiptLeaf majorityLeaf).
+    Module-level so the sp1165 assembler reuses the EXACT layout the submitter broadcasts (no
+    drift). ``majority_leaf_tuple`` is ``ReceiptLeafFields.to_tuple()``."""
+    if not HAS_WEB3:
+        raise RuntimeError("web3 required for consensus auxData encoding")
+    return bytes(abi_encode(
+        [
+            "bytes32",
+            "bytes32[]",
+            "(bytes32,uint32,bytes32,bytes32,bytes32,uint64,uint128,bytes32,bytes32)",
+        ],
+        [bytes(majority_batch_id), [bytes(p) for p in majority_proof],
+         tuple(majority_leaf_tuple)],
+    ))
 
 
 class ConsensusChallengeSubmitter:
@@ -233,14 +273,35 @@ class ConsensusChallengeSubmitter:
 
     def __init__(
         self,
-        rpc_url: str,
-        registry_address: str,
-        private_key: str,
+        rpc_url: Optional[str] = None,
+        registry_address: Optional[str] = None,
+        private_key: Optional[str] = None,
         gas_budget: int = DEFAULT_CHALLENGE_GAS,
+        *,
+        web3: object = None,
+        registry: object = None,
+        account: object = None,
     ) -> None:
+        self._tx_lock = threading.Lock()
+        self.gas_budget = gas_budget
+        # Injection seam (sp1165) — mirrors invalid_signature_submitter.ChallengeSubmitter:
+        # inject (web3, registry, account) for tests OR a KEYLESS read-only dry-run (the
+        # ``account`` may be a from-address-only stub with no signing key, since dry_run does
+        # a static eth_call). The live broadcast path still needs the rpc/key build below.
+        if registry is not None and account is not None:
+            self.web3 = web3
+            self.registry = registry
+            self._account = account
+            self.registry_address = getattr(registry, "address", None)
+            return
         if not HAS_WEB3:
             raise RuntimeError(
                 "web3 package is required (pip install web3 eth-account)"
+            )
+        if not (rpc_url and registry_address and private_key):
+            raise ValueError(
+                "rpc_url, registry_address and private_key are required for the live path "
+                "(or inject registry+account for a keyless dry-run / tests)"
             )
         self.web3 = Web3(Web3.HTTPProvider(rpc_url))
         self.registry_address = Web3.to_checksum_address(registry_address)
@@ -249,12 +310,27 @@ class ConsensusChallengeSubmitter:
             abi=self.CHALLENGE_RECEIPT_ABI,
         )
         self._account = Account.from_key(private_key)
-        self._tx_lock = threading.Lock()
-        self.gas_budget = gas_budget
 
     @property
     def address(self) -> str:
         return self._account.address
+
+    # ── read-only pre-flight (NOT a broadcast) ─────────────────
+
+    def dry_run(self, challenge: object) -> ConsensusDryRunResult:
+        """Static eth_call of ``challengeReceipt(*challenge.to_call_args())`` against current
+        chain state — no tx, no gas, no state change. ``challenge`` is a
+        ``ConsensusMismatchChallenge`` (reason CONSENSUS_MISMATCH; ``to_call_args()`` already
+        carries the consensus auxData). Returns whether the challenge WOULD succeed. This is
+        the verify-before-broadcast pre-flight the assistant/operator runs; the actual
+        broadcast (``submit_one``) stays the separate, user-gated step."""
+        try:
+            self.registry.functions.challengeReceipt(
+                *challenge.to_call_args()
+            ).call({"from": self.address})
+            return ConsensusDryRunResult(would_succeed=True)
+        except Exception as exc:  # noqa: BLE001 — surface the revert reason, don't raise
+            return ConsensusDryRunResult(would_succeed=False, revert_reason=str(exc))
 
     # ── Writes ─────────────────────────────────────────────────
 
@@ -317,23 +393,14 @@ class ConsensusChallengeSubmitter:
     # ── Internals ──────────────────────────────────────────────
 
     def _encode_aux(self, attempt: ChallengeAttempt) -> bytes:
-        """Mirror `_handleConsensusMismatch`'s auxData layout:
-           abi.encode(bytes32 conflictingBatchId, bytes32[] majorityProof,
-                      ReceiptLeaf majorityLeaf).
-        """
-        # Sprint 347 — ReceiptLeaf gained `signingMessageHash`.
-        return bytes(abi_encode(
-            [
-                "bytes32",
-                "bytes32[]",
-                "(bytes32,uint32,bytes32,bytes32,bytes32,uint64,uint128,bytes32,bytes32)",
-            ],
-            [
-                attempt.majority_batch_id,
-                attempt.majority_proof,
-                attempt.majority_leaf.to_tuple(),
-            ],
-        ))
+        """Mirror `_handleConsensusMismatch`'s auxData layout. Delegates to the shared
+        module-level ``encode_consensus_mismatch_aux`` so the sp1165 prepare assembler and
+        this submitter encode auxData IDENTICALLY (single source of truth)."""
+        return encode_consensus_mismatch_aux(
+            majority_batch_id=attempt.majority_batch_id,
+            majority_proof=attempt.majority_proof,
+            majority_leaf_tuple=attempt.majority_leaf.to_tuple(),
+        )
 
     def _tx_overrides(self) -> dict:
         return {

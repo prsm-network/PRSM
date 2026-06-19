@@ -243,11 +243,15 @@ def test_double_spend_fewer_than_two_occurrences_is_an_error():
 # ── unsupported reasons are fail-closed (never mis-assembled) ───────────────────────
 
 
-def test_consensus_mismatch_is_unsupported_by_this_bridge():
+def test_consensus_mismatch_with_empty_detail_fails_closed():
+    # sp1165 — consensus_mismatch is now PREPARABLE (assembled via the dedicated
+    # consensus_mismatch_assembler; see test_sprint_1165). With an EMPTY/incomplete detail
+    # (no minority/majority coordinates) it fails-closed with a ValueError (not
+    # UnsupportedChallengeReason, and never mis-assembled).
     rec = AuditFindingRecord(
         reason="consensus_mismatch", batch_id_hex="ee" * 32, target_index=0,
         on_chain_reason=5, detail={})
-    with pytest.raises(UnsupportedChallengeReason):
+    with pytest.raises(ValueError):
         prepare_challenge_from_finding(
             record=rec, receipt_lookup=_lookup_from({}))
 
