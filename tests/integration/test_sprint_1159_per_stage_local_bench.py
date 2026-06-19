@@ -406,10 +406,30 @@ def test_sp1159_per_stage_onchain_payout_e2e(hardhat_node, deployed):
     }
 
     # ── (e) BRICK 4: each node commits its OWN share-batch ────────────────────
+    # sp1172 — the requester signs a PerStagePaymentAuthorization over the per-node payee set;
+    # commit_per_node_share_batches binds the escrow draw to it (fail-closed). Sign + verify use
+    # the SAME chain_id (the default — the auth is off-chain, just a sign<->verify binding).
+    from eth_utils import keccak as _keccak
+
+    from prsm.settlement.per_stage_payment_authorization import (
+        compute_payee_set_hash,
+        sign_per_stage_authorization,
+    )
+    _payees = [(committer_for_node(nid), expected_share_by_node[nid]) for nid in node_ids]
+    _auth_payload = {
+        "requester": Web3.to_checksum_address(requester),
+        "payee_set_hash": compute_payee_set_hash(_payees),
+        "total_max_spend_wei": total_wei,
+        "job_nonce": _keccak(b"sp1159-nonce-" + ir.request_id.encode()),
+        "expiry_unix": int(time.time()) + 86400,
+        "request_hash": _keccak(b"sp1159-req-" + ir.request_id.encode()),
+    }
+    _auth_sig = sign_per_stage_authorization(_auth_payload, deployed["requesterKey"])
     committed = asyncio.run(commit_per_node_share_batches(
         shares=shares,
         client_for_node=client_for_node,
         committer_address_for_node=committer_for_node,
+        authorization=(_auth_payload, _auth_sig),
     ))
     assert set(committed.keys()) == set(node_ids), (
         f"every node must commit its share-batch; got {set(committed.keys())}"

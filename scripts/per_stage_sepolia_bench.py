@@ -368,6 +368,37 @@ def _build_node_clients(*, rpc_url: str, registry: str, assembly: StageBenchAsse
     return clients
 
 
+def _build_requester_authorization(*, assembly, committer_for_node, requester_addr,
+                                   requester_key, chain_id):
+    """sp1172 — the REQUESTER signs a PerStagePaymentAuthorization over the EXACT per-node payee
+    set the bench is about to commit, so the per-node commit's fail-closed gate can bind the
+    escrow draw to what the requester authorized. Cap == the total; bound to the request +
+    a 24h expiry. Signed with the LIVE chain_id (sp1127 — the EIP-712 domain is chain-locked)."""
+    import time as _time
+
+    from eth_utils import keccak
+
+    from prsm.settlement.per_stage_payment_authorization import (
+        compute_payee_set_hash,
+        sign_per_stage_authorization,
+    )
+
+    payees = [
+        (committer_for_node(nid), int(assembly.expected_share_by_node[nid]))
+        for nid in assembly.node_ids
+    ]
+    payload = {
+        "requester": requester_addr,
+        "payee_set_hash": compute_payee_set_hash(payees),
+        "total_max_spend_wei": int(assembly.total_wei),
+        "job_nonce": keccak(f"per-stage-nonce-{assembly.request_id}".encode()),
+        "expiry_unix": int(_time.time()) + 86400,
+        "request_hash": keccak(f"per-stage-request-{assembly.request_id}".encode()),
+    }
+    signature = sign_per_stage_authorization(payload, requester_key, chain_id=chain_id)
+    return payload, signature
+
+
 async def _run_phase1(args, endpoints, chain_id) -> int:
     from eth_account import Account
     from web3 import Web3
@@ -469,10 +500,19 @@ async def _run_phase1(args, endpoints, chain_id) -> int:
     def committer_for_node(nid):
         return assembly.node_eth[nid]
 
+    # sp1172 — the requester authorizes this EXACT per-node payee set; the commit's fail-closed
+    # gate binds the escrow draw to it (refuses to commit an unauthorized/over-cap/expired set).
+    authorization = _build_requester_authorization(
+        assembly=assembly, committer_for_node=committer_for_node,
+        requester_addr=requester_addr, requester_key=requester_key, chain_id=chain_id)
+    print("requester signed the per-stage PaymentAuthorization over the per-node payee set "
+          f"(cap={assembly.total_wei} wei, {len(assembly.node_ids)} payees)")
     committed = await commit_per_node_share_batches(
         shares=assembly.shares,
         client_for_node=client_for_node,
         committer_address_for_node=committer_for_node,
+        authorization=authorization,
+        chain_id=chain_id,
     )
     if set(committed.keys()) != set(assembly.node_ids):
         missing = set(assembly.node_ids) - set(committed.keys())

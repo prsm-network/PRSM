@@ -64,7 +64,7 @@ class _EP:
 
 
 def _fake_commit_factory():
-    async def _fake_commit(*, shares, client_for_node, committer_address_for_node):
+    async def _fake_commit(*, shares, client_for_node, committer_address_for_node, **_):
         from prsm.settlement.client import CommittedBatch
         from prsm.settlement.accumulator import TriggerReason
         out = {}

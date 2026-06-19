@@ -62,16 +62,31 @@ from __future__ import annotations
 import dataclasses
 import logging
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from prsm.settlement.client import (
     BatchSettlementClient,
     CommittedBatch,
     FinalizedBatch,
 )
+from prsm.settlement.per_stage_payment_authorization import (
+    DEFAULT_CHAIN_ID,
+    verify_per_stage_authorization,
+)
 from prsm.settlement.per_stage_settlement_split import StageSettlementShare
 
 logger = logging.getLogger(__name__)
+
+# A requester-signed PerStagePaymentAuthorization: (payload_dict, signature). The payload
+# commits to a canonical payee_set_hash + cumulative cap; the signature is the requester's
+# EIP-712 signature over it (see per_stage_payment_authorization).
+PerStageAuthorization = Tuple[Dict[str, Any], Union[bytes, str]]
+
+
+class PerStageAuthorizationError(Exception):
+    """sp1172 — raised when the requester's per-stage authorization does NOT cover the per-node
+    payee set about to be committed (missing auth, unauthorized payee/share, set-hash mismatch,
+    over-cap, expired). FAIL-CLOSED: NO share-batch is committed when this raises."""
 
 
 @dataclass(frozen=True)
@@ -105,17 +120,67 @@ def _restamp_provider_address(
     return dataclasses.replace(share, batched_receipt=restamped)
 
 
+def _verify_authorization(
+    shares: List[StageSettlementShare],
+    committer_address_for_node: Callable[[str], str],
+    authorization: Optional[PerStageAuthorization],
+    chain_id: int,
+    now_unix: Optional[float],
+) -> None:
+    """sp1172 FAIL-CLOSED money-safety gate. Bind the per-node payee set ABOUT TO BE COMMITTED
+    to the requester's signed PerStagePaymentAuthorization BEFORE any commit. Verifies EVERY
+    (committer_address, share_wei) is an authorized member of the signed set (which also
+    confirms the supplied set hashes to the signed payee_set_hash + the cumulative cap holds +
+    not expired). Raises ``PerStageAuthorizationError`` on a missing auth or ANY unauthorized
+    node — so the caller commits NOTHING (no partial / unauthorized payout)."""
+    if authorization is None:
+        raise PerStageAuthorizationError(
+            "per-stage commit requires the requester's signed PerStagePaymentAuthorization "
+            "(payload, signature); refusing to commit an unauthorized payee set — the escrow "
+            "draw must be bound to what the requester actually authorized"
+        )
+    payload, signature = authorization
+    # the FINAL per-node (payee, share) pairs about to be committed.
+    payees = [
+        (committer_address_for_node(s.node_id), int(s.share_wei)) for s in shares
+    ]
+    for s in shares:
+        committer = committer_address_for_node(s.node_id)
+        verdict = verify_per_stage_authorization(
+            payload, signature,
+            payees=payees, payee=committer, share_wei=int(s.share_wei),
+            chain_id=chain_id, now_unix=now_unix,
+        )
+        if not verdict.authorized:
+            raise PerStageAuthorizationError(
+                f"per-stage authorization does NOT cover node {s.node_id} "
+                f"(payee={committer}, share={s.share_wei} wei): {verdict.reason} — "
+                f"committing NOTHING (fail-closed)"
+            )
+
+
 async def commit_per_node_share_batches(
     *,
     shares: List[StageSettlementShare],
     client_for_node: Callable[[str], BatchSettlementClient],
     committer_address_for_node: Callable[[str], str],
+    authorization: Optional[PerStageAuthorization],
+    chain_id: int = DEFAULT_CHAIN_ID,
+    now_unix: Optional[float] = None,
 ) -> Dict[str, CommittedBatch]:
     """Each node commits its OWN share-batch on-chain (``msg.sender`` == that
     node => ``b.provider`` == that node, valued at its conserving share).
 
-    PURE ORCHESTRATION of the existing per-node ``BatchSettlementClient``s — for
-    each share it: re-stamps ``provider_address`` to the node's committer address
+    sp1172 MONEY-SAFETY GATE (fail-closed, runs FIRST): the per-node payee set about to be
+    committed is bound to the requester's signed ``authorization`` (a ``PerStagePaymentAuthorization``
+    payload + signature). EVERY (committer, share) must be an authorized member of the signed set
+    (which also confirms the set hashes to the signed commitment + the cumulative cap holds + the
+    auth is unexpired). If the auth is missing or does not cover ANY node, this raises
+    ``PerStageAuthorizationError`` and commits NOTHING — the escrow draw can never exceed / diverge
+    from what the requester authorized.
+
+    PURE ORCHESTRATION of the existing per-node ``BatchSettlementClient``s — after the auth gate,
+    for each share it: re-stamps ``provider_address`` to the node's committer address
     (leaf-neutral), ``accumulate``s the single share-receipt into THAT node's
     client, then drives ``commit_ready_batches`` on that client. Because each
     share is a single receipt whose value clears the accumulator's value
@@ -134,7 +199,14 @@ async def commit_per_node_share_batches(
         by that node's eth address (the node IS its own committer).
       committer_address_for_node: node_id -> the eth address that node commits
         with (== ``client_for_node(node_id)``'s bound address).
+      authorization: the requester's signed ``PerStagePaymentAuthorization`` (payload, signature)
+        covering the per-node payee set. REQUIRED — fail-closed (a missing/insufficient auth
+        commits nothing).
+      chain_id / now_unix: the EIP-712 chain binding + the expiry clock for auth verification.
     """
+    # FAIL-CLOSED: verify the requester authorized this exact payee set BEFORE committing anything.
+    _verify_authorization(shares, committer_address_for_node, authorization, chain_id, now_unix)
+
     committed: Dict[str, CommittedBatch] = {}
     for share in shares:
         node_id = share.node_id
