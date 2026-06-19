@@ -343,14 +343,44 @@ class ConsensusChallengeSubmitter:
         or drop.
         """
         try:
-            aux = self._encode_aux(attempt)
+            call_args = (
+                attempt.minority_batch_id,
+                attempt.minority_leaf.to_tuple(),
+                attempt.minority_proof,
+                int(ReasonCode.CONSENSUS_MISMATCH),
+                self._encode_aux(attempt),
+            )
+        except Exception as exc:  # noqa: BLE001 — uniform result on a bad attempt
+            return ChallengeResult(
+                success=False, tx_hash_hex=None,
+                error_type=type(exc).__name__, error_message=str(exc),
+            )
+        return self._broadcast_call_args(call_args)
+
+    def submit(self, challenge: object) -> ChallengeResult:
+        """Sprint 1166 — USER-GATED broadcast of a PREPARED consensus challenge via its
+        ``to_call_args()`` (uniform with ``invalid_signature_submitter.ChallengeSubmitter.submit``
+        and symmetric with this submitter's ``dry_run``). Shares the exact broadcast mechanics
+        with ``submit_one`` (``_broadcast_call_args``). Never raises — returns a uniform
+        ``ChallengeResult``. Spends gas + slashes a bond: the OPERATOR invokes this with their
+        own key; the assistant never does."""
+        try:
+            call_args = tuple(challenge.to_call_args())
+        except Exception as exc:  # noqa: BLE001 — uniform result on a bad challenge
+            return ChallengeResult(
+                success=False, tx_hash_hex=None,
+                error_type=type(exc).__name__, error_message=str(exc),
+            )
+        return self._broadcast_call_args(call_args)
+
+    def _broadcast_call_args(self, call_args: Tuple) -> ChallengeResult:
+        """Sign + broadcast ``challengeReceipt(*call_args)``. The single broadcast mechanism
+        shared by ``submit_one`` + ``submit`` (nonce-lock, gas floor, three-tier error
+        classification). Never raises — returns a uniform ``ChallengeResult``."""
+        try:
             with self._tx_lock:
                 tx = self.registry.functions.challengeReceipt(
-                    attempt.minority_batch_id,
-                    attempt.minority_leaf.to_tuple(),
-                    attempt.minority_proof,
-                    int(ReasonCode.CONSENSUS_MISMATCH),
-                    aux,
+                    *call_args
                 ).build_transaction(self._tx_overrides())
                 tx_hash_hex, _ = self._sign_and_send(tx)
             return ChallengeResult(
