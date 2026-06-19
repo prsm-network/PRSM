@@ -30,6 +30,13 @@ operator path against the real chain:
     the minority leaf must hash + verify against the committed root on-chain (it would revert
     InvalidMerkleProof if the convention were still wrong), then the disagreement is proven.
 
+sp1169 then completed the on-chain validation to ALL FIVE reason codes by adding the two
+NON-slashing classes (each invalidates the leaf value on-chain rather than slashing):
+  - EXPIRED — a receipt with an ancient executed_at is stale past the committed lookback window
+    (the registry default, 30 days) so it is challengeable while still PENDING; any observer files it;
+  - NO_ESCROW — the REQUESTER self-disputes (filed with the requester's key; the contract requires
+    msg.sender == b.requester), attesting the batch was never escrowed.
+
 Slashing the provider's bond is a best-effort, stake-bond-gated step (BatchSettlementRegistry.sol
 :698-735); with no bond configured (tier_slash_rate_bps==0) the challenge still PROVES the fraud
 and invalidates the receipt — which is exactly the on-chain-agreement property under test here.
@@ -151,6 +158,7 @@ async function main() {
     registry: await registry.getAddress(), verifier: await verifier.getAddress(),
     requester: requester.address, node0: node0.address, node1: node1.address,
     challenger: challenger.address,
+    requesterKey: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
     node0Key: "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
     node1Key: "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6",
     challengerKey: "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a",
@@ -569,4 +577,130 @@ def test_consensus_mismatch_fraud_defense_onchain_e2e(hardhat_node, deployed):
     after = int(cc.contract.functions.batches(batch_min.batch_id).call()[5])
     assert after - before == minority.value_ftns, (
         f"the minority (disagreeing) receipt must be invalidated on-chain; "
+        f"before={before} after={after}")
+
+
+@requires_hardhat
+def test_expired_fraud_defense_onchain_e2e(hardhat_node, deployed):
+    """EXPIRED (on-chain reason 3) on a real EVM. A receipt with an ANCIENT executed_at
+    (1000) is stale relative to the chain clock by far more than the committed lookback
+    window (the registry default, 30 days), so it is challengeable as EXPIRED while the
+    batch is still PENDING. EXPIRED does NOT slash (protocol hygiene) — it invalidates the
+    leaf value. ANY observer may file it (no msg.sender restriction)."""
+    import time as _time
+
+    from web3 import Web3
+
+    from prsm.node.identity import generate_node_identity
+    from prsm.settlement.challenge_broadcaster import gated_broadcast_prepared
+    from prsm.settlement.challenge_preparer import prepare_challenge_from_finding
+    from prsm.settlement.invalid_signature_submitter import ChallengeSubmitter
+    from prsm.settlement.merkle import (
+        batched_receipt_to_leaf,
+        hash_leaf,
+        verify_merkle_proof,
+    )
+    from prsm.settlement.settlement_audit_report import AuditFindingRecord
+
+    requester = Web3.to_checksum_address(deployed["requester"])
+    provider = Web3.to_checksum_address(deployed["node0"])
+    idn = generate_node_identity(display_name="sp1167-expired")
+
+    # executed_at_unix is hardcoded to 1000 in _batched_receipt -> ancient vs the chain clock.
+    stale = _batched_receipt(idn, requester=requester, provider=provider, job="E", shard=0,
+                             valid=True, out=("e0" * 32), escrow="stale")
+    cc, batch = _commit_batch(hardhat_node, deployed["registry"], deployed["node0Key"],
+                              provider, [stale])
+    batch_id = batch.batch_id
+    bid_hex = batch_id.hex()
+
+    # the committed lookback window (Batch struct index 10 = lookbackWindowSecondsAtCommit).
+    onchain = cc.contract.functions.batches(batch_id).call()
+    lookback = int(onchain[10])
+    age = int(_time.time()) - 1000
+    assert lookback > 0 and age > lookback, (
+        f"expected an ancient receipt past the committed lookback; age={age} lookback={lookback}")
+
+    record = AuditFindingRecord(
+        reason="expired", batch_id_hex=bid_hex, target_index=0, on_chain_reason=3,
+        detail={"target_index": 0, "age": age, "lookback": lookback})
+    prepared = prepare_challenge_from_finding(
+        record=record,
+        receipt_lookup=lambda b: [stale] if str(b).lower().removeprefix("0x") == bid_hex else None,
+        now=int(_time.time()))
+    assert prepared.on_chain_reason == 3
+    onchain_root = bytes(onchain[2])
+    assert hash_leaf(prepared.challenge.leaf) == hash_leaf(batched_receipt_to_leaf(stale))
+    assert verify_merkle_proof(
+        prepared.challenge.merkle_proof, onchain_root, hash_leaf(prepared.challenge.leaf))
+
+    submitter = ChallengeSubmitter(
+        rpc_url=hardhat_node, registry_address=deployed["registry"],
+        private_key=deployed["challengerKey"])
+    before = int(cc.contract.functions.batches(batch_id).call()[5])
+    outcome = gated_broadcast_prepared(prepared, submitter=submitter, broadcast_enabled=True)
+    assert outcome.dry_run_ok is True, f"expired dry-run should pass: {outcome.dry_run_reason}"
+    assert outcome.broadcast is True, f"expired challenge should broadcast: {outcome.error_message}"
+    after = int(cc.contract.functions.batches(batch_id).call()[5])
+    assert after - before == stale.value_ftns, (
+        f"the stale receipt must be invalidated on-chain (EXPIRED, no slash); "
+        f"before={before} after={after}")
+
+
+@requires_hardhat
+def test_no_escrow_fraud_defense_onchain_e2e(hardhat_node, deployed):
+    """NO_ESCROW (on-chain reason 2) on a real EVM — the REQUESTER self-dispute. The on-chain
+    _handleNoEscrow requires msg.sender == b.requester, so the challenge is filed with the
+    REQUESTER's key. NO_ESCROW does NOT slash (requester-attestation / griefing risk) — it
+    invalidates the leaf value so finalize won't draw it from escrow. No escrow funding is
+    needed (the whole point is the requester attesting they never escrowed)."""
+    from web3 import Web3
+
+    from prsm.node.identity import generate_node_identity
+    from prsm.settlement.challenge_broadcaster import gated_broadcast_prepared
+    from prsm.settlement.challenge_preparer import prepare_challenge_from_finding
+    from prsm.settlement.invalid_signature_submitter import ChallengeSubmitter
+    from prsm.settlement.merkle import (
+        batched_receipt_to_leaf,
+        hash_leaf,
+        verify_merkle_proof,
+    )
+    from prsm.settlement.settlement_audit_report import AuditFindingRecord
+
+    requester = Web3.to_checksum_address(deployed["requester"])
+    provider = Web3.to_checksum_address(deployed["node0"])
+    idn = generate_node_identity(display_name="sp1167-noescrow")
+
+    # the on-chain b.requester is set from the receipt's requester_address at commit; the
+    # NO_ESCROW challenge must be filed by THAT requester's key.
+    rec = _batched_receipt(idn, requester=requester, provider=provider, job="N", shard=0,
+                           valid=True, out=("f0" * 32), escrow="noesc")
+    cc, batch = _commit_batch(hardhat_node, deployed["registry"], deployed["node0Key"],
+                              provider, [rec])
+    batch_id = batch.batch_id
+    bid_hex = batch_id.hex()
+
+    record = AuditFindingRecord(
+        reason="no_escrow", batch_id_hex=bid_hex, target_index=0, on_chain_reason=2, detail={})
+    prepared = prepare_challenge_from_finding(
+        record=record,
+        receipt_lookup=lambda b: [rec] if str(b).lower().removeprefix("0x") == bid_hex else None)
+    assert prepared.on_chain_reason == 2
+    onchain = cc.contract.functions.batches(batch_id).call()
+    onchain_root = bytes(onchain[2])
+    assert hash_leaf(prepared.challenge.leaf) == hash_leaf(batched_receipt_to_leaf(rec))
+    assert verify_merkle_proof(
+        prepared.challenge.merkle_proof, onchain_root, hash_leaf(prepared.challenge.leaf))
+
+    # filed with the REQUESTER's key (the contract checks msg.sender == b.requester).
+    submitter = ChallengeSubmitter(
+        rpc_url=hardhat_node, registry_address=deployed["registry"],
+        private_key=deployed["requesterKey"])
+    before = int(cc.contract.functions.batches(batch_id).call()[5])
+    outcome = gated_broadcast_prepared(prepared, submitter=submitter, broadcast_enabled=True)
+    assert outcome.dry_run_ok is True, f"no-escrow dry-run should pass: {outcome.dry_run_reason}"
+    assert outcome.broadcast is True, f"no-escrow challenge should broadcast: {outcome.error_message}"
+    after = int(cc.contract.functions.batches(batch_id).call()[5])
+    assert after - before == rec.value_ftns, (
+        f"the receipt must be invalidated on-chain (NO_ESCROW requester self-dispute, no slash); "
         f"before={before} after={after}")
