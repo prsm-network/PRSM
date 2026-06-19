@@ -60,6 +60,8 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from eth_utils import is_address
+
 from prsm.compute.shard_receipt import (
     ShardExecutionReceipt,
     build_receipt_signing_payload,
@@ -167,6 +169,90 @@ def compute_per_stage_shares(
     return shares
 
 
+def resolve_node_eth_payee(
+    node_id: str,
+    wallet_map: Any,
+) -> Optional[str]:
+    """Resolve a topology ``node_id`` to its REGISTERED on-chain eth payee via the
+    EXISTING ``ComputeWalletMap`` (``prsm/node/compute_wallet_map.py``) — the SAME
+    resolver the off-chain sp1031 split (``credit_policy.py``) uses to map a stage
+    node_id to the operator's registered FTNS wallet. NO new resolver is invented.
+
+    ``ComputeWalletMap.resolve`` is a PURE PASS-THROUGH: when ``node_id`` is NOT
+    mapped it returns ``node_id`` ITSELF (the recipient_id). A node_id is the 32-hex
+    ``sha256(pubkey)[:32]`` — NOT a 20-byte eth address — so an unmapped node has NO
+    valid on-chain payee. This helper is therefore FAIL-CLOSED:
+
+      - returns the resolved eth address (checksum-agnostic) ONLY when the resolved
+        value is (i) a genuinely DIFFERENT string than the raw node_id (a real
+        mapping fired, not the pass-through) AND (ii) a valid eth address
+        (``eth_utils.is_address``);
+      - returns ``None`` otherwise (unmapped pass-through, or a mapped-but-non-eth
+        value) — NEVER fabricating a payee and NEVER returning a non-address.
+
+    The ``resolved != node_id`` guard is load-bearing: it rejects the pass-through
+    even in the (impossible-for-a-real-node_id but defended) case where a node_id
+    were itself a valid eth address — an unmapped node must never be paid.
+    """
+    if wallet_map is None:
+        return None
+    try:
+        resolved = wallet_map.resolve(node_id)
+    except Exception:
+        return None
+    if not isinstance(resolved, str):
+        return None
+    # Pass-through (unmapped) -> no genuine mapping -> fail-closed.
+    if resolved == node_id:
+        return None
+    # A genuine mapping must resolve to a real eth address.
+    if not is_address(resolved):
+        return None
+    return resolved
+
+
+def build_per_stage_payee_set(
+    *,
+    receipt: Any,
+    total_value_wei: int,
+    wallet_map: Any,
+) -> Optional[List[Tuple[str, int]]]:
+    """BRICK-3 payee-set builder: the (eth_payee, share_wei) SET the requester
+    signs an authorization over (``compute_payee_set_hash`` in
+    ``per_stage_payment_authorization``). It resolves the SAME topology nodes via
+    the SAME ``ComputeWalletMap`` and assigns the SAME conserving shares the
+    brick-1 splitter stamps — so the AUTHORIZATION and the SPLIT AGREE on exactly
+    who gets paid what.
+
+    Returns ``None`` (single-payee fallback) FAIL-CLOSED identically to the
+    splitter when: the topology is absent / malformed / names < 2 distinct nodes,
+    OR any distinct node is unmapped / resolves to a non-eth value
+    (``resolve_node_eth_payee`` returns ``None``). NEVER a partial or fabricated
+    set.
+
+    Pure: no I/O, no signing, no chain. ``total_value_wei`` is validated by
+    ``compute_per_stage_shares`` (propagates on a bad total — a caller
+    programming error, not a gating condition).
+    """
+    distinct = _distinct_node_ids_with_stage(
+        getattr(receipt, "topology_assignment", None)
+    )
+    if distinct is None:
+        return None
+
+    node_ids = [node_id for node_id, _stage in distinct]
+    shares = compute_per_stage_shares(total_value_wei, node_ids)
+    share_by_node = dict(shares)
+
+    payees: List[Tuple[str, int]] = []
+    for node_id in node_ids:
+        payee = resolve_node_eth_payee(node_id, wallet_map)
+        if payee is None:
+            return None  # FAIL-CLOSED: unmapped / non-address node -> no set.
+        payees.append((payee, share_by_node[node_id]))
+    return payees
+
+
 def _distinct_node_ids_with_stage(
     topology: Any,
 ) -> Optional[List[Tuple[str, int]]]:
@@ -215,6 +301,7 @@ def split_receipt_to_per_node_batched_receipts(
     total_value_wei: int,
     node_signatures: Dict[str, NodeSignatureMaterial],
     requester_address: str,
+    wallet_map: Any = None,
     tier_slash_rate_bps: int = 0,
     consensus_group_id: bytes = b"\x00" * 32,
 ) -> Optional[List[StageSettlementShare]]:
@@ -247,11 +334,25 @@ def split_receipt_to_per_node_batched_receipts(
         shares conserve). Validated to a non-negative uint128 int.
       node_signatures: node_id → ``NodeSignatureMaterial``. Each entry is that
         node's OWN challenge-defensible shard-payload signature material.
-      requester_address: 0x-hex address that OWES (funds from escrow). The
-        per-node ``provider_address`` audit field is set to the SAME address as
-        a deliberate placeholder — the on-chain provider-of-record is
-        ``msg.sender`` (the committing NODE in brick 4), NOT this string, and
-        the splitter has no node→eth-address map (that resolution is brick 3/4).
+      requester_address: 0x-hex address that OWES (funds from escrow). When NO
+        ``wallet_map`` is supplied the per-node ``provider_address`` audit field
+        is set to the SAME address as a deliberate placeholder — the on-chain
+        provider-of-record is ``msg.sender`` (the committing NODE in brick 4),
+        NOT this string, and brick 4 re-stamps it at commit time.
+      wallet_map: OPTIONAL ``ComputeWalletMap`` (or any object exposing
+        ``resolve(node_id) -> str``). When PROVIDED, each distinct node_id is
+        resolved to its REGISTERED eth payee via the EXISTING resolver (the SAME
+        one the off-chain sp1031 split uses) and that per-node
+        ``provider_address`` is stamped to the resolved payee — so the on-chain
+        payee of record matches who the brick-3 authorization signs over.
+        FAIL-CLOSED: if ANY node is unmapped (``resolve`` passes the node_id
+        through) or resolves to a non-eth value, the WHOLE split returns ``None``
+        (single-payee fallback) — NEVER a fabricated / non-address payee, NEVER a
+        partial set. When ``None`` (the current callers incl. the benches): the
+        EXISTING placeholder behavior is byte-for-byte unchanged (additive +
+        backward-compatible). LEAF-NEUTRAL either way — the canonical leaf
+        excludes ``provider_address`` (sp1158/sp1159), so this only affects WHO
+        the on-chain payee is, never the leaf hash / value / defensibility.
       tier_slash_rate_bps / consensus_group_id: passed through to each
         per-node ``BatchedReceipt`` (validated by ``BatchedReceipt``).
 
@@ -304,6 +405,20 @@ def split_receipt_to_per_node_batched_receipts(
         return None
     job_id = per_stage_leaf_job_id(request_id)
 
+    # OPTIONAL wallet_map resolution. When supplied, resolve EVERY distinct node
+    # to its registered eth payee up-front and FAIL-CLOSED (return None) if ANY
+    # node is unmapped / resolves to a non-eth value — NEVER a partial / fabricated
+    # set. When None: the per-node provider_address stays the requester placeholder
+    # (byte-for-byte unchanged; brick 4 re-stamps at commit).
+    payee_by_node: Optional[Dict[str, str]] = None
+    if wallet_map is not None:
+        payee_by_node = {}
+        for node_id, _stage in distinct:
+            payee = resolve_node_eth_payee(node_id, wallet_map)
+            if payee is None:
+                return None
+            payee_by_node[node_id] = payee
+
     node_ids = [node_id for node_id, _stage in distinct]
     # compute_per_stage_shares validates + raises on a bad total; that is a
     # caller programming error (a non-uint128 settled amount), not a gating
@@ -315,6 +430,12 @@ def split_receipt_to_per_node_batched_receipts(
     for node_id, _stage in distinct:
         mat = node_signatures[node_id]
         share_wei = share_by_node[node_id]
+        # The on-chain payee audit field: the resolved eth payee when a wallet_map
+        # was supplied (== who brick-3 authorizes), else the requester placeholder.
+        provider_address = (
+            payee_by_node[node_id] if payee_by_node is not None
+            else requester_address
+        )
         shard_receipt = ShardExecutionReceipt(
             job_id=job_id,
             shard_index=mat.stage_index,
@@ -331,7 +452,7 @@ def split_receipt_to_per_node_batched_receipts(
         batched = BatchedReceipt(
             receipt=shard_receipt,
             requester_address=requester_address,
-            provider_address=requester_address,
+            provider_address=provider_address,
             value_ftns=int(share_wei),
             local_escrow_id=f"{job_id}::stage::{node_id}",
             tier_slash_rate_bps=tier_slash_rate_bps,
