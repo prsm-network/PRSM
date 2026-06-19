@@ -59,6 +59,18 @@ class TestPartialResultSchema:
         )
         assert p.privacy_budget_consumed == 0.0
 
+    def test_default_pcu_consumed_is_zero(self):
+        # Sp1178 — default 0.0 (→ uniform settlement fallback) when
+        # the agent doesn't report PCU.
+        p = PartialResult(
+            shard_cid="x",
+            payload=b"y",
+            agent_signature=b"\x00" * 64,
+            creator_id="c",
+            dp_noise_applied=True,
+        )
+        assert p.pcu_consumed == 0.0
+
     def test_custom_source_agent_pubkey_threaded(self):
         real_pubkey = ed25519.Ed25519PrivateKey.generate().public_key().public_bytes_raw()
         p = PartialResult(
@@ -69,9 +81,11 @@ class TestPartialResultSchema:
             dp_noise_applied=True,
             source_agent_pubkey=real_pubkey,
             privacy_budget_consumed=0.42,
+            pcu_consumed=12.5,
         )
         assert p.source_agent_pubkey == real_pubkey
         assert p.privacy_budget_consumed == 0.42
+        assert p.pcu_consumed == 12.5
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -89,6 +103,9 @@ class TestSwarmDispatcherAdapterThreading:
             "dp_noise_applied": True,
             "source_agent_pubkey": real_pubkey,
             "privacy_budget_consumed": 0.15,
+            # Sp1178 — the agent's measured PCU (AgentExecutor emits
+            # it under the "pcu" key). Pre-fix the adapter dropped it.
+            "pcu": 3.5,
         }
 
         # Mock the AgentDispatcher
@@ -129,6 +146,10 @@ class TestSwarmDispatcherAdapterThreading:
         p = partials[0]
         assert p.source_agent_pubkey == real_pubkey
         assert p.privacy_budget_consumed == 0.15
+        # Sp1178 — PCU now threads from the result dict into the
+        # PartialResult (was silently dropped → always 0.0 → settlement
+        # always uniform despite agents reporting real PCU).
+        assert p.pcu_consumed == 3.5
 
     @pytest.mark.asyncio
     async def test_dispatcher_omits_pubkey_falls_back_to_default(self):
@@ -173,6 +194,9 @@ class TestSwarmDispatcherAdapterThreading:
         assert len(partials) == 1
         assert partials[0].source_agent_pubkey == b"\x00" * 32
         assert partials[0].privacy_budget_consumed == 0.0
+        # Sp1178 — no "pcu" key reported → defaults to 0.0 (→ uniform
+        # settlement fallback), preserving backwards compatibility.
+        assert partials[0].pcu_consumed == 0.0
 
 
 # ──────────────────────────────────────────────────────────────────────

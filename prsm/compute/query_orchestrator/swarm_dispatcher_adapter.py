@@ -264,6 +264,17 @@ class SwarmDispatcherAdapter:
           - privacy_budget_consumed: epsilon spent applying DP noise.
             Defaults to 0.0 — the aggregator's sum_privacy_budgets
             ceiling check is permissive when no budget is reported.
+          - pcu_consumed: the agent's measured PCU (Provider Compute
+            Units), sourced from the result dict's ``"pcu"`` key
+            (emitted by AgentExecutor via WASMExecutionResult.pcu()).
+            Sprint 1178 — pre-fix this was NOT extracted, so it
+            defaulted to 0.0 all the way to ParticipantAttribution,
+            and compute_split_amounts (which PCU-weights only when
+            ALL participants report pcu > 0) ALWAYS fell back to a
+            uniform split — the PCU-weighted settlement attribution
+            was inert. Now threaded so a swarm where every agent
+            reports real PCU settles proportional to compute spent.
+            Defaults to 0.0 (→ uniform fallback) when unreported.
         """
         # Sprint 176 — derive source_agent_pubkey with priority:
         #   1. result["source_agent_pubkey"]: explicit 32-byte raw
@@ -304,4 +315,8 @@ class SwarmDispatcherAdapter:
             privacy_budget_consumed=float(
                 result.get("privacy_budget_consumed", 0.0)
             ),
+            # Sp1178 — thread the agent's measured PCU (result key
+            # "pcu", per AgentExecutor) so settlement can PCU-weight
+            # the compute split. Was omitted → always 0.0 → uniform.
+            pcu_consumed=float(result.get("pcu", 0.0) or 0.0),
         )
