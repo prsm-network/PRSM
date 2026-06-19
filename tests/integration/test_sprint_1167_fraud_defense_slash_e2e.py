@@ -21,6 +21,15 @@ the broadcaster against a real EVM — the strongest possible proof, and exactly
 that would have caught the consensus convention bug. A genuine NEGATIVE control (an HONEST
 receipt) confirms fraud-specificity: the assembler refuses to even build a challenge for it.
 
+sp1168 EXTENDED this to ALL THREE SLASHABLE on-chain reason codes, each driven through the same
+operator path against the real chain:
+  - INVALID_SIGNATURE (single-leaf + multi-leaf non-trivial OZ merkle proof) — real verifier;
+  - DOUBLE_SPEND — the same leaf committed in two distinct batches; conflicting-batch auxData;
+  - CONSENSUS_MISMATCH — two providers disagree in the same consensus group; consensus auxData.
+    A GREEN consensus case is the REAL-EVM CONFIRMATION of the sp1165 leaf-hash convention fix:
+    the minority leaf must hash + verify against the committed root on-chain (it would revert
+    InvalidMerkleProof if the convention were still wrong), then the disagreement is proven.
+
 Slashing the provider's bond is a best-effort, stake-bond-gated step (BatchSettlementRegistry.sol
 :698-735); with no bond configured (tier_slash_rate_bps==0) the challenge still PROVES the fraud
 and invalidates the receipt — which is exactly the on-chain-agreement property under test here.
@@ -118,7 +127,7 @@ def deployed(hardhat_node):
 const hre = require("hardhat");
 const fs = require("fs");
 async function main() {
-  const [deployer, requester, node0, challenger] = await hre.ethers.getSigners();
+  const [deployer, requester, node0, node1, challenger] = await hre.ethers.getSigners();
   const Token = await hre.ethers.getContractFactory("MockERC20");
   const token = await Token.deploy();
   await token.waitForDeployment();
@@ -135,11 +144,15 @@ async function main() {
   const verifier = await Verifier.deploy();
   await verifier.waitForDeployment();
   await registry.connect(deployer).setSignatureVerifier(await verifier.getAddress());
+  // CORRECTLY-MATCHED hardhat default account key/address pairs (testnet-only):
+  //   node0 = signer 2 (acct 2), node1 = signer 3 (acct 3), challenger = signer 4 (acct 4).
   const out = {
     token: await token.getAddress(), pool: await pool.getAddress(),
     registry: await registry.getAddress(), verifier: await verifier.getAddress(),
-    requester: requester.address, node0: node0.address, challenger: challenger.address,
-    node0Key: "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6",
+    requester: requester.address, node0: node0.address, node1: node1.address,
+    challenger: challenger.address,
+    node0Key: "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
+    node1Key: "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6",
     challengerKey: "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a",
   };
   fs.writeFileSync("/tmp/prsm_sp1167_fraud_deploy.json", JSON.stringify(out));
@@ -166,9 +179,10 @@ main().catch((e) => { console.error(e); process.exit(1); });
 
 
 def _batched_receipt(identity, *, requester, provider, job="job-1", shard=0, valid=True,
-                     out=None, value=_ONE_FTNS, escrow="e1"):
+                     out=None, value=_ONE_FTNS, escrow="e1", group=b"\x00" * 32):
     """A challenge-defensible BatchedReceipt. valid=False signs a DIFFERENT payload, so the
-    committed signature does NOT verify over this leaf's signingMessageHash (genuine fraud)."""
+    committed signature does NOT verify over this leaf's signingMessageHash (genuine fraud).
+    ``group`` sets consensus_group_id (non-zero for CONSENSUS_MISMATCH)."""
     from prsm.compute.shard_receipt import (
         ShardExecutionReceipt,
         build_receipt_signing_payload,
@@ -188,7 +202,7 @@ def _batched_receipt(identity, *, requester, provider, job="job-1", shard=0, val
         executed_at_unix=1000, signature=sig)
     return BatchedReceipt(
         receipt=rec, requester_address=requester, provider_address=provider,
-        value_ftns=value, local_escrow_id=escrow)
+        value_ftns=value, local_escrow_id=escrow, consensus_group_id=group)
 
 
 @requires_hardhat
@@ -399,4 +413,160 @@ def test_invalid_signature_multileaf_proof_onchain_e2e(hardhat_node, deployed):
     after = int(contract_client.contract.functions.batches(batch_id).call()[5])
     assert after - before == fraud_leaf_value, (
         f"fraud receipt must be invalidated on-chain via the NON-TRIVIAL proof; "
+        f"before={before} after={after}")
+
+
+def _commit_batch(hardhat_node, registry_addr, key, provider, receipts):
+    """Commit a single batch of ``receipts`` on the real chain; return (client, CommittedBatch).
+    count_threshold == len(receipts) + an astronomically-high value threshold (wei) so ONLY the
+    count triggers -> all receipts commit together in insertion order."""
+    from prsm.economy.web3.batch_settlement_contract_client import (
+        Web3SettlementContractClient,
+    )
+    from prsm.settlement.accumulator import AccumulatorConfig, ReceiptAccumulator
+    from prsm.settlement.client import BatchSettlementClient
+
+    cc = Web3SettlementContractClient(
+        rpc_url=hardhat_node, contract_address=registry_addr, private_key=key)
+    # Hardhat's auto-gas-estimate for commitBatch can come up short -> pin an explicit generous
+    # gas limit on this test's commits so they never OOG (test-side override only).
+    _orig_overrides = cc._tx_overrides
+    cc._tx_overrides = lambda: {**_orig_overrides(), "gas": 3_000_000}
+    client = BatchSettlementClient(
+        accumulator=ReceiptAccumulator(
+            AccumulatorConfig(count_threshold=len(receipts), time_threshold_seconds=3600,
+                              value_threshold_ftns=10 ** 30)),
+        contract_client=cc, provider_address=provider)
+
+    async def _go():
+        for br in receipts:
+            await client.accumulate(br)
+        return await client.commit_ready_batches()
+
+    committed = asyncio.run(_go())
+    assert len(committed) == 1, f"commit returned {len(committed)} batches (expected 1)"
+    return cc, committed[0]
+
+
+@requires_hardhat
+def test_double_spend_fraud_defense_onchain_e2e(hardhat_node, deployed):
+    """DOUBLE_SPEND on a real EVM: the SAME receipt (leaf) committed in two DISTINCT batches.
+    The operator path assembles the conflicting-batch auxData + proves the re-commit on-chain.
+    Validates the DOUBLE_SPEND auxData + the conflicting-batch merkle proof convention."""
+    from web3 import Web3
+
+    from prsm.node.identity import generate_node_identity
+    from prsm.settlement.challenge_broadcaster import gated_broadcast_prepared
+    from prsm.settlement.challenge_preparer import prepare_challenge_from_finding
+    from prsm.settlement.invalid_signature_submitter import ChallengeSubmitter
+    from prsm.settlement.merkle import batched_receipt_to_leaf, hash_leaf
+    from prsm.settlement.settlement_audit_report import AuditFindingRecord
+
+    requester = Web3.to_checksum_address(deployed["requester"])
+    provider = Web3.to_checksum_address(deployed["node0"])
+    idn = generate_node_identity(display_name="sp1167-dspend")
+
+    # the DOUBLE-COMMITTED receipt — byte-identical leaf in both batches (a valid sig is fine;
+    # double-spend is about the re-commit, not sig validity).
+    dup = _batched_receipt(idn, requester=requester, provider=provider, job="D", shard=0,
+                           valid=True, out=("d0" * 32), escrow="dup")
+    filler_a = _batched_receipt(idn, requester=requester, provider=provider, job="D", shard=1,
+                                valid=True, out=("d1" * 32), escrow="fa")
+    filler_b = _batched_receipt(idn, requester=requester, provider=provider, job="D", shard=2,
+                                valid=True, out=("d2" * 32), escrow="fb")
+    # two DISTINCT batches (different second leaf -> different root -> different batch_id), both
+    # containing ``dup`` at index 0.
+    cc, batch_a = _commit_batch(hardhat_node, deployed["registry"], deployed["node0Key"],
+                                provider, [dup, filler_a])
+    _, batch_b = _commit_batch(hardhat_node, deployed["registry"], deployed["node0Key"],
+                               provider, [dup, filler_b])
+    assert batch_a.batch_id != batch_b.batch_id
+    a_hex, b_hex = batch_a.batch_id.hex(), batch_b.batch_id.hex()
+
+    receipts_by_batch = {a_hex: [dup, filler_a], b_hex: [dup, filler_b]}
+    record = AuditFindingRecord(
+        reason="double_spend", batch_id_hex=a_hex, target_index=0, on_chain_reason=0,
+        detail={"leaf_hash": hash_leaf(batched_receipt_to_leaf(dup)).hex(),
+                "occurrences": [
+                    {"batch_id": a_hex, "leaf_index": 0, "provider_address": provider},
+                    {"batch_id": b_hex, "leaf_index": 0, "provider_address": provider}]})
+    prepared = prepare_challenge_from_finding(
+        record=record,
+        receipt_lookup=lambda b: receipts_by_batch.get(str(b).lower().removeprefix("0x")))
+    assert prepared.on_chain_reason == 0
+
+    submitter = ChallengeSubmitter(
+        rpc_url=hardhat_node, registry_address=deployed["registry"],
+        private_key=deployed["challengerKey"])
+    before = int(cc.contract.functions.batches(batch_a.batch_id).call()[5])
+    outcome = gated_broadcast_prepared(prepared, submitter=submitter, broadcast_enabled=True)
+    assert outcome.dry_run_ok is True, f"double-spend dry-run should pass: {outcome.dry_run_reason}"
+    assert outcome.broadcast is True, f"double-spend should broadcast: {outcome.error_message}"
+    after = int(cc.contract.functions.batches(batch_a.batch_id).call()[5])
+    assert after - before == dup.value_ftns, (
+        f"the double-spent receipt must be invalidated in the TARGET batch on-chain; "
+        f"before={before} after={after}")
+
+
+@requires_hardhat
+def test_consensus_mismatch_fraud_defense_onchain_e2e(hardhat_node, deployed):
+    """CONSENSUS_MISMATCH on a real EVM — and the on-chain PROOF of the sp1165 leaf-hash
+    convention fix. Two providers in the SAME consensus group return DIFFERENT outputs for the
+    same job+shard; the operator path assembles the consensus challenge (minority leaf + the
+    majority leaf/proof in auxData) and proves the disagreement on-chain. If the sp1165
+    convention were still wrong, the minority leaf would not verify against the committed root
+    and this would revert InvalidMerkleProof — so a GREEN here is the real-EVM confirmation."""
+    from web3 import Web3
+
+    from prsm.marketplace.consensus_submitter import ConsensusChallengeSubmitter
+    from prsm.node.identity import generate_node_identity
+    from prsm.settlement.challenge_broadcaster import gated_broadcast_prepared
+    from prsm.settlement.challenge_preparer import prepare_challenge_from_finding
+    from prsm.settlement.settlement_audit_report import AuditFindingRecord
+
+    requester = Web3.to_checksum_address(deployed["requester"])
+    # the two batches must be committed by DIFFERENT on-chain providers (msg.sender) — the
+    # contract's Sybil-griefing guard (BatchSettlementRegistry.sol:935).
+    min_committer = Web3.to_checksum_address(deployed["node0"])
+    maj_committer = Web3.to_checksum_address(deployed["node1"])
+    group = b"\x07" * 32  # NON-ZERO consensus group (the minority must have opted in)
+    p_min = generate_node_identity(display_name="sp1167-minority")
+    p_maj = generate_node_identity(display_name="sp1167-majority")
+
+    # same group + same job+shard, DIFFERENT providers + DIFFERENT outputs -> disagreement.
+    minority = _batched_receipt(p_min, requester=requester, provider=min_committer, job="C",
+                                shard=0, valid=True, out=("c1" * 32), escrow="cmin", group=group)
+    majority = _batched_receipt(p_maj, requester=requester, provider=maj_committer, job="C",
+                                shard=0, valid=True, out=("c2" * 32), escrow="cmaj", group=group)
+    cc, batch_min = _commit_batch(hardhat_node, deployed["registry"], deployed["node0Key"],
+                                  min_committer, [minority])
+    _, batch_maj = _commit_batch(hardhat_node, deployed["registry"], deployed["node1Key"],
+                                 maj_committer, [majority])
+    min_hex, maj_hex = batch_min.batch_id.hex(), batch_maj.batch_id.hex()
+
+    receipts_by_batch = {min_hex: [minority], maj_hex: [majority]}
+    record = AuditFindingRecord(
+        reason="consensus_mismatch", batch_id_hex=min_hex, target_index=0, on_chain_reason=5,
+        detail={"consensus_group_id": group.hex(), "job_id_hash": "00" * 32, "shard_index": 0,
+                "minority_batch_id": min_hex, "minority_leaf_index": 0,
+                "minority_output_hash": "c1" * 32,
+                "majority_batch_id": maj_hex, "majority_leaf_index": 0,
+                "majority_output_hash": "c2" * 32})
+    prepared = prepare_challenge_from_finding(
+        record=record,
+        receipt_lookup=lambda b: receipts_by_batch.get(str(b).lower().removeprefix("0x")))
+    assert prepared.on_chain_reason == 5
+
+    submitter = ConsensusChallengeSubmitter(
+        rpc_url=hardhat_node, registry_address=deployed["registry"],
+        private_key=deployed["challengerKey"])
+    before = int(cc.contract.functions.batches(batch_min.batch_id).call()[5])
+    outcome = gated_broadcast_prepared(prepared, submitter=submitter, broadcast_enabled=True)
+    assert outcome.dry_run_ok is True, (
+        f"consensus dry-run should pass on-chain (proves the sp1165 leaf convention fix): "
+        f"{outcome.dry_run_reason}")
+    assert outcome.broadcast is True, f"consensus challenge should broadcast: {outcome.error_message}"
+    after = int(cc.contract.functions.batches(batch_min.batch_id).call()[5])
+    assert after - before == minority.value_ftns, (
+        f"the minority (disagreeing) receipt must be invalidated on-chain; "
         f"before={before} after={after}")
