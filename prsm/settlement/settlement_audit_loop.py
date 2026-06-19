@@ -144,6 +144,7 @@ class SettlementAuditLoop:
         cache: Any,
         engine: Any,
         max_fetches_per_run: int = _DEFAULT_MAX_FETCHES_PER_RUN,
+        verified_batch_store: Any = None,
     ) -> None:
         if max_fetches_per_run <= 0:
             raise ValueError(
@@ -156,6 +157,12 @@ class SettlementAuditLoop:
         self._cache = cache
         self._engine = engine
         self._max_fetches_per_run = int(max_fetches_per_run)
+        # sp1164 — OPTIONAL persisted sink for verified FOREIGN batches: when wired, a batch
+        # that PASSES the on-chain-root cross-check has its ordered receipts retained (keyed by
+        # batch_id) so an out-of-daemon operator can later PREPARE a challenge for it
+        # (challenge_preparer). Default None => byte-for-byte the prior behavior (nothing
+        # persisted); the verified receipts still live in the in-memory cache for this scan.
+        self._verified_batch_store = verified_batch_store
 
     async def run_once(
         self, from_block: int, to_block: int, *, provider: Optional[str] = None,
@@ -218,6 +225,12 @@ class SettlementAuditLoop:
 
             if ok:
                 verified += 1
+                # sp1164 — retain the CROSS-CHECK-PASSED foreign batch's receipts so an
+                # out-of-daemon operator can later prepare a challenge for it. Uses the
+                # TRUSTED on-chain root (the receipts provably recompute to it — the
+                # cross-check just passed), not the blob's self-claimed root. Best-effort,
+                # never aborts the run.
+                self._retain_verified_batch(observed_with_cid, pb)
             else:
                 # Cross-check failed — the set did NOT recompute to the on-chain root,
                 # so it was NOT cached and will NOT be scanned (trust preserved).
@@ -260,3 +273,39 @@ class SettlementAuditLoop:
             expired_findings=expired_findings,
             expired_finding_count=len(expired_findings),
         )
+
+    def _retain_verified_batch(self, observed: ObservedBatch, pb: Any) -> None:
+        """Best-effort persist a CROSS-CHECK-PASSED foreign batch's ordered receipts (sp1164).
+
+        Persists with the TRUSTED on-chain ``observed.merkle_root`` (the receipts recompute to
+        it — the cross-check just passed), so a forged set can never reach here (it fails the
+        check -> ok=False -> not persisted). Retention guards no funds, so any persist error is
+        logged + swallowed and NEVER aborts the audit run. No-ops when no store is wired.
+
+        ⚠️ TRUST SCOPE: only the merkle-LEAF-bound fields of each receipt are anchored to the
+        on-chain root (job/shard/provider-pubkey/output/executed_at/value/signature — see
+        merkle.batched_receipt_to_leaf). The ``BatchedReceipt`` WRAPPER fields
+        (``provider_address`` / ``requester_address`` / ``consensus_group_id`` /
+        ``local_escrow_id`` / ``tier_slash_rate_bps``) are NOT in the leaf, so a malicious blob
+        server can alter them and still pass the cross-check. This is SAFE for the four
+        challengeReceipt assemblers (they rebuild the leaf from leaf-bound fields only, and the
+        contract re-derives the leaf hash + verifies the proof against the trusted chain root —
+        the slash lands on the chain-committed provider, never a wrapper-chosen address). A
+        FUTURE consumer of these persisted receipts MUST NOT trust a wrapper field for
+        routing/grouping/payment without re-binding it to a trusted source."""
+        store = self._verified_batch_store
+        if store is None:
+            return
+        try:
+            store.put(
+                bytes(observed.batch_id),
+                list(pb.receipts),
+                bytes(observed.merkle_root),
+                int(getattr(pb, "commit_timestamp", 0) or 0),
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort; never abort the run
+            logger.warning(
+                "SettlementAuditLoop: retaining verified batch %s failed (%s); "
+                "challenge-prep for it will need the receipt-set blob re-fetched",
+                bytes(observed.batch_id).hex(), exc,
+            )

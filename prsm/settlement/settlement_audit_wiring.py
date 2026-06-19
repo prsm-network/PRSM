@@ -221,6 +221,7 @@ def build_settlement_audit_components(
     max_cached_batches: int = 10_000,
     findings_store: Any = None,
     on_findings: Optional[Callable[[Any], None]] = None,
+    verified_batch_store: Any = None,
 ) -> Optional[SettlementAuditBundle]:
     """Assemble the audit bundle, or None when ``enabled`` is False.
 
@@ -255,6 +256,9 @@ def build_settlement_audit_components(
         cache=cache,
         engine=engine,
         max_fetches_per_run=max_fetches_per_run,
+        # sp1164 — when wired, verified FOREIGN batches are retained here so an out-of-daemon
+        # operator can later PREPARE a challenge for them. Default None => not retained.
+        verified_batch_store=verified_batch_store,
     )
 
     # sp1144 (§7 producer wiring): when a content publisher is wired the announcer

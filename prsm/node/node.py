@@ -4199,6 +4199,10 @@ class PRSMNode:
             # OFF (the default) leaves it None => no §7 retention, plain published blob,
             # money path byte-for-byte unchanged.
             _inference_receipt_store = None
+            # sp1164 — the observer's verified-foreign-batch retention store (built under the
+            # SAME audit gate). OFF (the default) leaves it None => the audit loop retains
+            # nothing for out-of-daemon challenge prep (behavior unchanged).
+            _verified_batch_store = None
             try:
                 from prsm.settlement.settlement_audit_wiring import audit_enabled
                 if audit_enabled():
@@ -4221,6 +4225,16 @@ class PRSMNode:
                         or str(_Path.home() / ".prsm" / "inference_receipts.json")
                     )
                     _inference_receipt_store = InferenceReceiptStore(_ir_store_path)
+                    # sp1164 — the observer's VERIFIED-FOREIGN-BATCH store: the audit loop
+                    # retains cross-check-passed third-party batches here so an operator can
+                    # later PREPARE a challenge for them (scripts/settlement_challenge_prepare.py).
+                    _verified_batches_path = (
+                        os.environ.get(
+                            "PRSM_SETTLEMENT_VERIFIED_BATCHES_FILE", "",
+                        ).strip()
+                        or str(_Path.home() / ".prsm" / "settlement_verified_batches.json")
+                    )
+                    _verified_batch_store = PublishedBatchStore(_verified_batches_path)
             except Exception as _audit_store_exc:  # noqa: BLE001 — never crash startup
                 logger.warning(
                     "Settlement audit retention store build failed (audit OFF for "
@@ -4228,8 +4242,10 @@ class PRSMNode:
                 )
                 _published_batch_store = None
                 _inference_receipt_store = None
+                _verified_batch_store = None
             self._settlement_published_batch_store = _published_batch_store
             self._settlement_inference_receipt_store = _inference_receipt_store
+            self._settlement_verified_batch_store = _verified_batch_store
             self._onchain_settlement_client = (
                 build_onchain_settlement_client_or_none(
                     provider_address=self._operator_address,
@@ -5896,6 +5912,12 @@ class PRSMNode:
             chain_head_fn=_chain_head,
             interval_s=max(5.0, interval),
             findings_store=findings_store,
+            # sp1164 — retain verified foreign batches so an operator can later prepare a
+            # challenge for them (scripts/settlement_challenge_prepare.py). Audit-gated; None
+            # when unbuilt => not retained (behavior unchanged).
+            verified_batch_store=getattr(
+                self, "_settlement_verified_batch_store", None,
+            ),
         )
         if bundle is None:
             return

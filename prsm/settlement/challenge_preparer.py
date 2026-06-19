@@ -66,6 +66,7 @@ __all__ = [
     "prepare_findings",
     "dry_run_prepared",
     "published_batch_receipt_lookup",
+    "composite_receipt_lookup",
 ]
 
 # The operator-visible reason tags (mirror settlement_audit_report's stable tags). NO_ESCROW
@@ -372,5 +373,23 @@ def published_batch_receipt_lookup(store: Any) -> ReceiptLookup:
     def _lookup(batch_id_hex: str) -> Optional[List[BatchedReceipt]]:
         pb = store.get(bytes.fromhex(_strip0x(batch_id_hex)))
         return list(pb.receipts) if pb is not None else None
+
+    return _lookup
+
+
+def composite_receipt_lookup(*lookups: Optional[ReceiptLookup]) -> ReceiptLookup:
+    """Compose several ``ReceiptLookup``s into one: try each in order, FIRST non-empty hit
+    wins; a lookup that returns None/[] falls through to the next. Lets the prepare CLI source
+    receipts from the producer's/requester's OWN PublishedBatchStore AND the observer's
+    verified-foreign-batch store (sp1164) — so a finding on a third-party batch the observer
+    audited prepares too. None entries are ignored; no lookups -> always None."""
+    funcs = [f for f in lookups if f is not None]
+
+    def _lookup(batch_id_hex: str) -> Optional[List[BatchedReceipt]]:
+        for f in funcs:
+            got = f(batch_id_hex)
+            if got:
+                return got
+        return None
 
     return _lookup

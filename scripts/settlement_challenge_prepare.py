@@ -23,15 +23,19 @@ consensus_submitter) or §7 inference_receipt (off-chain reputation, no clean on
 — those are skipped with a clear message.
 
 RECEIPT SOURCE: a persisted finding carries only hashes/ids/indices (no receipt preimages),
-so the assemblers' ordered receipt set is re-sourced from a ``PublishedBatchStore`` file
-(--published-batches-file; default $PRSM_SETTLEMENT_PUBLISHED_BATCHES_FILE else
-~/.prsm/settlement_published_batches.json). That store retains the producer's/requester's OWN
-batches; an observer-audited FOREIGN batch is not retained there (its receipts come from the
-data-plane receipt-set blob — a future source), so such a finding is skipped MissingBatchReceipts.
+so the assemblers' ordered receipt set is re-sourced from TWO PublishedBatchStore files,
+composed (first hit wins):
+  - --published-batches-file: the producer's/requester's OWN batches (the SAME store node.py
+    writes on commit — default $PRSM_SETTLEMENT_AUDIT_STORE_FILE else ~/.prsm/published_batches.json);
+  - --verified-batches-file: FOREIGN batches an observer audited + cross-checked on-chain (sp1164;
+    default $PRSM_SETTLEMENT_VERIFIED_BATCHES_FILE else ~/.prsm/settlement_verified_batches.json).
+A finding whose batch is in neither store is skipped MissingBatchReceipts (e.g. a foreign batch
+this node never audited — re-fetch its receipt-set blob into the verified store first).
 
 MODES (argparse):
   --findings-file PATH         persisted SettlementAuditFindingsStore (default the node path)
-  --published-batches-file P   PublishedBatchStore (the receipt source)
+  --published-batches-file P   producer's/requester's OWN batches (the receipt source)
+  --verified-batches-file P    observer-verified FOREIGN batches (the receipt source; sp1164)
   --batch-id 0x..              prepare only findings for this batch id (else: all)
   --reason TAG                 prepare only findings with this reason tag (else: all)
   --target-index N             prepare only the finding at this leaf/receipt index
@@ -40,11 +44,11 @@ MODES (argparse):
   --rpc-url / --registry-address / --from-address   for --dry-run (keyless, read-only)
   --json                       machine-readable output instead of the human render
 
-Single-line shell, offline assemble:
-  cd ~/Documents/GitHub/PRSM && python scripts/settlement_challenge_prepare.py --published-batches-file ~/.prsm/settlement_published_batches.json
+Single-line shell, offline assemble (own + observer-verified batches, the defaults):
+  cd ~/Documents/GitHub/PRSM && python scripts/settlement_challenge_prepare.py
 
 Single-line shell, with the read-only on-chain dry-run (KEYLESS — a from-address, not a key):
-  cd ~/Documents/GitHub/PRSM && python scripts/settlement_challenge_prepare.py --published-batches-file ~/.prsm/settlement_published_batches.json --dry-run --rpc-url "$RPC" --registry-address 0xF8BEEb4362222b50109b6034767322B31aA92449 --from-address 0xYourChallengerAddress
+  cd ~/Documents/GitHub/PRSM && python scripts/settlement_challenge_prepare.py --dry-run --rpc-url "$RPC" --registry-address 0xF8BEEb4362222b50109b6034767322B31aA92449 --from-address 0xYourChallengerAddress
 
 Exit codes: 0 (incl. clean "nothing to prepare"); 1 runtime failure.
 """
@@ -61,6 +65,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from prsm.settlement.challenge_preparer import (  # noqa: E402
+    composite_receipt_lookup,
     dry_run_prepared,
     prepare_findings,
     published_batch_receipt_lookup,
@@ -83,8 +88,17 @@ def _default_findings_file() -> str:
 
 
 def _default_published_batches_file() -> str:
-    env = (os.environ.get("PRSM_SETTLEMENT_PUBLISHED_BATCHES_FILE", "") or "").strip()
-    return env or str(Path.home() / ".prsm" / "settlement_published_batches.json")
+    # the SAME env + default node.py uses for the producer's PublishedBatchStore
+    # (PRSM_SETTLEMENT_AUDIT_STORE_FILE), so the CLI reads the file the daemon writes.
+    env = (os.environ.get("PRSM_SETTLEMENT_AUDIT_STORE_FILE", "") or "").strip()
+    return env or str(Path.home() / ".prsm" / "published_batches.json")
+
+
+def _default_verified_batches_file() -> str:
+    # the SAME env + default node.py uses for the observer's verified-foreign-batch store
+    # (sp1164), so the CLI reads the file the daemon's audit loop writes.
+    env = (os.environ.get("PRSM_SETTLEMENT_VERIFIED_BATCHES_FILE", "") or "").strip()
+    return env or str(Path.home() / ".prsm" / "settlement_verified_batches.json")
 
 
 def _select(records, args):
@@ -181,8 +195,14 @@ def _emit(prepared_list, skipped, verdicts, as_json: bool) -> None:
 def _run(args) -> int:
     findings_store = SettlementAuditFindingsStore(Path(args.findings_file))
     records = _select(findings_store.all_findings(), args)
-    pb_store = PublishedBatchStore(Path(args.published_batches_file))
-    lookup = published_batch_receipt_lookup(pb_store)
+    # Source receipts from the producer's/requester's OWN store AND the observer's
+    # verified-foreign-batch store (sp1164) — first-hit wins — so findings on third-party
+    # batches the observer audited prepare too.
+    own_lookup = published_batch_receipt_lookup(
+        PublishedBatchStore(Path(args.published_batches_file)))
+    verified_lookup = published_batch_receipt_lookup(
+        PublishedBatchStore(Path(args.verified_batches_file)))
+    lookup = composite_receipt_lookup(own_lookup, verified_lookup)
     prepared_list, skipped = prepare_findings(records, lookup)
     verdicts = _maybe_dry_run(prepared_list, args)
     _emit(prepared_list, skipped, verdicts, args.json)
@@ -200,7 +220,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--findings-file", default=_default_findings_file(),
                    help="persisted SettlementAuditFindingsStore (default the node path)")
     p.add_argument("--published-batches-file", default=_default_published_batches_file(),
-                   help="PublishedBatchStore file (the receipt source for assembly)")
+                   help="PublishedBatchStore file — the producer's/requester's OWN batches "
+                        "(default $PRSM_SETTLEMENT_AUDIT_STORE_FILE)")
+    p.add_argument("--verified-batches-file", default=_default_verified_batches_file(),
+                   help="verified-foreign-batch store — batches an observer audited (sp1164; "
+                        "default $PRSM_SETTLEMENT_VERIFIED_BATCHES_FILE). Composed with "
+                        "--published-batches-file so observer findings prepare too.")
     p.add_argument("--batch-id", default=None,
                    help="prepare only findings for this batch id (hex, 0x optional)")
     p.add_argument("--reason", default=None,
