@@ -245,3 +245,46 @@ def make_on_confirmed_callback(
                     "intent %s: %s", intent.intent_id, exc,
                 )
     return _on_confirmed
+
+
+def make_on_expired_callback(*, compliance_ring: Any = None):
+    """Factory that returns a callable suitable for OnrampFunnel
+    .sweep(on_expired=...).
+
+    Fires on an intent's EXPIRED transition (no USDC arrived within
+    the 24h window → abandoned). Records a TERMINAL EXPIRED
+    onramp_execute compliance entry (usd_amount=0.0, same intent_id)
+    so that:
+      - the sp884 AML rolling total stops counting the sp968 PENDING
+        reservation for this abandoned intent —
+        FiatComplianceRing.total_usd_for_user dedups by intent_id and
+        the latest-timestamp entry wins, so the $0 EXPIRED entry
+        supersedes the reserved amount; and
+      - the regulator-facing compliance audit trail (5-7yr retention)
+        is COMPLETE: an abandoned reservation gets an explicit EXPIRED
+        terminal record instead of a dangling PENDING.
+
+    No-op when the ring isn't wired. The sp874 outbound completion
+    notifier is intentionally NOT fired on expiry — it signals a
+    settled conversion, not an abandonment. Fail-soft: a ring error
+    must never abort the sweep (mirrors the on_confirmed contract).
+    """
+    def _on_expired(intent):
+        if compliance_ring is None:
+            return
+        try:
+            compliance_ring.record(
+                kind="onramp_execute",
+                user_id=intent.user_id or "",
+                usd_amount=0.0,
+                ftns_amount=0.0,
+                status="EXPIRED",
+                address=intent.destination_address,
+                metadata={"intent_id": intent.intent_id},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "sp1176: compliance ring EXPIRED record failed for "
+                "intent %s: %s", intent.intent_id, exc,
+            )
+    return _on_expired

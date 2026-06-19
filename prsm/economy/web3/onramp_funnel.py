@@ -277,6 +277,7 @@ class OnrampFunnel:
     def sweep(
         self, *, balance_reader: Any,
         on_confirmed: Optional[Any] = None,
+        on_expired: Optional[Any] = None,
         now: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Periodic sweep: check on-chain USDC balance against
@@ -352,6 +353,27 @@ class OnrampFunnel:
                 rec.status = STATUS_EXPIRED
                 rec.expired_at = now
                 expired_new += 1
+                # Sp1176 — PERSIST the EXPIRED transition BEFORE firing
+                # the callback (same at-most-once rationale as the sp891
+                # CONFIRMED path): a concurrent / post-reload sweeper
+                # observes EXPIRED and skips it (guard at the loop top),
+                # so on_expired fires exactly once per abandoned intent.
+                # The callback writes the EXPIRED $0 compliance entry —
+                # the terminal counterpart to the sp968 PENDING
+                # reservation — so the AML rolling total stops counting
+                # this abandoned onramp and the audit trail is complete.
+                self._persist(rec)
+                if on_expired is not None:
+                    try:
+                        on_expired(rec)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "OnrampFunnel sweep: on_expired "
+                            "callback raised for intent %s: %s",
+                            rec.intent_id, exc,
+                        )
+                # Already persisted above; skip the tail persist.
+                continue
             else:
                 # First sweep after recording — leave at
                 # PENDING_SETTLEMENT for operator visibility.

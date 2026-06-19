@@ -3873,6 +3873,7 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         )
         from prsm.economy.web3.onramp_to_swap_orchestrator import (
             make_on_confirmed_callback,
+            make_on_expired_callback,
         )
         from prsm.config.networks import get_network_config
         funnel = getattr(node, "_onramp_funnel", None)
@@ -3905,10 +3906,19 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 node, "_fiat_compliance_ring", None,
             ),
         )
+        # Sp1176 — write a terminal EXPIRED $0 compliance entry when an
+        # intent is abandoned, so the AML rolling total stops counting
+        # the sp968 PENDING reservation and the audit trail is complete.
+        on_expired = make_on_expired_callback(
+            compliance_ring=getattr(
+                node, "_fiat_compliance_ring", None,
+            ),
+        )
         try:
             return funnel.sweep(
                 balance_reader=reader,
                 on_confirmed=on_confirmed,
+                on_expired=on_expired,
             )
         finally:
             reader.close()

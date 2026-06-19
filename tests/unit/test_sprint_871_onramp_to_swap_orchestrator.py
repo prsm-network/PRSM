@@ -305,6 +305,143 @@ def test_callback_fail_soft_when_callback_raises(tmp_path):
     )
 
 
+# ── Sp1176: on_expired terminal compliance record ────────────
+
+def _zero_balance_reader():
+    class _ZeroBal:
+        usdc = 0.0
+        usdc_units = 0
+
+    class _Reader:
+        def get_balances(self, addr):
+            return _ZeroBal()
+    return _Reader()
+
+
+def test_on_expired_records_terminal_entry_and_clears_rolling_total(
+    tmp_path,
+):
+    """Abandoned onramp → sweep past 24h → EXPIRED. The on_expired
+    callback writes a terminal EXPIRED $0 onramp_execute entry for
+    the same intent_id, so (a) the audit trail is complete and (b)
+    the sp968 PENDING reservation stops counting against the AML
+    rolling total (dedup-by-intent, latest-wins)."""
+    from prsm.economy.web3.fiat_compliance_ring import (
+        FiatComplianceRing,
+    )
+    from prsm.economy.web3.onramp_funnel import (
+        _EXPIRY_SECONDS, STATUS_EXPIRED,
+    )
+    from prsm.economy.web3.onramp_to_swap_orchestrator import (
+        make_on_expired_callback,
+    )
+
+    ring = FiatComplianceRing()
+    funnel = OnrampFunnel(persist_dir=tmp_path)
+    rec = funnel.record_intent(
+        user_id="alice",
+        destination_address="0x" + "11" * 20,
+        expected_usd=500.0, session_token="tk",
+    )
+    # Mirror the api.py sp968 PENDING reservation at session mint.
+    ring.record(
+        kind="onramp_execute", user_id="alice", usd_amount=500.0,
+        ftns_amount=0.0, status="PENDING",
+        metadata={"intent_id": rec.intent_id},
+    )
+    assert ring.total_usd_for_user("alice") == 500.0  # reserved
+
+    on_expired = make_on_expired_callback(compliance_ring=ring)
+    summary = funnel.sweep(
+        balance_reader=_zero_balance_reader(),
+        on_expired=on_expired,
+        now=rec.created_at + _EXPIRY_SECONDS + 1,  # past the window
+    )
+    assert summary["expired_new"] == 1
+    assert funnel.get_intent(rec.intent_id).status == STATUS_EXPIRED
+
+    expired = [
+        e for e in ring.recent(limit=100, user_id="alice")
+        if e.status == "EXPIRED"
+    ]
+    assert len(expired) == 1
+    assert expired[0].usd_amount == 0.0
+    assert expired[0].metadata["intent_id"] == rec.intent_id
+    # The abandoned reservation no longer counts against the limit.
+    assert ring.total_usd_for_user("alice") == 0.0
+
+
+def test_on_expired_fires_at_most_once(tmp_path):
+    """A second sweep does NOT re-record EXPIRED: the intent is
+    already terminal, so the loop skips it (the at-most-once
+    guarantee, same as the sp891 CONFIRMED path)."""
+    from prsm.economy.web3.fiat_compliance_ring import (
+        FiatComplianceRing,
+    )
+    from prsm.economy.web3.onramp_funnel import _EXPIRY_SECONDS
+    from prsm.economy.web3.onramp_to_swap_orchestrator import (
+        make_on_expired_callback,
+    )
+
+    ring = FiatComplianceRing()
+    funnel = OnrampFunnel(persist_dir=tmp_path)
+    rec = funnel.record_intent(
+        user_id="alice",
+        destination_address="0x" + "11" * 20,
+        expected_usd=500.0, session_token="tk",
+    )
+    on_expired = make_on_expired_callback(compliance_ring=ring)
+    when = rec.created_at + _EXPIRY_SECONDS + 1
+    funnel.sweep(
+        balance_reader=_zero_balance_reader(),
+        on_expired=on_expired, now=when,
+    )
+    summary2 = funnel.sweep(
+        balance_reader=_zero_balance_reader(),
+        on_expired=on_expired, now=when + 5,
+    )
+    assert summary2["expired_new"] == 0  # already terminal, skipped
+    expired = [
+        e for e in ring.recent(limit=100, user_id="alice")
+        if e.status == "EXPIRED"
+    ]
+    assert len(expired) == 1  # still exactly one terminal record
+
+
+def test_on_expired_fail_soft_when_callback_raises(tmp_path):
+    """A misbehaving on_expired callback must NOT undo the EXPIRED
+    transition (mirrors the on_confirmed fail-soft contract)."""
+    from prsm.economy.web3.onramp_funnel import (
+        _EXPIRY_SECONDS, STATUS_EXPIRED,
+    )
+    funnel = OnrampFunnel(persist_dir=tmp_path)
+    rec = funnel.record_intent(
+        user_id="alice",
+        destination_address="0x" + "11" * 20,
+        expected_usd=500.0, session_token="tk",
+    )
+
+    def _bad(intent):
+        raise RuntimeError("simulated on_expired bug")
+
+    summary = funnel.sweep(
+        balance_reader=_zero_balance_reader(),
+        on_expired=_bad,
+        now=rec.created_at + _EXPIRY_SECONDS + 1,
+    )
+    assert summary["expired_new"] == 1
+    assert funnel.get_intent(rec.intent_id).status == STATUS_EXPIRED
+
+
+def test_make_on_expired_callback_noop_when_ring_none():
+    """No compliance ring wired → the callback is a safe no-op."""
+    from prsm.economy.web3.onramp_to_swap_orchestrator import (
+        make_on_expired_callback,
+    )
+    cb = make_on_expired_callback(compliance_ring=None)
+    cb(_FakeIntent())  # must not raise
+
+
 def test_intent_dataclass_includes_swap_envelope_field():
     """The dataclass roundtrip preserves swap_envelope."""
     intent = OnrampIntent(

@@ -5311,6 +5311,7 @@ class PRSMNode:
                 )
                 from prsm.economy.web3.onramp_to_swap_orchestrator import (  # noqa: E501
                     make_on_confirmed_callback,
+                    make_on_expired_callback,
                 )
                 from prsm.economy.web3.onramp_completion_notifier import (  # noqa: E501
                     from_env as _notifier_from_env,
@@ -5339,10 +5340,20 @@ class PRSMNode:
                         self, "_fiat_compliance_ring", None,
                     ),
                 )
+                # Sp1176 — terminal EXPIRED $0 compliance entry on an
+                # abandoned intent (AML rolling-total correctness +
+                # complete audit trail); same callback the manual
+                # /wallet/onramp/sweep endpoint wires.
+                on_expired = make_on_expired_callback(
+                    compliance_ring=getattr(
+                        self, "_fiat_compliance_ring", None,
+                    ),
+                )
                 try:
                     return funnel.sweep(
                         balance_reader=reader,
                         on_confirmed=on_confirmed,
+                        on_expired=on_expired,
                     )
                 finally:
                     reader.close()
