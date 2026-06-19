@@ -56,6 +56,7 @@ ZERO_GROUP = b"\x00" * 32
 G1 = b"\x11" * 32
 PROV_A = "0x" + "a" * 40
 PROV_B = "0x" + "b" * 40
+PROV_C = "0x" + "c" * 40
 REQ = "0x" + "1" * 40
 
 
@@ -262,9 +263,28 @@ def _ingest_cogroup_pair(cache, *, out_a="11" * 32, out_b="22" * 32):
     return ba_id, bb_id
 
 
+def _ingest_cogroup_majority(cache, *, out_majority="11" * 32, out_minority="22" * 32):
+    """sp1170 — a 2-of-3 STRICT majority: PROV_A + PROV_B agree on out_majority (the honest
+    answer); PROV_C (lone faulty) commits out_minority. Returns (a_id, b_id, c_id). Only C is a
+    legitimately-challengeable minority; A + B must NEVER be the slash target."""
+    a = generate_node_identity("a")
+    b = generate_node_identity("b")
+    c = generate_node_identity("c")
+    ra = _receipt(a, job="J", shard=2, out=out_majority, provider=PROV_A, group=G1)
+    rb = _receipt(b, job="J", shard=2, out=out_majority, provider=PROV_B, group=G1)
+    rc = _receipt(c, job="J", shard=2, out=out_minority, provider=PROV_C, group=G1)
+    a_id, b_id, c_id = b"\xa1" * 32, b"\xb1" * 32, b"\xc1" * 32
+    assert cache.ingest(_observed(a_id, [ra], provider=PROV_A, group=G1), _published(a_id, [ra]))
+    assert cache.ingest(_observed(b_id, [rb], provider=PROV_B, group=G1), _published(b_id, [rb]))
+    assert cache.ingest(_observed(c_id, [rc], provider=PROV_C, group=G1), _published(c_id, [rc]))
+    return a_id, b_id, c_id
+
+
 def test_scan_surfaces_planted_mismatch_and_dry_runs_without_broadcast():
+    # sp1170 — a genuine 2-of-3 STRICT majority: A+B agree, C is the lone faulty minority.
+    # ONLY C is challengeable; the honest majority providers are NEVER the slash target.
     cache = VerifiedBatchCache()
-    _ingest_cogroup_pair(cache)
+    _ingest_cogroup_majority(cache)
     client = _FakeDryRunClient(would_succeed=True)
     engine = SettlementAuditEngine(cache, dry_run_client=client)
 
@@ -272,6 +292,9 @@ def test_scan_surfaces_planted_mismatch_and_dry_runs_without_broadcast():
     assert len(findings) == 1
     af = findings[0]
     assert af.finding.consensus_group_id == G1
+    assert af.finding.ambiguous is False                  # a strict majority exists
+    assert af.finding.minority_provider == PROV_C          # the FAULTY one, NOT honest A/B
+    assert af.finding.majority_provider in (PROV_A, PROV_B)
     assert af.dry_run_ok is True
     # A ChallengeAttempt was assembled and passed to dry_run.
     assert len(client.dry_run_calls) == 1
@@ -279,6 +302,24 @@ def test_scan_surfaces_planted_mismatch_and_dry_runs_without_broadcast():
     # NEVER broadcasts.
     client.submit_one.assert_not_called()
     client.submit_batch.assert_not_called()
+    client.broadcast.assert_not_called()
+
+
+def test_scan_one_vs_one_is_ambiguous_not_auto_challenged():
+    # sp1170 — a 1-vs-1 disagreement has NO strict majority (a tie): the honest side is
+    # undeterminable off-chain, so the finding is SURFACED but ambiguous + NOT auto-challenged
+    # (no ChallengeAttempt assembled, no dry-run verdict). Prevents a wrongful auto-slash.
+    cache = VerifiedBatchCache()
+    _ingest_cogroup_pair(cache)
+    client = _FakeDryRunClient(would_succeed=True)
+    engine = SettlementAuditEngine(cache, dry_run_client=client)
+    findings = engine.scan_consensus_mismatches()
+    assert len(findings) >= 1
+    for af in findings:
+        assert af.finding.ambiguous is True
+        assert af.dry_run_ok is None          # never auto-dry-run an ambiguous slash
+    assert len(client.dry_run_calls) == 0     # nothing assembled -> nothing dry-run
+    client.submit_one.assert_not_called()
     client.broadcast.assert_not_called()
 
 
@@ -378,16 +419,23 @@ async def test_loop_run_once_surfaces_and_counts_consensus_mismatch():
     from prsm.settlement.settlement_audit_loop import SettlementAuditLoop
 
     cache = VerifiedBatchCache()
+    # sp1170 — a 2-of-3 strict majority (A+B agree on the honest output, C is the lone faulty
+    # minority) so the surfaced finding has a genuine, auto-challengeable minority (C).
     a = generate_node_identity("a")
     b = generate_node_identity("b")
+    c = generate_node_identity("c")
     ra = _receipt(a, job="J", shard=2, out=("11" * 32), provider=PROV_A, group=G1)
-    rb = _receipt(b, job="J", shard=2, out=("22" * 32), provider=PROV_B, group=G1)
+    rb = _receipt(b, job="J", shard=2, out=("11" * 32), provider=PROV_B, group=G1)  # agrees with A
+    rc = _receipt(c, job="J", shard=2, out=("22" * 32), provider=PROV_C, group=G1)  # minority
     ba_id = b"\xa1" * 32
     bb_id = b"\xb1" * 32
+    bc_id = b"\xc1" * 32
     obs_a = _observed(ba_id, [ra], provider=PROV_A, group=G1)
     obs_b = _observed(bb_id, [rb], provider=PROV_B, group=G1)
+    obs_c = _observed(bc_id, [rc], provider=PROV_C, group=G1)
     pb_a = _published(ba_id, [ra])
     pb_b = _published(bb_id, [rb])
+    pb_c = _published(bc_id, [rc])
 
     client = _FakeDryRunClient(would_succeed=True)
     engine = SettlementAuditEngine(cache, dry_run_client=client)
@@ -397,12 +445,13 @@ async def test_loop_run_once_surfaces_and_counts_consensus_mismatch():
     blob_by_cid = {
         "cid-a": serialize_receipt_set(pb_a),
         "cid-b": serialize_receipt_set(pb_b),
+        "cid-c": serialize_receipt_set(pb_c),
     }
-    cid_by_batch = {ba_id: "cid-a", bb_id: "cid-b"}
+    cid_by_batch = {ba_id: "cid-a", bb_id: "cid-b", bc_id: "cid-c"}
 
     class _Enum:
         async def enumerate_committed_batches(self, f, t, *, provider=None):
-            return [obs_a, obs_b]
+            return [obs_a, obs_b, obs_c]
 
     class _Sel:
         def select(self, observed):
@@ -422,10 +471,12 @@ async def test_loop_run_once_surfaces_and_counts_consensus_mismatch():
         fetcher=_Fetch(), cache=cache, engine=engine)
 
     result = await loop.run_once(0, 100)
-    assert result.verified == 2
+    assert result.verified == 3
     assert result.consensus_mismatch_finding_count == 1
     assert len(result.consensus_mismatch_findings) == 1
-    assert result.consensus_mismatch_findings[0].dry_run_ok is True
+    af = result.consensus_mismatch_findings[0]
+    assert af.dry_run_ok is True
+    assert af.finding.minority_provider == PROV_C  # the faulty minority, not honest A/B
     # NEVER broadcasts.
     client.submit_one.assert_not_called()
     client.broadcast.assert_not_called()

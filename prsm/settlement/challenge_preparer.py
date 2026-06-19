@@ -185,7 +185,7 @@ def _prepare_no_escrow(record: Any, receipt_lookup: ReceiptLookup):
 
 
 def _prepare_expired(record: Any, receipt_lookup: ReceiptLookup, now: Optional[int]):
-    lookback = (record.detail or {}).get("lookback")
+    lookback = (record.detail if isinstance(record.detail, dict) else {}).get("lookback")
     if lookback is None:
         raise ValueError(
             "expired finding detail lacks 'lookback' — cannot prove expiry without a "
@@ -216,7 +216,8 @@ def _occ_batch_and_index(o: Any) -> Tuple[str, int]:
 
 
 def _prepare_double_spend(record: Any, receipt_lookup: ReceiptLookup):
-    occ = list((record.detail or {}).get("occurrences") or [])
+    occ = list(
+        (record.detail if isinstance(record.detail, dict) else {}).get("occurrences") or [])
     if len(occ) < 2:
         raise ValueError(
             "double_spend finding has fewer than two occurrences — cannot identify a "
@@ -263,7 +264,21 @@ def _prepare_consensus_mismatch(record: Any, receipt_lookup: ReceiptLookup):
     """Assemble a CONSENSUS_MISMATCH challenge from the finding's minority+majority coordinates
     (settlement_audit_report._consensus_mismatch_record's detail shape) + both batches' receipts.
     Fail-closed (ValueError) on missing/malformed detail so prepare_findings partitions it."""
-    d = record.detail or {}
+    d = record.detail if isinstance(record.detail, dict) else {}
+    # sp1170 money-safety: refuse to auto-prepare a consensus finding unless the off-chain
+    # majority determination EXPLICITLY says it is non-ambiguous. FAIL-CLOSED: a finding that is
+    # ambiguous (no strict majority — a tie/split, honest side undeterminable) OR that OMITS the
+    # determination entirely (``ambiguous`` defaults to True here) is MANUAL-review-only —
+    # auto-slashing it could slash an honest provider, and the on-chain check is symmetric so it
+    # would not protect us. The detector's _consensus_mismatch_record always sets the flag; only
+    # a hand-built / legacy record could omit it, and it must declare ambiguous=False to prepare.
+    if d.get("ambiguous", True):
+        raise UnsupportedChallengeReason(
+            "consensus_mismatch finding is AMBIGUOUS or lacks a majority determination (no "
+            "confirmed strict-majority output); the honest side is undeterminable off-chain, so "
+            "it cannot be auto-prepared into a slash. Adjudicate it manually (see the vote_tally) "
+            "before broadcasting — a record must declare ambiguous=False to be auto-prepared."
+        )
     min_bid = d.get("minority_batch_id")
     maj_bid = d.get("majority_batch_id")
     if not min_bid or not maj_bid:

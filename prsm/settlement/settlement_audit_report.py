@@ -295,6 +295,11 @@ def _consensus_mismatch_record(af) -> AuditFindingRecord:
         "consensus_group_id": _hex(f.consensus_group_id),
         "job_id_hash": _hex(f.job_id_hash),
         "shard_index": int(f.shard_index),
+        # sp1170 — surface the off-chain vote so the operator sees WHY this side is the slash
+        # target. ``ambiguous`` True = no strict majority (a tie); the operator must MANUALLY
+        # adjudicate and the prepare bridge refuses to auto-assemble it.
+        "ambiguous": bool(getattr(f, "ambiguous", False)),
+        "vote_tally": dict(getattr(f, "vote_tally", {}) or {}),
         "minority_batch_id": _hex(f.minority_batch_id),
         "minority_leaf_index": int(f.minority_leaf_index),
         "minority_output_hash": _hex(f.minority_output_hash),

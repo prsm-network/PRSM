@@ -36,11 +36,23 @@ slash — assembling + DRY-RUNNING the on-chain challenge (reusing
 stays the separate user-gated submitter/queue path. This mirrors the
 ``double_spend_detector`` → ``settlement_audit_engine`` split.
 
+WHICH SIDE IS SLASHED (sp1170 money-safety fix). The on-chain ``_handleConsensusMismatch`` is
+SYMMETRIC — it slashes whichever side is CHALLENGED (the ``minority_*`` side), delegating the
+"which side is truthful" determination to THIS off-chain layer. So the detector MUST pick the
+slash target by a real VOTE, not by position. Within each (group, job, shard) slot it tallies
+DISTINCT PROVIDERS per output_hash:
+  - if a STRICT majority output exists (backed by > half the distinct providers), that is the
+    honest answer: ONLY non-majority-output providers are emitted as challengeable
+    ``minority_*`` sides (``ambiguous=False``); a majority-output provider is NEVER targeted;
+  - if NO strict majority exists (a tie / split — e.g. 1-vs-1 or 2-vs-2), the honest side is
+    UNDETERMINABLE off-chain: the disagreement is surfaced for MANUAL review with
+    ``ambiguous=True`` + the ``vote_tally``, and the audit engine + prepare bridge REFUSE to
+    auto-assemble a slash for it (auto-picking by position could slash an honest provider).
+  (Pre-sp1170 the labelling was purely positional by batch_id sort — which slashed the honest
+  majority whenever its batch_ids sorted below the faulty minority's. That was the bug.)
+
 DETERMINISM. Findings are returned in a stable, input-order-independent order: sorted by
-(consensus_group_id, jobIdHash, shardIndex), and within a (group, job, shard) the two sides
-are sorted by (batch_id, provider) so the "minority"/"majority" labelling is deterministic.
-(The on-chain ``_handleConsensusMismatch`` is symmetric in which side is challenged; the
-audit engine challenges the chosen ``minority_*`` side. Labelling is purely positional here.)
+(consensus_group_id, jobIdHash, shardIndex, ambiguous, minority_batch_id, majority_batch_id).
 """
 from __future__ import annotations
 
@@ -112,12 +124,26 @@ class ConsensusMismatchFinding:
 
     on_chain_reason: int = _ON_CHAIN_CONSENSUS_MISMATCH
 
+    # sp1170 (money-safety fix). ``ambiguous`` is True when the (group, job, shard) slot has
+    # NO strict majority output (a tie / split — e.g. 1-vs-1 or 2-vs-2): which side is honest
+    # is then UNDETERMINABLE off-chain, so this finding is surfaced for MANUAL review only and
+    # MUST NOT be auto-assembled into a slash (the on-chain check is symmetric — it would slash
+    # whichever side is challenged). When ``ambiguous`` is False, a strict majority exists and
+    # ``minority_*`` is a genuine NON-majority-output provider (the honest answer is the
+    # majority output), so the challenge is safe to auto-prepare. ``vote_tally`` maps
+    # output_hash hex -> the count of DISTINCT providers that committed it (counted by
+    # provider, so one provider duplicating an output can't inflate the vote).
+    ambiguous: bool = False
+    vote_tally: Dict[str, int] = field(default_factory=dict)
+
     def to_dict(self) -> Dict[str, object]:
         return {
             "reason": _REASON_TAG,
             "consensus_group_id": self.consensus_group_id.hex(),
             "job_id_hash": self.job_id_hash.hex(),
             "shard_index": self.shard_index,
+            "ambiguous": self.ambiguous,
+            "vote_tally": dict(self.vote_tally),
             "minority": {
                 "batch_id": self.minority_batch_id.hex(),
                 "provider": self.minority_provider,
@@ -208,41 +234,88 @@ def detect_consensus_mismatches(
     for (group_id, job_id_hash, shard_index), sides in by_key.items():
         if len(sides) < 2:
             continue
-        # Deterministic side ordering -> deterministic minority/majority labelling.
+        # ── VOTE TALLY (sp1170): count DISTINCT PROVIDERS per output_hash. Counting by
+        # provider (not by leaf) means a single provider committing the same output twice
+        # cannot inflate the vote. ──
+        providers_by_output: Dict[bytes, set] = {}
+        for s in sides:
+            providers_by_output.setdefault(s.output_hash, set()).add(s.provider)
+        if len(providers_by_output) < 2:
+            continue  # all sides committed the SAME output -> no disagreement
+        n_providers = len({s.provider for s in sides})
+        tally = {out.hex(): len(provs) for out, provs in providers_by_output.items()}
+        # STRICT majority output: a single output backed by > half the distinct providers.
+        # (No output can satisfy this in a tie / even split.)
+        majority_output = next(
+            (out for out, provs in providers_by_output.items()
+             if len(provs) * 2 > n_providers),
+            None,
+        )
         ordered = sorted(sides, key=lambda s: (s.batch_id, s.provider, s.leaf_index))
-        n = len(ordered)
-        for i in range(n):
-            for j in range(i + 1, n):
-                lo, hi = ordered[i], ordered[j]
-                # FULL on-chain reject-set (every condition must hold):
-                if lo.batch_id == hi.batch_id:
-                    continue  # distinct batches (reject condition #1)
-                if lo.provider == hi.provider:
-                    continue  # different providers (reject condition #4)
-                if lo.output_hash == hi.output_hash:
-                    continue  # genuine disagreement (reject condition #7)
-                findings.append(
-                    ConsensusMismatchFinding(
-                        consensus_group_id=group_id,
-                        job_id_hash=job_id_hash,
-                        shard_index=shard_index,
-                        minority_batch_id=lo.batch_id,
-                        minority_provider=lo.provider,
-                        minority_receipt=lo.receipt,
-                        minority_leaf_index=lo.leaf_index,
-                        minority_output_hash=lo.output_hash,
-                        majority_batch_id=hi.batch_id,
-                        majority_provider=hi.provider,
-                        majority_receipt=hi.receipt,
-                        majority_leaf_index=hi.leaf_index,
-                        majority_output_hash=hi.output_hash,
-                        on_chain_reason=_ON_CHAIN_CONSENSUS_MISMATCH,
-                    )
+
+        if majority_output is not None:
+            # A strict majority exists -> the majority output is the honest answer. ONLY a
+            # NON-majority-output provider's leaf is challengeable (the slash target); a
+            # majority-output provider is NEVER targeted. Each minority leaf is proven against
+            # a majority leaf committed by a DIFFERENT provider (on-chain reject condition #4).
+            majority_sides = [s for s in ordered if s.output_hash == majority_output]
+            for s in ordered:
+                if s.output_hash == majority_output:
+                    continue
+                maj = next(
+                    (m for m in majority_sides
+                     if m.provider != s.provider and m.batch_id != s.batch_id),
+                    None,
                 )
+                if maj is None:
+                    continue  # cannot form a distinct-provider/distinct-batch challenge
+                findings.append(_make_finding(
+                    group_id, job_id_hash, shard_index, minority=s, majority=maj,
+                    ambiguous=False, tally=tally))
+        else:
+            # NO strict majority (tie / split, e.g. 1-vs-1 or 2-vs-2): which side is honest is
+            # UNDETERMINABLE off-chain. Surface every distinct-output disagreement pair for
+            # MANUAL review but mark it ``ambiguous`` so the engine + prepare bridge REFUSE to
+            # auto-assemble a slash (the on-chain check is symmetric — it would slash whichever
+            # side is challenged, so auto-picking by position could slash an honest provider).
+            n = len(ordered)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    lo, hi = ordered[i], ordered[j]
+                    if lo.batch_id == hi.batch_id:
+                        continue
+                    if lo.provider == hi.provider:
+                        continue
+                    if lo.output_hash == hi.output_hash:
+                        continue
+                    findings.append(_make_finding(
+                        group_id, job_id_hash, shard_index, minority=lo, majority=hi,
+                        ambiguous=True, tally=tally))
 
     findings.sort(key=lambda f: (f.consensus_group_id, f.job_id_hash, f.shard_index,
-                                 f.minority_batch_id, f.majority_batch_id))
+                                 f.ambiguous, f.minority_batch_id, f.majority_batch_id))
     return findings
+
+
+def _make_finding(group_id, job_id_hash, shard_index, *, minority, majority, ambiguous, tally):
+    return ConsensusMismatchFinding(
+        consensus_group_id=group_id,
+        job_id_hash=job_id_hash,
+        shard_index=shard_index,
+        minority_batch_id=minority.batch_id,
+        minority_provider=minority.provider,
+        minority_receipt=minority.receipt,
+        minority_leaf_index=minority.leaf_index,
+        minority_output_hash=minority.output_hash,
+        majority_batch_id=majority.batch_id,
+        majority_provider=majority.provider,
+        majority_receipt=majority.receipt,
+        majority_leaf_index=majority.leaf_index,
+        majority_output_hash=majority.output_hash,
+        on_chain_reason=_ON_CHAIN_CONSENSUS_MISMATCH,
+        ambiguous=ambiguous,
+        vote_tally=tally,
+    )
 
 
 __all__ = [

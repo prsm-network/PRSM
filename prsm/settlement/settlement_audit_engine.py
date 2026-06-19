@@ -641,6 +641,12 @@ class SettlementAuditEngine:
         attempt, or None if it can't be assembled (missing cache data or an encoding
         fail-fast). Never raises out — assembly failure leaves the finding surfaced without
         a dry-run verdict."""
+        # sp1170 money-safety: an AMBIGUOUS finding (no strict majority — a tie/split where the
+        # honest side is undeterminable off-chain) is surfaced for MANUAL review only. NEVER
+        # auto-assemble a slash for it (the on-chain check is symmetric — it would slash
+        # whichever side is challenged). Leave attempt=None.
+        if getattr(finding, "ambiguous", False):
+            return None
         try:
             minority_receipts = self._cache.receipts_for(finding.minority_batch_id)
             majority_receipts = self._cache.receipts_for(finding.majority_batch_id)

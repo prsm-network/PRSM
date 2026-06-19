@@ -556,6 +556,8 @@ def test_consensus_mismatch_fraud_defense_onchain_e2e(hardhat_node, deployed):
     record = AuditFindingRecord(
         reason="consensus_mismatch", batch_id_hex=min_hex, target_index=0, on_chain_reason=5,
         detail={"consensus_group_id": group.hex(), "job_id_hash": "00" * 32, "shard_index": 0,
+                # sp1170: a confirmed non-ambiguous majority is required to auto-prepare.
+                "ambiguous": False, "vote_tally": {"c1" * 32: 1, "c2" * 32: 2},
                 "minority_batch_id": min_hex, "minority_leaf_index": 0,
                 "minority_output_hash": "c1" * 32,
                 "majority_batch_id": maj_hex, "majority_leaf_index": 0,

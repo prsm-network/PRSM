@@ -75,6 +75,8 @@ def _consensus_record(min_bid, maj_bid, *, min_idx=0, maj_idx=0):
         on_chain_reason=REASON_CONSENSUS_MISMATCH,
         detail={
             "consensus_group_id": "33" * 32, "job_id_hash": "44" * 32, "shard_index": 0,
+            # sp1170: a confirmed strict majority (non-ambiguous) — required to auto-prepare.
+            "ambiguous": False, "vote_tally": {"11" * 32: 1, "22" * 32: 2},
             "minority_batch_id": min_bid, "minority_leaf_index": min_idx,
             "minority_output_hash": "11" * 32,
             "majority_batch_id": maj_bid, "majority_leaf_index": maj_idx,
