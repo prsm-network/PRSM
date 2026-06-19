@@ -209,6 +209,73 @@ def test_execute_no_kyc_client_not_gated():
     assert resp.status_code == 200
 
 
+# ── Sp1175: per-replica enforcement scope + strict-shared lever ──
+
+def test_tier_scope_surfaced_as_process_local(monkeypatch):
+    """The tier block exposes tier_limit_scope=process_local so a
+    caller/auditor sees the rolling AML total is per-replica, not
+    global. Default mode is a pure no-op on the allow path."""
+    monkeypatch.delenv("PRSM_FIAT_TIER_LIMIT_MODE", raising=False)
+    waas = _waas_with("alice")
+    kyc = _kyc_verified("alice", "basic")
+    resp = _client(waas=waas, kyc=kyc).post(
+        "/wallet/onramp/quote",
+        json={"usd_amount": 500.0, "destination_user_id": "alice"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["tier_limit_scope"] == "process_local"
+
+
+def test_strict_shared_mode_fails_closed_within_limit(monkeypatch):
+    """PRSM_FIAT_TIER_LIMIT_MODE=strict_shared — a VERIFIED user
+    WITHIN their limit is denied 503 (not 403): the cross-replica
+    AML limit can't be enforced without a shared backend, so the
+    gated fiat surface fails closed rather than under-enforcing."""
+    monkeypatch.setenv("PRSM_FIAT_TIER_LIMIT_MODE", "strict_shared")
+    waas = _waas_with("alice")
+    kyc = _kyc_verified("alice", "basic")
+    resp = _client(waas=waas, kyc=kyc).post(
+        "/wallet/onramp/execute",
+        json={"usd_amount": 100.0, "destination_user_id": "alice"},
+    )
+    assert resp.status_code == 503
+    detail = resp.json()["detail"]
+    assert detail["error"] == "tier_limit_enforcement_unavailable"
+    assert detail["tier_limit_scope"] == "process_local"
+
+
+def test_strict_shared_does_not_block_unverified_kyc_still_first(
+    monkeypatch,
+):
+    """Strict mode must not mask the KYC gate: an unverified user
+    is still 403 kyc_required (the strict block only applies to the
+    tier limit, which only VERIFIED users are subject to)."""
+    monkeypatch.setenv("PRSM_FIAT_TIER_LIMIT_MODE", "strict_shared")
+    waas = _waas_with("alice")
+    kyc = KYCClient(
+        vendor="persona", api_key="k", backend=_FakeKYCBackend(),
+    )  # alice never initiated
+    resp = _client(waas=waas, kyc=kyc).post(
+        "/wallet/onramp/execute",
+        json={"usd_amount": 100.0, "destination_user_id": "alice"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["error"] == "kyc_required"
+
+
+def test_default_mode_still_allows_within_limit(monkeypatch):
+    """Sanity: with the env unset (default process_local) a within-
+    limit VERIFIED user is NOT blocked — strict mode is opt-in."""
+    monkeypatch.delenv("PRSM_FIAT_TIER_LIMIT_MODE", raising=False)
+    waas = _waas_with("alice")
+    kyc = _kyc_verified("alice", "basic")
+    resp = _client(waas=waas, kyc=kyc).post(
+        "/wallet/onramp/execute",
+        json={"usd_amount": 500.0, "destination_user_id": "alice"},
+    )
+    assert resp.status_code == 200
+
+
 # ── Quote still advisory (unchanged) ─────────────────────────
 
 def test_quote_still_advisory_not_403():

@@ -3050,6 +3050,39 @@ class PRSMNode:
                     "_default_jurisdiction", None,
                 ),
             )
+            # Sp1175 — the AML tier-limit rolling total is PROCESS-LOCAL
+            # (this ring is an in-memory deque). On a MULTI-REPLICA
+            # deployment each replica enforces the limit independently,
+            # so a user fanned across N replicas can transact up to N×
+            # their tier limit. Single-replica deployments are unaffected.
+            # Operators running fiat on >1 replica without a shared
+            # real-time backend should set PRSM_FIAT_TIER_LIMIT_MODE=
+            # strict_shared to FAIL CLOSED (deny the gated fiat surface)
+            # until the shared-rolling-total follow-on ships.
+            _tier_mode = (
+                os.environ.get(
+                    "PRSM_FIAT_TIER_LIMIT_MODE", "process_local",
+                )
+                .strip()
+                .lower()
+            )
+            if _tier_mode == "strict_shared":
+                logger.warning(
+                    "Fiat tier-limit mode=strict_shared — the gated fiat "
+                    "onramp surface FAILS CLOSED (503) because the rolling "
+                    "AML total is process-local and cannot be enforced "
+                    "across replicas. Unset PRSM_FIAT_TIER_LIMIT_MODE for "
+                    "single-replica deployments."
+                )
+            else:
+                logger.warning(
+                    "Fiat AML tier-limit rolling total is PROCESS-LOCAL "
+                    "(per-replica). On a multi-replica deployment a user "
+                    "can transact up to N× their limit. Single-replica is "
+                    "safe; multi-replica operators should set "
+                    "PRSM_FIAT_TIER_LIMIT_MODE=strict_shared until the "
+                    "shared-rolling-total backend ships."
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "FiatComplianceRing construction failed: %s — "

@@ -3008,6 +3008,26 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                     requested_usd=float(body.usd_amount),
                     kyc_status=_rec.status,
                 )
+                # Sp1175 — strict_shared fail-closed: the AML tier limit
+                # can't be enforced globally on this deployment, so deny
+                # rather than under-enforce. 503 (server-side capability
+                # gap), NOT 403 (the caller is not over a known limit).
+                if _tier.get("tier_limit_strict_block"):
+                    raise HTTPException(
+                        status_code=503,
+                        detail={
+                            "error": "tier_limit_enforcement_unavailable",
+                            "tier_limit_scope": "process_local",
+                            "message": (
+                                "Fiat onramp is temporarily unavailable: "
+                                "the per-user AML tier limit cannot be "
+                                "enforced with global consistency on this "
+                                "deployment (PRSM_FIAT_TIER_LIMIT_MODE="
+                                "strict_shared, no shared real-time "
+                                "compliance backend). Contact the operator."
+                            ),
+                        },
+                    )
                 if _tier["tier_limit_exceeded"]:
                     _lvl = _tier["tier_level"]
                     _upgrade = (
@@ -4751,6 +4771,33 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         out["tier_limit_usd"] = limit_usd
         out["tier_limit_remaining_usd"] = remaining
         out["tier_limit_exceeded"] = exceeded
+        # Sp1175 — the rolling total (total_usd_for_user) is read from
+        # the PROCESS-LOCAL FiatComplianceRing (an in-memory deque per
+        # node). On a multi-replica deployment each replica keeps its
+        # OWN total, so a user whose requests fan across N replicas can
+        # transact up to N× their AML tier limit — the limit is enforced
+        # per-pod, NOT globally. `tier_limit_scope` makes that explicit
+        # to every caller (and to an auditor reading the response).
+        out["tier_limit_scope"] = "process_local"
+        # Operators running fiat on multiple replicas WITHOUT a shared
+        # real-time compliance backend can set
+        # PRSM_FIAT_TIER_LIMIT_MODE=strict_shared to FAIL CLOSED: deny
+        # the gated fiat surface rather than silently under-enforce the
+        # cross-replica limit. Default (process_local) is correct for a
+        # single-replica deployment and is a pure no-op here. The real
+        # fix — a shared atomic rolling total (Redis/Postgres) — is a
+        # follow-on requiring an infra decision (see the Vision
+        # fiat-compliance note); this lever is the honest interim.
+        mode = (
+            os.environ.get(
+                "PRSM_FIAT_TIER_LIMIT_MODE", "process_local",
+            )
+            .strip()
+            .lower()
+        )
+        if mode == "strict_shared":
+            out["tier_limit_exceeded"] = True
+            out["tier_limit_strict_block"] = True
         return out
 
     # ── Sprint 282 — Fiat compliance audit ring ───────────
