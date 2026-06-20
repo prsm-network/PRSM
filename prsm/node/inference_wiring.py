@@ -915,6 +915,35 @@ def _module_available(name: str) -> bool:
         return False
 
 
+def ml_inference_available() -> bool:
+    """Sprint 1184 — True iff the local real-inference deps (the `.[ml]` extra:
+    torch + transformers) are importable. Gates the unset→local default."""
+    return _module_available("torch") and _module_available("transformers")
+
+
+# Explicit "serve no inference" values (operator opt-out of the unset→local default).
+_INFERENCE_OFF_VALUES = frozenset({"none", "off", "disabled", "false", "0"})
+
+
+def resolve_inference_executor_kind(raw: str, *, ml_available: bool) -> str:
+    """Sprint 1184 (day-one-live blocker #2) — resolve the effective inference-executor
+    kind from the PRSM_INFERENCE_EXECUTOR value.
+
+    Day-one default: when UNSET (empty/whitespace), a node with the `.[ml]` extra
+    installed serves real single-node inference automatically (→ 'local') instead of
+    returning 503 — no env-var ceremony. Without `.[ml]`, it stays off ('') and the 503
+    diagnostic tells the operator to install it. An explicit none/off/disabled is an
+    operator opt-out. Any explicit kind (local/parallax/mock/...) passes through unchanged
+    — we never silently override an explicit choice (a bad one fails loudly + diagnoses).
+    """
+    kind = (raw or "").strip().lower()
+    if not kind:
+        return "local" if ml_available else ""
+    if kind in _INFERENCE_OFF_VALUES:
+        return ""
+    return kind
+
+
 def diagnose_inference_executor_unavailable(
     env=None,
     module_check=None,
@@ -940,10 +969,17 @@ def diagnose_inference_executor_unavailable(
 
     executor = (env.get("PRSM_INFERENCE_EXECUTOR", "") or "").strip().lower()
     if not executor:
+        # sp1184 — unset now DEFAULTS to 'local' real inference WHEN torch+transformers
+        # (the .[ml] extra) are installed. So reaching this 503-on-unset path means the
+        # ml deps are missing (or the local build failed) — point at the install, not at
+        # the env var. (sp1033 contract: still names PRSM_INFERENCE_EXECUTOR + local +
+        # parallax.)
         return (
-            "PRSM_INFERENCE_EXECUTOR is unset — set it to 'local' (single-node "
-            "real HuggingFace inference) or 'parallax' (the verifiable GPU "
-            "pool). A bare default node serves no inference by design."
+            "PRSM_INFERENCE_EXECUTOR is unset; it DEFAULTS to 'local' real "
+            "single-node HuggingFace inference when torch + transformers are "
+            "installed — install them with `pip install -e .[ml]` to enable "
+            "inference, or set PRSM_INFERENCE_EXECUTOR=parallax for a verifiable "
+            "GPU pool, or =none to serve no inference."
         )
     if executor == "parallax":
         if not (module_check("web3") and module_check("eth_account")):

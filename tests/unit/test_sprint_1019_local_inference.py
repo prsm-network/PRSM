@@ -45,6 +45,14 @@ MODEL = "distilgpt2"  # 6-layer, cached locally, fast on CPU
 _MOCK_STR = "Mock streaming inference from PRSM."
 
 
+@pytest.fixture(autouse=True)
+def _offline_cached_model(monkeypatch):
+    """sp1184 — these tests load distilgpt2 from the LOCAL HF cache and must NOT hit the
+    network. The day-one production default now allows a hub download (offline=False); pin
+    this hermetic module to offline so it keeps using the cache deterministically."""
+    monkeypatch.setenv("PRSM_LOCAL_INFERENCE_OFFLINE", "1")
+
+
 def _req(prompt="The capital of France is", privacy=PrivacyLevel.NONE, max_tokens=6):
     return InferenceRequest(
         prompt=prompt,

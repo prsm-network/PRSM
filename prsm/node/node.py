@@ -2674,9 +2674,21 @@ class PRSMNode:
         # PRSM_INFERENCE_EXECUTOR=mock. The mock zero-fills the
         # cryptographic fields and MUST NOT be trusted by real
         # verifiers — that's the explicit honest-scope.
-        _exec_kind = os.environ.get(
-            "PRSM_INFERENCE_EXECUTOR", "",
-        ).strip().lower()
+        # Sprint 1184 (day-one-live blocker #2) — resolve the effective executor kind.
+        # UNSET now DEFAULTS to 'local' real single-node inference WHEN the .[ml] extra
+        # (torch+transformers) is installed, so a properly-installed node serves real
+        # inference with NO env var (was: unset → None → 503 on every request). Without
+        # .[ml] it stays off and the 503 diagnostic points at the install. An explicit
+        # none/off/disabled opts out.
+        from prsm.node.inference_wiring import (
+            ml_inference_available,
+            resolve_inference_executor_kind,
+        )
+        _exec_raw = os.environ.get("PRSM_INFERENCE_EXECUTOR", "")
+        _ml_available = ml_inference_available()
+        _exec_kind = resolve_inference_executor_kind(
+            _exec_raw, ml_available=_ml_available,
+        )
         if _exec_kind == "mock":
             from prsm.compute.inference import (
                 MockInferenceExecutor,
@@ -2802,6 +2814,29 @@ class PRSMNode:
                 )
         else:
             self.inference_executor = None
+            # sp1184 — actionable startup signal so a non-operator isn't left to discover
+            # the 503 reason from a request. Distinguish "off by choice" from "missing deps".
+            _raw_norm = (_exec_raw or "").strip().lower()
+            if _raw_norm in ("none", "off", "disabled", "false", "0"):
+                logger.info(
+                    "Inference executor: DISABLED (PRSM_INFERENCE_EXECUTOR=%s). "
+                    "/compute/inference will return 503 by request.", _raw_norm,
+                )
+            elif not _raw_norm:
+                logger.warning(
+                    "Inference executor: NONE — PRSM_INFERENCE_EXECUTOR is unset and the "
+                    ".[ml] extra (torch+transformers) is NOT installed, so real "
+                    "single-node inference could not be enabled by default. Run "
+                    "`pip install -e '.[ml]'` to serve real inference automatically, set "
+                    "PRSM_INFERENCE_EXECUTOR=parallax for a GPU pool, or =none to silence "
+                    "this. /compute/inference returns 503 until then.",
+                )
+            else:
+                logger.warning(
+                    "Inference executor: NONE — PRSM_INFERENCE_EXECUTOR=%r is not a "
+                    "recognized kind (local|parallax|mock|mock-streaming|none). "
+                    "/compute/inference returns 503.", _exec_raw,
+                )
 
         # Sprint 1046 — activate REAL Intel SGX DCAP attestation verification on
         # the default registry (the one backing /compute/receipt/verify) when an

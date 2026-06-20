@@ -20,6 +20,7 @@ guarantee.
 """
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -60,6 +61,18 @@ _MAX_TOKENS_CEILING = 256
 # Software-tier attestation — honest scope (NOT a hardware TEE).
 _SOFTWARE_ATTESTATION = b"local-hf-runner-software-attestation"
 
+_OFFLINE_ENV = "PRSM_LOCAL_INFERENCE_OFFLINE"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _resolve_offline(explicit: Optional[bool]) -> bool:
+    """sp1184 — resolve the offline (local-files-only) flag. Explicit arg wins; else read
+    PRSM_LOCAL_INFERENCE_OFFLINE (default FALSE = allow a one-time hub download so a fresh
+    install's first request succeeds). True = airgapped/offline-only."""
+    if explicit is not None:
+        return bool(explicit)
+    return (os.environ.get(_OFFLINE_ENV, "") or "").strip().lower() in _TRUTHY
+
 
 class LocalHuggingFaceChainExecutor:
     """ChainExecutor that runs a real HF causal-LM in-process (single stage =
@@ -68,9 +81,17 @@ class LocalHuggingFaceChainExecutor:
     (deterministic) decode so output is reproducible. Lazy-loads the model on
     first use (construction stays cheap)."""
 
-    def __init__(self, *, model_id: str = DEFAULT_LOCAL_MODEL, max_tokens: int = _DEFAULT_MAX_TOKENS) -> None:
+    def __init__(self, *, model_id: str = DEFAULT_LOCAL_MODEL,
+                 max_tokens: int = _DEFAULT_MAX_TOKENS,
+                 offline: Optional[bool] = None) -> None:
         self._model_id = model_id
         self._default_max_tokens = max(1, int(max_tokens))
+        # sp1184 — offline resolves from the arg, else PRSM_LOCAL_INFERENCE_OFFLINE, else
+        # FALSE (day-one default): the model is DOWNLOADED on first use if not cached, so a
+        # fresh install's first /compute/inference actually succeeds instead of failing on
+        # local_files_only with an empty HF cache. offline=True restores the
+        # airgapped/deterministic no-network behavior.
+        self._offline = _resolve_offline(offline)
         self._model = None
         self._tokenizer = None
 
@@ -82,11 +103,12 @@ class LocalHuggingFaceChainExecutor:
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(
                 "local inference requires 'transformers' + 'torch' "
-                "(pip install transformers torch). " + str(exc)
+                "(pip install -e '.[ml]'). " + str(exc)
             ) from exc
-        # local_files_only=True → offline, deterministic, no network/hub round-trip.
-        tok = AutoTokenizer.from_pretrained(self._model_id, local_files_only=True)
-        model = AutoModelForCausalLM.from_pretrained(self._model_id, local_files_only=True)
+        # local_files_only=self._offline: False → allow a one-time hub download; True →
+        # offline-only, deterministic, no network round-trip.
+        tok = AutoTokenizer.from_pretrained(self._model_id, local_files_only=self._offline)
+        model = AutoModelForCausalLM.from_pretrained(self._model_id, local_files_only=self._offline)
         model.eval()
         if tok.pad_token_id is None:
             tok.pad_token = tok.eos_token
@@ -284,6 +306,7 @@ def build_local_inference_executor(
     *,
     model_id: str = DEFAULT_LOCAL_MODEL,
     max_tokens: int = _DEFAULT_MAX_TOKENS,
+    offline: Optional[bool] = None,
 ) -> ParallaxScheduledExecutor:
     """Assemble a runnable single-node REAL-inference ``ParallaxScheduledExecutor``.
 
@@ -353,6 +376,7 @@ def build_local_inference_executor(
         gpu_pool_provider=_provider,
         trust_stack=trust,
         model_catalog=catalog,
-        chain_executor=LocalHuggingFaceChainExecutor(model_id=model_id, max_tokens=max_tokens),
+        chain_executor=LocalHuggingFaceChainExecutor(
+            model_id=model_id, max_tokens=max_tokens, offline=offline),
         node_identity=node_identity,
     )
