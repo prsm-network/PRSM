@@ -175,7 +175,7 @@ def test_wallet_deposit_broadcast_failure_exits_1(runner, monkeypatch):
 def _patch_info(monkeypatch, payload=None, raise_exc=None):
     import httpx
 
-    def _get(u, timeout=None):
+    def _get(u, timeout=None, headers=None):
         if raise_exc is not None:
             raise raise_exc
 

@@ -181,6 +181,20 @@ def _api_url_from_creds(override: Optional[str]) -> str:
     return "http://127.0.0.1:8000"
 
 
+def _node_api_key_headers() -> dict:
+    """Sprint 1199 — the node-API-key auth header for daemon calls against an
+    AUTHENTICATED node.
+
+    NodeAuthMiddleware protects /compute/, /ftns/, /wallet/, ... when the operator
+    sets PRSM_NODE_API_KEY (the common day-one public-bind posture, now easy via the
+    sp1195 auto-provision). The CLI must therefore present that key or every inference
+    / faucet call 401s. Sent as ``X-API-Key`` (the middleware accepts it) so it never
+    collides with a user-login ``Authorization: Bearer`` JWT (_auth_headers). Empty
+    when PRSM_NODE_API_KEY is unset (dev / loopback no-key node → no header needed)."""
+    key = (os.environ.get("PRSM_NODE_API_KEY") or "").strip()
+    return {"X-API-Key": key} if key else {}
+
+
 @dataclass
 class PreflightCheckResult:
     """Node startup preflight check result."""
@@ -6983,6 +6997,7 @@ def compute_infer_cli(
             with _httpx.stream(
                 "POST", stream_endpoint,
                 json=body, timeout=120.0,
+                headers=_node_api_key_headers(),  # sp1199 — auth on a keyed node
             ) as resp:
                 if resp.status_code != 200:
                     # Sprint 825 — httpx streaming responses
@@ -7092,7 +7107,10 @@ def compute_infer_cli(
 
     endpoint = f"{url}/compute/inference"
     try:
-        resp = _httpx.post(endpoint, json=body, timeout=120.0)
+        resp = _httpx.post(
+            endpoint, json=body, timeout=120.0,
+            headers=_node_api_key_headers(),  # sp1199 — auth on a keyed node
+        )
     except Exception as exc:
         if output_format == "json":
             click.echo(_json.dumps({
@@ -7309,7 +7327,8 @@ def compute_pay_infer_cli(
         else:
             info = None
             try:
-                info = _httpx.get(f"{url}/info", timeout=10.0).json()
+                info = _httpx.get(f"{url}/info", timeout=10.0,
+                                  headers=_node_api_key_headers()).json()
             except Exception as exc:  # noqa: BLE001
                 checks.append((False, f"cannot reach daemon /info at {url}: {exc}"))
             if info is not None:
@@ -7377,7 +7396,10 @@ def compute_pay_infer_cli(
         return
 
     async def _go():
-        client = PRSMClient(base_url=url)
+        # sp1199 — pass the node API key so /compute/inference (protected) authenticates
+        # on a keyed node; PRSMClient sends it as a Bearer token.
+        client = PRSMClient(
+            base_url=url, api_key=(os.environ.get("PRSM_NODE_API_KEY") or "").strip())
         try:
             return await client.pay_and_infer(
                 prompt,
@@ -11870,7 +11892,10 @@ def content_publish_cli(
     url = _api_url_from_creds(api_url_override)
     endpoint = f"{url}/content/upload"
     try:
-        resp = _httpx.post(endpoint, json=body, timeout=120.0)
+        resp = _httpx.post(
+            endpoint, json=body, timeout=120.0,
+            headers=_node_api_key_headers(),  # sp1199 — auth on a keyed node
+        )
     except Exception as exc:
         if output_format == "json":
             click.echo(_json.dumps({
@@ -12598,7 +12623,8 @@ def wallet_faucet(
     if amount is not None:
         body["amount"] = amount
     try:
-        r = httpx.post(f"{url}/ftns/faucet/onchain", json=body, timeout=180.0)
+        r = httpx.post(f"{url}/ftns/faucet/onchain", json=body, timeout=180.0,
+                       headers=_node_api_key_headers())  # sp1199 — /ftns/ is protected
     except httpx.ConnectError:
         console.print(f"❌ cannot connect to {url}", style="red")
         raise SystemExit(2)

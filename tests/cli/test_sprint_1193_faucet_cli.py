@@ -38,9 +38,9 @@ class _Resp:
 
 
 def _patch_post(monkeypatch, resp=None, raise_connect=False, captured=None):
-    def _fake_post(url, json=None, timeout=None):
+    def _fake_post(url, json=None, timeout=None, headers=None):
         if captured is not None:
-            captured.update(url=url, body=json)
+            captured.update(url=url, body=json, headers=headers)
         if raise_connect:
             raise httpx.ConnectError("refused")
         return resp
