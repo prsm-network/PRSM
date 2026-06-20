@@ -8,7 +8,6 @@ Based on execution_plan.md Phase 3, Week 17-18 requirements.
 """
 
 import asyncio
-import math
 import statistics
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
@@ -340,13 +339,43 @@ class TokenWeightedVoting:
             return False
     
     
+    def _staking_service(self):
+        """Sp1181 — the FTNS service that owns the governance STAKE
+        (staked_balance). voting.py's primary ftns_service is the atomic
+        balance/locked service; the stake lives in the DatabaseFTNSService
+        wallet (stake_for_governance moves balance → staked_balance).
+        Lazily constructed + cached; injectable in tests."""
+        svc = getattr(self, "_staking_ftns_service", None)
+        if svc is None:
+            from prsm.economy.tokenomics.database_ftns_service import (
+                DatabaseFTNSService,
+            )
+            svc = DatabaseFTNSService()
+            self._staking_ftns_service = svc
+        return svc
+
+    async def _get_staked_balance(self, voter_id: str) -> float:
+        """Sp1181 — the voter's non-transferable GOVERNANCE STAKE, the
+        basis for voting power. Fail-safe to 0.0 (deny power on error —
+        the SECURE default: better to grant no power than to fall back to
+        the transferable live balance, which is the vulnerable path)."""
+        try:
+            data = await self._staking_service().get_user_balance(voter_id)
+            return float(data.get("staked_balance", 0.0) or 0.0)
+        except Exception as e:  # noqa: BLE001
+            self.logger.warning(
+                "Sp1181: staked-balance read failed; voting power = 0",
+                voter_id=voter_id, error=str(e),
+            )
+            return 0.0
+
     async def calculate_voting_power(self, voter_id: str) -> VotingPowerCalculation:
         """
         Calculate comprehensive voting power for a user
-        
+
         Args:
             voter_id: ID of the voter
-            
+
         Returns:
             Detailed voting power calculation
         """
@@ -357,17 +386,32 @@ class TokenWeightedVoting:
                 datetime.now(timezone.utc) < self.cache_expiry[voter_id]):
                 return self.voting_power_cache[voter_id]
             
-            # Get user's FTNS balance
-            balance_data = await FTNSQueries.get_user_balance(voter_id)
-            token_balance = balance_data.get("balance", 0.0)
-            
-            # Base voting power calculation
-            if token_balance < MIN_VOTING_BALANCE:
+            # Sp1181 — base voting power on the voter's GOVERNANCE STAKE
+            # (locked, non-transferable) via a LINEAR formula, NOT the
+            # live transferable balance via a concave curve. Both changes
+            # are required to close the confirmed Sybil-vote-inflation
+            # exploit (the user-approved Option 1 — route the tally
+            # through the existing stake-to-vote model):
+            #   (a) STAKED BASIS: staked tokens are moved out of `balance`
+            #       into `staked_balance` (stake_for_governance) and can't
+            #       be transferred (transfers spend available_balance), so
+            #       the same tokens can't be shuttled across N self-owned
+            #       identities (per-voter_id dedup) to vote N times.
+            #   (b) LINEAR (not the old sqrt power curve): a concave curve
+            #       is Sybil-AMPLIFIABLE — splitting one stake across N
+            #       identities yields ~sqrt(N) MORE power (sum of sqrt(x_i)
+            #       > sqrt(sum x_i)), inverting the anti-whale intent.
+            #       Linear power is split-neutral and matches the staked
+            #       voting-power path (stake_for_governance returns power
+            #       linear in the staked amount).
+            # delegate_voting_power derives its power from THIS method, so
+            # the delegation path inherits the staked basis automatically.
+            staked_balance = await self._get_staked_balance(voter_id)
+            token_balance = staked_balance  # recorded in the calculation
+            if staked_balance < MIN_VOTING_BALANCE:
                 base_voting_power = 0.0
             else:
-                # Apply power curve to reduce whale dominance
-                normalized_balance = token_balance / MIN_VOTING_BALANCE
-                base_voting_power = math.pow(normalized_balance, VOTING_POWER_CURVE)
+                base_voting_power = staked_balance / MIN_VOTING_BALANCE
             
             # Role multiplier
             role_multiplier = await self._calculate_role_multiplier(voter_id)
