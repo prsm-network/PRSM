@@ -12326,6 +12326,95 @@ def wallet_deposit(amount: float, network_name: str, yes: bool) -> None:
         "[dim]escrow now funds `prsm compute pay-infer` charges.[/dim]\n")
 
 
+@wallet.command("faucet")
+@click.option(
+    "--address", "address", default=None,
+    help="Destination address (default: derive from PRIVATE_KEY env)",
+)
+@click.option(
+    "--amount", "amount", default=None, type=float,
+    help="FTNS to request (default: the operator's per-request cap)",
+)
+@click.option(
+    "--network", "network_name",
+    type=click.Choice(["mainnet", "testnet"]), default="testnet",
+    help="Network (default: testnet; the faucet is TESTNET-ONLY)",
+)
+@click.option("--api-url", "api_url_override", default=None, help="Override daemon URL")
+@click.option(
+    "--format", "output_format",
+    type=click.Choice(["text", "json"]), default="text", help="Output format",
+)
+def wallet_faucet(
+    address, amount, network_name: str,
+    api_url_override, output_format: str,
+) -> None:
+    """Sprint 1193 — request TESTNET FTNS from the on-chain faucet.
+
+    POSTs to the daemon's /ftns/faucet/onchain (sp1190): the faucet wallet sends
+    real on-chain testnet FTNS to your address so you can `prsm wallet deposit`
+    then `prsm compute pay-infer`. TESTNET-ONLY — the faucet hard-refuses any
+    chain other than Base Sepolia, so it never dispenses real-value FTNS.
+
+    \b
+    No signing key needed — the faucet operator signs the transfer; this only
+    sends your destination address. The default address is derived from
+    PRIVATE_KEY / FTNS_WALLET_PRIVATE_KEY if set, else pass --address.
+
+    \b
+    Example (end-to-end testnet front door):
+        prsm wallet faucet --address 0x... --network testnet
+        prsm wallet deposit --amount 5 --network testnet
+        prsm compute pay-infer --prompt "Hello" --network testnet
+
+    Exit 0 success, 1 daemon error, 2 unreachable.
+    """
+    import json as _json
+    import httpx
+    dest = address
+    if not dest:
+        dest = _wallet_load_signer(network_name).get("address")
+    if not dest:
+        console.print(
+            "❌ no destination address — pass --address 0x... or set PRIVATE_KEY "
+            "(the address is derived from it).", style="red")
+        raise SystemExit(1)
+
+    url = _api_url_from_creds(api_url_override)
+    body = {"destination_address": dest}
+    if amount is not None:
+        body["amount"] = amount
+    try:
+        r = httpx.post(f"{url}/ftns/faucet/onchain", json=body, timeout=180.0)
+    except httpx.ConnectError:
+        console.print(f"❌ cannot connect to {url}", style="red")
+        raise SystemExit(2)
+    if r.status_code != 200:
+        try:
+            detail = r.json().get("detail", "")
+        except Exception:
+            detail = r.text[:300]
+        if output_format == "json":
+            click.echo(_json.dumps({"ok": False, "status": r.status_code, "detail": detail}))
+        else:
+            console.print(f"❌ faucet request failed (HTTP {r.status_code}):", style="red")
+            console.print(f"   {detail}")
+        raise SystemExit(1)
+    d = r.json()
+    if output_format == "json":
+        click.echo(_json.dumps(d))
+        return
+    console.print(
+        f"✅ dispensed [bold]{d.get('dispensed_ftns')} FTNS[/bold] → "
+        f"{d.get('recipient')}")
+    console.print(f"  tx        : [green]{d.get('tx_hash')}[/green]")
+    console.print(f"  faucet    : {d.get('faucet_address')}")
+    console.print(f"  network   : {d.get('network')}")
+    console.print(
+        "[dim]next: `prsm wallet deposit` to fund the EscrowPool, then "
+        "`prsm compute pay-infer`.[/dim]\n")
+
+
 @wallet.command("withdraw")
 @click.option(
     "--amount", required=True, type=float,
