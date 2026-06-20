@@ -87,6 +87,7 @@ class EscrowPoolClient:
         escrow_pool_address: str,
         ftns_token_address: str,
         private_key: Optional[str] = None,
+        expected_chain_id: Optional[int] = None,
     ) -> None:
         if not HAS_WEB3:
             raise RuntimeError(
@@ -100,6 +101,12 @@ class EscrowPoolClient:
         self.ftns = self.web3.eth.contract(
             address=self.ftns_address, abi=_ERC20_ABI)
         self._account = Account.from_key(private_key) if private_key else None
+        # sp1200 review (defense-in-depth): when set, the WRITE path refuses to sign
+        # against any other live chain — the signer enforces its own chain rather than
+        # trusting an external guard (mirrors OnChainFTNSFaucet.dispense). Default None
+        # = no gate (backward-compatible with all existing callers).
+        self._expected_chain_id = (
+            int(expected_chain_id) if expected_chain_id is not None else None)
 
         from prsm.economy.web3.tx_lock_registry import TX_LOCK_REGISTRY
         self._tx_lock = (
@@ -139,11 +146,23 @@ class EscrowPoolClient:
 
     # ── Sync implementations ─────────────────────────────────────────────────
 
+    def _assert_chain(self) -> None:
+        """sp1200 — refuse to sign a write against a chain other than the one this
+        client was pinned to (no-op when expected_chain_id is None)."""
+        if self._expected_chain_id is None:
+            return
+        live = int(self.web3.eth.chain_id)
+        if live != self._expected_chain_id:
+            raise RuntimeError(
+                f"EscrowPoolClient refuses to sign on chainId {live} "
+                f"(pinned to {self._expected_chain_id})")
+
     def _deposit_sync(self, amount: int) -> str:
         if not self._account:
             raise RuntimeError("private_key required for write calls (deposit)")
         if amount <= 0:
             raise ValueError(f"deposit amount must be positive (got {amount})")
+        self._assert_chain()
         with self._tx_lock:
             owner = self._account.address
             allowance = int(
@@ -167,6 +186,7 @@ class EscrowPoolClient:
             raise RuntimeError("private_key required for write calls (withdraw)")
         if amount <= 0:
             raise ValueError(f"withdraw amount must be positive (got {amount})")
+        self._assert_chain()
         with self._tx_lock:
             tx = self.pool.functions.withdraw(amount).build_transaction(
                 self._tx_overrides(gas=_WITHDRAW_GAS))

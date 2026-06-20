@@ -180,6 +180,7 @@ class PRSMClient:
         rpc_url: Optional[str] = None,
         escrow_pool_address: Optional[str] = None,
         ftns_token_address: Optional[str] = None,
+        expected_chain_id: Optional[int] = None,
         _client: Any = None,
     ) -> str:
         """Sprint 1189 — deposit ``amount_ftns`` of FTNS into the on-chain EscrowPool
@@ -201,6 +202,11 @@ class PRSMClient:
                 escrow_pool_address or ep.escrow_pool,
                 ftns_token_address or ep.ftns_token,
                 private_key=requester_key,
+                # sp1200 review (defense-in-depth): pin the signer to the resolved
+                # network's chain unless the caller pins it explicitly, so the deposit
+                # refuses to sign against a divergent chain (e.g. a round-robin RPC).
+                expected_chain_id=(
+                    expected_chain_id if expected_chain_id is not None else ep.chain_id),
             )
         return await client.deposit(amount_wei)
 
