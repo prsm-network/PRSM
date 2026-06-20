@@ -170,5 +170,89 @@ def test_wallet_deposit_broadcast_failure_exits_1(runner, monkeypatch):
     assert "deposit failed" in r.output.lower()
 
 
+# ── compute pay-infer --dry-run (sp1194 preflight) ───────────────────────────────────
+
+def _patch_info(monkeypatch, payload=None, raise_exc=None):
+    import httpx
+
+    def _get(u, timeout=None):
+        if raise_exc is not None:
+            raise raise_exc
+
+        class _R:
+            def json(self_inner):
+                return payload
+        return _R()
+    monkeypatch.setattr(httpx, "get", _get)
+
+
+def _patch_escrow(monkeypatch, balance_wei):
+    class _FakeEscrow:
+        def __init__(self, *a, **k):
+            pass
+
+        async def balance_of(self, addr):
+            return balance_wei
+    monkeypatch.setattr(
+        "prsm.economy.web3.escrow_pool_client.EscrowPoolClient", _FakeEscrow)
+
+
+def test_dry_run_all_pass(runner, monkeypatch):
+    monkeypatch.setenv("PRIVATE_KEY", _TEST_KEY)
+    _patch_info(monkeypatch, payload={"operator_address": "0xOperator"})
+    _patch_escrow(monkeypatch, balance_wei=10 * 10**18)  # 10 FTNS ≥ budget 1
+    # also assert pay_and_infer is NOT called (broadcast nothing)
+    cap = {}
+    _patch_client(monkeypatch, pay_result={"output": "x"}, captured=cap)
+    r = runner.invoke(main, ["compute", "pay-infer", "--prompt", "hi", "--dry-run"])
+    assert r.exit_code == 0, r.output
+    assert "PASS" in r.output and "ready to pay" in r.output.lower()
+    assert cap == {}, "dry-run must not call pay_and_infer"
+
+
+def test_dry_run_underfunded_escrow_fails(runner, monkeypatch):
+    monkeypatch.setenv("PRIVATE_KEY", _TEST_KEY)
+    _patch_info(monkeypatch, payload={"operator_address": "0xOperator"})
+    _patch_escrow(monkeypatch, balance_wei=0)  # 0 FTNS < budget
+    r = runner.invoke(
+        main, ["compute", "pay-infer", "--prompt", "hi", "--budget", "2", "--dry-run"])
+    assert r.exit_code == 1
+    assert "FAIL" in r.output
+    assert "wallet deposit" in r.output  # actionable next step
+
+
+def test_dry_run_no_operator_payee_fails(runner, monkeypatch):
+    monkeypatch.setenv("PRIVATE_KEY", _TEST_KEY)
+    _patch_info(monkeypatch, payload={})  # operator advertises no payee
+    _patch_escrow(monkeypatch, balance_wei=10 * 10**18)
+    r = runner.invoke(main, ["compute", "pay-infer", "--prompt", "hi", "--dry-run"])
+    assert r.exit_code == 1
+    assert "no payment address" in r.output.lower()
+
+
+def test_dry_run_explicit_provider_skips_info(runner, monkeypatch):
+    monkeypatch.setenv("PRIVATE_KEY", _TEST_KEY)
+    # /info would raise if hit — explicit --provider-address must skip it
+    _patch_info(monkeypatch, raise_exc=RuntimeError("should not be called"))
+    _patch_escrow(monkeypatch, balance_wei=10 * 10**18)
+    r = runner.invoke(main, [
+        "compute", "pay-infer", "--prompt", "hi", "--dry-run",
+        "--provider-address", "0xExplicit"])
+    assert r.exit_code == 0, r.output
+    assert "0xExplicit" in r.output
+
+
+def test_dry_run_json_format(runner, monkeypatch):
+    monkeypatch.setenv("PRIVATE_KEY", _TEST_KEY)
+    _patch_info(monkeypatch, payload={"operator_address": "0xOperator"})
+    _patch_escrow(monkeypatch, balance_wei=10 * 10**18)
+    r = runner.invoke(
+        main, ["compute", "pay-infer", "--prompt", "hi", "--dry-run", "--format", "json"])
+    assert r.exit_code == 0, r.output
+    payload = json.loads(r.output.strip().splitlines()[-1])
+    assert payload["ok"] is True
+    assert any(c["level"] == "pass" for c in payload["checks"])
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

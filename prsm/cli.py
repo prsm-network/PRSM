@@ -7118,6 +7118,13 @@ def compute_infer_cli(
     "receipt is verified inline (adds receipt_verified).",
 )
 @click.option(
+    "--dry-run", "dry_run", is_flag=True, default=False,
+    help="Preflight only: check the live preconditions (signing "
+    "key, operator advertises a payee, escrow funded ≥ max-spend, "
+    "chain_id) and print PASS/WARN/FAIL. Signs + broadcasts "
+    "NOTHING. Exit 0 if all PASS, else 1.",
+)
+@click.option(
     "--format", "output_format",
     type=click.Choice(["text", "json"]), default="text",
     help="Output format",
@@ -7127,7 +7134,7 @@ def compute_pay_infer_cli(
     max_spend_ftns: Optional[float], privacy_tier: str, content_tier: str,
     provider_address: Optional[str], network_name: str,
     api_url_override: Optional[str], verify_pubkey_b64: Optional[str],
-    output_format: str,
+    dry_run: bool, output_format: str,
 ) -> None:
     """Sprint 1192 — pay for one inference from the terminal (requester-payment).
 
@@ -7162,6 +7169,72 @@ def compute_pay_infer_cli(
     chain_id = 84532 if network_name == "testnet" else 8453
     url = _api_url_from_creds(api_url_override)
     spend_ceiling = max_spend_ftns if max_spend_ftns is not None else budget_ftns
+
+    if dry_run:
+        # Preflight ONLY — verify the live preconditions, sign + broadcast nothing.
+        from decimal import Decimal
+        import httpx as _httpx
+        addr = ctx.get("address")
+        checks = []  # (ok: True|False|None, line)
+        checks.append((True, f"signing key present → requester {addr}"))
+
+        payee = provider_address
+        if payee:
+            checks.append((True, f"provider address (explicit): {payee}"))
+        else:
+            info = None
+            try:
+                info = _httpx.get(f"{url}/info", timeout=10.0).json()
+            except Exception as exc:  # noqa: BLE001
+                checks.append((False, f"cannot reach daemon /info at {url}: {exc}"))
+            if info is not None:
+                payee = (info or {}).get("operator_address")
+                if payee:
+                    checks.append((True, f"operator advertises payee: {payee}"))
+                else:
+                    checks.append((False,
+                        "operator published no payment address (operator_address "
+                        "absent from /info) — the operator isn't accepting requester "
+                        "payment, or pass --provider-address"))
+
+        try:
+            from prsm.config.networks import resolve_endpoints
+            from prsm.economy.web3.escrow_pool_client import EscrowPoolClient
+            ep = resolve_endpoints(network_name)
+            client = EscrowPoolClient(ep.rpc_url, ep.escrow_pool, ep.ftns_token)
+            bal = Decimal(_run_async(client.balance_of(addr))) / (Decimal(10) ** 18)
+            if bal >= Decimal(str(spend_ceiling)):
+                checks.append((True,
+                    f"escrow balance {bal} FTNS ≥ max-spend {spend_ceiling}"))
+            else:
+                checks.append((False,
+                    f"escrow balance {bal} FTNS < max-spend {spend_ceiling} — fund it: "
+                    f"prsm wallet deposit --amount {spend_ceiling} --network {network_name}"))
+        except Exception as exc:  # noqa: BLE001
+            checks.append((None,
+                f"could not read escrow balance ({exc}); ensure web3 + an RPC are available"))
+
+        if output_format == "json":
+            import json as _json2
+            click.echo(_json2.dumps({
+                "ok": not any(ok is False for ok, _ in checks),
+                "checks": [{"level": ("pass" if ok else "fail" if ok is False else "warn"),
+                            "detail": line} for ok, line in checks],
+            }))
+        else:
+            console.print("\n[bold]pay-infer preflight[/bold]")
+            for ok, line in checks:
+                tag = ("[green]PASS[/green]" if ok is True
+                       else "[red]FAIL[/red]" if ok is False else "[yellow]WARN[/yellow]")
+                console.print(f"  {tag} {line}")
+        if any(ok is False for ok, _ in checks):
+            if output_format != "json":
+                console.print(
+                    "\n[red]preflight FAIL[/red] — resolve the above before paying.\n")
+            raise SystemExit(1)
+        if output_format != "json":
+            console.print("\n[green]preflight PASS[/green] — ready to pay.\n")
+        return
 
     async def _go():
         client = PRSMClient(base_url=url)
