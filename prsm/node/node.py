@@ -1157,6 +1157,115 @@ def should_refuse_insecure_public_bind(posture_level, *, allow_insecure):
     return not allow_insecure
 
 
+def decide_api_key_provisioning(*, api_host, env_key, persisted_key, auto_provision):
+    """Sprint 1195 — pure decision for self-provisioning the node API key.
+
+    Decides what to do with the management-API auth key BEFORE the fail-closed
+    public-bind posture gate runs, so a public-bind operator has a smooth,
+    secure-by-default path instead of just hitting the refuse-to-start wall.
+    Side-effect-free; the IO wrapper (``ensure_public_bind_api_key``) acts on it.
+
+    Returns ``(action, reason)`` where action ∈:
+      - ``"use_env"``      operator set PRSM_NODE_API_KEY explicitly — always wins.
+      - ``"use_persisted"`` a public bind has no env key but a persisted key exists
+                            → reuse it (STABLE across restarts so clients keep working).
+      - ``"generate"``     a public bind has no key at all AND the operator opted into
+                            PRSM_AUTO_PROVISION_API_KEY → mint + persist + log one.
+      - ``"none"``         loopback dev bind (auth optional), or a public bind with no
+                            key and no opt-in → leave it to the reviewed fail-closed gate.
+
+    Loopback is deliberately untouched (the documented dev posture); we never
+    silently flip a public bind from fail-closed to authenticated unless the
+    operator opted in OR a key was already provisioned."""
+    if (env_key or "").strip():
+        return ("use_env", "operator-supplied PRSM_NODE_API_KEY")
+    host = (api_host or "").strip().lower()
+    if host in _LOOPBACK_BIND_HOSTS:
+        return ("none", "loopback bind — API auth optional (dev posture)")
+    if (persisted_key or "").strip():
+        return ("use_persisted", "reusing the persisted node API key")
+    if auto_provision:
+        return ("generate", "auto-provisioning a node API key (PRSM_AUTO_PROVISION_API_KEY)")
+    return ("none", "public bind with no key — fail-closed gate applies")
+
+
+def _default_node_api_key_path():
+    """~/.prsm/node_api_key, overridable via PRSM_NODE_API_KEY_FILE (mirrors the
+    settlement-state-file convention)."""
+    import os
+    from pathlib import Path
+    override = (os.environ.get("PRSM_NODE_API_KEY_FILE") or "").strip()
+    if override:
+        return Path(override)
+    return Path.home() / ".prsm" / "node_api_key"
+
+
+def ensure_public_bind_api_key(*, api_host, key_path=None, env=None):
+    """Sprint 1195 — self-provision / reuse the node API key for a public bind.
+
+    Runs before the public-bind posture gate. Returns the resolved key (and sets
+    ``PRSM_NODE_API_KEY`` in ``env`` so the gate sees it), or None when no key
+    applies (loopback dev, or a public bind the operator hasn't opted into
+    provisioning for → the fail-closed gate then stops startup as designed).
+
+    Fail-SOFT on IO: a key-file read error is treated as "no persisted key"; a
+    write error on generation logs + still sets the in-process env key (so the
+    node comes up authenticated this run even if persistence failed) — it never
+    raises, so it can't break startup or weaken the gate."""
+    import os
+    import secrets as _secrets
+    e = env if env is not None else os.environ
+    path = key_path if key_path is not None else _default_node_api_key_path()
+
+    persisted = None
+    try:
+        if path.exists():
+            persisted = path.read_text(encoding="utf-8").strip() or None
+    except Exception as exc:  # noqa: BLE001 — unreadable file → treat as absent
+        logger.warning("Sprint 1195 — could not read node API key file %s (%s); "
+                       "treating as unset.", path, exc)
+
+    auto_provision = (e.get("PRSM_AUTO_PROVISION_API_KEY") or "").strip().lower() in {
+        "1", "true", "yes", "on"}
+    action, reason = decide_api_key_provisioning(
+        api_host=api_host,
+        env_key=e.get("PRSM_NODE_API_KEY", ""),
+        persisted_key=persisted,
+        auto_provision=auto_provision,
+    )
+
+    if action == "use_env":
+        return (e.get("PRSM_NODE_API_KEY") or "").strip()
+    if action == "none":
+        return None
+    if action == "use_persisted":
+        e["PRSM_NODE_API_KEY"] = persisted
+        logger.info("Sprint 1195 — %s (from %s); management API is authenticated.",
+                    reason, path)
+        return persisted
+    # action == "generate"
+    key = _secrets.token_urlsafe(32)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(key, encoding="utf-8")
+        try:
+            path.chmod(0o600)
+        except Exception:  # noqa: BLE001 — best-effort perms (e.g. Windows)
+            pass
+        persisted_note = f"persisted to {path} (0600)"
+    except Exception as exc:  # noqa: BLE001 — persist failed → still authenticate this run
+        logger.warning("Sprint 1195 — could not persist the auto-provisioned API key to "
+                       "%s (%s); using it for THIS process only (will regenerate on "
+                       "restart).", path, exc)
+        persisted_note = "NOT persisted (write failed) — ephemeral for this process"
+    e["PRSM_NODE_API_KEY"] = key
+    logger.warning(
+        "Sprint 1195 — auto-provisioned a node API key for the public bind (%s). "
+        "Use it as the Bearer token / X-API-Key for protected endpoints:\n"
+        "    PRSM_NODE_API_KEY=%s\n  (%s)", reason, key, persisted_note)
+    return key
+
+
 def _build_key_distribution_watcher_or_none(
     *, client, state_store=None, webhook_deliverer=None,
     webhook_url=None, webhook_secret=None, dedup_store=None,
@@ -4816,6 +4925,19 @@ class PRSMNode:
         # endpoints live on the API server; listen_host=0.0.0.0 is the P2P
         # listener and was a false-positive signal that refused every default
         # `prsm node start` even though the API was on loopback.
+        # sp1195 — self-provision / reuse the node API key BEFORE the posture gate
+        # so a public-bind operator gets a smooth, secure-by-default path: an
+        # explicit PRSM_NODE_API_KEY always wins; else a persisted key is reused
+        # (stable across restarts); else, opt-in via PRSM_AUTO_PROVISION_API_KEY, a
+        # key is minted + persisted + logged. Loopback is untouched; without a key
+        # and without opt-in, the fail-closed gate below still stops startup.
+        try:
+            ensure_public_bind_api_key(
+                api_host=getattr(self.config, "api_host", None) or "127.0.0.1",
+                env=_os_nice.environ,
+            )
+        except Exception as _apikey_exc:  # noqa: BLE001 — never block startup on this
+            logger.warning("Sprint 1195 — API-key provisioning skipped (%s).", _apikey_exc)
         _posture, _posture_msg = assess_public_bind_auth_posture(
             listen_host=getattr(self.config, "api_host", None) or "127.0.0.1",
             api_key_present=bool(
