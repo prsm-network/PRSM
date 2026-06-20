@@ -7064,6 +7064,166 @@ def compute_infer_cli(
             raise SystemExit(1)
 
 
+@compute.command("pay-infer")
+@click.option(
+    "--prompt", "prompt", required=True,
+    help="Prompt text to send to the inference path.",
+)
+@click.option(
+    "--model", "model_id", default="gpt2",
+    help="model_id (default: gpt2)",
+)
+@click.option(
+    "--max-tokens", "max_tokens", default=8, type=int,
+    help="Max output tokens (default: 8)",
+)
+@click.option(
+    "--budget", "budget_ftns", default=1.0, type=float,
+    help="FTNS budget for the request (default: 1.0)",
+)
+@click.option(
+    "--max-spend", "max_spend_ftns", default=None, type=float,
+    help="Ceiling you authorize the provider to charge "
+    "(default: --budget). The signed authorization caps the "
+    "charge at this amount.",
+)
+@click.option(
+    "--privacy-tier", "privacy_tier",
+    type=click.Choice(["none", "standard", "high", "maximum"]),
+    default="none",
+    help="Privacy tier (default: none)",
+)
+@click.option(
+    "--content-tier", "content_tier",
+    type=click.Choice(["A", "B", "C"]), default="A",
+    help="Content tier (default: A)",
+)
+@click.option(
+    "--provider-address", "provider_address", default=None,
+    help="Operator payee address (default: discover via GET /info)",
+)
+@click.option(
+    "--network", "network_name",
+    type=click.Choice(["mainnet", "testnet"]), default="testnet",
+    help="Network the EscrowPool + chain_id live on (default: "
+    "testnet = Base Sepolia 84532; mainnet = Base 8453)",
+)
+@click.option(
+    "--api-url", "api_url_override", default=None,
+    help="Override daemon URL",
+)
+@click.option(
+    "--verify-pubkey-b64", "verify_pubkey_b64", default=None,
+    help="Base64 operator public key — when set, the returned "
+    "receipt is verified inline (adds receipt_verified).",
+)
+@click.option(
+    "--format", "output_format",
+    type=click.Choice(["text", "json"]), default="text",
+    help="Output format",
+)
+def compute_pay_infer_cli(
+    prompt: str, model_id: str, max_tokens: int, budget_ftns: float,
+    max_spend_ftns: Optional[float], privacy_tier: str, content_tier: str,
+    provider_address: Optional[str], network_name: str,
+    api_url_override: Optional[str], verify_pubkey_b64: Optional[str],
+    output_format: str,
+) -> None:
+    """Sprint 1192 — pay for one inference from the terminal (requester-payment).
+
+    Wraps the sp1189 SDK: signs an EIP-712 PaymentAuthorization bound to THIS
+    request with your wallet key, and POSTs it so the provider settles A→B from
+    your on-chain EscrowPool balance. The operator must run with
+    PRSM_REQUESTER_PAYMENT=1; you must have escrow balance ≥ the charge (fund it
+    with `prsm wallet deposit`).
+
+    \b
+    Key source (signs the authorization): PRIVATE_KEY env, else
+    FTNS_WALLET_PRIVATE_KEY. NEVER passed on the command line.
+
+    \b
+    Example:
+        export PRIVATE_KEY=0x...                       # your wallet
+        prsm wallet deposit --amount 5 --network testnet
+        prsm compute pay-infer --prompt "Hello" --budget 1 --network testnet
+
+    Exit 0 success, 1 daemon/authorization error, 2 unreachable.
+    """
+    import json as _json
+    from prsm.sdk.client import PRSMClient
+    ctx = _wallet_load_signer(network_name)
+    requester_key = ctx.get("private_key")
+    if not requester_key:
+        console.print(
+            "❌ no signing key — set PRIVATE_KEY (or FTNS_WALLET_PRIVATE_KEY) "
+            "to your wallet's private key. pay-infer signs a payment "
+            "authorization with it.", style="red")
+        raise SystemExit(1)
+    chain_id = 84532 if network_name == "testnet" else 8453
+    url = _api_url_from_creds(api_url_override)
+    spend_ceiling = max_spend_ftns if max_spend_ftns is not None else budget_ftns
+
+    async def _go():
+        client = PRSMClient(base_url=url)
+        try:
+            return await client.pay_and_infer(
+                prompt,
+                requester_key=requester_key,
+                provider_address=provider_address,
+                model_id=model_id,
+                max_tokens=max_tokens,
+                budget_ftns=budget_ftns,
+                max_spend_ftns=spend_ceiling,
+                privacy_tier=privacy_tier,
+                content_tier=content_tier,
+                chain_id=chain_id,
+                verify_pubkey_b64=verify_pubkey_b64,
+            )
+        finally:
+            await client.close()
+
+    try:
+        result = _run_async(_go())
+    except ValueError as exc:
+        # e.g. operator published no payment address + none supplied
+        console.print(f"❌ {exc}", style="red")
+        raise SystemExit(1)
+    except Exception as exc:  # noqa: BLE001 — connection / signing failure
+        msg = str(exc)
+        if any(s in msg.lower() for s in ("connect", "refused", "unreachable", "timeout")):
+            console.print(f"❌ cannot reach daemon at {url}: {exc}", style="red")
+            raise SystemExit(2)
+        console.print(f"❌ pay-infer failed: {exc}", style="red")
+        raise SystemExit(1)
+
+    result = result or {}
+    # A rejected authorization comes back as the server's 402 body (FastAPI
+    # {"detail": ...}) — no output/success. Detect + surface it as an error.
+    succeeded = bool(result.get("success")) or ("output" in result)
+    if not succeeded:
+        detail = result.get("detail") or result.get("error") or result
+        if output_format == "json":
+            click.echo(_json.dumps({"ok": False, "detail": detail}))
+        else:
+            console.print("[red]Payment authorization rejected:[/red]")
+            console.print(f"   {detail}")
+        raise SystemExit(1)
+
+    if output_format == "json":
+        click.echo(_json.dumps(result))
+        return
+    console.print(f"\n[bold]{result.get('output', '')}[/bold]")
+    charged = result.get("ftns_charged")
+    if charged is not None:
+        console.print(f"\n[dim]charged: {charged} FTNS (settled from your escrow)[/dim]")
+    if "receipt_verified" in result:
+        ok = result["receipt_verified"]
+        console.print(
+            f"[dim]receipt_verified: "
+            f"{'[green]yes[/green]' if ok else '[red]no[/red]'}[/dim]")
+    console.print()
+
+
 @compute.command("models")
 @click.option(
     "--api-url", "api_url_override", default=None,
@@ -12089,6 +12249,81 @@ def wallet_link_address(
             f"❌ HTTP {r.status_code}: {r.text[:200]}", style="red",
         )
         raise SystemExit(1)
+
+
+@wallet.command("deposit")
+@click.option(
+    "--amount", required=True, type=float,
+    help="FTNS to deposit into the on-chain EscrowPool",
+)
+@click.option(
+    "--network", "network_name",
+    type=click.Choice(["mainnet", "testnet"]), default="testnet",
+    help="Network the EscrowPool lives on (default: testnet = Base Sepolia)",
+)
+@click.option(
+    "--yes", "-y", is_flag=True, default=False,
+    help="Skip confirmation prompt",
+)
+def wallet_deposit(amount: float, network_name: str, yes: bool) -> None:
+    """Sprint 1192 — deposit FTNS into the on-chain EscrowPool (self-custodied).
+
+    Funds the requester-payment escrow your address draws from when you
+    `prsm compute pay-infer`. Wraps the sp1189 SDK deposit_escrow: approves the
+    FTNS allowance then calls EscrowPool.deposit, signed + broadcast with your
+    wallet key. You keep custody — withdraw any unspent balance later.
+
+    \b
+    Key source (signs the tx): PRIVATE_KEY env, else FTNS_WALLET_PRIVATE_KEY.
+    Requires web3 + native gas (ETH on Base) on the signing address.
+
+    \b
+    Example:
+        export PRIVATE_KEY=0x...
+        prsm wallet deposit --amount 5 --network testnet
+
+    Exit 0 success, 1 on error.
+    """
+    from prsm.sdk.client import PRSMClient
+    ctx = _wallet_load_signer(network_name)
+    requester_key = ctx.get("private_key")
+    addr = ctx.get("address")
+    if not requester_key:
+        console.print(
+            "❌ no signing key — set PRIVATE_KEY (or FTNS_WALLET_PRIVATE_KEY) "
+            "to your wallet's private key.", style="red")
+        raise SystemExit(1)
+    if amount <= 0:
+        console.print("❌ --amount must be > 0", style="red")
+        raise SystemExit(1)
+
+    console.print(
+        f"\nDeposit [bold]{amount} FTNS[/bold] into the EscrowPool on "
+        f"[bold]{network_name}[/bold]")
+    console.print(f"  from: {addr or '<address from key>'}")
+    if not yes and not click.confirm("Sign + broadcast this on-chain deposit?"):
+        console.print("aborted", style="yellow")
+        raise SystemExit(1)
+
+    async def _go():
+        client = PRSMClient()
+        try:
+            return await client.deposit_escrow(
+                requester_key=requester_key,
+                amount_ftns=amount,
+                network=network_name,
+            )
+        finally:
+            await client.close()
+
+    try:
+        tx_hash = _run_async(_go())
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"❌ deposit failed: {exc}", style="red")
+        raise SystemExit(1)
+    console.print(f"✅ deposited {amount} FTNS — tx [green]{tx_hash}[/green]")
+    console.print(
+        "[dim]escrow now funds `prsm compute pay-infer` charges.[/dim]\n")
 
 
 @wallet.command("withdraw")
