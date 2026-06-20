@@ -18538,6 +18538,93 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
+    @app.post("/ftns/faucet/onchain", tags=["ftns"])
+    async def ftns_faucet_onchain(body: Dict[str, Any] = {}) -> Dict[str, Any]:
+        """Sprint 1190 (day-one blocker #3) — dispense REAL on-chain TESTNET FTNS to a
+        new user's address (ERC-20 transfer from the faucet wallet), so the wired front
+        door (real balance + deposit_escrow + pay_and_infer) works end to end on Base
+        Sepolia. TESTNET-ONLY: the faucet is built only on a Base-Sepolia config and the
+        transfer hard-refuses any other chainId — it never gives away real-value FTNS.
+
+        Body: {destination_address: 0x-hex (required), amount: FTNS (optional, capped)}.
+        Caps reuse PRSM_FAUCET_MAX_PER_REQUEST/_PER_WALLET (default 100/1000).
+        """
+        import os
+        if os.environ.get("PRSM_FAUCET_ENABLED", "1") == "0":
+            raise HTTPException(status_code=403, detail="Faucet disabled")
+
+        faucet = getattr(node, "_onchain_faucet", None)
+        if faucet is None:
+            from prsm.economy.web3.ftns_faucet import build_onchain_faucet_or_none
+            faucet = build_onchain_faucet_or_none()
+        if faucet is None:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "on-chain FTNS faucet is not available: it is TESTNET-ONLY and "
+                    "requires PRSM_FAUCET_PRIVATE_KEY on a Base-Sepolia (chainId 84532) "
+                    "node. (It never dispenses on mainnet.)"
+                ),
+            )
+
+        dest = (body.get("destination_address") or "").strip()
+        if not (dest.startswith("0x") and len(dest) == 42):
+            raise HTTPException(
+                status_code=422,
+                detail="destination_address must be a 0x-prefixed 20-byte hex address",
+            )
+
+        def _pos_int(env_key: str, default: int) -> int:
+            raw = (os.environ.get(env_key, "") or "").strip()
+            if not raw:
+                return default
+            try:
+                v = int(raw)
+            except (TypeError, ValueError):
+                return default
+            return v if v > 0 else default
+
+        per_request_cap = _pos_int("PRSM_FAUCET_MAX_PER_REQUEST", 100)
+        per_wallet_cap = _pos_int("PRSM_FAUCET_MAX_PER_WALLET", 1000)
+        try:
+            amount = float(body.get("amount", per_request_cap))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="amount must be a positive number")
+        if amount <= 0:
+            raise HTTPException(status_code=422, detail="amount must be > 0")
+        amount = min(amount, per_request_cap)
+
+        try:
+            decimals = faucet.decimals
+            unit = 10 ** decimals
+            # Per-wallet cap: refuse if the recipient already holds >= the cap (stateless,
+            # bounds how much one address can pull from the faucet).
+            current_wei = faucet.balance_of_wei(dest)
+            if current_wei >= per_wallet_cap * unit:
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        f"address already holds {current_wei / unit:.0f} FTNS "
+                        f"(max {per_wallet_cap} from the faucet)"
+                    ),
+                )
+            from decimal import Decimal
+            amount_wei = int(Decimal(str(amount)) * Decimal(unit))
+            tx_hash = faucet.dispense(dest, amount_wei)
+            return {
+                "status": "dispensed",
+                "tx_hash": tx_hash,
+                "dispensed_ftns": amount,
+                "recipient": dest,
+                "faucet_address": faucet.faucet_address,
+                "network": "base-sepolia",
+            }
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa: BLE001
+            # FaucetMainnetRefusedError / broadcast / revert → surface, never 200-with-error.
+            raise HTTPException(status_code=502, detail=f"faucet dispense failed: {e}")
+
     # ── Web Dashboard (served at /, /static, /api/) ──────────────────────────────
 
     from pathlib import Path as _Path

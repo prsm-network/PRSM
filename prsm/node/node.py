@@ -4422,6 +4422,25 @@ class PRSMNode:
                 _pay_exc,
             )
 
+        # Sprint 1190 (day-one blocker #3) — build the on-chain TESTNET FTNS faucet
+        # ONCE here (so /ftns/faucet/onchain doesn't rebuild a web3 client per request).
+        # build_onchain_faucet_or_none returns None unless PRSM_FAUCET_PRIVATE_KEY is set
+        # AND the active network is Base Sepolia — it NEVER constructs on mainnet, the
+        # config-time half of the kill-switch. Fail-open (None disables the endpoint).
+        self._onchain_faucet = None
+        try:
+            from prsm.economy.web3.ftns_faucet import build_onchain_faucet_or_none
+            self._onchain_faucet = build_onchain_faucet_or_none()
+            if self._onchain_faucet is not None:
+                logger.info(
+                    "On-chain TESTNET FTNS faucet wired (faucet=%s, Base Sepolia only).",
+                    self._onchain_faucet.faucet_address,
+                )
+        except Exception as _faucet_exc:  # noqa: BLE001
+            logger.warning(
+                "On-chain faucet build failed (non-fatal): %s", _faucet_exc,
+            )
+
         # ── Settler Registry (Phase 6: L2-style staking for batch security) ──
         from prsm.node.settler_registry import SettlerRegistry
         self._settler_registry = SettlerRegistry(
