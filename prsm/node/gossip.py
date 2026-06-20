@@ -183,6 +183,17 @@ GOSSIP_KNOWLEDGE_RESPONSE = "agent_knowledge_response"
 GOSSIP_DIGEST_REQUEST = "digest_request"
 GOSSIP_DIGEST_RESPONSE = "digest_response"
 
+# Sp1182 — bound the attacker-controlled digest REQUEST. The requester's
+# `timestamps` dict drives one ledger query per entry; a 16MB frame packs
+# ~1e6 entries, and a `last_seen` of 0 forces each query to the bottom of
+# the retention window — a CPU/DB DoS amplified far past the per-peer
+# message rate limit (which counts messages, not subtypes-per-message).
+# The legitimate requester only ever emits the handful of catch-up
+# subtypes, so cap the processed count and floor `last_seen` to the
+# retention window. Generous cap (legit ~4-7); env-tunable for headroom.
+_MAX_DIGEST_REQUEST_SUBTYPES = 32
+_DIGEST_REQUEST_MAX_LOOKBACK_SEC = 86400.0  # 24h — the gossip-log retention
+
 
 # sp1008 — gossip-layer replay barrier. The transport dedups nonces only within
 # its ~300s window, but the gossip log retains messages 1h–24h, so a captured
@@ -495,9 +506,17 @@ class GossipProtocol:
         subtype = msg.payload.get("subtype", "")
         data = msg.payload.get("data", {})
         # sp934 — authenticate the origin: trust payload['origin'] only if its
-        # attestation verifies, else use the transport-authenticated sender_id.
+        # attestation verifies, else fall back to the relayer's identity.
         # A peer can no longer impersonate another node by setting payload origin.
-        origin = _authenticate_origin(msg.payload, msg.nonce, msg.sender_id)
+        # Sp1182 — the fallback is now the HANDSHAKE-AUTHENTICATED peer.peer_id,
+        # not the raw (spoofable) msg.sender_id frame field: for a legitimately
+        # relayed message they coincide (the forwarder stamps its own id), but
+        # for an unattested message a peer could otherwise set sender_id=<victim>
+        # and have the fallback origin attribute the content to that victim.
+        origin = _authenticate_origin(
+            msg.payload, msg.nonce,
+            getattr(peer, "peer_id", None) or msg.sender_id,
+        )
 
         if not subtype:
             self._record_drop("", "missing_subtype")
@@ -650,19 +669,41 @@ class GossipProtocol:
         """
         data = msg.payload.get("data", {})
         timestamps = data.get("timestamps", {})
-        requester_id = data.get("requester_id", msg.sender_id)
-        
+        # Sp1182 — route the response to the HANDSHAKE-AUTHENTICATED peer
+        # (the connection this request arrived on), NOT the attacker-
+        # controlled data["requester_id"] payload field. The latter let a
+        # peer set requester_id=<victim> and reflect a digest response at
+        # an arbitrary node. peer.peer_id is the only trustworthy target.
+        requester_id = getattr(peer, "peer_id", None) or msg.sender_id
+
         if not self.ledger:
             logger.debug(f"No ledger available for digest request from {requester_id[:8]}...")
             return
-        
+
+        # Sp1182 — bound the attacker-controlled request before any work:
+        # cap the subtype count (one ledger query per entry) and floor
+        # last_seen to the retention window (an unvalidated 0 forces a
+        # full-window scan). Without this a single rate-limited 16MB
+        # request drives up to ~1e6 ledger queries (a CPU/DB DoS).
+        if not isinstance(timestamps, dict):
+            timestamps = {}
+        _capped_items = list(timestamps.items())[:_MAX_DIGEST_REQUEST_SUBTYPES]
+        _since_floor = time.time() - _DIGEST_REQUEST_MAX_LOOKBACK_SEC
+
         # Collect messages that the requester hasn't seen
         missing_messages: List[Dict[str, Any]] = []
-        
-        for subtype, last_seen in timestamps.items():
+
+        for subtype, last_seen in _capped_items:
             try:
+                # Clamp last_seen to a numeric value no older than the
+                # retention floor (reject an attacker's 0 / junk that
+                # would force a max-depth scan).
+                try:
+                    _since = max(float(last_seen), _since_floor)
+                except (TypeError, ValueError):
+                    _since = _since_floor
                 messages = await self.ledger.get_recent_gossip(
-                    since=last_seen,
+                    since=_since,
                     subtypes=[subtype]
                 )
                 missing_messages.extend(messages)

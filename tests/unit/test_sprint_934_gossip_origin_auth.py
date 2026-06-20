@@ -52,7 +52,12 @@ async def _deliver(gp, msg):
         seen.append(origin)
 
     gp._subscribers["test_sub"] = [cb]
-    await gp._handle_gossip(msg, MagicMock())
+    # Sp1182 — the fallback origin (when attestation is absent/invalid) is now
+    # the handshake-authenticated peer.peer_id, not the raw msg.sender_id frame
+    # field. An honest relayer's authenticated peer_id equals the sender_id it
+    # stamps, so pass a peer bound to msg.sender_id (these tests don't spoof the
+    # relayer identity itself; sp1182's own test covers the spoofed case).
+    await gp._handle_gossip(msg, MagicMock(peer_id=msg.sender_id))
     return seen
 
 
