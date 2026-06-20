@@ -14,8 +14,10 @@ destination_user_id:
     tier_limit_exceeded, with an upgrade-to-enhanced hint for
     basic-tier users (the teeth behind sp883's enhanced template)
 
-A raw destination_address (no PRSM identity) is NOT gated —
-documented operator responsibility, mirroring the quote's bypass.
+A raw destination_address (no PRSM identity) was originally NOT gated (operator
+responsibility) — sp1185 (day-one audit) made it FAIL-CLOSED by default (opt-in via
+PRSM_FIAT_ALLOW_UNVERIFIED_ADDRESS_ONRAMP), and made an identity onramp with KYC unwired
+fail closed (503) instead of silently minting.
 """
 from __future__ import annotations
 
@@ -182,31 +184,42 @@ def test_execute_blocks_enhanced_over_limit_no_upgrade_hint():
 
 # ── Bypass paths ─────────────────────────────────────────────
 
-def test_execute_address_only_not_gated():
-    """Raw destination_address (no user_id) → no KYC/tier gate
-    (operator responsibility). Proceeds past the gate."""
+def test_execute_address_only_blocked_by_default(monkeypatch):
+    """sp1185 — a raw destination_address bypasses PRSM-side KYC, so it is now FAIL-CLOSED
+    by default (403) instead of silently minting (was test_execute_address_only_not_gated,
+    which encoded the bypass)."""
+    monkeypatch.delenv("PRSM_FIAT_ALLOW_UNVERIFIED_ADDRESS_ONRAMP", raising=False)
     resp = _client(waas=None, kyc=_kyc_verified("x", "basic")).post(
         "/wallet/onramp/execute",
-        json={
-            "usd_amount": 999999.0,
-            "destination_address": "0x" + "22" * 20,
-        },
+        json={"usd_amount": 100.0, "destination_address": "0x" + "22" * 20},
     )
-    # Not 403 — no per-user identity to gate. Proceeds to session
-    # mint (PENDING_COMMISSION without CDP env).
-    assert resp.status_code == 200
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["error"] == "raw_address_onramp_disabled"
 
 
-def test_execute_no_kyc_client_not_gated():
-    """When _kyc_client is unwired, no gating (pre-sp884 behavior
-    for deployments that haven't wired KYC). destination_user_id
-    still resolves via WaaS."""
+def test_execute_address_only_allowed_with_operator_optin(monkeypatch):
+    """sp1185 — the operator can explicitly accept off-PRSM KYC responsibility for raw
+    addresses, restoring the (now opt-in) capability."""
+    monkeypatch.setenv("PRSM_FIAT_ALLOW_UNVERIFIED_ADDRESS_ONRAMP", "1")
+    resp = _client(waas=None, kyc=_kyc_verified("x", "basic")).post(
+        "/wallet/onramp/execute",
+        json={"usd_amount": 999999.0, "destination_address": "0x" + "22" * 20},
+    )
+    assert resp.status_code == 200  # proceeds to session mint (PENDING_COMMISSION w/o CDP)
+
+
+def test_execute_no_kyc_client_fails_closed():
+    """sp1185 — when _kyc_client is unwired, an identity-gated onramp now FAILS CLOSED
+    (503 kyc_enforcement_unavailable) instead of skipping the entire KYC/tier/AML block
+    and minting an unverified session (was test_execute_no_kyc_client_not_gated — the
+    regulatory bypass the day-one audit flagged)."""
     waas = _waas_with("alice")
     resp = _client(waas=waas, kyc=None).post(
         "/wallet/onramp/execute",
         json={"usd_amount": 5000.0, "destination_user_id": "alice"},
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 503
+    assert resp.json()["detail"]["error"] == "kyc_enforcement_unavailable"
 
 
 # ── Sp1175: per-replica enforcement scope + strict-shared lever ──

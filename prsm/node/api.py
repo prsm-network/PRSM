@@ -2980,9 +2980,51 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         # the destination_user_id path is gated — a raw
         # destination_address has no PRSM identity to enforce against
         # (documented operator responsibility, mirroring the quote).
+        # sp1185 (day-one-live blocker #6) — raw destination_address has NO PRSM identity
+        # to KYC against; minting a real-money onramp session for one bypasses PRSM-side
+        # KYC/tier/AML entirely. FAIL CLOSED: off unless the operator EXPLICITLY accepts
+        # that responsibility via PRSM_FIAT_ALLOW_UNVERIFIED_ADDRESS_ONRAMP=1. (Was: raw
+        # address silently minted with no checks.)
+        if has_address:
+            _allow_raw = (
+                os.environ.get("PRSM_FIAT_ALLOW_UNVERIFIED_ADDRESS_ONRAMP", "")
+                .strip().lower()
+            ) in ("1", "true", "yes", "on")
+            if not _allow_raw:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error": "raw_address_onramp_disabled",
+                        "message": (
+                            "Onramp to a raw destination_address is disabled because it "
+                            "bypasses PRSM-side KYC/tier/AML enforcement. Use the "
+                            "identity-gated destination_user_id path, or the operator "
+                            "must set PRSM_FIAT_ALLOW_UNVERIFIED_ADDRESS_ONRAMP=1 to "
+                            "accept off-PRSM KYC responsibility."
+                        ),
+                    },
+                )
         if has_user_id:
             _kyc = getattr(node, "_kyc_client", None)
-            if _kyc is not None:
+            # sp1185 — FAIL CLOSED when KYC enforcement is unavailable. Previously a node
+            # with no _kyc_client wired (the default day-one state) SKIPPED the entire
+            # KYC + tier + AML block and minted an unverified session — a regulatory
+            # bypass masquerading as a gate. An identity-gated onramp must not proceed
+            # without the KYC gate that is supposed to protect it.
+            if _kyc is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": "kyc_enforcement_unavailable",
+                        "message": (
+                            "Fiat onramp for an identity (destination_user_id) requires "
+                            "KYC enforcement, but no KYC client is configured on this "
+                            "node. Onramp is unavailable until the operator wires KYC "
+                            "(fail-closed; refusing to mint an unverified session)."
+                        ),
+                    },
+                )
+            if _kyc is not None:  # always true here (None raised above); defensive
                 _rec = _kyc.get_status(body.destination_user_id)
                 if _rec is None or _rec.status != "VERIFIED":
                     raise HTTPException(
