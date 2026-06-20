@@ -859,42 +859,62 @@ class APIHardening:
         self.status_websocket: Optional[StatusWebSocket] = None
         self._initialized = False
     
-    async def initialize(self):
-        """Initialize all hardening components."""
-        if self._initialized:
-            return
-        
-        # Initialize rate limiter
-        if self.config.enable_rate_limiting:
-            rate_limit_config = RateLimitConfig(
+    def _ensure_components_constructed(self):
+        """Sprint 1187 — SYNCHRONOUSLY construct the hardening components (idempotent).
+
+        Split out of initialize() so apply_middleware() can guarantee the components
+        EXIST before it registers middleware. Previously the rate_limiter was built only
+        inside the async initialize(), which create_api_app create_task's (does not await)
+        when the event loop is already running — so apply_middleware() ran first, saw
+        rate_limiter=None, and SILENTLY skipped RateLimitMiddleware (rate limiting / DDoS
+        protection off in the async-server path). Construction is pure (no await); the
+        async warm-up (redis/JWT) stays in initialize() and runs on these instances."""
+        if self.config.enable_rate_limiting and self.rate_limiter is None:
+            self.rate_limiter = RateLimiter(RateLimitConfig(
                 requests_per_minute=self.config.rate_limit_requests_per_minute,
                 requests_per_hour=self.config.rate_limit_requests_per_hour,
                 burst_size=self.config.rate_limit_burst_size,
-                enabled=True
-            )
-            self.rate_limiter = RateLimiter(rate_limit_config)
-            await self.rate_limiter.initialize()
-        
-        # Initialize JWT handler
-        if self.config.enable_jwt_auth:
+                enabled=True,
+            ))
+        if self.config.enable_jwt_auth and self.jwt_handler is None:
             try:
                 from prsm.core.auth.jwt_handler import JWTHandler
                 self.jwt_handler = JWTHandler()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("JWT handler construction failed", error=str(e))
+                self.jwt_handler = None
+        if self.config.enable_websocket and self.status_websocket is None:
+            self.status_websocket = StatusWebSocket()
+
+    async def initialize(self):
+        """Initialize all hardening components (the async warm-up: redis/JWT backends)."""
+        if self._initialized:
+            return
+
+        # Construct the components synchronously first (idempotent — apply_middleware may
+        # have already built them in the loop-running race path), then warm up the async
+        # backends on those instances.
+        self._ensure_components_constructed()
+
+        if self.config.enable_rate_limiting and self.rate_limiter is not None:
+            await self.rate_limiter.initialize()
+
+        if self.config.enable_jwt_auth and self.jwt_handler is not None:
+            try:
                 await self.jwt_handler.initialize()
             except Exception as e:
                 logger.warning("JWT handler initialization failed", error=str(e))
                 self.jwt_handler = None
-        
-        # Initialize WebSocket manager
-        if self.config.enable_websocket:
-            self.status_websocket = StatusWebSocket()
-        
+
         self._initialized = True
         logger.info("API hardening initialized")
-    
+
     def apply_middleware(self):
         """Apply all middleware to the FastAPI app."""
-        
+        # sp1187 — construct components synchronously so the rate-limit middleware is
+        # ALWAYS registered here, even if the async initialize() hasn't completed yet.
+        self._ensure_components_constructed()
+
         # Apply rate limiting middleware
         if self.config.enable_rate_limiting and self.rate_limiter:
             self.app.add_middleware(RateLimitMiddleware, rate_limiter=self.rate_limiter)
