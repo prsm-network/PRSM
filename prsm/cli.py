@@ -455,6 +455,131 @@ def _node_preflight_diagnostics(config: "NodeConfig") -> List[PreflightCheckResu
                 )
             )
 
+    # ── Sprint 1198 — day-one-live readiness: will a REAL user get REAL results? ──
+    # These aggregate the front-door work (sp1183-1197) into the pre-start verdict so
+    # `prsm node start` (and the preflight) tells the operator whether the node will
+    # actually serve, resolve its chain, refuse to start on an insecure bind, and
+    # honor paid requests — BEFORE it boots. Each check is cheap + fail-soft.
+
+    # 1. Inference serving by default (sp1184).
+    try:
+        from prsm.node.inference_wiring import (
+            ml_inference_available, resolve_inference_executor_kind,
+        )
+        _raw = (os.environ.get("PRSM_INFERENCE_EXECUTOR") or "").strip() or None
+        _kind = resolve_inference_executor_kind(
+            _raw, ml_available=ml_inference_available())
+        checks.append(PreflightCheckResult(
+            name="Inference serving",
+            status=PREFLIGHT_PASS if _kind else PREFLIGHT_WARN,
+            required=False,
+            details=(f"executor '{_kind}' will serve /compute/inference"
+                     if _kind else
+                     "no inference executor (ML deps absent or executor disabled) — "
+                     "/compute/inference will 503"),
+            remediation=("None" if _kind else
+                         "pip install -e '.[ml]' for real local inference by default, "
+                         "or set PRSM_INFERENCE_EXECUTOR=local|parallax|...."),
+        ))
+    except Exception as exc:  # noqa: BLE001
+        checks.append(PreflightCheckResult(
+            name="Inference serving", status=PREFLIGHT_WARN, required=False,
+            details=f"readiness check failed: {exc}",
+            remediation="Verify the prsm.node.inference_wiring import."))
+
+    # 2. Network + contract addresses resolve (sp1183).
+    try:
+        from prsm.config.networks import resolve_endpoints
+        _ep = resolve_endpoints()
+        _have = bool(getattr(_ep, "ftns_token", None) and getattr(_ep, "escrow_pool", None))
+        checks.append(PreflightCheckResult(
+            name="Network + contracts",
+            status=PREFLIGHT_PASS if _have else PREFLIGHT_WARN,
+            required=False,
+            details=(f"{_ep.network_name} (chainId {_ep.chain_id}): FTNS + EscrowPool resolved"
+                     if _have else
+                     f"{_ep.network_name} (chainId {_ep.chain_id}): FTNS/EscrowPool address missing"),
+            remediation=("None" if _have else
+                         "Set PRSM_NETWORK=mainnet|testnet to a network with deployed contracts."),
+        ))
+    except Exception as exc:  # noqa: BLE001
+        checks.append(PreflightCheckResult(
+            name="Network + contracts", status=PREFLIGHT_WARN, required=False,
+            details=f"network resolution failed: {exc}",
+            remediation="Set PRSM_NETWORK to a known network."))
+
+    # 3. Public-bind auth posture (sp1011 fail-closed gate + sp1195 provisioning).
+    #    This is the one that predicts a REFUSE-TO-START before it happens.
+    try:
+        from prsm.node.node import (
+            assess_public_bind_auth_posture, should_refuse_insecure_public_bind,
+            decide_api_key_provisioning, _default_node_api_key_path,
+        )
+        _truthy = {"1", "true", "yes", "on"}
+        _api_host = str(getattr(config, "api_host", None) or "127.0.0.1")
+        try:
+            _persisted = "x" if _default_node_api_key_path().exists() else None
+        except Exception:  # noqa: BLE001
+            _persisted = None
+        _auto = (os.environ.get("PRSM_AUTO_PROVISION_API_KEY") or "").strip().lower() in _truthy
+        _action, _ = decide_api_key_provisioning(
+            api_host=_api_host, env_key=os.environ.get("PRSM_NODE_API_KEY", ""),
+            persisted_key=_persisted, auto_provision=_auto)
+        _will_have_key = _action in ("use_env", "use_persisted", "generate")
+        _posture, _ = assess_public_bind_auth_posture(
+            listen_host=_api_host, api_key_present=_will_have_key)
+        _allow = (os.environ.get("PRSM_ALLOW_INSECURE_PUBLIC_BIND") or "").strip().lower() in _truthy
+        if _posture == "ok":
+            checks.append(PreflightCheckResult(
+                name="API auth posture", status=PREFLIGHT_PASS, required=True,
+                details=f"{_api_host}: loopback or authenticated", remediation="None"))
+        elif should_refuse_insecure_public_bind(_posture, allow_insecure=_allow):
+            checks.append(PreflightCheckResult(
+                name="API auth posture", status=PREFLIGHT_FAIL, required=True,
+                details=(f"{_api_host}: public bind with no API key — the node will "
+                         "REFUSE to start (money/KYC endpoints would be unauthenticated)"),
+                remediation=("Set PRSM_NODE_API_KEY, or PRSM_AUTO_PROVISION_API_KEY=1 to "
+                             "self-provision one, or bind 127.0.0.1 behind a reverse proxy.")))
+        else:
+            checks.append(PreflightCheckResult(
+                name="API auth posture", status=PREFLIGHT_WARN, required=False,
+                details=f"{_api_host}: public + unauthenticated (PRSM_ALLOW_INSECURE_PUBLIC_BIND ack'd)",
+                remediation="Front with an authenticating reverse proxy in production."))
+    except Exception as exc:  # noqa: BLE001
+        checks.append(PreflightCheckResult(
+            name="API auth posture", status=PREFLIGHT_WARN, required=False,
+            details=f"posture check failed: {exc}", remediation="None"))
+
+    # 4. Requester-payment readiness — ONLY when the operator opted in (sp1056/1196).
+    if (os.environ.get("PRSM_REQUESTER_PAYMENT") or "").strip().lower() in {
+            "1", "true", "yes", "on"}:
+        try:
+            from prsm.node.operator_address import resolve_operator_address
+            _addr = resolve_operator_address()
+            _settler = (os.environ.get("FTNS_WALLET_PRIVATE_KEY") or "").strip()
+            if _addr and _settler:
+                checks.append(PreflightCheckResult(
+                    name="Requester-payment readiness", status=PREFLIGHT_PASS,
+                    required=False,
+                    details="PRSM_REQUESTER_PAYMENT on; operator payee + settler key present",
+                    remediation="None"))
+            else:
+                _missing = []
+                if not _addr:
+                    _missing.append("operator payee address")
+                if not _settler:
+                    _missing.append("funded settler key (FTNS_WALLET_PRIVATE_KEY)")
+                checks.append(PreflightCheckResult(
+                    name="Requester-payment readiness", status=PREFLIGHT_WARN,
+                    required=False,
+                    details=("PRSM_REQUESTER_PAYMENT on but missing: " + ", ".join(_missing)
+                             + " — paid requests will be rejected (402) or won't settle"),
+                    remediation="Set FTNS_WALLET_PRIVATE_KEY (derives the payee + signs settle)."))
+        except Exception as exc:  # noqa: BLE001
+            checks.append(PreflightCheckResult(
+                name="Requester-payment readiness", status=PREFLIGHT_WARN, required=False,
+                details=f"readiness check failed: {exc}", remediation="None"))
+
     return checks
 
 
