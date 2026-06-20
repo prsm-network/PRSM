@@ -158,6 +158,33 @@ def _resolve_balance_lookup() -> Any:
         return wallet_api._ZeroBalanceLookup()
 
 
+def _resolve_nonce_store() -> Any:
+    """Sprint 1197 — resolve the SIWE nonce store: a shared SQLite file by default
+    (correct across multi-worker deployments), fail-soft to the in-memory store.
+
+    The default InMemoryNonceStore is per-process, so a multi-worker rollout issues a
+    nonce on one worker that another can't consume → intermittent SIWE login failure.
+    SqliteNonceStore (shared file at ~/.prsm/siwe_nonces.db, override
+    PRSM_WALLET_NONCE_DB) makes issue/consume cross-worker-correct without Redis. Any
+    init failure (unwritable path, etc.) degrades to in-memory so SIWE still works
+    single-process — never blocks wiring."""
+    from prsm.interface.api import wallet_api
+    env_path = (os.environ.get("PRSM_WALLET_NONCE_DB") or "").strip()
+    db_path = Path(env_path) if env_path else (Path.home() / ".prsm" / "siwe_nonces.db")
+    try:
+        from prsm.interface.onboarding.siwe import SqliteNonceStore
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteNonceStore(db_path)
+        logger.info("Sprint 1197 — using SqliteNonceStore at %s (multi-worker SIWE).",
+                    db_path)
+        return store
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Sprint 1197 — SqliteNonceStore init failed (%s); falling back to "
+            "InMemoryNonceStore (SIWE will NOT work across multiple workers).", exc)
+        return wallet_api.InMemoryNonceStore()
+
+
 def _resolve_price_source() -> Any:
     """Sprint 1191 — resolve the wallet's FTNS→USD price source from the operator/
     governance-configured rate (``FTNS_USD_RATE``), falling soft to $0 when unset/invalid.
@@ -277,7 +304,9 @@ def wire_wallet_api_services(node: Any) -> None:
                 session_secret=_sess_secret,
                 session_required=_sess_required,
             ),
-            nonce_store=wallet_api.InMemoryNonceStore(),
+            # sp1197 — shared SQLite nonce store so SIWE works across multi-worker
+            # deployments (fail-soft to in-memory; see _resolve_nonce_store).
+            nonce_store=_resolve_nonce_store(),
             binding_service=WalletBindingService(binding_store),
             # sp1191 — operator/governance-configured FTNS→USD price (FTNS_USD_RATE),
             # replacing the hardcoded $0 that rendered every real balance (sp1183) as

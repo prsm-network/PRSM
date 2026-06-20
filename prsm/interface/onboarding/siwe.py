@@ -15,11 +15,13 @@ domain/timing checks. This module wraps it with PRSM-specific invariants:
 from __future__ import annotations
 
 import secrets
+import sqlite3
 import string
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Dict, Optional, Protocol
+from pathlib import Path
+from typing import Callable, Dict, Optional, Protocol, Union
 
 from siwe import (
     DomainMismatch,
@@ -141,6 +143,80 @@ class InMemoryNonceStore:
         expired = [n for n, exp in self._nonces.items() if exp <= now]
         for n in expired:
             del self._nonces[n]
+
+
+_NONCE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS siwe_nonces (
+    nonce      TEXT PRIMARY KEY,
+    expires_at REAL NOT NULL
+);
+"""
+
+
+class SqliteNonceStore:
+    """Sprint 1197 — SQLite-backed single-use SIWE nonce store.
+
+    The default ``InMemoryNonceStore`` keeps nonces in a per-process dict, so a
+    multi-worker deployment (the realistic production posture: uvicorn/gunicorn
+    with N workers) issues a nonce on worker A that worker B can't see → SIWE
+    login fails intermittently with ``siwe_nonce_invalid_or_consumed``. A shared
+    SQLite file makes ``issue``/``consume`` correct across all workers on one host
+    WITHOUT a Redis dependency.
+
+    Single-use is atomic across workers: ``consume`` is a single
+    ``DELETE ... WHERE nonce=? AND expires_at>now`` — SQLite serializes writes, so
+    of two concurrent consumes of the same nonce exactly one sees ``rowcount==1``.
+    A short ``busy_timeout`` rides out cross-worker write contention. The Protocol
+    is identical to InMemoryNonceStore so it's a drop-in.
+    """
+
+    def __init__(
+        self,
+        db_path: Union[Path, str],
+        *,
+        _now: Optional[Callable[[], float]] = None,
+        busy_timeout_ms: int = 5000,
+    ) -> None:
+        self._path = Path(db_path)
+        self._now = _now or time.time
+        self._busy_timeout_ms = int(busy_timeout_ms)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._conn() as conn:
+            conn.executescript(_NONCE_SCHEMA_SQL)
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._path, timeout=self._busy_timeout_ms / 1000.0)
+        conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
+        return conn
+
+    def issue(self, ttl_seconds: int = 300) -> str:
+        now = self._now()
+        with self._conn() as conn:
+            conn.execute("DELETE FROM siwe_nonces WHERE expires_at <= ?", (now,))
+            expires_at = now + ttl_seconds
+            for _ in range(8):  # regenerate on the astronomically-unlikely collision
+                nonce = _random_nonce()
+                try:
+                    conn.execute(
+                        "INSERT INTO siwe_nonces (nonce, expires_at) VALUES (?, ?)",
+                        (nonce, expires_at),
+                    )
+                    conn.commit()
+                    return nonce
+                except sqlite3.IntegrityError:
+                    continue
+            raise RuntimeError("could not allocate a unique SIWE nonce")
+
+    def consume(self, nonce: str) -> bool:
+        now = self._now()
+        with self._conn() as conn:
+            conn.execute("DELETE FROM siwe_nonces WHERE expires_at <= ?", (now,))
+            cur = conn.execute(
+                "DELETE FROM siwe_nonces WHERE nonce = ? AND expires_at > ?",
+                (nonce, now),
+            )
+            conn.commit()
+            return cur.rowcount == 1
 
 
 def verify(
