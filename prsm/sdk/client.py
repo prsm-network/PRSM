@@ -169,6 +169,116 @@ class PRSMClient:
                 result["receipt_verified"] = False
         return result
 
+    # ── Sprint 1189 — pay-for-inference (requester-payment UX) ────
+
+    async def deposit_escrow(
+        self,
+        *,
+        requester_key: str,
+        amount_ftns,
+        network: Optional[str] = None,
+        rpc_url: Optional[str] = None,
+        escrow_pool_address: Optional[str] = None,
+        ftns_token_address: Optional[str] = None,
+        _client: Any = None,
+    ) -> str:
+        """Sprint 1189 — deposit ``amount_ftns`` of FTNS into the on-chain EscrowPool
+        under your own (requester) address, so settled inference can draw from it. Returns
+        the deposit tx hash. Self-custodied — withdraw any unspent balance later.
+
+        Resolves the EscrowPool / FTNS token / RPC from the active network (PRSM_NETWORK,
+        or ``network``) unless overridden. Requires web3 + the requester private key (this
+        signs + broadcasts a real on-chain tx). ``_client`` is injectable for tests."""
+        from decimal import Decimal
+        amount_wei = int(Decimal(str(amount_ftns)) * (Decimal(10) ** 18))
+        client = _client
+        if client is None:
+            from prsm.config.networks import resolve_endpoints
+            from prsm.economy.web3.escrow_pool_client import EscrowPoolClient
+            ep = resolve_endpoints(network)
+            client = EscrowPoolClient(
+                rpc_url or ep.rpc_url,
+                escrow_pool_address or ep.escrow_pool,
+                ftns_token_address or ep.ftns_token,
+                private_key=requester_key,
+            )
+        return await client.deposit(amount_wei)
+
+    async def pay_and_infer(
+        self,
+        prompt: str,
+        *,
+        requester_key: str,
+        provider_address: Optional[str] = None,
+        model_id: str = "gpt2",
+        max_tokens: int = 8,
+        budget_ftns: float = 1.0,
+        max_spend_ftns=None,
+        privacy_tier: str = "none",
+        content_tier: str = "A",
+        chain_id: int = 8453,
+        expiry_unix: Optional[int] = None,
+        verify_pubkey_b64: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Sprint 1189 — pay for one inference: sign an EIP-712 PaymentAuthorization bound
+        to this exact request and POST it so the provider settles A→B from your escrow.
+
+        Discovers the operator's payee address from GET /info when ``provider_address``
+        isn't supplied. ``max_spend_ftns`` is the ceiling you authorize (defaults to
+        ``budget_ftns``); ``chain_id`` MUST match the network (8453 mainnet / 84532 Base
+        Sepolia); ``expiry_unix`` defaults to now+5min. You must have escrow balance ≥ the
+        charge (see ``deposit_escrow``). Returns the server payload; a rejected
+        authorization surfaces as HTTP 402 in the response. ``verify_pubkey_b64`` runs the
+        inline receipt verification like ``infer``."""
+        import time
+        from prsm.settlement.payment_client import build_payment_authorization
+
+        if provider_address is None:
+            info = await self._get("/info")
+            provider_address = (info or {}).get("operator_address")
+            if not provider_address:
+                raise ValueError(
+                    "operator published no payment address (operator_address absent from "
+                    "/info); supply provider_address explicitly"
+                )
+        if max_spend_ftns is None:
+            max_spend_ftns = budget_ftns
+        if expiry_unix is None:
+            expiry_unix = int(time.time()) + 300
+        _max_tokens = int(max_tokens or 0)
+        auth = build_payment_authorization(
+            requester_key=requester_key,
+            provider_address=provider_address,
+            model_id=model_id,
+            prompt=prompt,
+            max_tokens=_max_tokens,
+            privacy_tier=privacy_tier,
+            content_tier=content_tier,
+            max_spend_ftns=max_spend_ftns,
+            expiry_unix=int(expiry_unix),
+            chain_id=chain_id,
+        )
+        body = {
+            "prompt": prompt,
+            "model_id": model_id,
+            "budget_ftns": budget_ftns,
+            "privacy_tier": privacy_tier,
+            "content_tier": content_tier,
+            "max_tokens": _max_tokens,
+            "payment_authorization": auth,
+        }
+        result = await self._post("/compute/inference", body)
+        if verify_pubkey_b64:
+            try:
+                from prsm.compute.inference.models import InferenceReceipt
+                from prsm.compute.inference.receipt import verify_receipt
+                receipt = InferenceReceipt.from_dict(result.get("receipt") or {})
+                result["receipt_verified"] = bool(
+                    verify_receipt(receipt, public_key_b64=verify_pubkey_b64))
+            except Exception:
+                result["receipt_verified"] = False
+        return result
+
     # ── Sprint 821 — Content publish + fetch ────────────────────
 
     async def publish_content(
