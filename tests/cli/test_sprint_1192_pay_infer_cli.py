@@ -254,5 +254,26 @@ def test_dry_run_json_format(runner, monkeypatch):
     assert any(c["level"] == "pass" for c in payload["checks"])
 
 
+def test_dry_run_operator_rejects_payment_fails(runner, monkeypatch):
+    # sp1196 — operator advertises an address but does NOT accept requester payment.
+    monkeypatch.setenv("PRIVATE_KEY", _TEST_KEY)
+    _patch_info(monkeypatch, payload={
+        "operator_address": "0xOperator", "requester_payment_accepted": False})
+    _patch_escrow(monkeypatch, balance_wei=10 * 10**18)
+    r = runner.invoke(main, ["compute", "pay-infer", "--prompt", "hi", "--dry-run"])
+    assert r.exit_code == 1
+    assert "does not accept requester payment" in r.output.lower()
+
+
+def test_dry_run_operator_accepts_payment_passes(runner, monkeypatch):
+    monkeypatch.setenv("PRIVATE_KEY", _TEST_KEY)
+    _patch_info(monkeypatch, payload={
+        "operator_address": "0xOperator", "requester_payment_accepted": True})
+    _patch_escrow(monkeypatch, balance_wei=10 * 10**18)
+    r = runner.invoke(main, ["compute", "pay-infer", "--prompt", "hi", "--dry-run"])
+    assert r.exit_code == 0, r.output
+    assert "accepts requester payment" in r.output.lower()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

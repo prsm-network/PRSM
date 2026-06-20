@@ -7196,6 +7196,21 @@ def compute_pay_infer_cli(
                         "operator published no payment address (operator_address "
                         "absent from /info) — the operator isn't accepting requester "
                         "payment, or pass --provider-address"))
+                # sp1196 — does the operator actually ACCEPT requester payment?
+                # operator_address alone doesn't guarantee it (PRSM_REQUESTER_PAYMENT
+                # may be off → a paid request gets a 402). Absent key = older node.
+                accepted = (info or {}).get("requester_payment_accepted")
+                if accepted is True:
+                    checks.append((True, "operator accepts requester payment"))
+                elif accepted is False:
+                    checks.append((False,
+                        "operator does NOT accept requester payment "
+                        "(PRSM_REQUESTER_PAYMENT is off on the node) — a paid request "
+                        "would be rejected (402)"))
+                else:
+                    checks.append((None,
+                        "operator does not advertise payment acceptance (older node); "
+                        "proceeding on operator_address"))
 
         try:
             from prsm.config.networks import resolve_endpoints

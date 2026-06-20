@@ -15079,6 +15079,16 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         op_addr = getattr(node, "_operator_address", None)
         if op_addr:
             body["operator_address"] = op_addr
+        # Sprint 1196 — advertise whether this operator ACCEPTS requester payment
+        # (PRSM_REQUESTER_PAYMENT on + a payment/relayer verifier wired). A requester
+        # needs this BEFORE signing: operator_address alone is the node's general
+        # on-chain identity and can be set without requester-payment enabled, in
+        # which case a paid /compute/inference is rejected (402 verifier-not-wired).
+        # The `pay-infer --dry-run` preflight reads this to give an accurate verdict.
+        body["requester_payment_accepted"] = bool(
+            getattr(node, "_payment_verifier", None)
+            or getattr(node, "_relayer_verifier", None)
+        )
         # Sprint 173 — surface whether QueryOrchestrator (agent_forge)
         # is wired. Operators flipping PRSM_QUERY_ORCHESTRATOR_ENABLED=1
         # need a quick check that the env var actually produced a
