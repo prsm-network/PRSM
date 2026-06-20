@@ -15198,6 +15198,29 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         """
         return {"status": "ok", "node_id": node.identity.node_id if node.identity else "unknown"}
 
+    # Sprint 1186 (day-one-live blocker #9) — READINESS probe (distinct from the /health
+    # LIVENESS probe above). Returns 503 when the node can't serve its primary path
+    # (inference dark) so a load balancer DRAINS traffic instead of routing to a broken
+    # node — without the 503-on-liveness mistake that would make k8s RESTART a merely-
+    # not-ready pod. Ungated (not in _GATED_PATHS) so the LB can reach it like /health;
+    # body is coarse non-sensitive flags only. Cheap (no RPC).
+    async def _readiness_response():
+        from fastapi.responses import JSONResponse
+        from prsm.node.readiness import compute_readiness
+        ready, detail = compute_readiness(node)
+        detail["node_id"] = node.identity.node_id if node.identity else "unknown"
+        return JSONResponse(status_code=200 if ready else 503, content=detail)
+
+    @app.get("/health/ready")
+    async def health_ready():
+        """Readiness probe — 200 when the node can serve inference, 503 otherwise."""
+        return await _readiness_response()
+
+    @app.get("/readyz")
+    async def readyz():
+        """Alias of /health/ready (the conventional k8s readiness path name)."""
+        return await _readiness_response()
+
     @app.get("/metrics")
     async def get_metrics() -> Any:
         """Prometheus text/plain exposition for ops dashboards.
