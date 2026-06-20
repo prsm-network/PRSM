@@ -133,6 +133,47 @@ class _ZeroBalanceLookup:
         return Decimal("0")
 
 
+class OnChainBalanceLookup:
+    """Sprint 1183 — the production ``BalanceLookup``: a REAL read-only on-chain FTNS
+    balance, replacing the ``_ZeroBalanceLookup`` $0 mock that made every user's wallet a
+    dead display (day-one-live blocker #1).
+
+    Wraps a duck-typed reader (``balance_wei(address) -> int`` + ``.decimals``, e.g.
+    ``ReadOnlyFTNSBalanceReader``), converts raw wei → WHOLE FTNS ``Decimal`` (what the
+    balance endpoint + ``ftns_to_usd`` expect), with:
+
+      * a short per-address TTL cache so /balance doesn't hammer the RPC; and
+      * FAIL-SOFT: any reader error returns the last-good cached value for that address,
+        else ``Decimal("0")`` — it NEVER raises, so the /balance endpoint never 500s and
+        a transient RPC-replica hiccup degrades to a stale-but-sane number rather than an
+        error (the MEMORY.md mainnet RPC-lag lesson: tolerate stale reads).
+    """
+
+    def __init__(self, reader: Any, *, cache_ttl_s: float = 15.0, _now=None) -> None:
+        import time as _time
+        self._reader = reader
+        self._ttl = float(cache_ttl_s)
+        self._now = _now or _time.monotonic
+        # address -> (whole_ftns Decimal, fetched_at monotonic)
+        self._cache: Dict[str, tuple] = {}
+
+    def get_ftns_balance(self, wallet_address: str) -> Decimal:
+        now = self._now()
+        cached = self._cache.get(wallet_address)
+        if cached is not None and (now - cached[1]) < self._ttl:
+            return cached[0]
+        try:
+            wei = int(self._reader.balance_wei(wallet_address))
+            decimals = int(getattr(self._reader, "decimals", 18))
+            whole = Decimal(wei) / (Decimal(10) ** decimals)
+            self._cache[wallet_address] = (whole, now)
+            return whole
+        except Exception:  # noqa: BLE001 — fail-soft: never raise out of /balance
+            if cached is not None:
+                return cached[0]            # last-good (tolerate transient RPC failure)
+            return Decimal("0")             # no prior value → safe zero
+
+
 class ReceiptLookup(Protocol):
     """Sprint 792 — abstract surface for "give me receipts for
     these node_ids".

@@ -141,6 +141,48 @@ class _ReceiptStoreAdapter:
             return []
 
 
+def _resolve_balance_lookup() -> Any:
+    """Sprint 1183 — resolve the active network's RPC + FTNS token and build the on-chain
+    balance lookup (fail-soft to the $0 placeholder on any resolution error)."""
+    try:
+        from prsm.config.networks import resolve_endpoints
+        ep = resolve_endpoints()
+        return build_balance_lookup_or_zero(
+            rpc_url=ep.rpc_url, token_address=ep.ftns_token)
+    except Exception as exc:  # noqa: BLE001
+        from prsm.interface.api import wallet_api
+        logger.warning(
+            "Sprint 1183 — network resolution failed (%s); wallet balance defaults to "
+            "0.", exc,
+        )
+        return wallet_api._ZeroBalanceLookup()
+
+
+def build_balance_lookup_or_zero(
+    *, rpc_url: Optional[str], token_address: Optional[str],
+) -> Any:
+    """Sprint 1183 — build the production on-chain FTNS balance lookup, or fall back to
+    the $0 placeholder when the network/token can't be resolved or web3 is unavailable.
+
+    Fail-soft by construction: a node with no resolvable token address (or no web3, or a
+    bad RPC) degrades to ``_ZeroBalanceLookup`` rather than erroring — and even a built
+    ``OnChainBalanceLookup`` is itself fail-soft per-call. So wiring this can never break
+    daemon startup nor 500 the /balance endpoint."""
+    from prsm.interface.api import wallet_api
+    if not token_address or not rpc_url:
+        return wallet_api._ZeroBalanceLookup()
+    try:
+        from prsm.economy.web3.ftns_balance_reader import ReadOnlyFTNSBalanceReader
+        reader = ReadOnlyFTNSBalanceReader(rpc_url=rpc_url, token_address=token_address)
+        return wallet_api.OnChainBalanceLookup(reader)
+    except Exception as exc:  # noqa: BLE001 — web3 missing / bad address → safe zero
+        logger.warning(
+            "Sprint 1183 — on-chain balance lookup unavailable (%s); wallet balance "
+            "will display 0 until resolvable.", exc,
+        )
+        return wallet_api._ZeroBalanceLookup()
+
+
 def wire_wallet_api_services(node: Any) -> None:
     """Sprint 793 — register a production WalletApiServices on
     `wallet_api`.
@@ -202,7 +244,10 @@ def wire_wallet_api_services(node: Any) -> None:
             price_source=wallet_api.StaticPriceSource(
                 price_usd=0,  # type: ignore[arg-type]
             ),
-            balance_lookup=wallet_api._ZeroBalanceLookup(),
+            # sp1183 — real read-only on-chain FTNS balance (kills the $0 mock). Resolves
+            # the FTNS token + RPC from the active network (PRSM_NETWORK, default mainnet);
+            # fail-soft to the zero placeholder if unresolvable or web3 is absent.
+            balance_lookup=_resolve_balance_lookup(),
             receipt_lookup=adapter,
         )
         wallet_api.set_services(services)
