@@ -157,8 +157,13 @@ class NodeConfig:
     gas_price_multiplier: float = 1.2
     max_gas_gwei: int = 50
 
-    # libp2p transport configuration
-    transport_backend: str = "libp2p"          # "libp2p" or "websocket"
+    # Transport configuration. sp1188 (day-one-live #7) — default to the hardened
+    # WebSocket path: it carries the origin-auth / replay / table-bound defenses
+    # (sp941/1005/1026), it's what the live fleet + bootstrap server actually run
+    # (operators were all overriding the old "libp2p" default with
+    # PRSM_TRANSPORT_BACKEND=websocket), and the libp2p data-plane still lacks per-message
+    # auth (sp1010 Residual A). libp2p remains available via PRSM_TRANSPORT_BACKEND=libp2p.
+    transport_backend: str = "websocket"       # "websocket" or "libp2p"
     libp2p_library_path: str = ""              # Auto-detected if empty
     enable_relay: bool = True                  # Circuit Relay v2
     enable_nat_traversal: bool = True          # AutoNAT + hole punching
