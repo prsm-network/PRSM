@@ -158,6 +158,44 @@ def _resolve_balance_lookup() -> Any:
         return wallet_api._ZeroBalanceLookup()
 
 
+def _resolve_price_source() -> Any:
+    """Sprint 1191 — resolve the wallet's FTNS→USD price source from the operator/
+    governance-configured rate (``FTNS_USD_RATE``), falling soft to $0 when unset/invalid.
+
+    Pre-fix the wallet hardcoded ``StaticPriceSource(0)`` → every real on-chain balance
+    (sp1183) rendered as ``$0.00`` regardless of what the operator knew the price to be.
+    This reads ``FTNS_USD_RATE`` — the SAME env the ``FTNSOracle`` uses as its internal-rate
+    fallback (``prsm/economy/blockchain/ftns_oracle.py``) — so the displayed price and the
+    economy oracle agree on one configured number.
+
+    Honest scope: ``FTNS_USD_RATE`` IS the price source pre-market. There is no liquid FTNS
+    market to read a live price from until the Aerodrome USDC/FTNS pool is seeded (a gated
+    Foundation ceremony), and the oracle's external feeds (CoinGecko/CMC/DEX) return zero
+    for an unlisted token. Once FTNS is listed/traded, bridging the async ``FTNSOracle`` into
+    this SYNC display protocol (a TTL-cached, background-refreshed source) is the
+    post-seeding follow-on. Fail-soft by construction: any parse error → $0, never raises,
+    so wiring this can't break daemon startup nor the /balance endpoint."""
+    from decimal import Decimal, InvalidOperation
+    from prsm.interface.api import wallet_api
+    raw = (os.environ.get("FTNS_USD_RATE") or "").strip()
+    if not raw:
+        return wallet_api.StaticPriceSource(price_usd=Decimal(0))
+    try:
+        rate = Decimal(raw)
+        if rate < 0:
+            raise ValueError("FTNS_USD_RATE must be non-negative")
+    except (InvalidOperation, ValueError, ArithmeticError) as exc:
+        logger.warning(
+            "Sprint 1191 — FTNS_USD_RATE=%r is not a valid non-negative decimal (%s); "
+            "wallet USD display defaults to $0.00.", raw, exc,
+        )
+        return wallet_api.StaticPriceSource(price_usd=Decimal(0))
+    logger.info(
+        "Sprint 1191 — wallet FTNS→USD price source configured at $%s/FTNS.", rate,
+    )
+    return wallet_api.StaticPriceSource(price_usd=rate)
+
+
 def build_balance_lookup_or_zero(
     *, rpc_url: Optional[str], token_address: Optional[str],
 ) -> Any:
@@ -241,9 +279,11 @@ def wire_wallet_api_services(node: Any) -> None:
             ),
             nonce_store=wallet_api.InMemoryNonceStore(),
             binding_service=WalletBindingService(binding_store),
-            price_source=wallet_api.StaticPriceSource(
-                price_usd=0,  # type: ignore[arg-type]
-            ),
+            # sp1191 — operator/governance-configured FTNS→USD price (FTNS_USD_RATE),
+            # replacing the hardcoded $0 that rendered every real balance (sp1183) as
+            # $0.00. Fail-soft to $0 when unset/invalid; live-feed integration is the
+            # post-market-seeding follow-on (see _resolve_price_source).
+            price_source=_resolve_price_source(),
             # sp1183 — real read-only on-chain FTNS balance (kills the $0 mock). Resolves
             # the FTNS token + RPC from the active network (PRSM_NETWORK, default mainnet);
             # fail-soft to the zero placeholder if unresolvable or web3 is absent.
