@@ -587,6 +587,31 @@ def _build_anchor_or_none():
     RPC URL also comes from resolve_endpoints() so PRSM_NETWORK +
     BASE_RPC_URL overrides apply uniformly.
     """
+    # Sprint 1213 — off-chain static anchor (dev/bench/airgapped). When
+    # PRSM_PUBLISHER_KEY_ANCHOR_KIND=static, resolve node_id->pubkey from a local JSON
+    # file (PRSM_PUBLISHER_KEY_ANCHOR_FILE) instead of the on-chain contract, so a
+    # multi-host parallax fleet's per-stage HandoffToken verification works without
+    # on-chain registration. NOT production trust (no on-chain binding) — opt-in only.
+    _anchor_kind = (os.environ.get("PRSM_PUBLISHER_KEY_ANCHOR_KIND", "") or "").strip().lower()
+    if _anchor_kind == "static":
+        _f = (os.environ.get("PRSM_PUBLISHER_KEY_ANCHOR_FILE", "") or "").strip()
+        if not _f:
+            logger.warning(
+                "Sprint 1213: PRSM_PUBLISHER_KEY_ANCHOR_KIND=static but "
+                "PRSM_PUBLISHER_KEY_ANCHOR_FILE is unset — no anchor.")
+            return None
+        try:
+            from prsm.security.publisher_key_anchor.static_anchor import StaticFileAnchor
+            _anchor = StaticFileAnchor(_f)
+            logger.warning(
+                "Sprint 1213: using STATIC file anchor (%s, %d nodes) — OFF-CHAIN, "
+                "dev/bench only; production must use the on-chain anchor.", _f, len(_anchor))
+            return _anchor
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Sprint 1213: static anchor load failed (%s); returning None.", exc)
+            return None
+
     try:
         from prsm.config.networks import resolve_endpoints
         endpoints = resolve_endpoints()
