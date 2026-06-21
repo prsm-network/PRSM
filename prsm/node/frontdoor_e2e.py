@@ -260,9 +260,15 @@ async def run_payinfer_step(
     ok = (output is not None) and (parsed is not False)
     if verify_pubkey_b64 is not None:
         ok = ok and bool(receipt_verified)
+    # sp1203 — the /compute/inference response carries no top-level ftns_charged; the
+    # cost lives in the signed receipt as cost_ftns. Surface it so the proof report
+    # shows what the request actually cost (was always None before).
+    charged = result.get("ftns_charged")
+    if charged is None and isinstance(receipt, dict):
+        charged = receipt.get("cost_ftns")
     return {
         "step": "pay-infer", "ok": ok,
-        "output": output, "ftns_charged": result.get("ftns_charged"),
+        "output": output, "ftns_charged": charged,
         "has_receipt": bool(receipt), "receipt_verified": receipt_verified,
         "escrow_before_wei": escrow_before, "escrow_after_wei": escrow_after,
         "note": "real output + signed receipt; on-chain settle runs over the challenge "

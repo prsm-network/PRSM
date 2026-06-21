@@ -190,6 +190,17 @@ async def test_payinfer_step_false_pass_guard_unparseable_receipt():
     assert out["ok"] is False  # unparseable receipt → not a real proof
 
 
+async def test_payinfer_step_surfaces_charge_from_receipt():
+    # sp1203: the response has no ftns_charged; the cost is in the receipt's cost_ftns.
+    escrow = _SeqAsync([5 * _WEI])
+    rcpt = _signed_receipt()  # InferenceReceipt.to_dict() includes cost_ftns
+    client = _Client(pay_result={"success": True, "output": "x", "receipt": rcpt})
+    out = await run_payinfer_step(client=client, prompt="hi", requester_key="k",
+                                  escrow_client=escrow, requester_address=_REQ)
+    assert out["ok"] is True
+    assert out["ftns_charged"] == rcpt["cost_ftns"]  # surfaced, not None
+
+
 async def test_payinfer_step_unsigned_receipt_not_ok():
     # A parseable receipt with NO settler signature is not a settled receipt.
     escrow = _SeqAsync([5 * _WEI])
