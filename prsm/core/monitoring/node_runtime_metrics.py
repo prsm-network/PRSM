@@ -32,6 +32,63 @@ from typing import Any, List
 from prsm.core.monitoring.metrics import CustomMetric, MetricValue
 
 
+class InferenceServingCounters:
+    """Sprint 1219 — process-local cumulative counters for the inference
+    serving path (the PRIMARY request path of a day-one inference node).
+
+    Monotonic totals + a latency sum so an operator's Prometheus can derive
+    request rate / error rate / avg latency via ``rate()`` and
+    ``…_sum / …_total`` — the correct way to alert on RATES (a cumulative
+    counter must not be threshold-alerted directly). Cheap + always-on; the
+    metrics only surface when the opt-in MetricsCollector reads them."""
+
+    __slots__ = ("requests_total", "failures_total", "latency_seconds_sum")
+
+    def __init__(self) -> None:
+        self.requests_total = 0
+        self.failures_total = 0
+        self.latency_seconds_sum = 0.0
+
+    def record(self, *, success: bool, latency_seconds: float = 0.0) -> None:
+        self.requests_total += 1
+        if not success:
+            self.failures_total += 1
+        try:
+            lat = float(latency_seconds)
+            if lat > 0:
+                self.latency_seconds_sum += lat
+        except (TypeError, ValueError):
+            pass
+
+    def snapshot(self) -> dict:
+        return {
+            "requests_total": self.requests_total,
+            "failures_total": self.failures_total,
+            "latency_seconds_sum": round(self.latency_seconds_sum, 6),
+        }
+
+
+def record_inference_result(node: Any, result: Any) -> None:
+    """Sprint 1219 — record ONE inference outcome into the node's serving
+    counters. Fail-soft no-op when the node has no counters (or anything
+    raises) — instrumentation must never affect the request path. ``result``
+    is an InferenceResult-like with ``.success`` and an optional
+    ``.receipt.duration_seconds`` (used as the served latency on success)."""
+    try:
+        counters = getattr(node, "_inference_serving_counters", None)
+        if counters is None:
+            return
+        success = bool(getattr(result, "success", False))
+        latency = 0.0
+        if success:
+            receipt = getattr(result, "receipt", None)
+            if receipt is not None:
+                latency = float(getattr(receipt, "duration_seconds", 0.0) or 0.0)
+        counters.record(success=success, latency_seconds=latency)
+    except Exception:  # noqa: BLE001 — never affect the inference path
+        pass
+
+
 class NodeRuntimeMetrics(CustomMetric):
     """Expose a live node's readiness + on-chain-settlement runtime state."""
 
@@ -93,6 +150,26 @@ class NodeRuntimeMetrics(CustomMetric):
                             now,
                         )
                     )
+        except Exception:  # noqa: BLE001
+            pass
+
+        # ── inference serving (the primary request path) ──
+        try:
+            counters = getattr(self._node, "_inference_serving_counters", None)
+            if counters is not None:
+                snap = counters.snapshot()
+                out.append(MetricValue(
+                    "prsm_inference_requests_total",
+                    snap["requests_total"], now,
+                ))
+                out.append(MetricValue(
+                    "prsm_inference_failures_total",
+                    snap["failures_total"], now,
+                ))
+                out.append(MetricValue(
+                    "prsm_inference_latency_seconds_sum",
+                    snap["latency_seconds_sum"], now,
+                ))
         except Exception:  # noqa: BLE001
             pass
 

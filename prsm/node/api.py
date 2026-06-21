@@ -8596,6 +8596,16 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             else:
                 result = await node.inference_executor.execute(request)
 
+            # sp1219 — record the served outcome into the node's inference
+            # serving counters (observability; fail-soft no-op when off).
+            try:
+                from prsm.core.monitoring.node_runtime_metrics import (
+                    record_inference_result,
+                )
+                record_inference_result(node, result)
+            except Exception:  # noqa: BLE001 — never affect the request path
+                pass
+
             if not result.success:
                 # Inference rejected the request (unknown model, budget too
                 # low for this executor's pricing, etc.). Refund the escrow.
@@ -9282,6 +9292,15 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                         tokens_emitted += 1
                         yield _sse_event("token", _token_event_to_dict(item))
                     elif isinstance(item, InferenceResult):
+                        # sp1219 — record the served outcome into the node's
+                        # inference serving counters (observability; fail-soft).
+                        try:
+                            from prsm.core.monitoring.node_runtime_metrics import (
+                                record_inference_result,
+                            )
+                            record_inference_result(node, item)
+                        except Exception:  # noqa: BLE001 — never affect streaming
+                            pass
                         if item.success:
                             await _settle_streaming_escrow(
                                 node, job_id, escrow_entry, request,

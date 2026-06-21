@@ -2387,6 +2387,16 @@ class PRSMNode:
         self._collateral_refresh_task = None  # sp1081 — attestation collateral refresh
         self._metrics_collector = None  # sp1217 — opt-in runtime MetricsCollector
         self._alert_manager = None  # sp1217 — opt-in runtime AlertManager
+        # sp1219 — always-on, cheap inference serving counters (the metrics
+        # only surface when the opt-in MetricsCollector reads them). Fail-soft
+        # so observability can never block node construction.
+        try:
+            from prsm.core.monitoring.node_runtime_metrics import (
+                InferenceServingCounters,
+            )
+            self._inference_serving_counters = InferenceServingCounters()
+        except Exception:  # noqa: BLE001
+            self._inference_serving_counters = None
         self._heartbeat_scheduler_task = None
         self._key_distribution_watcher_task = None
         self._storage_slashing_watcher_task = None

@@ -17,7 +17,11 @@ import asyncio
 import pytest
 
 from prsm.core.monitoring.metrics import CustomMetric, MetricValue
-from prsm.core.monitoring.node_runtime_metrics import NodeRuntimeMetrics
+from prsm.core.monitoring.node_runtime_metrics import (
+    InferenceServingCounters,
+    NodeRuntimeMetrics,
+    record_inference_result,
+)
 
 
 class _FakeSettlementClient:
@@ -34,11 +38,22 @@ class _FakeSettlementClient:
 class _Node:
     """Minimal node-like object. compute_readiness reads inference_executor /
     settlement_client / ftns_ledger; the settlement adapter reads
-    _onchain_settlement_client."""
+    _onchain_settlement_client; the inference adapter reads
+    _inference_serving_counters."""
 
-    def __init__(self, *, inference_executor=None, onchain_settlement_client=None):
+    def __init__(self, *, inference_executor=None, onchain_settlement_client=None,
+                 inference_serving_counters=None):
         self.inference_executor = inference_executor
         self._onchain_settlement_client = onchain_settlement_client
+        self._inference_serving_counters = inference_serving_counters
+
+
+class _Result:
+    def __init__(self, success, duration=None):
+        self.success = success
+        self.receipt = None if duration is None else type(
+            "_R", (), {"duration_seconds": duration},
+        )()
 
 
 def _collect(metric: CustomMetric) -> dict:
@@ -123,6 +138,61 @@ def test_settlement_status_error_is_tolerated():
     m = _collect(NodeRuntimeMetrics(node))
     assert m["prsm_settlement_enabled"] == 1
     assert "prsm_settlement_pending_commits" not in m
+
+
+# ── sp1219: inference serving counters ───────────────────────────────────────
+
+def test_counter_records_success_failure_latency():
+    c = InferenceServingCounters()
+    c.record(success=True, latency_seconds=0.5)
+    c.record(success=True, latency_seconds=1.5)
+    c.record(success=False, latency_seconds=0.0)
+    snap = c.snapshot()
+    assert snap["requests_total"] == 3
+    assert snap["failures_total"] == 1
+    assert snap["latency_seconds_sum"] == 2.0
+
+
+def test_counter_ignores_bad_latency():
+    c = InferenceServingCounters()
+    c.record(success=True, latency_seconds=None)  # type: ignore[arg-type]
+    c.record(success=True, latency_seconds=-3.0)  # negative ignored
+    assert c.snapshot() == {
+        "requests_total": 2, "failures_total": 0, "latency_seconds_sum": 0.0,
+    }
+
+
+def test_record_inference_result_helper():
+    node = _Node(inference_serving_counters=InferenceServingCounters())
+    record_inference_result(node, _Result(True, duration=0.25))
+    record_inference_result(node, _Result(False))
+    snap = node._inference_serving_counters.snapshot()
+    assert snap["requests_total"] == 2
+    assert snap["failures_total"] == 1
+    assert snap["latency_seconds_sum"] == 0.25
+
+
+def test_record_inference_result_noop_without_counter():
+    node = _Node(inference_serving_counters=None)
+    # must not raise when the node has no counter
+    record_inference_result(node, _Result(True, duration=1.0))
+
+
+def test_adapter_emits_inference_counters():
+    c = InferenceServingCounters()
+    c.record(success=True, latency_seconds=0.4)
+    c.record(success=False)
+    node = _Node(inference_executor=object(), inference_serving_counters=c)
+    m = _collect(NodeRuntimeMetrics(node))
+    assert m["prsm_inference_requests_total"] == 2
+    assert m["prsm_inference_failures_total"] == 1
+    assert m["prsm_inference_latency_seconds_sum"] == 0.4
+
+
+def test_adapter_omits_inference_counters_when_absent():
+    node = _Node(inference_executor=object(), inference_serving_counters=None)
+    m = _collect(NodeRuntimeMetrics(node))
+    assert "prsm_inference_requests_total" not in m
 
 
 if __name__ == "__main__":
