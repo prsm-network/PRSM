@@ -102,12 +102,19 @@ def _build_mock_trust_stack():
     # (had async def submit() but the hook invokes the submitter as
     # a sync Callable). Sample-rate=0.0 in both kinds today so the
     # hook never actually fires; the fix is defensive.
+    # Sprint 1212 — the mock anchor accepts every node_id, but the stake adapter
+    # (zero-stake lookup) + tier gate still ENFORCE by default, so a mock-trust-stack
+    # pool with un-staked / software-tier nodes is filtered to empty ("no GPU passed
+    # pool gating"). Honor the SAME advisory bypasses production does
+    # (PRSM_PARALLAX_STAKE_ELIGIBILITY=advisory / PRSM_PARALLAX_TIER_GATE=advisory) so a
+    # dev/bench operator can run a real multi-host pool off-chain. Default (no advisory)
+    # is unchanged — enforced — so this can't silently weaken anything.
     return TrustStack(
         anchor_verify=AnchorVerifyAdapter(anchor=_AcceptAllAnchor()),
-        tier_gate=TierGateAdapter(),
+        tier_gate=_wrap_tier_gate_for_advisory(TierGateAdapter()),
         profile_source=StakeWeightedTrustAdapter(
             inner=InMemoryProfileSource(snapshots={}),
-            stake_lookup=_ZeroStakeLookup(),
+            stake_lookup=_wrap_stake_lookup_for_eligibility(_ZeroStakeLookup()),
         ),
         consensus_hook=ConsensusMismatchHook(
             submitter=_build_consensus_submitter(),
