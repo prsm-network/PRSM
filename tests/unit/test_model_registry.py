@@ -491,7 +491,7 @@ class TestFilesystemRegistryRegister:
             total_shards=1,
             shards=[_make_shard("..", 0, 1)],
         )
-        with pytest.raises(ValueError, match="reserved|escapes"):
+        with pytest.raises(ValueError, match="reserved|escapes|unsafe"):
             fs_registry.register(bad_model, identity=identity)
         # Verify nothing was written outside the registry root
         parent = tmp_path.parent
@@ -506,7 +506,7 @@ class TestFilesystemRegistryRegister:
             total_shards=1,
             shards=[_make_shard(".", 0, 1)],
         )
-        with pytest.raises(ValueError, match="reserved|escapes"):
+        with pytest.raises(ValueError, match="reserved|escapes|unsafe"):
             fs_registry.register(bad_model, identity=identity)
 
     def test_dotdot_shard_id_rejected(self, fs_registry, identity):
@@ -523,7 +523,7 @@ class TestFilesystemRegistryRegister:
     def test_get_with_dotdot_rejected(self, fs_registry):
         # The read path also runs _validate_fs_id, so bare ".." raises
         # before any disk access.
-        with pytest.raises(ValueError, match="reserved"):
+        with pytest.raises(ValueError, match="reserved|unsafe"):
             fs_registry.get("..")
 
 

@@ -74,6 +74,26 @@ def _validate_fs_id(kind: str, value: str) -> None:
         )
 
 
+def _validate_model_id(value: str) -> None:
+    """Sprint 1214 — a model_id may be a HuggingFace ``org/model`` id (slash-separated,
+    fs-safe segments), unlike shard/publisher ids which stay strict (no slash). Each
+    ``/``-separated segment must match ``_SAFE_FS_ID`` and not be a reserved name; that
+    plus ``_model_dir``'s ``is_relative_to(root)`` guard keeps path traversal impossible
+    while letting the registry hold standard HF ids like 'Qwen/Qwen2.5-3B-Instruct'
+    (pre-1214 the strict slash-rejecting check failed every org/model id — only slashless
+    ids like 'gpt2' could be staged, which blocked production models on the parallax path).
+    """
+    if not value:
+        raise ValueError("model_id must be a non-empty string")
+    for seg in value.split("/"):
+        if not _SAFE_FS_ID.fullmatch(seg) or seg in _RESERVED_FS_NAMES:
+            raise ValueError(
+                f"model_id={value!r} unsafe for filesystem registry: each "
+                f"'/'-separated segment must match {_SAFE_FS_ID.pattern} and not be "
+                f"'.'/'..' (offending segment: {seg!r})"
+            )
+
+
 # --------------------------------------------------------------------------
 # Exceptions
 # --------------------------------------------------------------------------
@@ -477,7 +497,7 @@ class FilesystemModelRegistry(ModelRegistry):
     def register(
         self, model: ShardedModel, *, identity: NodeIdentity
     ) -> ModelManifest:
-        _validate_fs_id("model_id", model.model_id)
+        _validate_model_id(model.model_id)
         for shard in model.shards:
             _validate_fs_id("shard_id", shard.shard_id)
 
@@ -547,7 +567,7 @@ class FilesystemModelRegistry(ModelRegistry):
     # -- read path --
 
     def get(self, model_id: str) -> ShardedModel:
-        _validate_fs_id("model_id", model_id)
+        _validate_model_id(model_id)
         manifest = self._load_manifest_or_raise(model_id)
 
         # Resolve publisher pubkey: anchor takes precedence over
@@ -639,7 +659,7 @@ class FilesystemModelRegistry(ModelRegistry):
         return sorted(models)
 
     def get_manifest(self, model_id: str) -> ModelManifest:
-        _validate_fs_id("model_id", model_id)
+        _validate_model_id(model_id)
         return self._load_manifest_or_raise(model_id)
 
     # -- internals --
