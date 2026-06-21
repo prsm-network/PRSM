@@ -20,6 +20,7 @@ guarantee.
 """
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
@@ -52,6 +53,8 @@ _GPT2_FAMILY_DIMS = dict(
     head_size=64, hidden_dim=768, intermediate_dim=3072,
     num_attention_heads=12, num_kv_heads=12, vocab_size=50257,
 )
+logger = logging.getLogger(__name__)
+
 _KNOWN_MODELS: Dict[str, int] = {"gpt2": 12, "distilgpt2": 6}
 
 DEFAULT_LOCAL_MODEL = "distilgpt2"  # fastest on CPU
@@ -74,6 +77,65 @@ def _resolve_offline(explicit: Optional[bool]) -> bool:
     return (os.environ.get(_OFFLINE_ENV, "") or "").strip().lower() in _TRUTHY
 
 
+# ── sp1204: real inference quality (GPU + instruct model, greedy/§7-deterministic) ────
+_DEVICE_ENV = "PRSM_LOCAL_INFERENCE_DEVICE"      # cuda | mps | cpu | auto (default auto)
+_DTYPE_ENV = "PRSM_LOCAL_INFERENCE_DTYPE"        # float16 | bfloat16 | float32 | auto
+_CHAT_TEMPLATE_ENV = "PRSM_LOCAL_INFERENCE_CHAT_TEMPLATE"  # 0 disables (default on)
+_VALID_DEVICES = frozenset({"cuda", "mps", "cpu"})
+_VALID_DTYPES = frozenset({"float16", "bfloat16", "float32"})
+
+
+def resolve_device(explicit: Optional[str], *, cuda: bool, mps: bool) -> str:
+    """Pick the torch device. Explicit env (PRSM_LOCAL_INFERENCE_DEVICE) wins when valid;
+    else cuda > mps > cpu. So a Lambda A10 uses the GPU automatically, a Mac uses MPS, and
+    a plain box falls back to CPU — no config needed."""
+    e = (explicit or "").strip().lower()
+    if e in _VALID_DEVICES:
+        return e
+    if cuda:
+        return "cuda"
+    if mps:
+        return "mps"
+    return "cpu"
+
+
+def resolve_dtype(explicit: Optional[str], device: str) -> str:
+    """Pick the load dtype. Explicit env wins; else float16 on CUDA (≈2x less VRAM →
+    a 7-8B instruct model fits a 24GB A10), float32 elsewhere (CPU/MPS fp16 is slow or
+    flaky). Greedy decoding stays deterministic at any dtype (§7-safe)."""
+    e = (explicit or "").strip().lower()
+    if e in _VALID_DTYPES:
+        return e
+    return "float16" if device == "cuda" else "float32"
+
+
+def should_use_chat_template(tokenizer: Any, *, enabled: bool) -> bool:
+    """True iff the model is an INSTRUCT model (its tokenizer ships a chat_template) and
+    the operator hasn't disabled templating. Instruct models produce coherent output ONLY
+    when the prompt is wrapped in their chat template; base models (gpt2) have none → raw
+    encoding. This is the single biggest quality lever."""
+    return bool(enabled and getattr(tokenizer, "chat_template", None))
+
+
+def encode_for_generation(tokenizer: Any, prompt: str, *, use_chat_template: bool) -> Any:
+    """Build the model inputs. Instruct path: apply_chat_template([{user, prompt}],
+    add_generation_prompt=True) so the model sees its native instruction framing. Base
+    path: raw encode (unchanged pre-sp1204 behavior). Returns an enc mapping with at least
+    ``input_ids`` (the caller adds attention_mask + moves to device)."""
+    if use_chat_template:
+        ids = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            add_generation_prompt=True, return_tensors="pt",
+        )
+        return {"input_ids": ids}
+    return tokenizer(prompt, return_tensors="pt")
+
+
+def _chat_template_enabled(env: Optional[dict] = None) -> bool:
+    e = env if env is not None else os.environ
+    return (e.get(_CHAT_TEMPLATE_ENV, "") or "").strip().lower() not in {"0", "false", "no", "off"}
+
+
 class LocalHuggingFaceChainExecutor:
     """ChainExecutor that runs a real HF causal-LM in-process (single stage =
     whole model). Implements both ``execute_chain`` (unary, for /compute/inference)
@@ -92,12 +154,15 @@ class LocalHuggingFaceChainExecutor:
         # local_files_only with an empty HF cache. offline=True restores the
         # airgapped/deterministic no-network behavior.
         self._offline = _resolve_offline(offline)
+        self._use_chat_template = _chat_template_enabled()
+        self._device = "cpu"
         self._model = None
         self._tokenizer = None
 
     def _ensure_loaded(self) -> None:
         if self._model is not None:
             return
+        import torch
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
         except Exception as exc:  # noqa: BLE001
@@ -105,15 +170,31 @@ class LocalHuggingFaceChainExecutor:
                 "local inference requires 'transformers' + 'torch' "
                 "(pip install -e '.[ml]'). " + str(exc)
             ) from exc
+        # sp1204 — auto-detect GPU + dtype so a Lambda A10 (or a Mac MPS) is used without
+        # config; CPU/float32 fallback preserves the pre-sp1204 behavior on a plain box.
+        mps = bool(getattr(getattr(torch, "backends", None), "mps", None)
+                   and torch.backends.mps.is_available())
+        device = resolve_device(os.environ.get(_DEVICE_ENV),
+                                cuda=bool(torch.cuda.is_available()), mps=mps)
+        dtype_str = resolve_dtype(os.environ.get(_DTYPE_ENV), device)
+        torch_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16,
+                       "float32": torch.float32}[dtype_str]
         # local_files_only=self._offline: False → allow a one-time hub download; True →
         # offline-only, deterministic, no network round-trip.
         tok = AutoTokenizer.from_pretrained(self._model_id, local_files_only=self._offline)
-        model = AutoModelForCausalLM.from_pretrained(self._model_id, local_files_only=self._offline)
+        model = AutoModelForCausalLM.from_pretrained(
+            self._model_id, local_files_only=self._offline, torch_dtype=torch_dtype)
         model.eval()
+        model.to(device)
         if tok.pad_token_id is None:
             tok.pad_token = tok.eos_token
         self._tokenizer = tok
         self._model = model
+        self._device = device
+        logger.info(
+            "local inference loaded model=%s device=%s dtype=%s chat_template=%s",
+            self._model_id, device, dtype_str,
+            should_use_chat_template(tok, enabled=self._use_chat_template))
 
     def _resolve_max_tokens(self, request: Any) -> int:
         mt = getattr(request, "max_tokens", None)
@@ -131,7 +212,13 @@ class LocalHuggingFaceChainExecutor:
         self._ensure_loaded()
         prompt = getattr(request, "prompt", "") or ""
         max_new = self._resolve_max_tokens(request)
-        enc = self._tokenizer(prompt, return_tensors="pt")
+        # sp1204 — wrap the prompt in the model's chat template when it's an instruct
+        # model (coherent output vs gibberish); raw encode for base models (gpt2).
+        use_ct = should_use_chat_template(self._tokenizer, enabled=self._use_chat_template)
+        enc = encode_for_generation(self._tokenizer, prompt, use_chat_template=use_ct)
+        if "attention_mask" not in enc:
+            enc["attention_mask"] = torch.ones_like(enc["input_ids"])
+        enc = {k: v.to(self._device) for k, v in enc.items()}
         prompt_len = enc["input_ids"].shape[1]
         with torch.no_grad():
             out = self._model.generate(
