@@ -57,7 +57,9 @@ def main() -> int:
                     help="FTNS to deposit into the EscrowPool (default 5.0)")
     ap.add_argument("--budget", type=float, default=1.0,
                     help="FTNS budget / max-spend for the inference (default 1.0)")
-    ap.add_argument("--model", default="gpt2")
+    ap.add_argument("--model", default="distilgpt2",
+                    help="model_id (default distilgpt2 — what `PRSM_INFERENCE_EXECUTOR=local` "
+                         "serves out of the box; pass the model your node actually loads)")
     ap.add_argument("--max-tokens", type=int, default=8)
     ap.add_argument("--faucet-address", default=None,
                     help="If set, first dispense testnet FTNS to this address (proves "

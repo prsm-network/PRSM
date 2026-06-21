@@ -229,9 +229,23 @@ async def run_payinfer_step(
     output = result.get("output")
     accepted = bool(result.get("success")) or (output is not None)
     if not accepted:
+        # Distinguish WHERE it failed (review-of-live-run sp1202): a 402 means the
+        # PAYMENT was rejected; a success:False/error body with a job_id means the
+        # payment was ACCEPTED but the inference itself failed (e.g. unknown model).
+        # Conflating them ("payment REJECTED") misleads — payment may have worked.
+        detail = result.get("detail")
+        err = result.get("error")
+        if detail and ("payment" in str(detail).lower()
+                       or "authorization" in str(detail).lower()):
+            raise FrontDoorValidationError(
+                "payment authorization REJECTED (the node did not honor the paid "
+                "request): " + str(detail))
+        if err or result.get("job_id"):
+            raise FrontDoorValidationError(
+                "payment was ACCEPTED but the inference FAILED (not a payment problem): "
+                + str(err or detail or result))
         raise FrontDoorValidationError(
-            "payment authorization REJECTED (the node did not honor the paid request): "
-            + str(result.get("detail") or result))
+            "pay-infer returned no output: " + str(detail or result))
     receipt = result.get("receipt")
     # parsed: False = absent/unparseable/UNSIGNED; None = parsed+signed (no pubkey to
     # verify); True/False = real signature check when a pubkey is given. The gate

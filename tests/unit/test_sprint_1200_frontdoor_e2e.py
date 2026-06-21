@@ -202,7 +202,18 @@ async def test_payinfer_step_unsigned_receipt_not_ok():
 async def test_payinfer_step_raises_on_402_rejection():
     escrow = _SeqAsync([5 * _WEI])
     client = _Client(pay_result={"detail": "payment authorization rejected: expired"})
-    with pytest.raises(FrontDoorValidationError):
+    with pytest.raises(FrontDoorValidationError, match="payment authorization REJECTED"):
+        await run_payinfer_step(client=client, prompt="hi", requester_key="k",
+                                escrow_client=escrow, requester_address=_REQ)
+
+
+async def test_payinfer_step_inference_error_is_not_called_a_payment_rejection():
+    # sp1202: payment ACCEPTED (no 402) but the inference failed (e.g. unknown model)
+    # — the harness must NOT mislabel it as a payment rejection.
+    escrow = _SeqAsync([5 * _WEI])
+    client = _Client(pay_result={
+        "success": False, "error": "Unknown model_id: gpt2", "job_id": "infer-1"})
+    with pytest.raises(FrontDoorValidationError, match="inference FAILED"):
         await run_payinfer_step(client=client, prompt="hi", requester_key="k",
                                 escrow_client=escrow, requester_address=_REQ)
 
