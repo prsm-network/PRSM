@@ -15835,6 +15835,22 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         lines.append("# TYPE prsm_node_up gauge")
         lines.append("prsm_node_up 1")
 
+        # sp1217 — append the opt-in runtime MetricsCollector's bridged
+        # Prometheus exposition (NodeRuntimeMetrics: readiness + on-chain
+        # settlement). None unless PRSM_RUNTIME_METRICS_ENABLED, so when off the
+        # output is byte-for-byte unchanged. Fail-soft: a render error never
+        # breaks the scrape.
+        try:
+            _mc = getattr(node, "_metrics_collector", None)
+            if _mc is not None:
+                _extra = _mc.get_prometheus_metrics()
+                # Only a genuine non-empty str is appended — guards the
+                # join() below from a mock/None render (never 500 the scrape).
+                if isinstance(_extra, str) and _extra.strip():
+                    lines.append(_extra.rstrip("\n"))
+        except Exception:  # noqa: BLE001 — a metrics scrape must never 500
+            pass
+
         body = "\n".join(lines) + "\n"
         return PlainTextResponse(
             body, media_type="text/plain; version=0.0.4",

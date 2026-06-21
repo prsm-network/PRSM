@@ -28,7 +28,11 @@ def compute_readiness(node: Any) -> Tuple[bool, Dict[str, Any]]:
     inference = _present("inference_executor")
     subsystems = {
         "inference": inference,
-        "settlement": _present("settlement_client"),
+        # sp1217 — the node stores the on-chain settlement client as
+        # ``_onchain_settlement_client`` (node.py); reading ``settlement_client``
+        # (which the node never sets) made this boolean ALWAYS False on a real
+        # node — a latent readiness mis-report. Read the real attr.
+        "settlement": _present("_onchain_settlement_client"),
         "ftns_ledger": _present("ftns_ledger"),
     }
     ready = inference

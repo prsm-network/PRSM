@@ -687,8 +687,73 @@ class AlertManager:
         # Add rules
         for rule in [error_rule, response_time_rule, quality_rule, ftns_rule]:
             self.add_rule(rule)
-        
+
         logger.info(f"Setup {len(self.rules)} default alert rules")
+
+    def setup_node_runtime_rules(self) -> None:
+        """Sprint 1217 — alert rules over a live PRSM node's runtime metrics
+        (emitted by ``NodeRuntimeMetrics``). Channels default to [] so these
+        rules register + log + populate ``active_alerts`` WITHOUT requiring an
+        email/slack/webhook channel to be wired (an operator scrapes
+        ``active_alerts`` / logs); add channel names here once an operator opts
+        into notifications."""
+        logger.info("Setting up node-runtime alert rules")
+
+        # Node not ready (can't serve the primary inference path) — fire fast.
+        not_ready_rule = AlertRule(
+            name="node_not_ready",
+            description="Node is not ready to serve inference (primary path down)",
+            condition=AlertCondition(
+                metric_name="prsm_node_ready",
+                operator="lt",
+                threshold=1,
+                duration=timedelta(minutes=1),
+                aggregation="min",
+            ),
+            severity=AlertSeverity.CRITICAL,
+            channels=[],
+            tags={"category": "availability", "component": "inference"},
+        )
+
+        # On-chain settlement funds continuously in-flight — a transient
+        # in-flight during a normal commit is fine; SUSTAINED (min>0 over the
+        # window) means a quarantined/unconfirmed commit may be stuck.
+        funds_in_flight_rule = AlertRule(
+            name="settlement_funds_in_flight_stuck",
+            description="On-chain settlement funds in-flight for a sustained period",
+            condition=AlertCondition(
+                metric_name="prsm_settlement_funds_in_flight",
+                operator="gt",
+                threshold=0,
+                duration=timedelta(minutes=15),
+                aggregation="min",
+            ),
+            severity=AlertSeverity.WARNING,
+            channels=[],
+            tags={"category": "settlement", "component": "escrow"},
+        )
+
+        # Commit-intent WAL entries unresolved — a sustained non-zero means a
+        # commit may have landed on chain but its local promote was lost
+        # (awaiting chain-scan recovery).
+        committing_intents_rule = AlertRule(
+            name="settlement_committing_intents_unresolved",
+            description="Settlement commit-intent WAL entries unresolved (possible stranded commit)",
+            condition=AlertCondition(
+                metric_name="prsm_settlement_committing_intents",
+                operator="gt",
+                threshold=0,
+                duration=timedelta(minutes=15),
+                aggregation="min",
+            ),
+            severity=AlertSeverity.WARNING,
+            channels=[],
+            tags={"category": "settlement", "component": "wal"},
+        )
+
+        for rule in [not_ready_rule, funds_in_flight_rule, committing_intents_rule]:
+            self.add_rule(rule)
+        logger.info("Setup %d node-runtime alert rules", 3)
 
     def setup_collaboration_rules(self) -> None:
         """Setup collaboration/trust-path alert rules for P3 observability.

@@ -461,3 +461,51 @@ class TestSubsystemLabeledGauges:
         node.ftns_ledger = broken
         resp = _client(node).get("/metrics")
         assert resp.status_code == 200
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Sprint 1217 — opt-in runtime MetricsCollector exposition appended to /metrics
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestRuntimeMetricsAugmentation:
+    """/metrics appends the opt-in MetricsCollector's bridged Prometheus
+    exposition (NodeRuntimeMetrics) when wired; output is unchanged when off,
+    and a render error never 500s the scrape."""
+
+    def test_absent_when_collector_not_wired(self):
+        node = _node()
+        node._metrics_collector = None
+        body = _client(node).get("/metrics").text
+        assert "sp1217_sentinel_metric" not in body
+        assert "prsm_node_up 1" in body  # base exposition intact
+
+    def test_appended_when_collector_present(self):
+        node = _node()
+        mc = MagicMock()
+        mc.get_prometheus_metrics.return_value = (
+            "# HELP sp1217_sentinel_metric x\n"
+            "# TYPE sp1217_sentinel_metric gauge\n"
+            "sp1217_sentinel_metric 7\n"
+        )
+        node._metrics_collector = mc
+        body = _client(node).get("/metrics").text
+        assert "sp1217_sentinel_metric 7" in body
+        assert "prsm_node_up 1" in body
+
+    def test_non_string_render_is_ignored(self):
+        """A mock/None render (non-str) is skipped, not appended — the
+        join() must not see a non-str item."""
+        node = _node()  # MagicMock node: _metrics_collector auto-mocks
+        resp = _client(node).get("/metrics")
+        assert resp.status_code == 200
+        assert "prsm_node_up 1" in resp.text
+
+    def test_collector_render_error_does_not_500(self):
+        node = _node()
+        mc = MagicMock()
+        mc.get_prometheus_metrics.side_effect = RuntimeError("render boom")
+        node._metrics_collector = mc
+        resp = _client(node).get("/metrics")
+        assert resp.status_code == 200
+        assert "prsm_node_up 1" in resp.text

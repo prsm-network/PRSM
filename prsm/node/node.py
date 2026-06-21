@@ -2385,6 +2385,8 @@ class PRSMNode:
         self._settlement_audit_task = None  # sp1140 brick E.2 (opt-in audit loop)
         self._settlement_audit_bundle = None  # sp1140 — None unless PRSM_SETTLEMENT_AUDIT
         self._collateral_refresh_task = None  # sp1081 — attestation collateral refresh
+        self._metrics_collector = None  # sp1217 — opt-in runtime MetricsCollector
+        self._alert_manager = None  # sp1217 — opt-in runtime AlertManager
         self._heartbeat_scheduler_task = None
         self._key_distribution_watcher_task = None
         self._storage_slashing_watcher_task = None
@@ -5460,6 +5462,72 @@ class PRSMNode:
             )
             logger.info("Sprint 1081 attestation collateral auto-refresh loop launched.")
 
+        # Sprint 1217 — OPT-IN node runtime observability (default OFF). A
+        # MetricsCollector populated by NodeRuntimeMetrics (readiness +
+        # on-chain settlement funds-in-flight) and, when also enabled, an
+        # AlertManager evaluating node-runtime rules over it. Both collectors
+        # own their internal async tasks (started here, drained in stop()), so
+        # we instantiate+start rather than create_task ourselves. Fully fenced:
+        # any failure leaves observability OFF and never crashes startup. With
+        # both flags unset this block is a single falsy `if` — startup is
+        # byte-for-byte unchanged.
+        import os as _os_obs
+
+        def _obs_on(_name: str) -> bool:
+            return str(_os_obs.environ.get(_name, "")).strip().lower() in (
+                "1", "true", "yes", "on",
+            )
+
+        def _obs_interval(_name: str, _default: float) -> float:
+            try:
+                v = float(str(_os_obs.environ.get(_name, "")).strip())
+                return v if v > 0 else _default
+            except (TypeError, ValueError):
+                return _default
+
+        if _obs_on("PRSM_RUNTIME_METRICS_ENABLED"):
+            try:
+                from prsm.core.monitoring.metrics import MetricsCollector
+                from prsm.core.monitoring.node_runtime_metrics import (
+                    NodeRuntimeMetrics,
+                )
+                _m_interval = _obs_interval("PRSM_RUNTIME_METRICS_INTERVAL_S", 30.0)
+                self._metrics_collector = MetricsCollector(
+                    collection_interval=_m_interval,
+                )
+                self._metrics_collector.registry.register_metric(
+                    NodeRuntimeMetrics(self),
+                )
+                await self._metrics_collector.start_collection()
+                logger.info(
+                    "Sprint 1217 runtime MetricsCollector started "
+                    "(interval=%ss).", _m_interval,
+                )
+                if _obs_on("PRSM_RUNTIME_ALERTS_ENABLED"):
+                    from prsm.core.monitoring.alerts import AlertManager
+                    _a_interval = _obs_interval(
+                        "PRSM_RUNTIME_ALERTS_INTERVAL_S", 30.0,
+                    )
+                    self._alert_manager = AlertManager(
+                        evaluation_interval=_a_interval,
+                    )
+                    self._alert_manager.set_metrics_collector(
+                        self._metrics_collector,
+                    )
+                    self._alert_manager.setup_node_runtime_rules()
+                    await self._alert_manager.start_monitoring()
+                    logger.info(
+                        "Sprint 1217 runtime AlertManager started "
+                        "(node-runtime rules, interval=%ss).", _a_interval,
+                    )
+            except Exception as _obs_exc:  # noqa: BLE001 — never crash startup
+                logger.warning(
+                    "Sprint 1217 runtime observability launch failed "
+                    "(observability OFF): %s", _obs_exc,
+                )
+                self._metrics_collector = None
+                self._alert_manager = None
+
         # Start management API in background
         self._api_task = asyncio.create_task(self._run_api())
 
@@ -6358,6 +6426,20 @@ class PRSMNode:
             await self._daemon_watchdog.stop()
         if getattr(self, "_pending_withdraw_reconciler", None) is not None:
             await self._pending_withdraw_reconciler.stop()  # sp916
+        # sp1217 — stop runtime observability. AlertManager FIRST (its eval loop
+        # reads the collector's registry); then the collector. Both own their
+        # internal async tasks via these coroutines; bounded so a wedged stop
+        # can't hang shutdown.
+        if getattr(self, "_alert_manager", None) is not None:
+            await _await_bounded(
+                self._alert_manager.stop_monitoring(), _STOP_TIMEOUT, "alert_manager",
+            )
+            self._alert_manager = None
+        if getattr(self, "_metrics_collector", None) is not None:
+            await _await_bounded(
+                self._metrics_collector.stop_collection(), _STOP_TIMEOUT, "metrics_collector",
+            )
+            self._metrics_collector = None
         for task_attr in (
             "_heartbeat_scheduler_task",
             "_job_reaper_task",

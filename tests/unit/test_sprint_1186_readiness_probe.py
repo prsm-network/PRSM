@@ -31,7 +31,8 @@ def test_ready_when_inference_executor_present():
 
 
 def test_not_ready_when_inference_executor_absent():
-    node = SimpleNamespace(inference_executor=None, settlement_client=None,
+    node = SimpleNamespace(inference_executor=None,
+                           _onchain_settlement_client=None,
                            ftns_ledger=None)
     ready, detail = compute_readiness(node)
     assert ready is False
@@ -41,8 +42,11 @@ def test_not_ready_when_inference_executor_absent():
 
 
 def test_detail_surfaces_coarse_subsystem_flags_only():
+    # sp1217 — settlement reads the REAL node attr (_onchain_settlement_client),
+    # not the never-set settlement_client.
     node = SimpleNamespace(inference_executor=object(),
-                           settlement_client=object(), ftns_ledger=object())
+                           _onchain_settlement_client=object(),
+                           ftns_ledger=object())
     _, detail = compute_readiness(node)
     subs = detail["subsystems"]
     # coarse booleans only — no addresses / topology leaked (safe for an ungated probe)
@@ -52,6 +56,24 @@ def test_detail_surfaces_coarse_subsystem_flags_only():
 def test_compute_readiness_never_raises_on_odd_node():
     ready, detail = compute_readiness(object())  # no attrs at all
     assert ready is False and detail["ready"] is False
+
+
+def test_settlement_reads_real_node_attr_not_legacy_name():
+    """sp1217 regression — the readiness 'settlement' boolean must reflect the
+    node's actual on-chain settlement client (_onchain_settlement_client). A
+    node carrying ONLY the legacy/never-set 'settlement_client' name must report
+    settlement=False (the bug was reading that name → always False)."""
+    legacy_only = SimpleNamespace(inference_executor=object(),
+                                  settlement_client=object(),  # legacy, ignored
+                                  ftns_ledger=object())
+    _, detail = compute_readiness(legacy_only)
+    assert detail["subsystems"]["settlement"] is False
+
+    real = SimpleNamespace(inference_executor=object(),
+                           _onchain_settlement_client=object(),
+                           ftns_ledger=object())
+    _, detail2 = compute_readiness(real)
+    assert detail2["subsystems"]["settlement"] is True
 
 
 # ── endpoints: 200/503 + ungated ─────────────────────────────────────────────────────
