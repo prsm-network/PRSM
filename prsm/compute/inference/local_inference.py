@@ -136,6 +136,18 @@ def _chat_template_enabled(env: Optional[dict] = None) -> bool:
     return (e.get(_CHAT_TEMPLATE_ENV, "") or "").strip().lower() not in {"0", "false", "no", "off"}
 
 
+def dtype_kwarg_for_transformers(version: str) -> str:
+    """sp1206 — pick from_pretrained's dtype kwarg name. transformers v5 renamed
+    ``torch_dtype`` → ``dtype`` (and removed ``torch_dtype``); 4.x uses ``torch_dtype``.
+    Getting this wrong is not cosmetic: an ignored dtype kwarg loads a 7B model in
+    float32 (~28GB) and OOMs a 24GB A10 — the load MUST honor float16."""
+    try:
+        major = int(str(version).split(".")[0])
+    except (ValueError, IndexError, AttributeError):
+        major = 4
+    return "dtype" if major >= 5 else "torch_dtype"
+
+
 class LocalHuggingFaceChainExecutor:
     """ChainExecutor that runs a real HF causal-LM in-process (single stage =
     whole model). Implements both ``execute_chain`` (unary, for /compute/inference)
@@ -182,8 +194,17 @@ class LocalHuggingFaceChainExecutor:
         # local_files_only=self._offline: False → allow a one-time hub download; True →
         # offline-only, deterministic, no network round-trip.
         tok = AutoTokenizer.from_pretrained(self._model_id, local_files_only=self._offline)
-        model = AutoModelForCausalLM.from_pretrained(
-            self._model_id, local_files_only=self._offline, torch_dtype=torch_dtype)
+        # sp1206 — use the dtype kwarg the installed transformers expects (v5 renamed
+        # torch_dtype→dtype). An ignored dtype loads fp32 → a 7B OOMs a 24GB A10.
+        import transformers as _tf
+        _dtype_kw = dtype_kwarg_for_transformers(getattr(_tf, "__version__", "4"))
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                self._model_id, local_files_only=self._offline, **{_dtype_kw: torch_dtype})
+        except TypeError:  # version-detect missed → try the other kwarg name
+            _other = "torch_dtype" if _dtype_kw == "dtype" else "dtype"
+            model = AutoModelForCausalLM.from_pretrained(
+                self._model_id, local_files_only=self._offline, **{_other: torch_dtype})
         model.eval()
         model.to(device)
         if tok.pad_token_id is None:

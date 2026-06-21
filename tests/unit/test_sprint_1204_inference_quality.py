@@ -17,11 +17,29 @@ import pytest
 from prsm.compute.inference.local_inference import (
     LocalHuggingFaceChainExecutor,
     _chat_template_enabled,
+    dtype_kwarg_for_transformers,
     encode_for_generation,
     resolve_device,
     resolve_dtype,
     should_use_chat_template,
 )
+
+
+# ── sp1206: transformers v4/v5 dtype kwarg ────────────────────────────────────────────
+
+def test_dtype_kwarg_v5_uses_dtype():
+    assert dtype_kwarg_for_transformers("5.12.1") == "dtype"
+    assert dtype_kwarg_for_transformers("5.0.0") == "dtype"
+
+
+def test_dtype_kwarg_v4_uses_torch_dtype():
+    assert dtype_kwarg_for_transformers("4.35.0") == "torch_dtype"
+    assert dtype_kwarg_for_transformers("4.56.0") == "torch_dtype"
+
+
+def test_dtype_kwarg_bad_version_defaults_safe():
+    assert dtype_kwarg_for_transformers("") == "torch_dtype"
+    assert dtype_kwarg_for_transformers("weird") == "torch_dtype"
 
 
 # ── device selection ──────────────────────────────────────────────────────────────────
