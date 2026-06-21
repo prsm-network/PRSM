@@ -366,6 +366,24 @@ async def resolve_relayer_requester(
         request_hash=request_hash, quoted_price_wei=quoted_price_wei)
 
 
+def _resolve_verifier_chain_id(environ) -> Optional[int]:
+    """Sprint 1201 — the EIP-712 domain chainId the requester-payment verifier MUST use
+    to recover the signer.
+
+    The payment authorization is signed over a domain that includes chainId; the
+    verifier must recompute the digest with the SAME chainId or recovery yields a
+    different address ("signer-mismatch"). Pre-fix, the verifier passed no chainId and
+    ``verify_payment_authorization_signature`` fell back to DEFAULT_CHAIN_ID=8453
+    (Base mainnet) — so on a TESTNET node (chainId 84532) every testnet-signed auth was
+    rejected. Resolve the node's active network chain so signer and verifier agree.
+    Fail-soft to None (the verifier then uses its 8453 default, the prior behavior)."""
+    try:
+        from prsm.config.networks import resolve_endpoints
+        return int(resolve_endpoints(environ.get("PRSM_NETWORK")).chain_id)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def build_relayer_verifier_or_none(
     environ=None, *, provider_address: Optional[str] = None,
     balance_reader: Optional[Any] = None,
@@ -411,7 +429,9 @@ def build_relayer_verifier_or_none(
         return RelayerAuthorizationVerifier(
             provider_address=provider_address,
             nonce_store=nonce_store, budget_store=budget_store,
-            balance_reader=balance_reader)
+            balance_reader=balance_reader,
+            chain_id=_resolve_verifier_chain_id(environ),  # sp1201 — match the signer
+        )
     except Exception as exc:  # noqa: BLE001 - never crash startup over this
         logger.warning(
             "relayer payment verifier build failed (staying OFF): %s: %s",
@@ -459,6 +479,7 @@ def build_payment_verifier_or_none(
             provider_address=provider_address,
             nonce_store=store,
             balance_reader=balance_reader,
+            chain_id=_resolve_verifier_chain_id(environ),  # sp1201 — match the signer
         )
     except Exception as exc:  # noqa: BLE001 - never crash startup over this
         logger.warning(
