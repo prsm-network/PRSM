@@ -367,6 +367,30 @@ def _model_info_for(model_id: str) -> ModelInfo:
         return _gpt2_hardcode_model_info(model_id)
 
 
+def catalog_entry_for_config(config: Any, model_id: str) -> Dict[str, Any]:
+    """Sprint 1205 — derive a parallax-catalog ModelInfo entry (a dict of kwargs) from a
+    HF config. Reuses _derive_model_info (the same logic the local path uses for layer
+    slicing), so a production instruct model's num_layers/kv_heads/head_size/etc. are
+    correct for the MULTI-HOST scheduler — no hand-authoring. Round-trips through
+    ModelInfo(**entry) and satisfies the v1 catalog's required fields."""
+    from dataclasses import asdict
+    return asdict(_derive_model_info(config, model_id))
+
+
+def build_parallax_catalog_v1(model_id_to_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Sprint 1205 — assemble a v1 parallax model-catalog
+    (``{schema_version: "v1", models: {model_id: ModelInfo-kwargs}}``) from
+    {model_id: HF-config}. This is the exact shape build_parallax_executor_or_none reads
+    from PRSM_PARALLAX_MODEL_CATALOG_FILE."""
+    return {
+        "schema_version": "v1",
+        "models": {
+            mid: catalog_entry_for_config(cfg, mid)
+            for mid, cfg in model_id_to_config.items()
+        },
+    }
+
+
 class _SelfAnchor:
     def __init__(self, node_id: str) -> None:
         self._node_id = node_id
