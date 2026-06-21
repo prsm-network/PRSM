@@ -121,13 +121,24 @@ def encode_for_generation(tokenizer: Any, prompt: str, *, use_chat_template: boo
     """Build the model inputs. Instruct path: apply_chat_template([{user, prompt}],
     add_generation_prompt=True) so the model sees its native instruction framing. Base
     path: raw encode (unchanged pre-sp1204 behavior). Returns an enc mapping with at least
-    ``input_ids`` (the caller adds attention_mask + moves to device)."""
+    ``input_ids`` (and usually ``attention_mask``).
+
+    sp1208: transformers v5's apply_chat_template returns a BatchEncoding (a dict-like with
+    input_ids + attention_mask), so the old ``{"input_ids": <result>}`` wrap put a
+    BatchEncoding under input_ids and broke ``torch.ones_like``. Request
+    ``return_dict=True`` (BatchEncoding on 4.41+/v5) and pass it through; on older
+    transformers that don't accept return_dict, fall back to the bare-tensor form + wrap."""
     if use_chat_template:
-        ids = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            add_generation_prompt=True, return_tensors="pt",
-        )
-        return {"input_ids": ids}
+        msgs = [{"role": "user", "content": prompt}]
+        try:
+            out = tokenizer.apply_chat_template(
+                msgs, add_generation_prompt=True, return_tensors="pt", return_dict=True)
+        except TypeError:  # older transformers: no return_dict kwarg → bare tensor
+            out = tokenizer.apply_chat_template(
+                msgs, add_generation_prompt=True, return_tensors="pt")
+        if isinstance(out, dict) or hasattr(out, "keys"):
+            return out  # BatchEncoding/dict: already has input_ids (+ attention_mask)
+        return {"input_ids": out}  # bare tensor → wrap (caller adds attention_mask)
     return tokenizer(prompt, return_tensors="pt")
 
 

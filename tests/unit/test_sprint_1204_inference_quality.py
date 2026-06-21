@@ -82,13 +82,28 @@ class _TokWithTemplate:
     def __init__(self):
         self.applied = None
 
-    def apply_chat_template(self, messages, add_generation_prompt, return_tensors):
+    def apply_chat_template(self, messages, add_generation_prompt, return_tensors,
+                            return_dict=False):
         self.applied = {"messages": messages, "agp": add_generation_prompt,
-                        "rt": return_tensors}
+                        "rt": return_tensors, "return_dict": return_dict}
+        if return_dict:  # transformers 4.41+/v5: BatchEncoding-style dict
+            return {"input_ids": "CHAT_IDS", "attention_mask": "MASK"}
         return "CHAT_IDS"
 
     def __call__(self, prompt, return_tensors):  # pragma: no cover
         raise AssertionError("instruct model must use the chat template, not raw encode")
+
+
+class _TokOldTemplate:
+    """Older transformers: apply_chat_template has no return_dict kwarg → TypeError on it
+    → encode_for_generation falls back to the bare-tensor call."""
+    chat_template = "{{ messages }}"
+
+    def apply_chat_template(self, messages, add_generation_prompt, return_tensors):
+        return "BARE_IDS"
+
+    def __call__(self, prompt, return_tensors):  # pragma: no cover
+        raise AssertionError("should use the chat template")
 
 
 class _TokRaw:
@@ -110,9 +125,20 @@ def test_should_use_chat_template_only_for_instruct_and_when_enabled():
 def test_encode_applies_chat_template_for_instruct():
     tok = _TokWithTemplate()
     enc = encode_for_generation(tok, "Hello", use_chat_template=True)
-    assert enc == {"input_ids": "CHAT_IDS"}
+    # sp1208: returns the BatchEncoding-style dict directly (input_ids + attention_mask),
+    # NOT {"input_ids": <BatchEncoding>} which broke torch.ones_like.
+    assert enc["input_ids"] == "CHAT_IDS"
+    assert "attention_mask" in enc
     assert tok.applied["messages"] == [{"role": "user", "content": "Hello"}]
     assert tok.applied["agp"] is True  # add_generation_prompt
+    assert tok.applied["return_dict"] is True
+
+
+def test_encode_chat_template_old_transformers_wraps_bare_tensor():
+    # sp1208: a transformers without the return_dict kwarg → TypeError → bare-tensor
+    # fallback → wrapped under input_ids so the caller's ones_like gets a real tensor.
+    enc = encode_for_generation(_TokOldTemplate(), "Hi", use_chat_template=True)
+    assert enc == {"input_ids": "BARE_IDS"}
 
 
 def test_encode_raw_for_base_model():
