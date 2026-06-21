@@ -614,6 +614,42 @@ def _resolve_hf_lm_head(hf_model: Any) -> Any:
     )
 
 
+def _resolve_hf_rotary_position_embeddings(
+    hf_model: Any, hidden: Any, position_ids: Any,
+) -> Any:
+    """Sprint 1216 — compute model-level rotary ``(cos, sin)`` once.
+
+    transformers v4.4x+/v5 moved rotary-embedding computation OUT of each
+    attention sub-layer UP to the model level: ``Qwen2Model.forward`` (and
+    LLaMA / Mistral) computes
+    ``position_embeddings = self.rotary_emb(hidden, position_ids)`` ONCE
+    and threads the tuple to every decoder layer, which then does
+    ``cos, sin = position_embeddings`` internally.
+
+    The layer-slice runner drives the decoder layers DIRECTLY, so it must
+    supply that tuple; otherwise ``position_embeddings`` defaults to
+    ``None`` and the layer's internal unpack raises
+    "cannot unpack non-iterable NoneType object" (the 2-A10 Qwen-1.5B
+    bench failure).
+
+    Returns the ``(cos, sin)`` tuple for rotary architectures
+    (LLaMA / Qwen / Mistral, which expose ``.model.rotary_emb``), else
+    ``None`` for GPT-2 / GPT-NeoX (learned absolute / per-layer positions
+    → the existing ``position_ids``-only call is correct and unchanged).
+
+    ``cos``/``sin`` depend only on ``position_ids`` (and ``hidden``'s
+    dtype/device), not on the hidden VALUES, so computing once before the
+    layer loop is correct.
+    """
+    inner = getattr(hf_model, "model", None)
+    if inner is None:
+        return None
+    rotary_emb = getattr(inner, "rotary_emb", None)
+    if rotary_emb is None:
+        return None
+    return rotary_emb(hidden, position_ids)
+
+
 class HuggingFaceLayerSliceRunner:
     """Sprint 610 (Phase 2F-5a) — first real-model LayerSliceRunner
     skeleton.
@@ -745,10 +781,19 @@ class HuggingFaceLayerSliceRunner:
         position_ids = _torch.arange(
             seq_len, device=self.device,
         ).unsqueeze(0)
+        # Sprint 1216 — rotary models (LLaMA/Qwen/Mistral) need the
+        # model-level (cos, sin) tuple threaded into each layer; gpt2
+        # returns None here and keeps the position_ids-only call.
+        position_embeddings = _resolve_hf_rotary_position_embeddings(
+            hf_model, hidden, position_ids,
+        )
+        layer_kwargs: Dict[str, Any] = {"position_ids": position_ids}
+        if position_embeddings is not None:
+            layer_kwargs["position_embeddings"] = position_embeddings
         try:
             with _torch.no_grad():
                 for i in range(start, end):
-                    out = layers[i](hidden, position_ids=position_ids)
+                    out = layers[i](hidden, **layer_kwargs)
                     # LLaMA layer returns tuple (hidden_state, ...)
                     hidden = out[0] if isinstance(out, tuple) else out
                 # Sprint 613 (Phase 2F-5d) — chain tail: apply LM
@@ -870,16 +915,24 @@ class HuggingFaceLayerSliceRunner:
         cache_position = _torch.arange(
             past_seq_len, past_seq_len + seq_len, device=self.device,
         )
+        # Sprint 1216 — rotary models need (cos, sin) computed from the
+        # ABSOLUTE positions of the new tokens (= cache_position), threaded
+        # into each layer. gpt2 → None (keeps cache_position-only call).
+        position_embeddings = _resolve_hf_rotary_position_embeddings(
+            hf_model, hidden, cache_position.unsqueeze(0),
+        )
+        layer_kwargs: Dict[str, Any] = {
+            "past_key_values": cache,
+            "cache_position": cache_position,
+            "use_cache": True,
+        }
+        if position_embeddings is not None:
+            layer_kwargs["position_embeddings"] = position_embeddings
 
         try:
             with _torch.no_grad():
                 for i in range(start, end):
-                    out = layers[i](
-                        hidden,
-                        past_key_values=cache,
-                        cache_position=cache_position,
-                        use_cache=True,
-                    )
+                    out = layers[i](hidden, **layer_kwargs)
                     hidden = out[0] if isinstance(out, tuple) else out
                 # Final-stage: same ln_f + lm_head as run_layer_range
                 if is_final_stage:
