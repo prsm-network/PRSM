@@ -5514,7 +5514,28 @@ class PRSMNode:
                     self._alert_manager.set_metrics_collector(
                         self._metrics_collector,
                     )
-                    self._alert_manager.setup_node_runtime_rules()
+                    # sp1218 — opt-in webhook delivery. PRSM_ALERT_WEBHOOK_URL
+                    # set → register a WebhookAlertChannel + route the
+                    # node-runtime rules to it (Slack/PagerDuty/etc. accept a
+                    # generic JSON webhook). Unset → channels=[] (alerts still
+                    # register in active_alerts + log; just no push).
+                    _alert_channels: list = []
+                    _webhook_url = str(
+                        _os_obs.environ.get("PRSM_ALERT_WEBHOOK_URL", ""),
+                    ).strip()
+                    if _webhook_url:
+                        from prsm.core.monitoring.alerts import (
+                            WebhookAlertChannel,
+                        )
+                        self._alert_manager.add_channel(
+                            WebhookAlertChannel(
+                                "node-webhook", {"url": _webhook_url},
+                            ),
+                        )
+                        _alert_channels.append("node-webhook")
+                    self._alert_manager.setup_node_runtime_rules(
+                        channels=_alert_channels,
+                    )
                     await self._alert_manager.start_monitoring()
                     logger.info(
                         "Sprint 1217 runtime AlertManager started "

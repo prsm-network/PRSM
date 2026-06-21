@@ -119,6 +119,47 @@ def test_collector_alert_stack_interoperates_and_lifecycles():
     asyncio.run(_run())
 
 
+def test_rules_carry_provided_channels():
+    """sp1218 — setup_node_runtime_rules(channels=[...]) routes fired rules to
+    the named channels; default → no channels (register/log only)."""
+    am = AlertManager()
+    am.setup_node_runtime_rules(channels=["node-webhook"])
+    for name in (
+        "node_not_ready",
+        "settlement_funds_in_flight_stuck",
+        "settlement_committing_intents_unresolved",
+    ):
+        assert am.rules[name].channels == ["node-webhook"]
+
+    am2 = AlertManager()
+    am2.setup_node_runtime_rules()
+    assert am2.rules["node_not_ready"].channels == []
+
+
+def test_fired_alert_delivers_to_registered_channel():
+    """sp1218 — a fired node-runtime rule actually pushes to its channel
+    (the create_alert → _send_notifications path), not just active_alerts."""
+    from prsm.core.monitoring.alerts import AlertChannel
+
+    delivered = []
+
+    class _StubChannel(AlertChannel):
+        async def send_alert(self, alert):
+            delivered.append(alert)
+            return True
+
+    am = AlertManager()
+    am.add_channel(_StubChannel("node-webhook", {"enabled": True}))
+    am.setup_node_runtime_rules(channels=["node-webhook"])
+    rule = am.rules["node_not_ready"]
+
+    asyncio.run(am.create_alert(rule, 0.0))
+    assert len(delivered) == 1
+    assert delivered[0].rule_name == "node_not_ready"
+    # and it's tracked as active
+    assert any(a.rule_name == "node_not_ready" for a in am.get_active_alerts())
+
+
 def test_prometheus_exposition_includes_node_metrics():
     prom = pytest.importorskip("prometheus_client")  # noqa: F841
     node = _Node(inference_executor=object(), onchain_settlement_client=None)

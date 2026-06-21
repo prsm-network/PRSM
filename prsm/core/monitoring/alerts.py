@@ -690,14 +690,17 @@ class AlertManager:
 
         logger.info(f"Setup {len(self.rules)} default alert rules")
 
-    def setup_node_runtime_rules(self) -> None:
+    def setup_node_runtime_rules(self, channels: Optional[List[str]] = None) -> None:
         """Sprint 1217 — alert rules over a live PRSM node's runtime metrics
-        (emitted by ``NodeRuntimeMetrics``). Channels default to [] so these
-        rules register + log + populate ``active_alerts`` WITHOUT requiring an
-        email/slack/webhook channel to be wired (an operator scrapes
-        ``active_alerts`` / logs); add channel names here once an operator opts
-        into notifications."""
-        logger.info("Setting up node-runtime alert rules")
+        (emitted by ``NodeRuntimeMetrics``).
+
+        ``channels`` (sp1218): the channel names a fired rule notifies. Default
+        None → ``[]`` so the rules register + log + populate ``active_alerts``
+        WITHOUT requiring an email/slack/webhook channel (an operator scrapes
+        ``active_alerts`` / logs). Pass e.g. ``["node-webhook"]`` (with a
+        matching ``add_channel``) to deliver notifications."""
+        chans: List[str] = list(channels) if channels else []
+        logger.info("Setting up node-runtime alert rules (channels=%s)", chans)
 
         # Node not ready (can't serve the primary inference path) — fire fast.
         not_ready_rule = AlertRule(
@@ -711,7 +714,7 @@ class AlertManager:
                 aggregation="min",
             ),
             severity=AlertSeverity.CRITICAL,
-            channels=[],
+            channels=list(chans),
             tags={"category": "availability", "component": "inference"},
         )
 
@@ -729,7 +732,7 @@ class AlertManager:
                 aggregation="min",
             ),
             severity=AlertSeverity.WARNING,
-            channels=[],
+            channels=list(chans),
             tags={"category": "settlement", "component": "escrow"},
         )
 
@@ -747,7 +750,7 @@ class AlertManager:
                 aggregation="min",
             ),
             severity=AlertSeverity.WARNING,
-            channels=[],
+            channels=list(chans),
             tags={"category": "settlement", "component": "wal"},
         )
 
