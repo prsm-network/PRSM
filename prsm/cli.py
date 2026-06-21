@@ -8,7 +8,7 @@ import socket
 import sys
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     # Forward references for type annotations — the actual NodeConfig class
