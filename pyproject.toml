@@ -209,6 +209,10 @@ ml = [
     "transformers>=4.35.0",
     "sentence-transformers>=2.2.0",
     "chromadb>=0.4.0",
+    # sp1209 — instruct-model chat templates (apply_chat_template, sp1204/sp1208) render
+    # via jinja2; transformers requires >=3.1.0 or inference fails on a fresh box that
+    # only has an older distro jinja2 (the Lambda A10 bench hit exactly this).
+    "jinja2>=3.1.0",
 ]
 
 blockchain = [

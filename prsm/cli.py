@@ -284,6 +284,20 @@ def parse_active_days(value: Optional[str]) -> List[int]:
     return sorted(days)
 
 
+def _should_warn_no_inference_backend(any_real_backend: bool, executor: Any) -> bool:
+    """Sprint 1209 — decide whether to print the 'no real inference backend' startup
+    warning. Pre-fix the node always cried 'inference will return mock responses' when no
+    Anthropic/OpenAI key was set — MISLEADING for a node running PRSM_INFERENCE_EXECUTOR=
+    local|parallax, which serves REAL /compute/inference with no API key (it confused the
+    GPU bench). Warn only when there's NEITHER a real LLM-API backend NOR a real
+    (non-mock) inference executor wired."""
+    if any_real_backend:
+        return False
+    if executor is not None and "mock" not in type(executor).__name__.lower():
+        return False
+    return True
+
+
 def _node_preflight_diagnostics(config: "NodeConfig") -> List[PreflightCheckResult]:
     """Run non-breaking node startup diagnostics with required/optional classification."""
 
@@ -1543,15 +1557,19 @@ def start(wizard: bool, background: bool, p2p_port: int, api_port: int, bootstra
         await prsm_node.initialize()
         await prsm_node.start()
 
-        # Check for LLM backends and warn if only mock is available
+        # Check for inference backends and warn only if NONE is real (sp1209).
         backends = detect_available_backends()
-        if not backends.get("any_real_backend"):
+        if _should_warn_no_inference_backend(
+            bool(backends.get("any_real_backend")),
+            getattr(prsm_node, "inference_executor", None),
+        ):
             print()
-            print("⚠️   No LLM API keys detected — inference will return mock responses.")
-            print("    To enable real AI inference:")
-            print("      1. cp .env.example .env")
-            print("      2. Set ANTHROPIC_API_KEY or OPENAI_API_KEY in .env")
-            print("      3. Restart the node")
+            print("⚠️   No real inference backend — /compute/inference will be "
+                  "unavailable or mock.")
+            print("    Enable real inference either way:")
+            print("      • local model:  PRSM_INFERENCE_EXECUTOR=local "
+                  "(after: pip install -e '.[ml]')")
+            print("      • or an LLM API: set ANTHROPIC_API_KEY / OPENAI_API_KEY in .env")
             print()
 
         try:
