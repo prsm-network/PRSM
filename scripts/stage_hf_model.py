@@ -197,8 +197,12 @@ def main(argv: Optional[list] = None) -> int:
 
     # Single-shard sentinel covering all layers. HF runner ignores
     # tensor_data + uses transformers.from_pretrained() at runtime.
+    # sp1215 — the shard_id is a filesystem-mapped identifier (a filename in shards/),
+    # so it must stay slash-free even though sp1214 lets the model_id be an HF org/model
+    # id. Sanitize the model_id portion ('/'->'_'); the id is just a stored, read-back
+    # label so this is self-consistent.
     shard = ModelShard(
-        shard_id=f"{args.model_id}-shard-0",
+        shard_id=f"{args.model_id.replace('/', '_')}-shard-0",
         model_id=args.model_id,
         shard_index=0,
         total_shards=1,
