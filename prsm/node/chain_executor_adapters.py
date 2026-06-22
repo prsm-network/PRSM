@@ -654,6 +654,34 @@ def _slice_load_enabled() -> bool:
     )
 
 
+def _build_embedding_only(model_id: str, device: str, dtype: str) -> Any:
+    """Sprint 1224 (Brick 5) — load ONLY the input embedding
+    (model.embed_tokens) as a standalone nn.Embedding, so a slice-load HEAD
+    (which runs the prompt encoder + its stage-0 slice) does NOT carry a full
+    model just to embed the prompt. Required for genuinely-too-big-for-one-GPU
+    models: the head can't load the full model to encode. Rotary arch only —
+    raises (→ caller falls back to full-load) if there's no model.embed_tokens,
+    which keeps gpt2's learned-position (wpe) path on the full model."""
+    import torch as _torch
+    snapshot_dir = _resolve_snapshot_dir(model_id)
+    weight_map = _resolve_weight_map(snapshot_dir)
+    if _SLICE_EMBED_KEY not in weight_map:
+        raise StageExecutionError(
+            f"embed-only: {model_id!r} has no {_SLICE_EMBED_KEY} "
+            f"(non-rotary arch, e.g. gpt2) — use full-load.",
+        )
+    sd = _read_owned_state_dict(
+        snapshot_dir, weight_map, {_SLICE_EMBED_KEY},
+        layers_prefix=_SLICE_LAYERS_PREFIX, start=0, dtype=dtype,
+    )
+    w = sd[_SLICE_EMBED_KEY]  # [vocab, hidden]
+    # from_pretrained builds an Embedding whose weight IS w — no full-vocab
+    # random alloc; freeze (inference). Bit-identical lookup to the full
+    # model's get_input_embeddings() (same weight, and rotary adds no wpe).
+    emb = _torch.nn.Embedding.from_pretrained(w, freeze=True)
+    return emb.to(device).eval()
+
+
 def _resolve_hf_layers(hf_model: Any) -> Any:
     """Sprint 612 (Phase 2F-5c) — polymorphic HF layer extraction.
 
@@ -755,16 +783,34 @@ def build_hf_prompt_encoder(
                 from transformers import AutoTokenizer
                 import torch as _torch  # noqa: F401
                 tok = AutoTokenizer.from_pretrained(model_id)
-                # sp1220 — share the process-level model cache with the
-                # layer-slice runner + streaming runner (one load per
-                # (model_id, device, dtype), correct dtype: fp16 on CUDA so a
-                # 7B head fits, fp32 on CPU). Replaces the encoder's separate
-                # hardcoded-fp32 from_pretrained (the 2nd full copy on the
-                # head). sp702 F48's low_cpu_mem_usage=False is preserved
-                # inside _load_hf_model_cached.
-                model = _load_hf_model_cached(
-                    model_id, device, _resolve_model_dtype(device),
-                )
+                _dtype = _resolve_model_dtype(device)
+                # sp1224 (Brick 5) — under slice-load, materialize ONLY the
+                # input embedding (rotary arch) so a sliced head doesn't carry
+                # the full model just to embed. Falls back to the full-model
+                # load (sp1220 shared cache) for gpt2/wpe or any embed-only
+                # failure. _state["model"]=None on the embed-only path → the
+                # wpe branch below is skipped (rotary needs none).
+                _embed_only = None
+                if _slice_load_enabled():
+                    try:
+                        _embed_only = _build_embedding_only(
+                            model_id, device, _dtype,
+                        )
+                    except Exception as _eo_exc:  # noqa: BLE001 — full fallback
+                        import logging as _lg
+                        _lg.getLogger(__name__).warning(
+                            "embed-only encoder load failed for %s — falling "
+                            "back to full-model embed: %s", model_id, _eo_exc,
+                        )
+                if _embed_only is not None:
+                    model = None
+                    embed_layer = _embed_only
+                else:
+                    # sp1220 — share the process-level model cache with the
+                    # layer-slice runner + streaming runner (one load per
+                    # (model_id, device, dtype); fp16 on CUDA, fp32 on CPU).
+                    model = _load_hf_model_cached(model_id, device, _dtype)
+                    embed_layer = model.get_input_embeddings()
             except Exception as exc:  # noqa: BLE001
                 raise StageExecutionError(
                     f"build_hf_prompt_encoder failed to load "
@@ -772,7 +818,7 @@ def build_hf_prompt_encoder(
                 ) from exc
             _state["tokenizer"] = tok
             _state["model"] = model
-            _state["embed_layer"] = model.get_input_embeddings()
+            _state["embed_layer"] = embed_layer
         try:
             import torch as _torch
             token_ids = _state["tokenizer"].encode(
