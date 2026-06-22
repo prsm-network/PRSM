@@ -22,6 +22,18 @@ import numpy as np
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _clear_hf_cache():
+    # sp1220 — the runner now loads through a PROCESS-shared _HF_MODEL_CACHE
+    # (keyed model_id,device,dtype). Clear it around each test so the
+    # from_pretrained.call_count assertions + per-test fake models don't leak
+    # across tests.
+    import prsm.node.chain_executor_adapters as _cea
+    _cea._HF_MODEL_CACHE.clear()
+    yield
+    _cea._HF_MODEL_CACHE.clear()
+
+
 def _install_fake_transformers_torch():
     """Build mock transformers + torch modules that the runner can import.
     Returns (transformers_mod, torch_mod, fake_model)."""
@@ -92,8 +104,11 @@ def test_run_layer_range_loads_model_lazily_on_first_call():
             is_final_stage=False,
         )
 
+        # sp1220 — load goes through _load_hf_model_cached: dtype kwarg name is
+        # version-resolved (the MagicMock version → "torch_dtype") + the sp702
+        # low_cpu_mem_usage=False is now applied uniformly to the runner too.
         fake_tf.AutoModelForCausalLM.from_pretrained.assert_called_once_with(
-            "fake/model", torch_dtype="float32_sentinel",
+            "fake/model", torch_dtype="float32_sentinel", low_cpu_mem_usage=False,
         )
         assert runner._hf_model is fake_model
 

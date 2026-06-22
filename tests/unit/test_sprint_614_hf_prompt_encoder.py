@@ -27,6 +27,18 @@ import numpy as np
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _clear_hf_cache():
+    # sp1220 — the encoder now shares the process-level _HF_MODEL_CACHE with the
+    # runner. Clear it around each test so the from_pretrained.call_count
+    # assertions + per-test fake models don't leak across tests (incl. across
+    # the sp611 runner tests, which use the same model_id/device/dtype key).
+    import prsm.node.chain_executor_adapters as _cea
+    _cea._HF_MODEL_CACHE.clear()
+    yield
+    _cea._HF_MODEL_CACHE.clear()
+
+
 def _install_fake_tokenizer_and_model():
     fake_tokenizer = MagicMock()
     fake_tokenizer.encode = MagicMock()

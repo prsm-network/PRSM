@@ -305,6 +305,79 @@ class LayerStageServerStageExecutor:
             ) from exc
 
 
+# Sprint 1220 (Brick 1) — process-shared HF model cache. The layer-slice
+# runner + the prompt encoder + the streaming runner each from_pretrained'd the
+# FULL model separately (2-4 full copies on the head) and reloaded per request.
+# Keyed by (model_id, device, dtype) so one process loads each model ONCE; the
+# instance-level `self._hf_model` still short-circuits, but a fresh
+# runner/encoder now reuses the cached weights instead of re-reading them.
+_HF_MODEL_CACHE: Dict[tuple, Any] = {}
+
+
+def _torch_dtype_from_str(dtype_str: str) -> Any:
+    """Map a dtype string → torch dtype (fp32 fallback)."""
+    import torch as _torch
+    return {
+        "float16": _torch.float16,
+        "bfloat16": _torch.bfloat16,
+        "float32": _torch.float32,
+    }.get(dtype_str, _torch.float32)
+
+
+def _resolve_model_dtype(device: str) -> str:
+    """Sprint 1220 — load dtype string for the HF runner/encoder: fp16 on CUDA
+    (≈2x less VRAM → a 7-8B model fits a 24GB A10), fp32 elsewhere. Reuses
+    local_inference.resolve_dtype so PRSM_LOCAL_INFERENCE_DTYPE overrides apply
+    uniformly. Greedy decode stays deterministic at any dtype (§7-safe)."""
+    from prsm.compute.inference.local_inference import resolve_dtype
+    return resolve_dtype(None, device)
+
+
+def _model_compute_dtype(hf_model: Any) -> Any:
+    """Sprint 1220 (adversarial-verify C1) — the dtype of the model's params,
+    for the activation-boundary cast. Feeding an fp32 activation into an fp16
+    nn.Linear raises 'mat1 and mat2 must have the same dtype', so the cast MUST
+    match the loaded model — not the old hardcoded float32. fp32 fallback when
+    the model exposes no params (defensive)."""
+    import torch as _torch
+    try:
+        return next(hf_model.parameters()).dtype
+    except (StopIteration, Exception):  # noqa: BLE001
+        return _torch.float32
+
+
+def _load_hf_model_cached(model_id: str, device: str, dtype_str: str) -> Any:
+    """Sprint 1220 — load (or fetch from the process cache) an HF causal-LM in
+    the resolved dtype on the target device. Collapses the prior multi-copy +
+    per-request reloads to ONE load per (model_id, device, dtype). transformers
+    v5 renamed torch_dtype→dtype (and ignores torch_dtype), so the dtype kwarg
+    name is version-resolved — getting it wrong silently loads fp32 and OOMs."""
+    key = (model_id, device, dtype_str)
+    cached = _HF_MODEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    import transformers  # noqa: F401
+    from transformers import AutoModelForCausalLM
+    from prsm.compute.inference.local_inference import (
+        dtype_kwarg_for_transformers,
+    )
+    # getattr default keeps mocked-`transformers` test doubles (no __version__)
+    # working; "" → dtype_kwarg_for_transformers falls back to torch_dtype.
+    dtype_kwarg = dtype_kwarg_for_transformers(
+        getattr(transformers, "__version__", "") or "",
+    )
+    kwargs = {
+        dtype_kwarg: _torch_dtype_from_str(dtype_str),
+        # sp702 F48 — materialize weights during load (not meta) so
+        # `.to(device)` doesn't raise "Cannot copy out of meta tensor".
+        "low_cpu_mem_usage": False,
+    }
+    model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+    model = model.to(device).eval()
+    _HF_MODEL_CACHE[key] = model
+    return model
+
+
 def _resolve_hf_layers(hf_model: Any) -> Any:
     """Sprint 612 (Phase 2F-5c) — polymorphic HF layer extraction.
 
@@ -403,22 +476,19 @@ def build_hf_prompt_encoder(
                     f"+ `torch` packages installed: {exc}."
                 ) from exc
             try:
-                from transformers import (
-                    AutoTokenizer, AutoModelForCausalLM,
-                )
-                import torch as _torch
+                from transformers import AutoTokenizer
+                import torch as _torch  # noqa: F401
                 tok = AutoTokenizer.from_pretrained(model_id)
-                # Sprint 702 F48 fix — force low_cpu_mem_usage=False
-                # so weights materialize during load instead of staying
-                # on meta-tensor. Without this, newer transformers
-                # versions default to lazy/meta loading and `.to(device)`
-                # raises NotImplementedError: "Cannot copy out of meta
-                # tensor". gpt2 is ~500MB; fits any droplet.
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_id, torch_dtype=_torch.float32,
-                    low_cpu_mem_usage=False,
+                # sp1220 — share the process-level model cache with the
+                # layer-slice runner + streaming runner (one load per
+                # (model_id, device, dtype), correct dtype: fp16 on CUDA so a
+                # 7B head fits, fp32 on CPU). Replaces the encoder's separate
+                # hardcoded-fp32 from_pretrained (the 2nd full copy on the
+                # head). sp702 F48's low_cpu_mem_usage=False is preserved
+                # inside _load_hf_model_cached.
+                model = _load_hf_model_cached(
+                    model_id, device, _resolve_model_dtype(device),
                 )
-                model = model.to(device).eval()
             except Exception as exc:  # noqa: BLE001
                 raise StageExecutionError(
                     f"build_hf_prompt_encoder failed to load "
@@ -707,12 +777,10 @@ class HuggingFaceLayerSliceRunner:
                 f"`pip install transformers torch`."
             ) from exc
         try:
-            from transformers import AutoModelForCausalLM
-            import torch as _torch
-            model = AutoModelForCausalLM.from_pretrained(
-                self.model_id, torch_dtype=_torch.float32,
-            )
-            model = model.to(self.device).eval()
+            # sp1220 — resolve dtype (fp16 on CUDA fits 7B on 24GB; fp32 on
+            # CPU keeps the proven path) + fetch from the process-shared cache.
+            dtype_str = _resolve_model_dtype(self.device)
+            model = _load_hf_model_cached(self.model_id, self.device, dtype_str)
         except Exception as exc:  # noqa: BLE001
             raise StageExecutionError(
                 f"HuggingFaceLayerSliceRunner failed to load "
@@ -764,13 +832,14 @@ class HuggingFaceLayerSliceRunner:
                 f"({start}, {end}) for model with {len(layers)} layers"
             )
         original_ndim = activation.ndim
-        # Sprint 687 F36 — match model dtype (float32 per
-        # _ensure_model_loaded). numpy activations default to
-        # float64 on most platforms; passing fp64 into fp32 layers
-        # raises "mixed dtype (CPU)" on torch>=2.x. Cast at the
-        # boundary.
+        # sp1220 (adversarial-verify C1) — match the LOADED model's compute
+        # dtype, NOT hardcoded fp32. numpy activations default to float64;
+        # feeding an fp32/fp64 activation into an fp16 nn.Linear (the whole
+        # point of Brick 1's fp16 load) raises "mat1 and mat2 must have the
+        # same dtype". Cast at the boundary to the model's dtype (fp32 on the
+        # CPU/gpt2 path → unchanged behavior there).
         hidden = _torch.from_numpy(activation).to(
-            self.device, dtype=_torch.float32,
+            self.device, dtype=_model_compute_dtype(hf_model),
         )
         if hidden.dim() == 2:
             hidden = hidden.unsqueeze(0)
@@ -891,13 +960,14 @@ class HuggingFaceLayerSliceRunner:
                 f"({start}, {end}) for model with {len(layers)} layers"
             )
         original_ndim = activation.ndim
-        # Sprint 687 F36 — match model dtype (float32 per
-        # _ensure_model_loaded). numpy activations default to
-        # float64 on most platforms; passing fp64 into fp32 layers
-        # raises "mixed dtype (CPU)" on torch>=2.x. Cast at the
-        # boundary.
+        # sp1220 (adversarial-verify C1) — match the LOADED model's compute
+        # dtype, NOT hardcoded fp32. numpy activations default to float64;
+        # feeding an fp32/fp64 activation into an fp16 nn.Linear (the whole
+        # point of Brick 1's fp16 load) raises "mat1 and mat2 must have the
+        # same dtype". Cast at the boundary to the model's dtype (fp32 on the
+        # CPU/gpt2 path → unchanged behavior there).
         hidden = _torch.from_numpy(activation).to(
-            self.device, dtype=_torch.float32,
+            self.device, dtype=_model_compute_dtype(hf_model),
         )
         if hidden.dim() == 2:
             hidden = hidden.unsqueeze(0)
