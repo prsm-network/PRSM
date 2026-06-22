@@ -152,8 +152,29 @@ def make_rpc_chain_executor(
                          below this ride inline; above, streamed.
       chunk_bytes        Per-chunk size on the streamed path (default
                          1 MiB from Phase 6 ``ShardChunker``).
-      default_deadline_seconds  Default 30s.
+      default_deadline_seconds  Default 30s. Overridable via the env
+                         ``PRSM_PARALLAX_CHAIN_DEADLINE_S`` — the per-stage
+                         HandoffToken deadline budget. 30s is fine for WARM
+                         inference, but a node COLD-loading a big model's layer
+                         slice (sp1220-1225 slice-load: read ~GBs of
+                         safetensors + build the skeleton + move to GPU) can
+                         take minutes on the first request, which would expire a
+                         30s token mid-load (DEADLINE_EXCEEDED). Operators
+                         serving large models set this higher (e.g. 600).
     """
+    import os as _os
+    _dl_env = (_os.environ.get("PRSM_PARALLAX_CHAIN_DEADLINE_S", "") or "").strip()
+    if _dl_env:
+        try:
+            _dl_val = float(_dl_env)
+            if _dl_val > 0:
+                default_deadline_seconds = _dl_val
+        except ValueError:
+            logger.warning(
+                "PRSM_PARALLAX_CHAIN_DEADLINE_S=%r not a positive float; "
+                "keeping default_deadline_seconds=%s",
+                _dl_env, default_deadline_seconds,
+            )
     if prompt_encoder is None or output_decoder is None:
         # Loud one-time warning when defaults activate. The docstring
         # already calls this out, but an SDK user constructing the
