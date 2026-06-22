@@ -568,6 +568,19 @@ def build_reduced_config_slice_model(
         )
     tie = bool(getattr(cfg, "tie_word_embeddings", False))
 
+    # Resolve the weight_map + arch-check EARLY (cheap index.json read) so an
+    # unsupported architecture (gpt2's .transformer.h, no model.layers) fails
+    # FAST here → the runner's cheap fallback to the proven full-load path,
+    # without first building a from_config skeleton.
+    weight_map = _resolve_weight_map(snapshot_dir)
+    if not any(
+        _layer_index_of(k, _SLICE_LAYERS_PREFIX) is not None for k in weight_map
+    ):
+        raise StageExecutionError(
+            f"slice-load: {model_id!r} has no {_SLICE_LAYERS_PREFIX}.* keys — "
+            f"unsupported architecture for slicing (e.g. gpt2). Use full-load.",
+        )
+
     # C2 — slice every config list coupled to the layer count (layer_types et
     # al.), THEN set num_hidden_layers, so from_config's length validation
     # passes.
@@ -590,7 +603,6 @@ def build_reduced_config_slice_model(
     elif not tie:
         model.model.embed_tokens = None
 
-    weight_map = _resolve_weight_map(snapshot_dir)
     owned = _resolve_slice_owned_keys(
         set(weight_map), layers_prefix=_SLICE_LAYERS_PREFIX,
         norm_key=_SLICE_NORM_KEY, lm_head_key=_SLICE_LM_HEAD_KEY,
@@ -629,6 +641,17 @@ def build_reduced_config_slice_model(
 
     model = model.to(device=device, dtype=_torch_dtype_from_str(dtype)).eval()
     return model, full_num_layers
+
+
+def _slice_load_enabled() -> bool:
+    """Sprint 1223 (Brick 4) — per-stage layer-slice weight loading is OPT-IN
+    via PRSM_PARALLAX_SLICE_LOAD. Default OFF keeps the proven full-load path
+    (gpt2/1.5B) byte-identical; on, the runner loads only its assigned layers
+    so a >24GB model shards across nodes."""
+    import os
+    return str(os.environ.get("PRSM_PARALLAX_SLICE_LOAD", "")).strip().lower() in (
+        "1", "true", "yes", "on",
+    )
 
 
 def _resolve_hf_layers(hf_model: Any) -> Any:
@@ -1011,8 +1034,49 @@ class HuggingFaceLayerSliceRunner:
         self.model_id = model_id
         # Sprint 617 — auto-detect / safe-fallback device selection.
         self.device = _resolve_hf_device(device)
-        # Lazy-cached on first run_layer_range call.
+        # Lazy-cached on first run_layer_range call (full-load path).
         self._hf_model: Any = None
+        # sp1223 (Brick 4, adversarial-verify C4) — per-(start,end,is_final)
+        # slice-model cache. The runner is shared across calls and a node can
+        # host >1 range in a chain, so slice models are keyed PER RANGE (not a
+        # single swap). Opt-in via PRSM_PARALLAX_SLICE_LOAD; any loader error or
+        # unsupported (gpt2-style) arch falls back to the full-load path.
+        self._slice_models: Dict[tuple, Any] = {}
+
+    def _resolve_model_for_range(
+        self, start: int, end: int, is_final_stage: bool,
+    ) -> tuple:
+        """sp1223 (Brick 4) — return ``(model, layers, slice_loaded,
+        full_depth)`` for THIS range. Slice-loads (cached per
+        (start,end,is_final)) when PRSM_PARALLAX_SLICE_LOAD is on AND the arch
+        supports it; otherwise (or on ANY slice-load error) full-loads the
+        proven path. Per-call → safe for a shared runner hosting multiple
+        ranges."""
+        if _slice_load_enabled():
+            key = (int(start), int(end), bool(is_final_stage))
+            cached = self._slice_models.get(key)
+            if cached is not None:
+                model, full_depth = cached
+                return model, _resolve_hf_layers(model), True, full_depth
+            try:
+                dtype_str = _resolve_model_dtype(self.device)
+                model, full_depth = build_reduced_config_slice_model(
+                    self.model_id, start=int(start), end=int(end),
+                    is_final_stage=bool(is_final_stage),
+                    device=self.device, dtype=dtype_str,
+                )
+                self._slice_models[key] = (model, full_depth)
+                return model, _resolve_hf_layers(model), True, full_depth
+            except Exception as exc:  # noqa: BLE001 — fall back to full-load
+                import logging as _lg
+                _lg.getLogger(__name__).warning(
+                    "slice-load failed for %s [%s,%s) is_final=%s — falling "
+                    "back to full-load: %s",
+                    self.model_id, start, end, is_final_stage, exc,
+                )
+        model = self._ensure_model_loaded()
+        layers = _resolve_hf_layers(model)
+        return model, layers, False, len(layers)
 
     def _ensure_model_loaded(self) -> Any:
         """Sprint 611 (Phase 2F-5b) — lazy model load + cache."""
@@ -1068,21 +1132,24 @@ class HuggingFaceLayerSliceRunner:
         sprints handle GPT-style (.transformer.h) + other variants.
         """
         import time as _time
-        hf_model = self._ensure_model_loaded()
         import torch as _torch
         from prsm.compute.chain_rpc.server import LayerSliceResult
         from prsm.compute.tee.models import TEEType
 
         start_t = _time.monotonic()
-        # Sprint 612 — polymorphic layer extraction (LLaMA / GPT-2 /
-        # GPT-NeoX). Raises StageExecutionError listing attempted
-        # paths if unsupported architecture.
-        layers = _resolve_hf_layers(hf_model)
         start, end = int(layer_range[0]), int(layer_range[1])
-        if start < 0 or end > len(layers) or start >= end:
+        # sp1223 (Brick 4) — resolve the model for THIS range: a slice-loaded
+        # skeleton (relative-indexed layers 0..n-1) when PRSM_PARALLAX_SLICE_LOAD
+        # is on + the arch supports it, else the full model (absolute indices,
+        # the proven path). Per-call → safe for a shared runner / multi-range
+        # node.
+        hf_model, layers, slice_loaded, full_depth = (
+            self._resolve_model_for_range(start, end, is_final_stage)
+        )
+        if start < 0 or end > full_depth or start >= end:
             raise StageExecutionError(
                 f"HuggingFaceLayerSliceRunner: invalid layer_range "
-                f"({start}, {end}) for model with {len(layers)} layers"
+                f"({start}, {end}) for model with {full_depth} layers"
             )
         original_ndim = activation.ndim
         # sp1220 (adversarial-verify C1) — match the LOADED model's compute
@@ -1114,7 +1181,13 @@ class HuggingFaceLayerSliceRunner:
             layer_kwargs["position_embeddings"] = position_embeddings
         try:
             with _torch.no_grad():
-                for i in range(start, end):
+                # sp1223 (Brick 4) — a slice-loaded model's `layers` already
+                # holds EXACTLY the [start,end) slice at relative indices
+                # 0..n-1, so iterate relatively; the full-load path keeps the
+                # proven absolute indices. (indexing_decision: relative iff
+                # slice_loaded — the only bit-exact-loop edit, guarded.)
+                _indices = range(end - start) if slice_loaded else range(start, end)
+                for i in _indices:
                     out = layers[i](hidden, **layer_kwargs)
                     # LLaMA layer returns tuple (hidden_state, ...)
                     hidden = out[0] if isinstance(out, tuple) else out
@@ -1198,19 +1271,22 @@ class HuggingFaceLayerSliceRunner:
         is mutated in-place (HF API) AND returned for clarity.
         """
         import time as _time
-        hf_model = self._ensure_model_loaded()
         import torch as _torch
         from transformers.cache_utils import DynamicCache
         from prsm.compute.chain_rpc.server import LayerSliceResult
         from prsm.compute.tee.models import TEEType
 
         start_t = _time.monotonic()
-        layers = _resolve_hf_layers(hf_model)
         start, end = int(layer_range[0]), int(layer_range[1])
-        if start < 0 or end > len(layers) or start >= end:
+        # sp1223 (Brick 4) — slice-aware model resolution (relative indices when
+        # sliced, absolute on the proven full-load path); per-call.
+        hf_model, layers, slice_loaded, full_depth = (
+            self._resolve_model_for_range(start, end, is_final_stage)
+        )
+        if start < 0 or end > full_depth or start >= end:
             raise StageExecutionError(
                 f"HuggingFaceLayerSliceRunner: invalid layer_range "
-                f"({start}, {end}) for model with {len(layers)} layers"
+                f"({start}, {end}) for model with {full_depth} layers"
             )
         original_ndim = activation.ndim
         # sp1220 (adversarial-verify C1) — match the LOADED model's compute
@@ -1254,7 +1330,10 @@ class HuggingFaceLayerSliceRunner:
 
         try:
             with _torch.no_grad():
-                for i in range(start, end):
+                # sp1223 (Brick 4) — relative indices on a slice-loaded model,
+                # absolute on the proven full-load path.
+                _indices = range(end - start) if slice_loaded else range(start, end)
+                for i in _indices:
                     out = layers[i](hidden, **layer_kwargs)
                     hidden = out[0] if isinstance(out, tuple) else out
                 # Final-stage: same ln_f + lm_head as run_layer_range
@@ -1454,6 +1533,21 @@ def build_layer_stage_server_executor(
     _stream_kind = (_os.environ.get(
         "PRSM_PARALLAX_STREAMING_RUNNER_KIND", "",
     ) or "").strip().lower() or "embedder_backed"
+    # sp1223 (Brick 4, adversarial-verify streaming guard) — the
+    # embedder_backed/synthetic streaming runners call model.generate on the
+    # FULL model (runner._ensure_model_loaded). Under slice-load a node holds
+    # only its layer slice (and a 7B that NEEDS sharding can't even load the
+    # full model), so streaming is unsupported: leave streaming_runner=None so
+    # the streaming path surfaces "no streaming_runner configured" rather than
+    # OOM'ing or handing generate() a layer slice. Unary inference is unaffected.
+    if _hf_id_raw and _slice_load_enabled():
+        import logging as _lg
+        _lg.getLogger(__name__).warning(
+            "Sprint 1223 — streaming runner DISABLED under "
+            "PRSM_PARALLAX_SLICE_LOAD (a sliced node cannot run model.generate; "
+            "use unary /compute/inference). Model: %s", _hf_id_raw,
+        )
+        _hf_id_raw = ""  # skip the streaming-runner construction below
     if _hf_id_raw:
         try:
             _hf_device_raw = (_os.environ.get(
