@@ -590,7 +590,17 @@ def build_reduced_config_slice_model(
             setattr(cfg, attr, val[start:end])
     cfg.num_hidden_layers = n_slice
 
-    model = AutoModelForCausalLM.from_config(cfg)
+    # sp1227 — build the skeleton on the META device: instant, and crucially
+    # NO wasteful random-init of the ~billions of params we immediately
+    # overwrite via load_state_dict. That CPU-bound init took MINUTES for a
+    # 14B's slices and starved the node's P2P heartbeat → the worker dropped →
+    # pool churn → slice rebuild (cascade that blocked the live 14B chain).
+    # transformers 5.2 removed no_init_weights; meta is the accelerate-free way
+    # to skip init. Owned weights are materialized off-meta by
+    # load_state_dict(assign=True); the model-level rotary buffer is rebuilt and
+    # unused modules are deleted below, so no meta tensor survives to .to().
+    with _torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(cfg)
 
     # M1 — free the full-vocab modules this stage never reads, BEFORE load.
     # Non-final (incl. stage 0): the head embeds upstream + only the final
@@ -600,6 +610,9 @@ def build_reduced_config_slice_model(
     if not is_final_stage:
         model.model.embed_tokens = None
         model.lm_head = None
+        # sp1227 — the final norm is unused on a non-final stage; delete it so
+        # it doesn't survive as an (unloaded) meta tensor that .to() can't move.
+        model.model.norm = None
     elif not tie:
         model.model.embed_tokens = None
 
@@ -616,6 +629,22 @@ def build_reduced_config_slice_model(
     result = model.load_state_dict(slice_sd, strict=False, assign=True)
     if is_final_stage and tie:
         model.tie_weights()
+
+    # sp1227 — the meta-built skeleton's model-level rotary buffer (inv_freq) is
+    # a meta tensor (it's computed in __init__, not a checkpoint weight, so
+    # assign didn't materialize it). Rebuild the rotary module on the real
+    # device — recomputes a real, finite inv_freq. Version-agnostic via
+    # type(rotary)(config=cfg). Needed by EVERY stage (all decoder layers use
+    # the model-level cos/sin — sp1216).
+    _inner = getattr(model, "model", None)
+    if _inner is not None and getattr(_inner, "rotary_emb", None) is not None:
+        try:
+            _inner.rotary_emb = type(_inner.rotary_emb)(config=cfg).to(device)
+        except Exception as exc:  # noqa: BLE001
+            raise StageExecutionError(
+                f"slice-load: failed to rebuild rotary_emb after meta-build "
+                f"for {model_id!r}: {type(exc).__name__}: {exc}"
+            ) from exc
 
     # C3 — fail-loud AFTER tie_weights: no OWNED key may be missing; nothing
     # unexpected (an off-by-one relative remap surfaces here as an unexpected
@@ -637,6 +666,18 @@ def build_reduced_config_slice_model(
         raise StageExecutionError(
             f"slice-load: {model_id!r} [{start},{end}) failed to load OWNED "
             f"keys (silent-corruption guard): {sorted(still_missing)[:5]}",
+        )
+
+    # sp1227 — guard: NO meta tensor may survive (the .to(device) below cannot
+    # copy out of meta). Every owned param is off-meta via assign, the rotary
+    # was rebuilt, and unused modules were deleted — a leftover meta tensor is a
+    # materialization bug, surfaced loudly rather than crashing the .to().
+    _meta = [n for n, t in model.named_parameters() if t.is_meta]
+    _meta += [n for n, t in model.named_buffers() if t.is_meta]
+    if _meta:
+        raise StageExecutionError(
+            f"slice-load: {model_id!r} [{start},{end}) left meta tensors after "
+            f"materialization (incomplete load): {sorted(_meta)[:5]}",
         )
 
     model = model.to(device=device, dtype=_torch_dtype_from_str(dtype)).eval()
