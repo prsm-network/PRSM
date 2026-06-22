@@ -59,7 +59,7 @@ jobs:
           echo "✅ Version: $VERSION"
       
       - name: Install git-cliff
-        uses: orhun/git-cliff-action@v3
+        uses: orhun/git-cliff-action@v4
         with:
           version: 'latest'
           config: 'pyproject.toml'
