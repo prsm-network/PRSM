@@ -495,6 +495,142 @@ def _read_owned_state_dict(
     return sd
 
 
+# ── Sprint 1222 (Brick 3) — reduced-config slice loader ──
+# Standard LLaMA/Qwen/Mistral (rotary `.model.layers`) state-dict keys. Slice
+# loading is gated to this architecture family (Brick 4); gpt2 (.transformer.h,
+# no model-level rotary) keeps the full-load path.
+_SLICE_LAYERS_PREFIX = "model.layers"
+_SLICE_NORM_KEY = "model.norm.weight"
+_SLICE_LM_HEAD_KEY = "lm_head.weight"
+_SLICE_EMBED_KEY = "model.embed_tokens.weight"
+
+
+def _resolve_snapshot_dir(model_id: str) -> str:
+    """Sprint 1222 (adversarial-verify CO3) — resolve a model id → its local HF
+    snapshot dir (holding config.json + model.safetensors[.index.json]). A
+    local path is used directly; otherwise the HF cache is resolved offline
+    (the model must be fully downloaded — the daemon stages it at startup)."""
+    import os
+    if os.path.isdir(model_id) and os.path.exists(
+        os.path.join(model_id, "config.json")
+    ):
+        return model_id
+    try:
+        from huggingface_hub import snapshot_download
+        return snapshot_download(
+            model_id, local_files_only=True,
+            allow_patterns=["*.json", "*.safetensors"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise StageExecutionError(
+            f"slice-load: cannot resolve a local snapshot for {model_id!r} "
+            f"({type(exc).__name__}: {exc}). The model must be fully "
+            f"downloaded (daemon startup staging / snapshot_download)."
+        ) from exc
+
+
+def build_reduced_config_slice_model(
+    model_id: str, *, start: int, end: int, is_final_stage: bool,
+    device: str, dtype: str,
+) -> tuple:
+    """Sprint 1222 (Brick 3) — build a reduced-config skeleton holding ONLY the
+    [start,end) decoder layers (+ on the final stage the norm + lm_head/embed)
+    and materialize ONLY this stage's owned weights from the sharded
+    safetensors. Resident weights ≈ the slice (≈6.5GB/side for a 7B 14+14 fp16)
+    instead of the full model — the unblock for >24GB models multi-host.
+    Returns ``(model, full_num_layers)``.
+
+    Adversarial-review fixes folded in:
+      C2 — shrink num_hidden_layers AND every config list of length
+           full_num_layers (Qwen2/3 carry ``layer_types`` validated against it;
+           setting only num_hidden_layers raises ValueError in transformers v5).
+      C3 — run the fail-loud key assertion AFTER tie_weights() (a tied
+           lm_head.weight reads as 'missing' until tie_weights wires it, which
+           would FALSE-FAIL tied models and silently defeat sharding).
+      M1 — delete the from_config full-vocab modules this stage never reads
+           BEFORE loading, to cap the transient memory spike.
+    The model-level rotary_emb (sp1216) is auto-built by from_config (inv_freq
+    is a non-persistent buffer, not a checkpoint tensor) — free + correct."""
+    import torch as _torch
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    if not (0 <= start < end):
+        raise StageExecutionError(
+            f"slice-load: invalid range start={start} end={end}",
+        )
+    snapshot_dir = _resolve_snapshot_dir(model_id)
+    cfg = AutoConfig.from_pretrained(snapshot_dir)
+    full_num_layers = int(getattr(cfg, "num_hidden_layers"))
+    if end > full_num_layers:
+        raise StageExecutionError(
+            f"slice-load: end={end} exceeds model depth {full_num_layers} "
+            f"for {model_id!r}",
+        )
+    tie = bool(getattr(cfg, "tie_word_embeddings", False))
+
+    # C2 — slice every config list coupled to the layer count (layer_types et
+    # al.), THEN set num_hidden_layers, so from_config's length validation
+    # passes.
+    n_slice = end - start
+    for attr, val in list(vars(cfg).items()):
+        if isinstance(val, list) and len(val) == full_num_layers:
+            setattr(cfg, attr, val[start:end])
+    cfg.num_hidden_layers = n_slice
+
+    model = AutoModelForCausalLM.from_config(cfg)
+
+    # M1 — free the full-vocab modules this stage never reads, BEFORE load.
+    # Non-final (incl. stage 0): the head embeds upstream + only the final
+    # stage decodes → neither embed nor lm_head is used. Final-untied: drop
+    # embed (lm_head is loaded). Final-tied: keep both (embed loaded; lm_head
+    # tied to it by tie_weights()).
+    if not is_final_stage:
+        model.model.embed_tokens = None
+        model.lm_head = None
+    elif not tie:
+        model.model.embed_tokens = None
+
+    weight_map = _resolve_weight_map(snapshot_dir)
+    owned = _resolve_slice_owned_keys(
+        set(weight_map), layers_prefix=_SLICE_LAYERS_PREFIX,
+        norm_key=_SLICE_NORM_KEY, lm_head_key=_SLICE_LM_HEAD_KEY,
+        embed_key=_SLICE_EMBED_KEY, start=start, end=end,
+        is_final_stage=is_final_stage, tie_word_embeddings=tie,
+    )
+    slice_sd = _read_owned_state_dict(
+        snapshot_dir, weight_map, owned,
+        layers_prefix=_SLICE_LAYERS_PREFIX, start=start, dtype=dtype,
+    )
+    result = model.load_state_dict(slice_sd, strict=False, assign=True)
+    if is_final_stage and tie:
+        model.tie_weights()
+
+    # C3 — fail-loud AFTER tie_weights: no OWNED key may be missing; nothing
+    # unexpected (an off-by-one relative remap surfaces here as an unexpected
+    # key). This is the silent-corruption guard for strict=False.
+    missing = set(getattr(result, "missing_keys", []) or [])
+    unexpected = set(getattr(result, "unexpected_keys", []) or [])
+    owned_remapped = {
+        _remap_layer_key(k, _SLICE_LAYERS_PREFIX, start) for k in owned
+    }
+    still_missing = owned_remapped & missing
+    if is_final_stage and tie:
+        still_missing.discard(_SLICE_LM_HEAD_KEY)  # satisfied by tie_weights
+    if unexpected:
+        raise StageExecutionError(
+            f"slice-load: {model_id!r} [{start},{end}) produced UNEXPECTED "
+            f"keys (relative-remap bug?): {sorted(unexpected)[:5]}",
+        )
+    if still_missing:
+        raise StageExecutionError(
+            f"slice-load: {model_id!r} [{start},{end}) failed to load OWNED "
+            f"keys (silent-corruption guard): {sorted(still_missing)[:5]}",
+        )
+
+    model = model.to(device=device, dtype=_torch_dtype_from_str(dtype)).eval()
+    return model, full_num_layers
+
+
 def _resolve_hf_layers(hf_model: Any) -> Any:
     """Sprint 612 (Phase 2F-5c) — polymorphic HF layer extraction.
 
