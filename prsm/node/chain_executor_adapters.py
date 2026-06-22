@@ -23,7 +23,9 @@ scaffolding lets test code reference the eventual contract today.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable, Coroutine, Dict, Protocol, runtime_checkable
+from typing import (
+    Any, Callable, Coroutine, Dict, Optional, Protocol, runtime_checkable,
+)
 
 
 # Re-export the canonical SendMessage signature from the factory's
@@ -376,6 +378,121 @@ def _load_hf_model_cached(model_id: str, device: str, dtype_str: str) -> Any:
     model = model.to(device).eval()
     _HF_MODEL_CACHE[key] = model
     return model
+
+
+# ── Sprint 1221 (Brick 2) — pure slice-key resolver + sharded-safetensors reader ──
+# A stage loads ONLY the checkpoint tensors it owns: its decoder layers
+# [start,end) plus, on the final stage, the final norm + lm_head (untied) or
+# embed_tokens (tied — tie_weights wires lm_head to it). No model construction
+# here; these are pure functions over a snapshot's weight_map + safetensors.
+
+def _resolve_weight_map(snapshot_dir: str) -> Dict[str, str]:
+    """Map checkpoint-key → shard-filename. Handles BOTH the sharded case
+    (model.safetensors.index.json `weight_map`) AND the single-file case
+    (a lone model.safetensors with NO index — small models; adversarial-verify
+    CO1)."""
+    import json
+    import os
+    index_path = os.path.join(snapshot_dir, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as fh:
+            idx = json.load(fh)
+        wm = idx.get("weight_map") or {}
+        if not isinstance(wm, dict) or not wm:
+            raise StageExecutionError(
+                f"slice-load: {index_path} has no usable weight_map",
+            )
+        return dict(wm)
+    single = os.path.join(snapshot_dir, "model.safetensors")
+    if os.path.exists(single):
+        from safetensors import safe_open
+        with safe_open(single, framework="pt", device="cpu") as f:
+            return {k: "model.safetensors" for k in f.keys()}
+    raise StageExecutionError(
+        f"slice-load: no safetensors checkpoint found in {snapshot_dir} "
+        f"(expected model.safetensors[.index.json])",
+    )
+
+
+def _layer_index_of(key: str, layers_prefix: str) -> Optional[int]:
+    """Parse the decoder-layer index N from a key like
+    f'{layers_prefix}.{N}.…' (e.g. 'model.layers.7.self_attn.q_proj.weight' →
+    7). Returns None for non-layer keys (embed/norm/lm_head)."""
+    pre = layers_prefix + "."
+    if not key.startswith(pre):
+        return None
+    head = key[len(pre):].split(".", 1)[0]
+    return int(head) if head.isdigit() else None
+
+
+def _remap_layer_key(key: str, layers_prefix: str, start: int) -> str:
+    """Relative-remap a layer key's index by -start (model.layers.{start+i} →
+    model.layers.{i}); non-layer keys pass through unchanged. This is what lets
+    a [start,end) slice load into a reduced-config skeleton whose layer list is
+    indexed 0..(end-start-1)."""
+    idx = _layer_index_of(key, layers_prefix)
+    if idx is None:
+        return key
+    pre = layers_prefix + "."
+    rest = key[len(pre):]
+    suffix = rest.split(".", 1)[1] if "." in rest else ""
+    new_idx = idx - start
+    return f"{pre}{new_idx}.{suffix}" if suffix else f"{pre}{new_idx}"
+
+
+def _resolve_slice_owned_keys(
+    all_keys: Any, *, layers_prefix: str, norm_key: str, lm_head_key: str,
+    embed_key: str, start: int, end: int, is_final_stage: bool,
+    tie_word_embeddings: bool,
+) -> set:
+    """The exact checkpoint keys this stage OWNS. Decoder layers in [start,end)
+    (ALL of each layer's tensors — incl. Qwen2's q/k/v .bias). The final stage
+    also owns the final norm + the head: lm_head.weight when untied, else
+    embed_tokens.weight (the tied source — tie_weights() points lm_head at it).
+    Stage 0 owns NO input embedding: run_layer_range never embeds (the head's
+    prompt encoder applies embeddings upstream)."""
+    owned = set()
+    for k in all_keys:
+        idx = _layer_index_of(k, layers_prefix)
+        if idx is not None and start <= idx < end:
+            owned.add(k)
+    if is_final_stage:
+        if norm_key in all_keys:
+            owned.add(norm_key)
+        target = embed_key if tie_word_embeddings else lm_head_key
+        if target in all_keys:
+            owned.add(target)
+    return owned
+
+
+def _read_owned_state_dict(
+    snapshot_dir: str, weight_map: Dict[str, str], owned_keys: Any, *,
+    layers_prefix: str, start: int, dtype: str,
+) -> Dict[str, Any]:
+    """Read ONLY the owned tensors from the sharded safetensors, casting to
+    `dtype` and relative-remapping layer keys. Groups owned keys BY SHARD (a
+    single layer's tensors can straddle two shards) so each shard file is opened
+    exactly once."""
+    import os
+    from safetensors import safe_open
+    by_shard: Dict[str, list] = {}
+    for k in owned_keys:
+        shard = weight_map.get(k)
+        if shard is None:
+            raise StageExecutionError(
+                f"slice-load: owned key {k!r} absent from weight_map",
+            )
+        by_shard.setdefault(shard, []).append(k)
+    td = _torch_dtype_from_str(dtype)
+    sd: Dict[str, Any] = {}
+    for shard, keys in by_shard.items():
+        path = os.path.join(snapshot_dir, shard)
+        with safe_open(path, framework="pt", device="cpu") as f:
+            for k in keys:
+                sd[_remap_layer_key(k, layers_prefix, start)] = (
+                    f.get_tensor(k).to(td)
+                )
+    return sd
 
 
 def _resolve_hf_layers(hf_model: Any) -> Any:
