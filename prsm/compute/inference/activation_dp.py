@@ -44,6 +44,7 @@ calibrated Gaussian noise on EACH inter-stage activation:
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -53,6 +54,70 @@ from prsm.compute.tee.models import DPConfig, PrivacyLevel
 
 
 _EPSILON_TOLERANCE = 1e-6
+
+
+def _clip_activation(
+    activation: np.ndarray, clip_norm: float, clip_mode: str = "tensor",
+) -> np.ndarray:
+    """Clip an activation to bound DP sensitivity. Operates on a copy.
+
+    - ``"tensor"`` (default, pre-sp1233 behavior): clip the WHOLE tensor to
+      L2-norm ``clip_norm``. For a high-dim activation this shrinks every
+      element by the (large) global norm → catastrophic SNR.
+    - ``"token"`` (sp1233): clip each TOKEN's vector (the last axis) to
+      ``clip_norm`` independently. The DP unit becomes a single token, so a
+      high-norm activation isn't shrunk by its global norm — each token keeps
+      unit scale. (Per-token SNR is still ∝ ε²/hidden — see the sp1233 analysis
+      — but it removes the global-norm shrink; an experiment knob, not a
+      claimed fix.)
+    """
+    clipped = activation.copy()
+    if clip_mode == "token" and clipped.ndim >= 1:
+        norms = np.linalg.norm(clipped, axis=-1, keepdims=True)
+        scale = np.where(
+            norms > clip_norm, clip_norm / np.maximum(norms, 1e-12), 1.0,
+        )
+        return clipped * scale
+    norm = np.linalg.norm(clipped)
+    if norm > clip_norm:
+        clipped = clipped * (clip_norm / norm)
+    return clipped
+
+
+def _resolve_dp_env_overrides(
+    total_epsilon: float, clip_norm: float,
+) -> Tuple[float, float, str]:
+    """sp1233 — read sweepable DP overrides from the environment so the
+    privacy/quality curve can be characterized without per-run code edits.
+    Returns ``(total_epsilon, clip_norm, clip_mode)``; unset/garbage values
+    leave the inputs unchanged and clip_mode defaults to ``"tensor"`` (the
+    pre-sp1233 behavior — zero regression when no env is set).
+
+    NOTE: the ε override here is the NATIVE-tier total; callers must gate the
+    NONE tier on the native (inf) value so an ε override can never give the
+    NONE tier noise.
+    """
+    eps_env = (os.environ.get("PRSM_ACTIVATION_DP_EPSILON", "") or "").strip()
+    if eps_env:
+        try:
+            v = float(eps_env)
+            if v > 0:
+                total_epsilon = v
+        except ValueError:
+            pass
+    clip_env = (os.environ.get("PRSM_ACTIVATION_DP_CLIP_NORM", "") or "").strip()
+    if clip_env:
+        try:
+            v = float(clip_env)
+            if v > 0:
+                clip_norm = v
+        except ValueError:
+            pass
+    mode_env = (
+        os.environ.get("PRSM_ACTIVATION_DP_CLIP_MODE", "") or ""
+    ).strip().lower()
+    clip_mode = mode_env if mode_env in ("tensor", "token") else "tensor"
+    return total_epsilon, clip_norm, clip_mode
 
 
 @dataclass
@@ -79,6 +144,7 @@ class StageNoisePolicy:
     clip_norm: float = 1.0
     delta: float = 1e-5
     enabled: bool = True
+    clip_mode: str = "tensor"  # sp1233: "tensor" | "token"
 
     @classmethod
     def for_tier(
@@ -94,8 +160,14 @@ class StageNoisePolicy:
                 f"stage_count must be a positive integer, "
                 f"got {stage_count!r}"
             )
-        total = PrivacyLevel.config_for_level(tier).epsilon
-        if math.isinf(total) or tier == PrivacyLevel.NONE:
+        native_total = PrivacyLevel.config_for_level(tier).epsilon
+        # sp1233 — apply sweepable env overrides. clip_norm/clip_mode apply in
+        # ALL cases (clipping happens even on the disabled path); the ε override
+        # is gated on the NATIVE tier below so it can never give NONE noise.
+        total, clip_norm, clip_mode = _resolve_dp_env_overrides(
+            native_total, clip_norm,
+        )
+        if math.isinf(native_total) or tier == PrivacyLevel.NONE:
             return cls(
                 per_stage_epsilon=float("inf"),
                 total_expected_epsilon=float("inf"),
@@ -104,6 +176,7 @@ class StageNoisePolicy:
                 clip_norm=clip_norm,
                 delta=delta,
                 enabled=False,
+                clip_mode=clip_mode,
             )
         per_stage = total / stage_count
         return cls(
@@ -114,6 +187,7 @@ class StageNoisePolicy:
             clip_norm=clip_norm,
             delta=delta,
             enabled=True,
+            clip_mode=clip_mode,
         )
 
 
@@ -199,12 +273,11 @@ class ActivationDPInjector:
                 f"used twice for the same stage)"
             )
 
-        # Clip activation to bound sensitivity. Operates on a
-        # copy so caller's array isn't mutated.
-        clipped = activation.copy()
-        norm = np.linalg.norm(clipped)
-        if norm > self._policy.clip_norm:
-            clipped = clipped * (self._policy.clip_norm / norm)
+        # Clip activation to bound sensitivity (sp1233: tensor- or
+        # per-token, per the policy). Operates on a copy.
+        clipped = _clip_activation(
+            activation, self._policy.clip_norm, self._policy.clip_mode,
+        )
 
         # When disabled (NONE tier), return clipped result
         # without noise + record ε=0.
