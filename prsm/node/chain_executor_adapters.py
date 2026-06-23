@@ -822,6 +822,40 @@ def _resolve_hf_layers(hf_model: Any) -> Any:
     )
 
 
+def _parallax_chat_template_enabled(env: Any = None) -> bool:
+    """Sprint 1230 — apply the model's chat template on the parallax encode
+    path (default ON). ``PRSM_PARALLAX_CHAT_TEMPLATE`` in {0,false,no,off}
+    disables it (independent of the single-node sp1208 flag)."""
+    import os as _os
+    e = env if env is not None else _os.environ
+    return (e.get("PRSM_PARALLAX_CHAT_TEMPLATE", "") or "").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
+def _encode_prompt_tokens(tokenizer: Any, prompt: str, *, env: Any = None) -> Any:
+    """Sprint 1230 — tokenize a prompt for the parallax encode path, applying
+    the model's chat template for instruct models (mirrors the single-node
+    sp1208 path by REUSING its tested helpers). Returns the bare ``input_ids``
+    tensor the embedding lookup expects. Base models (no ``chat_template``) →
+    raw encode, byte-identical to the pre-sp1230 ``tokenizer.encode`` path.
+    """
+    from prsm.compute.inference.local_inference import (
+        should_use_chat_template,
+        encode_for_generation,
+    )
+    use_ct = should_use_chat_template(
+        tokenizer, enabled=_parallax_chat_template_enabled(env),
+    )
+    enc = encode_for_generation(tokenizer, prompt, use_chat_template=use_ct)
+    # encode_for_generation returns a BatchEncoding/dict (chat-template path and
+    # the raw tokenizer(...) path both do); extract input_ids. A bare tensor
+    # (older transformers fallback) passes through unchanged.
+    if isinstance(enc, dict) or hasattr(enc, "keys"):
+        return enc["input_ids"]
+    return enc
+
+
 def build_hf_prompt_encoder(
     *,
     model_id: str,
@@ -917,9 +951,10 @@ def build_hf_prompt_encoder(
             _state["embed_layer"] = embed_layer
         try:
             import torch as _torch
-            token_ids = _state["tokenizer"].encode(
-                prompt, return_tensors="pt",
-            )
+            # Sprint 1230 — apply the model's chat template for instruct models
+            # (was raw tokenizer.encode → instruct models tokenized
+            # completion-style on the distributed path). No-op for base models.
+            token_ids = _encode_prompt_tokens(_state["tokenizer"], prompt)
             # Sprint 698 F47 fix — move token_ids to the model's
             # device before embedding lookup. tokenizer.encode
             # returns CPU tensor; embed_layer is on the model's

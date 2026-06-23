@@ -42,6 +42,11 @@ def _clear_hf_cache():
 def _install_fake_tokenizer_and_model():
     fake_tokenizer = MagicMock()
     fake_tokenizer.encode = MagicMock()
+    # sp1230 — base model (gpt2/rotary): no chat_template, so the encoder takes
+    # the raw encode path (tokenizer(prompt) via the reused sp1208 helper). A
+    # bare MagicMock would otherwise expose a truthy auto-attr chat_template and
+    # send this base-model test down the instruct path.
+    fake_tokenizer.chat_template = None
 
     fake_embed_layer = MagicMock()
     fake_embed_output = MagicMock()
@@ -105,9 +110,13 @@ def test_encoder_returns_numpy_array_on_call():
         encoder = build_hf_prompt_encoder(model_id="fake/model")
         result = encoder("hello world")
     assert isinstance(result, np.ndarray)
-    fake_tokenizer.encode.assert_called_once_with(
+    # sp1230 — base model (chat_template=None) → raw encode via the reused
+    # sp1208 helper, which calls tokenizer(prompt, ...) (BatchEncoding) rather
+    # than the legacy tokenizer.encode(prompt, ...). Same input_ids.
+    fake_tokenizer.assert_called_once_with(
         "hello world", return_tensors="pt",
     )
+    fake_tokenizer.encode.assert_not_called()
     fake_embed.assert_called_once()
 
 
