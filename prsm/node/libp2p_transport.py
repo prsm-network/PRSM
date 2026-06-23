@@ -547,16 +547,56 @@ class Libp2pTransport:
         if self._is_keepalive(raw):
             return
 
-        # Reconstruct P2PMessage
+        # Reconstruct P2PMessage.
+        # sp1235 — normalize the wire payload to a dict. The libp2p UDS frame
+        # carries the inner P2PMessage as a JSON STRING in `data` (send_to_peer/
+        # gossip put msg.to_json() on the wire); parse it and use the inner
+        # payload dict + metadata, matching WebSocketTransport.from_json so
+        # handlers get an identical msg across backends. Routing stays on the
+        # OUTER msg_type — unchanged. (Was: payload assigned the raw string →
+        # every direct handler's payload.get(...) AttributeError'd; the gossip
+        # handler json.loads'd it itself, hiding the asymmetry.)
+        _payload = raw.get("payload", raw.get("data", {}))
+        _sender = raw.get("sender_id", raw.get("from", ""))
+        _sig = raw.get("signature", "")
+        _ts = raw.get("timestamp", time.time())
+        _ttl = raw.get("ttl", 5)
+        _nonce = raw.get("nonce", uuid.uuid4().hex[:16])
+        if isinstance(_payload, (str, bytes)):
+            try:
+                _inner = json.loads(_payload)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                _inner = None
+            if isinstance(_inner, dict):
+                # match WebSocketTransport.from_json: payload = inner["payload"]
+                _payload = _inner.get("payload", {})
+                # adopt inner-message metadata (matches from_json / websocket).
+                # NOTE: inbound-peer warming (sp1229, above) deliberately keeps
+                # the OUTER libp2p sender_id — only the handler-facing msg below
+                # uses the inner sender_id.
+                _sender = _inner.get("sender_id", _sender)
+                _sig = _inner.get("signature", _sig)
+                _ts = _inner.get("timestamp", _ts)
+                _ttl = _inner.get("ttl", _ttl)
+                _nonce = _inner.get("nonce", _nonce)
+            else:
+                _payload = {}                       # malformed inner JSON → empty dict
+        # sp1235 — guarantee handlers always get a dict (the P2PMessage payload
+        # contract). Defends against a non-dict wire payload of ANY shape: a
+        # JSON null/list/scalar in `data` (which skips the str block above), or
+        # a non-dict inner "payload". Without this, such a payload reaches a
+        # handler and its payload.get(...) errors into dispatch_failure_total.
+        if not isinstance(_payload, dict):
+            _payload = {}
         try:
             msg = P2PMessage(
                 msg_type=msg_type,
-                sender_id=raw.get("sender_id", raw.get("from", "")),
-                payload=raw.get("payload", raw.get("data", {})),
-                timestamp=raw.get("timestamp", time.time()),
-                signature=raw.get("signature", ""),
-                ttl=raw.get("ttl", 5),
-                nonce=raw.get("nonce", uuid.uuid4().hex[:16]),
+                sender_id=_sender,
+                payload=_payload,
+                timestamp=_ts,
+                signature=_sig,
+                ttl=_ttl,
+                nonce=_nonce,
             )
         except Exception as exc:
             logger.debug("Failed to reconstruct P2PMessage: %s", exc)
