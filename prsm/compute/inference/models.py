@@ -61,7 +61,12 @@ class InferenceRequest:
     prompt: str
     model_id: str
     budget_ftns: Decimal
-    privacy_tier: PrivacyLevel = PrivacyLevel.STANDARD
+    # sp1234 — default NONE (usable output). The activation-DP tiers
+    # (STANDARD/HIGH/MAXIMUM) are experimental/best-effort obfuscation, NOT
+    # strong privacy: per-element Gaussian noise on a high-dim activation has
+    # SNR ∝ ε²/D, so usable quality needs a near-no-privacy ε (sp1233 GPU
+    # sweep). Real privacy = TEE (Tier 3). Operators opt into DP explicitly.
+    privacy_tier: PrivacyLevel = PrivacyLevel.NONE
     content_tier: ContentTier = ContentTier.A
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None

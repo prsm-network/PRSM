@@ -114,5 +114,5 @@ def test_quote_pre_sprint_262_fields_still_present():
     body = resp.json()
     assert body["model_id"] == "mock-llama-3-8b"
     assert body["cost_ftns"] == "0.10"
-    assert body["privacy_tier"] == "standard"
+    assert body["privacy_tier"] == "none"  # sp1234 — quote default is now none (DP is experimental)
     assert body["content_tier"] == "A"

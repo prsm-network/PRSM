@@ -51,7 +51,7 @@ class TestInferenceRequest:
             budget_ftns=Decimal("1.0"),
         )
         assert req.prompt == "Hello"
-        assert req.privacy_tier == PrivacyLevel.STANDARD
+        assert req.privacy_tier == PrivacyLevel.NONE  # sp1234 — honest default (DP is experimental)
         assert req.content_tier == ContentTier.A
         assert req.budget_ftns == Decimal("1.0")
         assert req.request_id.startswith("infer-")

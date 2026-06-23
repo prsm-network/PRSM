@@ -29,12 +29,20 @@ class TEEType(str, Enum):
 
 
 class PrivacyLevel(str, Enum):
-    """Privacy level presets mapping to DPConfig parameters."""
+    """Privacy level presets mapping to DPConfig parameters.
+
+    sp1234 — NONE is the production default. STANDARD/HIGH/MAXIMUM apply
+    activation-DP noise and are EXPERIMENTAL / best-effort obfuscation, NOT
+    strong privacy: per-element Gaussian noise on a high-dim activation has
+    SNR ∝ ε²/D, so usable output quality requires a near-no-privacy ε (sp1233
+    GPU sweep — these tiers corrupt output at their nominal ε). For real
+    privacy guarantees use a TEE (Tier 3), not these DP tiers.
+    """
 
     NONE = "none"
-    STANDARD = "standard"
-    HIGH = "high"
-    MAXIMUM = "maximum"
+    STANDARD = "standard"   # experimental DP — see class docstring
+    HIGH = "high"           # experimental DP — see class docstring
+    MAXIMUM = "maximum"     # experimental DP — see class docstring
 
     @staticmethod
     def config_for_level(level: PrivacyLevel) -> DPConfig:

@@ -768,7 +768,7 @@ async def _resolve_paid_requester_or_402(
         model_id=body.get("model_id", ""),
         prompt=body.get("prompt", ""),
         max_tokens=int(body.get("max_tokens") or 0),
-        privacy_tier=str(body.get("privacy_tier", "standard")),
+        privacy_tier=str(body.get("privacy_tier", "none")),  # sp1234 — must match the inference default (else omitted-tier requests hash-mismatch)
         content_tier=str(body.get("content_tier", "A")),
     ))
     quoted_price_wei = int(_D(str(budget_ftns)) * (_D(10) ** 18))
@@ -8149,7 +8149,7 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         )
         from prsm.compute.tee.models import PrivacyLevel
 
-        _privacy_raw = body.get("privacy_tier", "standard")
+        _privacy_raw = body.get("privacy_tier", "none")  # sp1234 — honest default (DP is experimental/best-effort)
         try:
             privacy_level = PrivacyLevel(_privacy_raw)
         except (ValueError, TypeError):
@@ -8431,7 +8431,7 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         # Sprint 156 — enum body fields validated upfront, BEFORE
         # the executor 503 check. Pre-fix bad enum values leaked
         # through to a 503 ("Inference executor not initialized").
-        _privacy_raw = body.get("privacy_tier", "standard")
+        _privacy_raw = body.get("privacy_tier", "none")  # sp1234 — honest default (DP is experimental/best-effort)
         try:
             privacy_level = PrivacyLevel(_privacy_raw)
         except (ValueError, TypeError):
@@ -9064,7 +9064,7 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
 
         # Sprint 156 — enum body fields validated upfront, BEFORE
         # the executor 503 check.
-        _privacy_raw = body.get("privacy_tier", "standard")
+        _privacy_raw = body.get("privacy_tier", "none")  # sp1234 — honest default (DP is experimental/best-effort)
         try:
             privacy_level = PrivacyLevel(_privacy_raw)
         except (ValueError, TypeError):
