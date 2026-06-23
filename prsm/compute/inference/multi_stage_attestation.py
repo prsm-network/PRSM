@@ -683,13 +683,32 @@ class StageVerificationResult:
 
 def verify_stage_attestations(
     blob: bytes,
+    *,
+    registry: Any = None,
+    expected_node_ids: Optional[List[str]] = None,
+    expected_stage_count: Optional[int] = None,
 ) -> Tuple[bool, List[StageVerificationResult]]:
     """Iterate the multi-stage envelope and produce per-stage results.
 
     Returns ``(all_ok, results)``:
-      - ``all_ok`` is True iff every stage parsed cleanly. v1 doesn't
-        wire vendor verification, so structural correctness is the
-        only signal.
+      - ``all_ok``: with NO ``registry`` (default), True iff every stage
+        parsed cleanly (structural-only — byte-identical to pre-sp1236).
+        With a ``registry`` supplied (sp1236), True iff EVERY stage is
+        structurally valid AND its attestation is cryptographically
+        ``vendor_verified`` by the registry AND the verified quote's
+        REPORT_DATA binds to the stage's ``stage_node_id`` (anti-replay,
+        the sp1083 single-stage binding now on the multi-stage chain)
+        AND (when ``expected_node_ids`` is given) the stage's node matches
+        the expected topology position (anti-substitution). Fail-closed.
+
+    Args (sp1236, all opt-in — defaults preserve pre-sp1236 behavior):
+      registry             AttestationBackendRegistry (or any object with
+                           ``.verify(blob) -> result`` exposing
+                           ``vendor_verified`` + ``vendor_data``). Build the
+                           real one via ``configure_default_registry_from_env``.
+      expected_node_ids    Caller's known per-stage node_ids (anti-substitution).
+      expected_stage_count Reject a chain with a different stage count
+                           (anti-omission); threaded to the decoder.
       - ``results`` is a list (one per stage) with the per-stage
         verification outcome.
 
@@ -721,7 +740,9 @@ def verify_stage_attestations(
         )]
 
     try:
-        stages = decode_multi_stage_attestation(blob)
+        stages = decode_multi_stage_attestation(
+            blob, expected_stage_count=expected_stage_count,
+        )
     except MultiStageAttestationError as exc:
         return False, [StageVerificationResult(
             stage_index=-1,
@@ -744,12 +765,62 @@ def verify_stage_attestations(
             message="decode returned None despite magic prefix present",
         )]
 
-    results = [StageVerificationResult(
-        stage_index=s.stage_index,
-        stage_node_id=s.stage_node_id,
-        tee_type=s.tee_type,
-        structurally_ok=True,
-        vendor_verified=None,  # v2 wires platform-vendor RPC here
-        message="structurally valid; vendor verification not wired (v1)",
-    ) for s in stages]
-    return True, results
+    # sp1236 — NO registry: byte-identical to the pre-sp1236 structural-only
+    # path (vendor_verified=None, all_ok = structural). Verification is strictly
+    # opt-in so existing callers + the worst-case tee_type signing are unchanged.
+    if registry is None:
+        results = [StageVerificationResult(
+            stage_index=s.stage_index,
+            stage_node_id=s.stage_node_id,
+            tee_type=s.tee_type,
+            structurally_ok=True,
+            vendor_verified=None,
+            message="structurally valid; vendor verification not wired (no registry)",
+        ) for s in stages]
+        return True, results
+
+    # sp1236 — with a registry: run each stage's attestation through the real
+    # backend verifier (the same IntelDCAPBackend/AMDSEVSNPBackend the
+    # single-stage path uses) AND bind the verified quote to the stage's node.
+    from prsm.compute.inference.attestation_backends import (
+        expected_attestation_report_data,
+    )
+    results = []
+    all_ok = True
+    for i, s in enumerate(stages):
+        # anti-substitution: the stage's claimed node must match the caller's
+        # expected topology position (a settler can't relabel a stage).
+        node_ok = expected_node_ids is None or (
+            i < len(expected_node_ids)
+            and s.stage_node_id == expected_node_ids[i]
+        )
+        try:
+            res = registry.verify(s.attestation)
+            vendor_verified = bool(getattr(res, "vendor_verified", False))
+            rdh = ((getattr(res, "vendor_data", None) or {}).get(
+                "report_data_hex") or "").lower()
+            vendor = getattr(res, "vendor", "unknown")
+        except Exception as exc:  # noqa: BLE001 — a backend must never crash chain verify
+            vendor_verified, rdh, vendor = False, "", f"verify-error:{type(exc).__name__}"
+        # anti-replay: the verified quote must carry THIS node's commitment in the
+        # first 32 bytes of REPORT_DATA (the remaining 32 are opaque to this layer).
+        # Matches the sp1083 single-stage binding (.lower() + len(expected)). A backend
+        # that returns vendor_verified=True MUST populate vendor_data["report_data_hex"]
+        # (IntelDCAPBackend + AMDSEVSNPBackend do; structural backends return
+        # vendor_verified=False and are gated out before this matters).
+        expected_rd = expected_attestation_report_data(s.stage_node_id)
+        bound = bool(rdh) and rdh[:len(expected_rd)] == expected_rd
+        if not (vendor_verified and bound and node_ok):
+            all_ok = False
+        results.append(StageVerificationResult(
+            stage_index=s.stage_index,
+            stage_node_id=s.stage_node_id,
+            tee_type=s.tee_type,
+            structurally_ok=True,
+            vendor_verified=vendor_verified,
+            message=(
+                f"vendor={vendor} vendor_verified={vendor_verified} "
+                f"report_data_bound={bound} node_ok={node_ok}"
+            ),
+        ))
+    return all_ok, results

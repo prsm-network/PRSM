@@ -179,12 +179,17 @@ _VENDOR_TO_TEE_TYPE = {
 
 def expected_attestation_report_data(node_id: str) -> str:
     """Sprint 1083 — the canonical node-identity commitment a node must embed in the
-    first 32 bytes of its TEE quote's REPORT_DATA: ``sha256(node_id)`` (hex). The
-    consumer checks the verified quote carries THIS commitment so a quote can't be
-    replayed by a different node (binding the hardware attestation to the node_id, the
-    parallel to the sp788 operator-delegation node_id binding)."""
-    import hashlib
-    return hashlib.sha256((node_id or "").encode()).hexdigest()
+    first 32 bytes of its TEE quote's REPORT_DATA: ``sha256(node_id)`` (hex), so a
+    quote can't be replayed by a different node.
+
+    sp1236 — the canonical implementation moved to the attestation leaf module
+    (attestation_backends) so the multi-stage chain verifier can reuse it without an
+    inference→parallax import cycle. This delegates (lazy import) to keep one source
+    of truth + this module's public name."""
+    from prsm.compute.inference.attestation_backends import (
+        expected_attestation_report_data as _impl,
+    )
+    return _impl(node_id)
 
 
 def verified_tier_attestation(blob, *, node_id=None, registry=None) -> str:

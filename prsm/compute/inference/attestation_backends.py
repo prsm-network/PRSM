@@ -48,6 +48,7 @@ Real Intel SGX/TDX quote format references:
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import struct
 from dataclasses import dataclass, field
@@ -120,6 +121,18 @@ class AttestationBackend(Protocol):
     def verify(
         self, blob: Optional[bytes],
     ) -> AttestationVerificationResult: ...
+
+
+def expected_attestation_report_data(node_id: str) -> str:
+    """Sprint 1083 — the canonical node-identity commitment a node must embed in the
+    first 32 bytes of its TEE quote's REPORT_DATA: ``sha256(node_id)`` (hex). The
+    consumer checks the verified quote carries THIS commitment so a quote can't be
+    replayed by a different node (binding the hardware attestation to the node_id).
+
+    sp1236 — relocated here (the attestation leaf module) from
+    parallax_scheduling.trust_adapter so the multi-stage chain verifier can reuse it
+    without an inference→parallax import cycle; trust_adapter re-imports it."""
+    return hashlib.sha256((node_id or "").encode()).hexdigest()
 
 
 def detect_vendor(blob: Optional[bytes]) -> str:
