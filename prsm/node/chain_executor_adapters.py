@@ -529,6 +529,39 @@ def _resolve_snapshot_dir(model_id: str) -> str:
         ) from exc
 
 
+def _shard_fetch_enabled() -> bool:
+    """Sprint 1228 — OPT-IN per-node shard-only download (PRSM_PARALLAX_SHARD_FETCH).
+    When on, a node fetches ONLY the safetensors shards holding its assigned
+    layers (+ config + index) from the HF hub, instead of the whole model — so
+    it DOWNLOADS + STORES ~its slice (GBs), not the full model (hundreds of GB
+    for a frontier model). The loader already READS only its owned shards
+    (sp1221); this closes the FETCH side, realizing the storage half of the
+    distributed-model end-state. Default OFF preserves the full-snapshot path
+    (back-compat + the local-dir unit tests)."""
+    import os
+    return str(os.environ.get("PRSM_PARALLAX_SHARD_FETCH", "")).strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _fetch_only_files(model_id: str, shards: Any = None) -> str:
+    """Sprint 1228 — download ONLY config.json + the safetensors index (both
+    tiny) + the given `shards` from the HF hub. Idempotent (hf_hub_download is
+    cached). Returns the snapshot dir (all fetched files land there). A node
+    never pulls the full model — only the shards for the layers it owns."""
+    import os
+    from huggingface_hub import hf_hub_download
+    cfg_path = hf_hub_download(repo_id=model_id, filename="config.json")
+    snapshot_dir = os.path.dirname(cfg_path)
+    try:
+        hf_hub_download(repo_id=model_id, filename="model.safetensors.index.json")
+    except Exception:  # noqa: BLE001 — single-file model has no index
+        pass
+    for s in (shards or []):
+        hf_hub_download(repo_id=model_id, filename=s)
+    return snapshot_dir
+
+
 def build_reduced_config_slice_model(
     model_id: str, *, start: int, end: int, is_final_stage: bool,
     device: str, dtype: str,
@@ -558,7 +591,15 @@ def build_reduced_config_slice_model(
         raise StageExecutionError(
             f"slice-load: invalid range start={start} end={end}",
         )
-    snapshot_dir = _resolve_snapshot_dir(model_id)
+    # sp1228 — shard-fetch: pull ONLY config+index now (tiny); the owned shards
+    # are fetched below, once we know which layers (and thus shards) we own. A
+    # local dir (tests / pre-staged) skips fetch entirely. Off → full snapshot.
+    import os as _os_sf
+    _shard_fetch = _shard_fetch_enabled() and not _os_sf.path.isdir(model_id)
+    if _shard_fetch:
+        snapshot_dir = _fetch_only_files(model_id)
+    else:
+        snapshot_dir = _resolve_snapshot_dir(model_id)
     cfg = AutoConfig.from_pretrained(snapshot_dir)
     full_num_layers = int(getattr(cfg, "num_hidden_layers"))
     if end > full_num_layers:
@@ -622,6 +663,11 @@ def build_reduced_config_slice_model(
         embed_key=_SLICE_EMBED_KEY, start=start, end=end,
         is_final_stage=is_final_stage, tie_word_embeddings=tie,
     )
+    # sp1228 — now that we know our owned keys, fetch ONLY the shards holding
+    # them (config+index were fetched above). This node downloads ~its slice,
+    # never the full model.
+    if _shard_fetch:
+        _fetch_only_files(model_id, {weight_map[k] for k in owned})
     slice_sd = _read_owned_state_dict(
         snapshot_dir, weight_map, owned,
         layers_prefix=_SLICE_LAYERS_PREFIX, start=start, dtype=dtype,
@@ -704,13 +750,22 @@ def _build_embedding_only(model_id: str, device: str, dtype: str) -> Any:
     raises (→ caller falls back to full-load) if there's no model.embed_tokens,
     which keeps gpt2's learned-position (wpe) path on the full model."""
     import torch as _torch
-    snapshot_dir = _resolve_snapshot_dir(model_id)
+    import os as _os_sf
+    # sp1228 — shard-fetch: pull config+index, then ONLY the embed shard (the
+    # head needs just the embedding to encode, not the whole model).
+    _shard_fetch = _shard_fetch_enabled() and not _os_sf.path.isdir(model_id)
+    if _shard_fetch:
+        snapshot_dir = _fetch_only_files(model_id)
+    else:
+        snapshot_dir = _resolve_snapshot_dir(model_id)
     weight_map = _resolve_weight_map(snapshot_dir)
     if _SLICE_EMBED_KEY not in weight_map:
         raise StageExecutionError(
             f"embed-only: {model_id!r} has no {_SLICE_EMBED_KEY} "
             f"(non-rotary arch, e.g. gpt2) — use full-load.",
         )
+    if _shard_fetch:
+        _fetch_only_files(model_id, {weight_map[_SLICE_EMBED_KEY]})
     sd = _read_owned_state_dict(
         snapshot_dir, weight_map, {_SLICE_EMBED_KEY},
         layers_prefix=_SLICE_LAYERS_PREFIX, start=0, dtype=dtype,
