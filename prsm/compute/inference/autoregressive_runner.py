@@ -428,7 +428,22 @@ class AutoregressiveStreamingRunner:
         prompt = self._prompt_provider(
             layer_range, activation, privacy_tier,
         )
-        input_ids = self._tokenizer.encode(prompt)
+        # Sprint 1231 — apply the model's chat template for instruct models on
+        # the streaming path too (mirrors the unary encoder sp1230), so chat
+        # models stream coherent output instead of completion-style. No-op for
+        # base models (no chat_template) — byte-identical to the prior raw
+        # tokenizer.encode(prompt). Gated by PRSM_PARALLAX_CHAT_TEMPLATE.
+        from prsm.compute.inference.local_inference import (
+            should_use_chat_template,
+            parallax_chat_template_enabled,
+            encode_ids_for_generation,
+        )
+        _use_ct = should_use_chat_template(
+            self._tokenizer, enabled=parallax_chat_template_enabled(),
+        )
+        input_ids = encode_ids_for_generation(
+            self._tokenizer, prompt, use_chat_template=_use_ct,
+        )
         # Capture the prompt token count BEFORE the tensor wrap —
         # the adapter uses it to skip the prompt's text on the
         # first put() call (Phase 3.x.10.y Task 1 fix; HF's

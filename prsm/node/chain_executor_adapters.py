@@ -824,13 +824,13 @@ def _resolve_hf_layers(hf_model: Any) -> Any:
 
 def _parallax_chat_template_enabled(env: Any = None) -> bool:
     """Sprint 1230 — apply the model's chat template on the parallax encode
-    path (default ON). ``PRSM_PARALLAX_CHAT_TEMPLATE`` in {0,false,no,off}
-    disables it (independent of the single-node sp1208 flag)."""
-    import os as _os
-    e = env if env is not None else _os.environ
-    return (e.get("PRSM_PARALLAX_CHAT_TEMPLATE", "") or "").strip().lower() not in {
-        "0", "false", "no", "off",
-    }
+    path (default ON). Delegates to the single source of truth in
+    local_inference (shared with the sp1231 streaming path) so the
+    ``PRSM_PARALLAX_CHAT_TEMPLATE`` toggle has one definition."""
+    from prsm.compute.inference.local_inference import (
+        parallax_chat_template_enabled,
+    )
+    return parallax_chat_template_enabled(env)
 
 
 def _encode_prompt_tokens(tokenizer: Any, prompt: str, *, env: Any = None) -> Any:

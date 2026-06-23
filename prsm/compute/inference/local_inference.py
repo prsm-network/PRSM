@@ -81,6 +81,7 @@ def _resolve_offline(explicit: Optional[bool]) -> bool:
 _DEVICE_ENV = "PRSM_LOCAL_INFERENCE_DEVICE"      # cuda | mps | cpu | auto (default auto)
 _DTYPE_ENV = "PRSM_LOCAL_INFERENCE_DTYPE"        # float16 | bfloat16 | float32 | auto
 _CHAT_TEMPLATE_ENV = "PRSM_LOCAL_INFERENCE_CHAT_TEMPLATE"  # 0 disables (default on)
+_PARALLAX_CHAT_TEMPLATE_ENV = "PRSM_PARALLAX_CHAT_TEMPLATE"  # 0 disables (default on); distributed path
 _VALID_DEVICES = frozenset({"cuda", "mps", "cpu"})
 _VALID_DTYPES = frozenset({"float16", "bfloat16", "float32"})
 
@@ -145,6 +146,37 @@ def encode_for_generation(tokenizer: Any, prompt: str, *, use_chat_template: boo
 def _chat_template_enabled(env: Optional[dict] = None) -> bool:
     e = env if env is not None else os.environ
     return (e.get(_CHAT_TEMPLATE_ENV, "") or "").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def parallax_chat_template_enabled(env: Optional[dict] = None) -> bool:
+    """Sprint 1230/1231 — single source of truth for the parallax (distributed)
+    chat-template toggle. ``PRSM_PARALLAX_CHAT_TEMPLATE`` in {0,false,no,off}
+    disables it (independent of the single-node ``PRSM_LOCAL_INFERENCE_CHAT_TEMPLATE``).
+    Used by BOTH the unary encoder (chain_executor_adapters) and the streaming
+    runner (autoregressive_runner)."""
+    e = env if env is not None else os.environ
+    return (e.get(_PARALLAX_CHAT_TEMPLATE_ENV, "") or "").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
+def encode_ids_for_generation(tokenizer: Any, prompt: str, *, use_chat_template: bool) -> Any:
+    """Sprint 1231 — like ``encode_for_generation`` but returns a flat
+    ``List[int]`` of token ids (the shape the streaming/autoregressive path
+    needs: ``len()`` for prompt-skip + a manual tensor wrap). Instruct path:
+    ``apply_chat_template([{user, prompt}], add_generation_prompt=True)`` with
+    NO ``return_tensors`` → HF returns a token-id list. Base path: raw
+    ``tokenizer.encode(prompt)`` (unchanged behavior)."""
+    if use_chat_template:
+        ids = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}], add_generation_prompt=True,
+        )
+        # default (no return_tensors) yields List[int]; a tokenizer that hands
+        # back a BatchEncoding/dict gets normalized to its input_ids list.
+        if isinstance(ids, dict) or hasattr(ids, "keys"):
+            ids = ids["input_ids"]
+        return ids
+    return tokenizer.encode(prompt)
 
 
 def dtype_kwarg_for_transformers(version: str) -> str:
