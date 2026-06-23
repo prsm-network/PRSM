@@ -70,6 +70,20 @@ class Libp2pTransport:
         self._reader_task: Optional[asyncio.Task] = None
         self._running = False
 
+        # Sprint 1229 — application-level keepalive. A downstream chain
+        # stage can idle for many minutes while upstream stages cold-load
+        # multi-GB slices; without periodic traffic the libp2p stream is
+        # reaped and the head's eventual dispatch fails with a transport
+        # TimeoutError. A background task pings every connected peer every
+        # ``_keepalive_interval`` seconds to keep the bidirectional stream
+        # warm. Set PRSM_P2P_KEEPALIVE_INTERVAL_S<=0 to disable.
+        self._keepalive_task: Optional[asyncio.Task] = None
+        self._keepalive_interval: float = self._resolve_keepalive_interval()
+        # Peers that dialed US (recorded from inbound frames). connect_to_peer
+        # only records OUTBOUND dials in _peers; a node that just receives
+        # dials (e.g. the pipeline head) would otherwise have nothing to ping.
+        self._inbound_peer_ids: set = set()
+
         # Handler registry  (msg_type -> list[handler])
         self._handlers: Dict[str, List[MessageHandler]] = {}
 
@@ -86,6 +100,7 @@ class Libp2pTransport:
             "dispatch_success_total": 0,
             "dispatch_failure_total": 0,
             "dispatch_failure_reasons": collections.Counter(),
+            "keepalive_pings_sent": 0,
         }
 
     # ── Properties ──────────────────────────────────────────────
@@ -160,14 +175,29 @@ class Libp2pTransport:
 
         # Start UDS reader
         self._reader_task = asyncio.create_task(self._uds_reader())
+
+        # Sprint 1229 — start the keepalive loop (no-op if disabled)
+        if self._keepalive_interval > 0:
+            self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+
         logger.info(
-            "libp2p transport started  handle=%d  uds=%s  port=%d",
+            "libp2p transport started  handle=%d  uds=%s  port=%d  "
+            "keepalive=%.1fs",
             self._handle, self._uds_path, self.port,
+            self._keepalive_interval,
         )
 
     async def stop(self) -> None:
         """Stop the Go daemon, cancel the reader, clean up."""
         self._running = False
+
+        if self._keepalive_task is not None:
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except asyncio.CancelledError:
+                pass
+            self._keepalive_task = None
 
         if self._reader_task is not None:
             self._reader_task.cancel()
@@ -191,6 +221,106 @@ class Libp2pTransport:
 
         self._peers.clear()
         logger.info("libp2p transport stopped")
+
+    # ── Keepalive (Sprint 1229) ─────────────────────────────────
+
+    @staticmethod
+    def _resolve_keepalive_interval() -> float:
+        """Seconds between keepalive pings. Default 30s — well under any
+        cloud TCP / libp2p idle reaper, negligible overhead. ``<=0`` (or a
+        garbage value resolving to non-positive) disables; an unparseable
+        value falls back to the default."""
+        raw = (os.environ.get("PRSM_P2P_KEEPALIVE_INTERVAL_S", "") or "").strip()
+        if not raw:
+            return 30.0
+        try:
+            val = float(raw)
+        except ValueError:
+            return 30.0
+        return val if val > 0 else 0.0
+
+    @staticmethod
+    def _is_keepalive(raw: dict) -> bool:
+        """True if an inbound UDS frame is a keepalive ping — in EITHER
+        framing: a bare ``msg_type="keepalive_ping"`` frame, or the libp2p
+        direct-protocol wrapper ``{"msg_type":"direct","data":<inner-json>}``
+        where the inner message is a keepalive. Used to short-circuit before
+        handler fan-out so the ping never errors in (and inflates the failure
+        counters of) the registered direct-message handlers."""
+        if raw.get("msg_type") == "keepalive_ping" or raw.get("type") == "keepalive_ping":
+            return True
+        p = raw.get("payload")
+        if isinstance(p, dict) and p.get("subtype") == "keepalive_ping":
+            return True
+        data = raw.get("data")
+        if isinstance(data, (str, bytes)):
+            # Cheap guard: skip the json.loads for frames that can't be a
+            # keepalive (avoids parsing every inbound direct message).
+            marker = b"keepalive_ping" if isinstance(data, bytes) else "keepalive_ping"
+            if marker not in data:
+                return False
+            try:
+                inner = json.loads(data)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return False
+            if isinstance(inner, dict):
+                if inner.get("msg_type") == "keepalive_ping":
+                    return True
+                ip = inner.get("payload")
+                if isinstance(ip, dict) and ip.get("subtype") == "keepalive_ping":
+                    return True
+        return False
+
+    async def _ping_all_peers(self) -> None:
+        """Ping every peer we know — OUTBOUND dials (``self._peers``) AND
+        INBOUND-seen peers (``self._inbound_peer_ids``).
+
+        The inbound set is load-bearing: a node that only RECEIVES dials (the
+        pipeline head — workers dial into it) has an empty ``_peers`` and would
+        otherwise warm nothing toward the very workers it must dispatch to. A
+        ping opens (and the Go side closes) a short-lived ``/prsm/direct/1.0.0``
+        stream, which resets the underlying connection's idle timer in BOTH
+        directions, so the head's later dispatch reuses a live connection
+        instead of hitting a reaped one. Point-to-point, never gossiped. A
+        failure to one peer must never abort the sweep; an inbound-only peer
+        that fails is pruned (it's gone). (Relies on off-event-loop slice
+        loading — sp1227 — so this task actually gets scheduled mid-cold-load.)
+        """
+        targets = set(self._peers.keys()) | set(self._inbound_peer_ids)
+        for peer_id in targets:
+            try:
+                ping = P2PMessage(
+                    msg_type="keepalive_ping",
+                    sender_id=self._identity.node_id,
+                    payload={"subtype": "keepalive_ping", "ts": time.time()},
+                )
+                ok = await self.send_to_peer(peer_id, ping)
+                if ok:
+                    self._telemetry["keepalive_pings_sent"] += 1
+                elif peer_id in self._inbound_peer_ids and peer_id not in self._peers:
+                    self._inbound_peer_ids.discard(peer_id)
+            except Exception as exc:  # noqa: BLE001 — never let one peer kill the loop
+                logger.debug("keepalive ping to %s failed: %s", peer_id, exc)
+                if peer_id not in self._peers:
+                    self._inbound_peer_ids.discard(peer_id)
+
+    async def _keepalive_loop(self) -> None:
+        """Background task: ping all peers every ``_keepalive_interval`` s.
+
+        Self-healing — the try/except is INSIDE the loop so a single bad sweep
+        is logged and the loop keeps running. A resilience mechanism must not
+        be permanently disabled by one transient error.
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(self._keepalive_interval)
+                if not self._running:
+                    break
+                await self._ping_all_peers()
+            except asyncio.CancelledError:
+                raise  # let cancellation propagate (stop() awaits it)
+            except Exception as exc:  # noqa: BLE001 — a bad sweep must not kill keepalive
+                logger.error("keepalive sweep error (continuing): %s", exc)
 
     # ── Peer operations ─────────────────────────────────────────
 
@@ -339,6 +469,7 @@ class Libp2pTransport:
             "dispatch_success_total": int(self._telemetry["dispatch_success_total"]),
             "dispatch_failure_total": int(self._telemetry["dispatch_failure_total"]),
             "dispatch_failure_reasons": dict(self._telemetry["dispatch_failure_reasons"]),
+            "keepalive_pings_sent": int(self._telemetry["keepalive_pings_sent"]),
         }
 
     # ── DHT helpers ─────────────────────────────────────────────
@@ -400,6 +531,21 @@ class Libp2pTransport:
             return
 
         self._telemetry["messages_received"] += 1
+
+        # Sprint 1229 — remember peers that dial US so the keepalive sweep can
+        # warm the reverse direction. The head never adds inbound dialers to
+        # _peers; without this it would ping nothing toward its workers.
+        sender_id = raw.get("sender_id", raw.get("from", ""))
+        if sender_id and sender_id != self._identity.node_id:
+            self._inbound_peer_ids.add(sender_id)
+
+        # Sprint 1229 — a keepalive ping is pure connection-warming traffic;
+        # short-circuit BEFORE handler fan-out (it is delivered over the
+        # /prsm/direct/1.0.0 protocol, so it would otherwise reach every
+        # registered direct-message handler, error on the wrapped payload, and
+        # inflate dispatch_failure_total / the sp1217 runtime metrics).
+        if self._is_keepalive(raw):
+            return
 
         # Reconstruct P2PMessage
         try:

@@ -156,6 +156,7 @@ class TestTelemetry:
             "dispatch_success_total",
             "dispatch_failure_total",
             "dispatch_failure_reasons",
+            "keepalive_pings_sent",  # sprint 1229
         }
         assert set(snap.keys()) == expected_keys
 
