@@ -100,6 +100,9 @@ def test_ensure_loaded_passes_local_files_only_from_offline(monkeypatch):
         def eval(self):
             return self
 
+        def to(self, *args, **kwargs):  # _ensure_loaded calls model.to(device)
+            return self
+
     def fake_tok(model_id, **kw):
         seen["tok_local_files_only"] = kw.get("local_files_only")
         return _FakeTok()
