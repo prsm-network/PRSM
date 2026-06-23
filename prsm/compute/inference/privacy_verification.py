@@ -76,6 +76,11 @@ class PrivacyVerification:
     dp_noise_applied: bool = False
     hardware_attested: bool = False
     multi_stage_envelope_present: bool = False
+    # sp1236-B — real per-stage verification verdict for a multi-stage chain:
+    # None = not a multi-stage envelope OR no attestation_registry supplied
+    # (structural-only, back-compat); True/False = every stage cryptographically
+    # vendor_verified + REPORT_DATA-bound to its node (fail-closed aggregate).
+    multi_stage_verified: Optional[bool] = None
     # Diagnostic fields (always populated for caller
     # inspection; surfacing the values is half the point of
     # this API).
@@ -115,6 +120,7 @@ class PrivacyVerification:
             "multi_stage_envelope_present": (
                 self.multi_stage_envelope_present
             ),
+            "multi_stage_verified": self.multi_stage_verified,
             "privacy_tier": self.privacy_tier,
             "epsilon_spent": self.epsilon_spent,
             "expected_epsilon": self.expected_epsilon,
@@ -172,6 +178,7 @@ def verify_receipt_privacy_claim(
     public_key_b64: Optional[str] = None,
     topology_history: Any = None,
     expected_anti_repeat_window: int = 3,
+    attestation_registry: Any = None,
 ) -> PrivacyVerification:
     """Run all privacy-claim checks against a receipt.
 
@@ -314,24 +321,44 @@ def verify_receipt_privacy_claim(
     # here so callers can surface "this inference used the
     # cross-host attestation path."
     multi_stage_present = False
+    multi_stage_verified: Optional[bool] = None
     try:
         from prsm.compute.inference.multi_stage_attestation import (
+            is_multi_stage_attestation as _is_ms,
             verify_stage_attestations as _ms_verify,
         )
-        result = _ms_verify(attestation)
-        # The verifier returns a list when an envelope is
-        # present; a sentinel single-entry list otherwise.
-        # Distinguish via the presence of a stage-specific
-        # marker. The public API ships a more decisive
-        # check; for v1 we treat any non-error response as
-        # an envelope being structurally parseable.
-        multi_stage_present = (
-            isinstance(result, (list, tuple))
-            and len(result) > 0
-            and not is_dev_only
-        )
-    except Exception:  # noqa: BLE001
+        multi_stage_present = _is_ms(attestation) and not is_dev_only
+        # sp1236-B — when the caller supplies the real backend registry, run
+        # every stage of the proven cross-host chain through cryptographic
+        # verification + REPORT_DATA->node binding (sp1236), instead of the
+        # permissive "non-empty + not-DEV-ONLY" heuristic. No registry → still
+        # structural-only (multi_stage_verified stays None), back-compat.
+        if multi_stage_present and attestation_registry is not None:
+            _exp_count = None
+            _topo = getattr(receipt, "topology_assignment", None)
+            _sc = getattr(_topo, "stage_count", None) if _topo is not None else None
+            if isinstance(_sc, int) and _sc > 0:
+                _exp_count = _sc
+            _all_ok, _ = _ms_verify(
+                attestation,
+                registry=attestation_registry,
+                expected_stage_count=_exp_count,
+            )
+            multi_stage_verified = bool(_all_ok)
+            if require_hardware_attestation and not multi_stage_verified:
+                reasons.append(
+                    "multi-stage attestation failed cryptographic "
+                    "verification / node-binding"
+                )
+    except Exception as exc:  # noqa: BLE001
         multi_stage_present = False
+        if require_hardware_attestation and attestation_registry is not None:
+            reasons.append(f"multi-stage attestation check raised: {exc}")
+
+    # sp1236-B — when the multi-stage chain was really verified, that verdict
+    # (not the permissive heuristic) is the hardware-attestation signal.
+    if multi_stage_verified is not None:
+        hardware_attested = multi_stage_verified
 
     # ── Sprint 297: activation_noise_trace integrity ────
     activation_noise_trace_valid = True  # default-true when absent
@@ -489,6 +516,7 @@ def verify_receipt_privacy_claim(
         dp_noise_applied=dp_noise_applied,
         hardware_attested=hardware_attested,
         multi_stage_envelope_present=multi_stage_present,
+        multi_stage_verified=multi_stage_verified,
         privacy_tier=tier_str,
         epsilon_spent=float(receipt.epsilon_spent),
         expected_epsilon=(
