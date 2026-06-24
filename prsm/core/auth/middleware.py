@@ -13,7 +13,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 from starlette.status import HTTP_429_TOO_MANY_REQUESTS, HTTP_401_UNAUTHORIZED
 
-from prsm.core.redis_client import get_redis_client
+from prsm.core.redis_client import get_redis_client, resolve_async_redis
 from prsm.core.integrations.security.audit_logger import audit_logger
 
 logger = structlog.get_logger(__name__)
@@ -170,18 +170,23 @@ class AuthMiddleware(BaseHTTPMiddleware):
         Returns:
             Rate limit response if exceeded, None if OK
         """
-        if not self.redis_client:
+        # sp1247 — resolve the live inner async Redis (self.redis_client is the
+        # RedisClient wrapper, which has no .pipeline; calling it raised AttributeError
+        # → the except below failed OPEN, silently disabling rate limiting). None →
+        # no live Redis → skip (the documented no-Redis behavior).
+        _redis = resolve_async_redis(self.redis_client)
+        if _redis is None:
             # Skip rate limiting if Redis not available
             return None
-        
+
         try:
             # Create rate limit key
             rate_limit_key = f"rate_limit:{client_ip}"
             current_time = int(time.time())
             window_start = current_time - (current_time % self.rate_limit_window)
-            
+
             # Use Redis pipeline for atomic operations
-            pipe = self.redis_client.pipeline()
+            pipe = _redis.pipeline()
             
             # Sliding window rate limiting
             window_key = f"{rate_limit_key}:{window_start}"
@@ -247,13 +252,17 @@ class AuthMiddleware(BaseHTTPMiddleware):
         Returns:
             Block response if IP is blocked, None if OK
         """
-        if not self.redis_client:
+        # sp1247 — resolve the live inner async Redis (the wrapper has no .get;
+        # calling it raised AttributeError → the block check failed OPEN, so a
+        # blocked IP was admitted). None → no live Redis → skip.
+        _redis = resolve_async_redis(self.redis_client)
+        if _redis is None:
             return None
-        
+
         try:
             # Check if IP is in block list
             blocked_key = f"blocked_ip:{client_ip}"
-            is_blocked = await self.redis_client.get(blocked_key)
+            is_blocked = await _redis.get(blocked_key)
             
             if is_blocked:
                 await audit_logger.log_security_event(

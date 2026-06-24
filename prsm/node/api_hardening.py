@@ -26,6 +26,8 @@ from fastapi.security import HTTPBearer
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
+
+from prsm.core.redis_client import resolve_async_redis  # sp1247
 from starlette.status import (
     HTTP_401_UNAUTHORIZED,
     HTTP_403_FORBIDDEN,
@@ -140,11 +142,15 @@ class RateLimiter:
         current_time = time.time()
         window_start = current_time - 60  # 1 minute window
         
-        if self.redis_client:
+        # sp1247 — only take the Redis path when a LIVE inner client is resolvable.
+        # self.redis_client is the RedisClient WRAPPER (get_redis_client()); a bare
+        # truthiness check was always True even when Redis was disconnected, then
+        # wrapper.pipeline() raised → the except failed OPEN (rate limiting disabled).
+        if resolve_async_redis(self.redis_client) is not None:
             return await self._check_rate_limit_redis(key, client_id, requests_per_minute)
         else:
             return self._check_rate_limit_local(key, client_id, requests_per_minute, current_time, window_start)
-    
+
     async def _check_rate_limit_redis(
         self,
         key: str,
@@ -152,13 +158,18 @@ class RateLimiter:
         limit: int
     ) -> RateLimitResult:
         """Check rate limit using Redis backend."""
+        current_time = time.time()
+        window_start = current_time - 60
         try:
-            current_time = time.time()
-            window_start = current_time - 60
-            
+            # sp1247 — resolve the live inner async Redis (the wrapper has no
+            # .pipeline); None → degrade to local below rather than fail open.
+            _redis = resolve_async_redis(self.redis_client)
+            if _redis is None:
+                raise RuntimeError("redis unavailable")
+
             # Use Redis pipeline for atomic operations
-            pipe = self.redis_client.pipeline()
-            
+            pipe = _redis.pipeline()
+
             # Remove old entries
             pipe.zremrangebyscore(key, 0, window_start)
             # Count current entries
@@ -167,13 +178,13 @@ class RateLimiter:
             pipe.zadd(key, {str(current_time): current_time})
             # Set expiration
             pipe.expire(key, 120)
-            
+
             results = await pipe.execute()
             current_count = results[1]  # Count after cleanup
-            
+
             remaining = max(0, limit - current_count)
             allowed = current_count <= limit
-            
+
             return RateLimitResult(
                 allowed=allowed,
                 limit=limit,
@@ -181,16 +192,14 @@ class RateLimiter:
                 reset_at=current_time + 60,
                 retry_after=None if allowed else 60
             )
-            
+
         except Exception as e:
-            logger.error("Redis rate limit check failed", error=str(e), client_id=client_id)
-            # Fail open
-            return RateLimitResult(
-                allowed=True,
-                limit=limit,
-                remaining=limit,
-                reset_at=time.time() + 60
-            )
+            logger.error("Redis rate limit check failed; degrading to local limiter",
+                         error=str(e), client_id=client_id)
+            # sp1247 — DEGRADE to the in-memory limiter, do NOT fail open. A Redis
+            # blip (or a misconfigured client) must not disable rate limiting; the
+            # local limiter still enforces a per-process bound.
+            return self._check_rate_limit_local(key, client_id, limit, current_time, window_start)
     
     def _check_rate_limit_local(
         self,

@@ -1119,3 +1119,32 @@ def get_pubsub() -> PubSubManager:
 def get_redis_client() -> RedisClient:
     """Get Redis client instance"""
     return redis_manager.client
+
+
+def resolve_async_redis(client):
+    """Sprint 1247 — return the live, pipeline-capable async Redis from whatever a
+    caller holds, or None when Redis is unavailable.
+
+    Several security components (api_hardening rate limiter, the auth middlewares)
+    stored the ``RedisClient`` WRAPPER (``get_redis_client()``) and then called
+    ``.pipeline()`` / ``.incr()`` directly on it — but the wrapper exposes no raw
+    Redis commands; its inner ``.redis_client`` is the real ``redis.asyncio.Redis``.
+    The resulting ``AttributeError`` was swallowed by a fail-OPEN ``except``, so rate
+    limiting was silently disabled on the Redis backend. This normalizes the access:
+
+      - ``None``                      -> None
+      - a raw async ``Redis`` (already has ``.pipeline``) -> itself
+      - a ``RedisClient`` wrapper     -> its inner ``.redis_client`` IFF ``connected``
+                                         (else None — a disconnected/uninitialized
+                                         wrapper must route callers to their fallback,
+                                         not look usable).
+    """
+    if client is None:
+        return None
+    # A raw async Redis is already pipeline-capable — pass it through.
+    if hasattr(client, "pipeline"):
+        return client
+    # A RedisClient wrapper: only usable when it reports a live connection.
+    if getattr(client, "connected", False):
+        return getattr(client, "redis_client", None)
+    return None

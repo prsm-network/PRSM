@@ -22,7 +22,7 @@ from starlette.status import (
 )
 
 from prsm.core.config import get_settings
-from prsm.core.redis_client import get_redis_client
+from prsm.core.redis_client import get_redis_client, resolve_async_redis
 from prsm.core.integrations.security.audit_logger import audit_logger
 
 logger = structlog.get_logger(__name__)
@@ -463,9 +463,11 @@ class EnhancedAuthMiddleware(BaseHTTPMiddleware):
                 return None
             
             # Check if token is blacklisted (if Redis available)
-            if self.redis_client:
+            # sp1247 — resolve the inner async Redis (the wrapper has no .get).
+            _redis = resolve_async_redis(self.redis_client)
+            if _redis is not None:
                 token_hash = hashlib.sha256(token.encode()).hexdigest()
-                if await self.redis_client.get(f"blacklist:{token_hash}"):
+                if await _redis.get(f"blacklist:{token_hash}"):
                     logger.warning("Blacklisted JWT token")
                     return None
             
@@ -498,8 +500,10 @@ class EnhancedAuthMiddleware(BaseHTTPMiddleware):
                 return None
             
             # Check if API key is blacklisted
-            if self.redis_client:
-                if await self.redis_client.get(f"blacklist_key:{api_key}"):
+            # sp1247 — resolve the inner async Redis (the wrapper has no .get).
+            _redis = resolve_async_redis(self.redis_client)
+            if _redis is not None:
+                if await _redis.get(f"blacklist_key:{api_key}"):
                     logger.warning("Blacklisted API key")
                     return None
             
@@ -565,9 +569,13 @@ class EnhancedAuthMiddleware(BaseHTTPMiddleware):
     
     async def _check_enhanced_rate_limit(self, user_info: Dict[str, Any], context: Dict[str, Any]) -> Optional[Response]:
         """Enhanced rate limiting with user-based limits"""
-        if not self.redis_client:
+        # sp1247 — resolve the live inner async Redis (self.redis_client is the
+        # RedisClient wrapper, which has no .pipeline; calling it raised AttributeError
+        # → the except failed OPEN). None → no live Redis → skip.
+        _redis = resolve_async_redis(self.redis_client)
+        if _redis is None:
             return None  # Skip if Redis not available
-        
+
         user_role = user_info.get("role", "anonymous")
         user_id = user_info.get("user_id", context["ip"])
         
@@ -582,7 +590,7 @@ class EnhancedAuthMiddleware(BaseHTTPMiddleware):
             window_key = f"{rate_key}:{window_start}"
             
             # Use Redis pipeline for atomic operations
-            pipe = self.redis_client.pipeline()
+            pipe = _redis.pipeline()
             pipe.incr(window_key)
             pipe.expire(window_key, rate_config["window"] * 2)
             results = await pipe.execute()
@@ -629,19 +637,22 @@ class EnhancedAuthMiddleware(BaseHTTPMiddleware):
     
     async def _detect_anomalies(self, user_info: Dict[str, Any], context: Dict[str, Any]):
         """Detect suspicious request patterns"""
-        if not self.redis_client:
+        # sp1247 — resolve the live inner async Redis (the wrapper has no .incr/.get;
+        # calling them raised AttributeError → anomaly detection silently no-op'd).
+        _redis = resolve_async_redis(self.redis_client)
+        if _redis is None:
             return
-        
+
         try:
             user_id = user_info.get("user_id", context["ip"])
             fingerprint = context["fingerprint"]
-            
+
             # Track request patterns
             pattern_key = f"pattern:{user_id}:{fingerprint}"
-            await self.redis_client.incr(pattern_key)
-            await self.redis_client.expire(pattern_key, 3600)  # 1 hour window
-            
-            pattern_count = await self.redis_client.get(pattern_key)
+            await _redis.incr(pattern_key)
+            await _redis.expire(pattern_key, 3600)  # 1 hour window
+
+            pattern_count = await _redis.get(pattern_key)
             pattern_count = int(pattern_count) if pattern_count else 0
             
             # Detect anomalies
@@ -809,11 +820,14 @@ async def blacklist_token(token: str, redis_client = None):
     """Blacklist a JWT token"""
     if not redis_client:
         redis_client = get_redis_client()
-    
-    if redis_client:
+
+    # sp1247 — resolve the live inner async Redis (the wrapper has no .setex; the
+    # blacklist WRITE was silently failing, so a revoked token was never recorded).
+    _redis = resolve_async_redis(redis_client)
+    if _redis is not None:
         token_hash = hashlib.sha256(token.encode()).hexdigest()
         # Blacklist for 24 hours (token expiry)
-        await redis_client.setex(f"blacklist:{token_hash}", 86400, "blacklisted")
+        await _redis.setex(f"blacklist:{token_hash}", 86400, "blacklisted")
 
 
 async def create_api_key(user_id: str, description: str = "") -> str:
