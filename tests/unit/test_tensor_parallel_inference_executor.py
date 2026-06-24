@@ -150,6 +150,7 @@ class TestConstruction:
             def available(self): return True
             def load(self, wasm_bytes): return None
             def execute(self, module, input_data, resource_limits): raise NotImplementedError
+            def get_attestation_bytes(self): return b"sgx-fake-quote"  # sp1239
 
         ex = TensorParallelInferenceExecutor(
             model_registry=registry, tee_runtime=FakeHardwareTEE()

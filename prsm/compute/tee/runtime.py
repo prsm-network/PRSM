@@ -40,6 +40,22 @@ class TEERuntime(abc.ABC):
     def execute(self, module: Any, input_data: bytes, resource_limits: ResourceLimits) -> ExecutionResult:
         """Execute in TEE sandbox."""
 
+    @abc.abstractmethod
+    def get_attestation_bytes(self) -> bytes:
+        """Sprint 1239 (TEE Tier-3 roadmap D) — generate this runtime's
+        attestation quote bytes for the current enclave/measurement. The
+        quote-GENERATION half of the attestation contract (verification is
+        attestation_backends / the sp1236 multi-stage chain). chain_rpc/server.py
+        stamps the returned bytes onto each stage's §7 proof; verifiers route
+        them through the AttestationBackendRegistry.
+
+        ABSTRACT on purpose: a TEE runtime MUST declare how it attests — a
+        hardware runtime that forgot to implement this would otherwise silently
+        emit a software/dev-only blob, masking the bug. ``SoftwareTEERuntime``
+        returns a DEV-ONLY-marked blob (NO confidentiality — verifiers MUST
+        reject it as non-production); real ``SgxTEERuntime``/``SevTEERuntime``
+        return a hardware quote (sprint E, needs hardware)."""
+
 
 class SoftwareTEERuntime(TEERuntime):
     """Software-only TEE using Ring 1 WASM sandbox as fallback."""
@@ -70,3 +86,16 @@ class SoftwareTEERuntime(TEERuntime):
 
     def execute(self, module: Any, input_data: bytes, resource_limits: ResourceLimits) -> ExecutionResult:
         return self._get_wasm_runtime().execute(module, input_data, resource_limits)
+
+    def get_attestation_bytes(self) -> bytes:
+        """A DEV-ONLY-marked blob (16-byte ``DEV-ONLY-SW-TEE:`` prefix + a
+        48-byte sha384 tag = 64 bytes), matching the executor's software-stub
+        format. Verifiers (DevOnlyBackend / is_dev_only) treat it as having NO
+        confidentiality guarantee — it brands itself non-production so a
+        software TEE can never be mistaken for a hardware one. Lazy imports keep
+        this low-level runtime module decoupled from the heavier executor."""
+        import hashlib
+        from prsm.compute.inference.executor import (
+            SOFTWARE_TEE_ATTESTATION_PREFIX,
+        )
+        return SOFTWARE_TEE_ATTESTATION_PREFIX + hashlib.sha384(b"sw-tee").digest()
