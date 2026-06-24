@@ -19,6 +19,16 @@ Signals (Brick 1):
     note readiness.py reads ``settlement_client`` which the node does NOT set,
     so the settlement signal MUST come from this helper, not the readiness
     detail).
+  - ``prsm_collateral_refresh_enabled`` + per-item ``prsm_collateral_item_stale``
+    / ``prsm_collateral_age_seconds`` (label ``item``) + the unlabeled aggregate
+    ``prsm_collateral_stale`` (max over items — the alert target) — sp1244, from
+    the sp1090 ``collateral_refresh_status`` (horizon-aware: parses each cached
+    item's real nextUpdate). Emitted ONLY when a collateral cache dir is
+    configured, so non-TEE nodes stay silent. The machine-readable half of what
+    was previously only on ``/health/detailed`` — lets the AlertManager warn when
+    the TEE revocation/recency collateral has gone stale (auto-refresh silently
+    failing). The aggregate exists because the AlertManager reduces a metric to a
+    single series, so a per-label gauge cannot express "ANY item stale".
 
 Reuses ``prsm.node.readiness.compute_readiness`` and
 ``prsm.settlement.client_wiring.get_settlement_status`` — both never-raising —
@@ -170,6 +180,50 @@ class NodeRuntimeMetrics(CustomMetric):
                     "prsm_inference_latency_seconds_sum",
                     snap["latency_seconds_sum"], now,
                 ))
+        except Exception:  # noqa: BLE001
+            pass
+
+        # ── attestation collateral freshness (sp1244 — TEE revocation/recency) ──
+        # Bridges the sp1090 health-JSON status (collateral_refresh_status, which is
+        # horizon-aware: it parses each cached item's real nextUpdate) into Prometheus
+        # + the AlertManager. Without this an operator scraping /metrics had NO signal
+        # that the collateral auto-refresh (sp1081/1082) had silently stopped — once a
+        # cached CRL/TCB-Info ages past its nextUpdate the verifiers' freshness gates
+        # (sp1060/sp1089) start rejecting, i.e. revocation/recency enforcement degrades.
+        # Gated on a configured collateral cache dir so non-TEE nodes emit nothing.
+        try:
+            from prsm.compute.inference.collateral_refresh import (
+                collateral_refresh_status,
+            )
+
+            st = collateral_refresh_status()
+            if st.get("cache_dir"):
+                out.append(MetricValue(
+                    "prsm_collateral_refresh_enabled",
+                    1 if st.get("enabled") else 0, now,
+                ))
+                any_stale = 0
+                for item, d in (st.get("items") or {}).items():
+                    labels = {"item": str(item)}
+                    age = d.get("age_seconds")
+                    if isinstance(age, (int, float)) and not isinstance(age, bool):
+                        out.append(MetricValue(
+                            "prsm_collateral_age_seconds", age, now, labels,
+                        ))
+                    # item_stale=1 unless provably fresh (now <= nextUpdate). fresh
+                    # is None when the horizon is unparseable/absent → the verifier
+                    # can't trust it either, so flag it (conservative).
+                    item_stale = 0 if d.get("fresh") is True else 1
+                    out.append(MetricValue(
+                        "prsm_collateral_item_stale", item_stale, now, labels,
+                    ))
+                    any_stale = max(any_stale, item_stale)
+                # The UNLABELED max-over-items aggregate is the ALERT target: the
+                # AlertManager reduces a metric to ONE series (latest by timestamp),
+                # so a per-label gauge can't express "any item stale" — this scalar
+                # can. Always emitted on a collateral-configured node (0 when nothing
+                # is cached yet) so the alert rule always has a series to evaluate.
+                out.append(MetricValue("prsm_collateral_stale", any_stale, now))
         except Exception:  # noqa: BLE001
             pass
 

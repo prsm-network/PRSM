@@ -56,6 +56,34 @@ def test_setup_registers_node_runtime_rules():
     assert fif.severity == AlertSeverity.WARNING
 
 
+def test_setup_registers_collateral_stale_rule():
+    """sp1244 — the TEE-collateral staleness rule over prsm_collateral_stale
+    (emitted by NodeRuntimeMetrics from the sp1090 horizon-aware status)."""
+    am = AlertManager()
+    am.setup_node_runtime_rules()
+    assert "attestation_collateral_stale" in am.rules
+    r = am.rules["attestation_collateral_stale"]
+    assert r.condition.metric_name == "prsm_collateral_stale"
+    assert r.condition.operator == "gt" and r.condition.threshold == 0
+    assert r.condition.aggregation == "max"   # any item stale → fire
+    assert r.severity == AlertSeverity.WARNING
+    assert r.channels == []                    # no channel dependency by default
+    assert r.tags.get("category") == "attestation"
+
+
+def test_collateral_stale_rule_fires_only_after_sustained_duration():
+    am = AlertManager()
+    am.setup_node_runtime_rules()
+    r = am.rules["attestation_collateral_stale"]
+    t0 = datetime(2026, 6, 24, 12, 0, 0)
+    # fresh (stale=0) never fires
+    assert r.evaluate(0.0, t0) is False
+    # a single stale sample starts the window (not yet)
+    assert r.evaluate(1.0, t0) is False
+    # still stale past the duration → fires
+    assert r.evaluate(1.0, t0 + r.condition.duration + timedelta(seconds=1)) is True
+
+
 # ── duration-gated firing ────────────────────────────────────────────────────
 
 def test_node_not_ready_fires_only_after_sustained_duration():
@@ -128,6 +156,7 @@ def test_rules_carry_provided_channels():
         "node_not_ready",
         "settlement_funds_in_flight_stuck",
         "settlement_committing_intents_unresolved",
+        "attestation_collateral_stale",
     ):
         assert am.rules[name].channels == ["node-webhook"]
 

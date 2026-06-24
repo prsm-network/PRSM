@@ -754,9 +754,35 @@ class AlertManager:
             tags={"category": "settlement", "component": "wal"},
         )
 
-        for rule in [not_ready_rule, funds_in_flight_rule, committing_intents_rule]:
+        # TEE attestation collateral past its nextUpdate (sp1244). A stale CRL /
+        # TCB-Info means the verifiers' freshness gates (sp1060/sp1089) have begun
+        # rejecting, i.e. revocation/recency enforcement is degrading — almost
+        # always because the collateral auto-refresh (sp1081/1082) is silently
+        # failing. ``prsm_collateral_stale`` is already horizon-aware (1 = past
+        # nextUpdate or unverifiable), so a fixed age threshold isn't needed; max
+        # aggregation fires if ANY cached item is stale. Sustained-1h debounces a
+        # transient collect/parse hiccup (a real staleness persists — the refresh
+        # loop is daily, CRLs monthly, so there is ample runway to act).
+        collateral_stale_rule = AlertRule(
+            name="attestation_collateral_stale",
+            description="TEE attestation collateral past its nextUpdate (revocation/"
+                        "recency enforcement degrading — auto-refresh likely failing)",
+            condition=AlertCondition(
+                metric_name="prsm_collateral_stale",
+                operator="gt",
+                threshold=0,
+                duration=timedelta(hours=1),
+                aggregation="max",
+            ),
+            severity=AlertSeverity.WARNING,
+            channels=list(chans),
+            tags={"category": "attestation", "component": "collateral"},
+        )
+
+        for rule in [not_ready_rule, funds_in_flight_rule, committing_intents_rule,
+                     collateral_stale_rule]:
             self.add_rule(rule)
-        logger.info("Setup %d node-runtime alert rules", 3)
+        logger.info("Setup %d node-runtime alert rules", 4)
 
     def setup_collaboration_rules(self) -> None:
         """Setup collaboration/trust-path alert rules for P3 observability.

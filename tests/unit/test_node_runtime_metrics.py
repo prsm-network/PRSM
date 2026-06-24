@@ -195,5 +195,127 @@ def test_adapter_omits_inference_counters_when_absent():
     assert "prsm_inference_requests_total" not in m
 
 
+# ── sp1244: attestation-collateral freshness metrics ─────────────────────────
+# Bridges the sp1090 horizon-aware health status into Prometheus so an operator
+# can ALERT when the TEE revocation/recency collateral has silently gone stale.
+
+import datetime as _dt  # noqa: E402
+
+from cryptography import x509  # noqa: E402
+from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
+from cryptography.x509.oid import NameOID  # noqa: E402
+
+from prsm.compute.inference.collateral_refresh import (  # noqa: E402
+    INTEL_PCK_PLATFORM_CRL_FILE,
+    amd_crl_cache_file,
+)
+
+
+def _crl_pem(*, next_update):
+    """A signature-valid CRL whose nextUpdate the status helper parses (the
+    horizon that decides fresh vs stale)."""
+    priv = ec.generate_private_key(ec.SECP256R1())
+    # anchor lastUpdate before nextUpdate so the builder accepts a past nextUpdate
+    # (a stale CRL) as well as a future one (a fresh CRL).
+    crl = (x509.CertificateRevocationListBuilder()
+           .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "CA")]))
+           .last_update(next_update - _dt.timedelta(days=5)).next_update(next_update)
+           .sign(priv, hashes.SHA256()))
+    return crl.public_bytes(serialization.Encoding.PEM)
+
+
+def _collect_list(metric):
+    """Full MetricValue list (the by-name _collect helper drops labels, which
+    the per-item collateral metrics depend on)."""
+    values = asyncio.run(metric.collect())
+    assert all(isinstance(v, MetricValue) for v in values)
+    return values
+
+
+def _series(values, name):
+    return [v for v in values if v.name == name]
+
+
+def test_collateral_metrics_absent_without_cache_dir(monkeypatch):
+    # The common (non-TEE) node has no collateral cache configured → the adapter
+    # must emit NO collateral metrics at all (no per-node noise).
+    monkeypatch.delenv("PRSM_ATTESTATION_COLLATERAL_DIR", raising=False)
+    values = _collect_list(NodeRuntimeMetrics(_Node(inference_executor=object())))
+    assert not [v for v in values if v.name.startswith("prsm_collateral")]
+
+
+def _future(days):
+    return _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=days)
+
+
+def test_collateral_metrics_fresh_crl(monkeypatch, tmp_path):
+    (tmp_path / INTEL_PCK_PLATFORM_CRL_FILE).write_bytes(_crl_pem(next_update=_future(20)))
+    monkeypatch.setenv("PRSM_ATTESTATION_COLLATERAL_DIR", str(tmp_path))
+    monkeypatch.setenv("PRSM_COLLATERAL_AUTO_REFRESH", "1")
+    values = _collect_list(NodeRuntimeMetrics(_Node(inference_executor=object())))
+
+    enabled = _series(values, "prsm_collateral_refresh_enabled")
+    assert len(enabled) == 1 and enabled[0].value == 1
+
+    # per-item detail (labeled)
+    item = _series(values, "prsm_collateral_item_stale")
+    assert len(item) == 1
+    assert item[0].labels == {"item": "intel_pck_platform_crl"}
+    assert item[0].value == 0  # within nextUpdate → not stale
+
+    # the unlabeled alert aggregate
+    agg = _series(values, "prsm_collateral_stale")
+    assert len(agg) == 1 and agg[0].labels == {} and agg[0].value == 0
+
+    age = _series(values, "prsm_collateral_age_seconds")
+    assert len(age) == 1 and age[0].value >= 0
+
+
+def test_collateral_metrics_stale_when_past_next_update(monkeypatch, tmp_path):
+    # A CRL whose nextUpdate is in the PAST = the verifier freshness gate is now
+    # rejecting → both the per-item and the aggregate must flag stale=1.
+    (tmp_path / INTEL_PCK_PLATFORM_CRL_FILE).write_bytes(_crl_pem(next_update=_future(-1)))
+    monkeypatch.setenv("PRSM_ATTESTATION_COLLATERAL_DIR", str(tmp_path))
+    values = _collect_list(NodeRuntimeMetrics(_Node(inference_executor=object())))
+    item = _series(values, "prsm_collateral_item_stale")
+    assert len(item) == 1 and item[0].value == 1
+    agg = _series(values, "prsm_collateral_stale")
+    assert len(agg) == 1 and agg[0].value == 1
+
+
+def test_collateral_aggregate_is_max_over_items(monkeypatch, tmp_path):
+    # THE regression guard: a fresh item AND a stale item present. The AlertManager
+    # reduces a metric to ONE series, so the alert MUST read the unlabeled aggregate
+    # — which has to be max-over-items (=1) even though one item is fresh. (A naive
+    # per-label gauge could let the fresh series mask the stale one.)
+    (tmp_path / INTEL_PCK_PLATFORM_CRL_FILE).write_bytes(_crl_pem(next_update=_future(20)))
+    (tmp_path / amd_crl_cache_file("milan")).write_bytes(_crl_pem(next_update=_future(-1)))
+    monkeypatch.setenv("PRSM_ATTESTATION_COLLATERAL_DIR", str(tmp_path))
+    values = _collect_list(NodeRuntimeMetrics(_Node(inference_executor=object())))
+
+    item = {v.labels["item"]: v.value for v in _series(values, "prsm_collateral_item_stale")}
+    assert item["intel_pck_platform_crl"] == 0
+    assert item["amd_milan_crl"] == 1
+
+    agg = _series(values, "prsm_collateral_stale")
+    assert len(agg) == 1 and agg[0].labels == {} and agg[0].value == 1   # any stale → 1
+
+
+def test_collateral_block_fail_soft(monkeypatch, tmp_path):
+    # A raising status helper must not break the whole collection (the contract
+    # MetricsRegistry.collect_all relies on) — and the other blocks still emit.
+    monkeypatch.setenv("PRSM_ATTESTATION_COLLATERAL_DIR", str(tmp_path))
+
+    def _boom(*a, **k):
+        raise RuntimeError("status exploded")
+
+    monkeypatch.setattr(
+        "prsm.compute.inference.collateral_refresh.collateral_refresh_status", _boom)
+    m = _collect(NodeRuntimeMetrics(_Node(inference_executor=object())))
+    assert m["prsm_node_ready"] == 1                 # other blocks unaffected
+    assert "prsm_collateral_stale" not in m           # collateral block skipped
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
