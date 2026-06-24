@@ -119,6 +119,7 @@ class MockSettlementChain:
         *,
         tier_slash_rate_bps: int = 0,
         consensus_group_id: bytes = b"\x00" * 32,
+        attestation_commitment: bytes = b"",  # sp1242 — accepted, mock ignores
     ) -> Tuple[bytes, int]:
         """Mock of BatchSettlementRegistry.commitBatch. Returns
         (batch_id, commit_timestamp_unix).
@@ -218,6 +219,7 @@ class MockContractClient:
         tier_slash_rate_bps: int = 0,
         consensus_group_id: bytes = b"\x00" * 32,
         metadata_uri: str = "",
+        attestation_commitment: bytes = b"",  # sp1242 — accepted, mock ignores
     ) -> Tuple[bytes, int]:
         """Mirrors SettlementContractClient.commit_batch exactly —
         positional args + tier_slash_rate_bps (Phase 7) +

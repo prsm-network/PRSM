@@ -88,6 +88,7 @@ class SettlementContractClient(Protocol):
         tier_slash_rate_bps: int,
         consensus_group_id: bytes,
         metadata_uri: str,
+        attestation_commitment: bytes = b"",
     ) -> Tuple[bytes, int]:
         """Submit commitBatch; return (batch_id, commit_timestamp_unix).
 
@@ -484,6 +485,18 @@ class BatchSettlementClient:
         if leaf_hashes is None or root is None:
             leaf_hashes, root = self._build_leaves_root(ready)
 
+        # sp1242 (TEE Tier-3 roadmap F final glue) — compute the batch's
+        # attestation commitment from its receipts' tee_attestation audit dicts
+        # (sp1238) and pass it through. Weakest-link + bytes32(0) when nothing is
+        # attested; the contract client only routes to commitBatchWithAttestation
+        # when this is non-zero AND the deployed registry supports it (sp1241), so
+        # this is a pure no-op on the legacy commit path.
+        from prsm.compute.shard_receipt import batch_attestation_commitment
+        attestation_commitment = batch_attestation_commitment(
+            [getattr(br.receipt, "tee_attestation", None)
+             for br in ready.batch.receipts]
+        )
+
         batch_id, commit_ts = await self._contract.commit_batch(
             provider_address=provider_address,
             requester_address=requester_address,
@@ -493,6 +506,7 @@ class BatchSettlementClient:
             tier_slash_rate_bps=slash_rate_bps,
             consensus_group_id=group_id,
             metadata_uri="",
+            attestation_commitment=attestation_commitment,
         )
 
         return CommittedBatch(
