@@ -4869,6 +4869,21 @@ class PRSMNode:
         if self._started:
             return
 
+        # Sprint 1245 — opt-in bounded/rotated FILE logging. The proven deploy
+        # posture (`setsid -f bash start_node.sh … >log 2>&1`) grows an unbounded
+        # logfile → fills the disk → kills a long-running node. PRSM_LOG_FILE
+        # attaches a size-capped RotatingFileHandler to the root logger instead.
+        # No-op (stdout-only, byte-identical) when unset; fail-soft so logging
+        # setup can never block startup. Done FIRST so the node's own startup
+        # logs land in the rotated file from the very beginning.
+        try:
+            from prsm.core.logging_config import configure_rotating_file_logging
+            _log_file = configure_rotating_file_logging()
+            if _log_file:
+                logger.info("Sprint 1245: node logs → rotating file %s", _log_file)
+        except Exception:  # noqa: BLE001 — logging setup must never block startup
+            pass
+
         # Sprint 762 — operator-facing CPU politeness via os.nice().
         # Consumer-device operators (MacBook, gaming PC) often want
         # the daemon to YIELD CPU to their interactive workloads
