@@ -104,6 +104,12 @@ class NodeSignatureMaterial:
     stage_index: int
     output_hash: str
     executed_at_unix: int
+    # sp1238 — optional per-stage attestation (the audit-only schema dict, e.g.
+    # from tee_attestation_audit_dict). Carried onto this stage's
+    # ShardExecutionReceipt so the per-stage attestation survives to the
+    # settlement boundary. None = unchanged (NOT in the signed payload / leaf →
+    # zero consensus impact); the worker-emission brick populates it.
+    tee_attestation: Optional[Dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -444,7 +450,7 @@ def split_receipt_to_per_node_batched_receipts(
             output_hash=mat.output_hash,
             executed_at_unix=mat.executed_at_unix,
             signature=mat.signature,             # the node's OWN signature
-            tee_attestation=None,
+            tee_attestation=mat.tee_attestation,  # sp1238 — per-stage attestation (audit-only)
         )
         # local_escrow_id namespaces the per-node share-batch under the job +
         # this node so the accumulator's sp973 idempotency key is stable +

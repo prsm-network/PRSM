@@ -42,6 +42,48 @@ def build_receipt_signing_payload(
     return keccak(raw)
 
 
+def tee_attestation_audit_dict(
+    attestation: Any, tee_type: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Sprint 1238 (TEE Tier-3 roadmap C) — build the audit-only
+    ``ShardExecutionReceipt.tee_attestation`` dict from a receipt's raw
+    attestation BYTES (+ optional ``TEEType``), so the attestation survives to
+    the settlement boundary for inspection / re-verification by a settler or
+    auditor. Returns ``None`` for an empty attestation.
+
+    PURELY ADDITIVE / audit-only: this field is NOT in the receipt's signing
+    payload (``build_receipt_signing_payload``) nor the merkle leaf
+    (``batched_receipt_to_leaf``) — it's a Phase-2.1 schema reservation — so
+    threading it has ZERO signature / leaf / consensus impact.
+    """
+    if not attestation:
+        return None
+    import base64
+    blob = bytes(attestation)
+    try:
+        from prsm.compute.inference.attestation_backends import (
+            SOFTWARE_TEE_ATTESTATION_PREFIX,
+        )
+        is_dev_only = blob.startswith(SOFTWARE_TEE_ATTESTATION_PREFIX)
+    except Exception:  # noqa: BLE001
+        is_dev_only = False
+    try:
+        from prsm.compute.inference.multi_stage_attestation import (
+            is_multi_stage_attestation,
+        )
+        is_multi_stage = bool(is_multi_stage_attestation(blob))
+    except Exception:  # noqa: BLE001
+        is_multi_stage = False
+    d: Dict[str, Any] = {
+        "attestation_b64": base64.b64encode(blob).decode("ascii"),
+        "is_dev_only": is_dev_only,
+        "is_multi_stage": is_multi_stage,
+    }
+    if tee_type is not None:
+        d["tee_type"] = getattr(tee_type, "value", str(tee_type))
+    return d
+
+
 def settlement_job_id(request_id: str, *, streamed: bool) -> str:
     """Deterministic settlement ``job_id`` for an inference, derived purely from
     its ``request_id``.

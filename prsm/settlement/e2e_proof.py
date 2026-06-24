@@ -61,6 +61,8 @@ def build_signed_batched_receipt(
     value_wei: int,
     local_escrow_id: str,
     shard_index: int = 0,
+    tee_attestation: Any = None,
+    tee_type: Any = None,
 ):
     """Build a challenge-defensible signed ``BatchedReceipt``: sign the canonical
     shard payload with ``identity`` (the same preimage the on-chain
@@ -72,6 +74,7 @@ def build_signed_batched_receipt(
     from prsm.compute.shard_receipt import (
         ShardExecutionReceipt,
         build_receipt_signing_payload,
+        tee_attestation_audit_dict,
     )
     from prsm.settlement.accumulator import BatchedReceipt
 
@@ -88,7 +91,9 @@ def build_signed_batched_receipt(
         output_hash=output_hash,
         executed_at_unix=executed_at_unix,
         signature=signature_b64,
-        tee_attestation=None,
+        # sp1238 — optional audit-only attestation carriage (default None →
+        # unchanged; NOT in the signing payload / leaf, so zero consensus impact).
+        tee_attestation=tee_attestation_audit_dict(tee_attestation, tee_type),
     )
     return BatchedReceipt(
         receipt=receipt,

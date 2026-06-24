@@ -47,6 +47,7 @@ from typing import Any
 from prsm.compute.shard_receipt import (
     ShardExecutionReceipt,
     build_receipt_signing_payload,
+    tee_attestation_audit_dict,
 )
 from prsm.settlement.accumulator import BatchedReceipt
 
@@ -193,7 +194,14 @@ def inference_receipt_to_batched_receipt(
         output_hash=output_hash_hex,
         executed_at_unix=executed_at_unix,
         signature=signature,
-        tee_attestation=None,                  # ir.tee_attestation is bytes, not a dict
+        # sp1238 — carry the inference's attestation to the settlement boundary
+        # as the audit-only schema dict (NOT in the signing payload / merkle
+        # leaf → zero consensus impact). Was hardcoded None because ir's
+        # attestation is raw bytes; tee_attestation_audit_dict converts it.
+        tee_attestation=tee_attestation_audit_dict(
+            getattr(receipt, "tee_attestation", None),
+            getattr(receipt, "tee_type", None),
+        ),
     )
     return BatchedReceipt(
         receipt=shard_receipt,
