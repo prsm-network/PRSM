@@ -348,11 +348,16 @@ def build_dht_backed_pool_provider(
         # provide it). Fall back to `.known_peers.values()` for
         # callers (legacy test fixtures, mock objects) where
         # the method returns something unusable.
-        # Sprint 1085 — whether this discovery transport AUTHENTICATES a peer's node_id.
-        # The WebSocket PeerDiscovery verifies sha256(pubkey)==node_id + a signature on
-        # every announce; the libp2p gossip path does not (sp1010 Residual A). When the
-        # node_id isn't authenticated, a peer's attestation must not grant a hardware tier
-        # (the sp1083 binding is void). Default True for back-compat (WS + test fixtures).
+        # Sprint 1085/1246 — the COARSE transport-level authentication default, used
+        # ONLY as the fallback when a peer's per-entry marker is None (see below). The
+        # WebSocket PeerDiscovery verifies sha256(pubkey)==node_id + a signature on every
+        # announce; the libp2p path now ALSO authenticates — discovery announces
+        # self-verify (sp1086/1087) and gossip authenticates the origin (sp1246) — but its
+        # class default stays False because the only entries reaching here with per-entry
+        # None are the unauthenticated connectivity stubs (peer_join / DHT find_providers,
+        # explicitly marked False). When a node_id isn't authenticated, its attestation
+        # must not grant a hardware tier (the sp1083 binding is void). Default True for
+        # back-compat (WS + test fixtures).
         _node_id_authd = bool(getattr(discovery, "node_id_authenticated", True))
         peer_list: List[Any] = []
         getter = getattr(discovery, "get_known_peers", None)

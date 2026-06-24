@@ -12,25 +12,39 @@ Subsequent callbacks for the same subtype reuse the existing subscription.
 
 Message envelope format (JSON, published to GossipSub topic):
     {
-        "subtype":   str,   # e.g. "job_offer"
-        "data":      dict,
-        "sender_id": str,
-        "timestamp": float
+        "subtype":      str,    # e.g. "job_offer"
+        "data":         dict,
+        "sender_id":    str,
+        "timestamp":    float,
+        # sp1246 — sp934 origin attestation (lets a receiver authenticate the
+        # author across multi-hop relay) + the nonce bound into its signature:
+        "nonce":        str,
+        "origin":       str,    # author node_id
+        "origin_time":  float,
+        "origin_pubkey": str,   # base64
+        "origin_sig":   str,    # base64
     }
 """
 
 import json
 import logging
 import time
+import uuid
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
+from prsm.node.gossip import (
+    _attestation_from_payload,
+    _authenticate_origin,
+    build_gossip_origin_fields,
+)
 from prsm.node.transport import MSG_GOSSIP, P2PMessage
 
 logger = logging.getLogger(__name__)
 
 # Re-export the same callback type as gossip.py
 GossipCallback = Callable[[str, Dict[str, Any], str], Coroutine[Any, Any, None]]
-# (subtype, payload, sender_id) -> None
+# (subtype, data, origin) -> None  — sp1246: the 3rd arg is the AUTHENTICATED
+# origin (sp934), not the raw relay sender_id.
 
 
 class Libp2pGossip:
@@ -162,11 +176,23 @@ class Libp2pGossip:
         topic = self._topic_name(subtype)
         sender_id = self.transport.identity.node_id
 
+        # sp1246 (Residual A) — attach the sp934 origin attestation + a fresh nonce
+        # (bound into the signed bytes) so a receiver can authenticate THIS node as
+        # the author across multi-hop GossipSub relay, exactly as the WebSocket
+        # GossipProtocol.publish does. A discovery `data` payload may ALSO carry its
+        # own sp937/sp1086 attestation — the two layers coexist (envelope vs data)
+        # and must not be conflated.
+        nonce = uuid.uuid4().hex[:16]
+        origin_fields = build_gossip_origin_fields(
+            self.transport.identity, subtype, data, time.time(), nonce,
+        )
         envelope = {
             "subtype": subtype,
             "data": data,
             "sender_id": sender_id,
             "timestamp": time.time(),
+            "nonce": nonce,
+            **origin_fields,
         }
 
         payload_bytes = json.dumps(envelope).encode("utf-8")
@@ -191,7 +217,7 @@ class Libp2pGossip:
             if self.ledger and subtype != "heartbeat":
                 try:
                     await self.ledger.log_gossip(
-                        nonce="",
+                        nonce=nonce,
                         subtype=subtype,
                         origin=sender_id,
                         payload=data,
@@ -245,24 +271,39 @@ class Libp2pGossip:
         if not subtype:
             return
 
+        # sp1246 (Residual A) — authenticate the ORIGIN, exactly as the WebSocket
+        # GossipProtocol does: trust payload['origin'] only if its attestation
+        # verifies (pubkey hashes to the claimed node_id AND the signature checks
+        # out), else fall back to the transport-relayed sender_id — NEVER the bare,
+        # unsigned payload origin. Security-critical subscribers (settlement _on_ad:
+        # admit iff origin == announcer_id) are thus secure-by-design, not merely
+        # fail-safe-by-omission. Discovery subscribers self-verify their `data`
+        # (sp1086/1087/1097) and ignore this arg, so they are unaffected.
+        origin = _authenticate_origin(payload, payload.get("nonce", ""), sender_id)
+
         callbacks = self._callbacks.get(subtype, [])
         for cb in callbacks:
             try:
-                await cb(subtype, data, sender_id)
+                await cb(subtype, data, origin)
                 self._telemetry["deliver_total"] += 1
             except Exception as exc:
                 logger.error("Gossip callback error (%s): %s", subtype, exc)
                 self._telemetry["error_total"] += 1
 
-        # Optional ledger persistence
+        # Optional ledger persistence. sp1246 — mirror the WebSocket GossipProtocol
+        # (gossip.py): persist the AUTHENTICATED origin (not the relay sender_id),
+        # the signature-bound envelope nonce (not msg.nonce, which the transport may
+        # regenerate), and the sp961 attestation so a future digest catch-up consumer
+        # can RE-verify authorship relayer-independently (_authenticate_catchup_origin).
         if self.ledger and subtype != "heartbeat":
             try:
                 await self.ledger.log_gossip(
-                    nonce=msg.nonce,
+                    nonce=payload.get("nonce") or msg.nonce,
                     subtype=subtype,
-                    origin=sender_id,
+                    origin=origin,
                     payload=data,
                     ttl=msg.ttl,
+                    attestation=_attestation_from_payload(payload),
                 )
             except Exception:
                 pass

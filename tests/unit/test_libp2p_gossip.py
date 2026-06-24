@@ -20,8 +20,12 @@ from prsm.node.transport import MSG_GOSSIP, P2PMessage
 def _make_transport(node_id: str = "test-node-001") -> MagicMock:
     """Return a minimal mock that looks like Libp2pTransport."""
     transport = MagicMock()
-    transport.identity = MagicMock()
-    transport.identity.node_id = node_id
+    # sp1246 — publish() now signs an sp934 origin attestation, so the transport
+    # needs a REAL identity (public_key_b64 + sign) that JSON-serializes, not a
+    # MagicMock. node_id is used as the display name (the derived node_id differs
+    # but no test asserts a specific value).
+    from prsm.node.identity import generate_node_identity
+    transport.identity = generate_node_identity(node_id)
     transport._handle = 0
     transport._lib = MagicMock()
     transport._lib.PrsmSubscribe.return_value = 0

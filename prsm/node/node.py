@@ -59,26 +59,35 @@ logger = logging.getLogger(__name__)
 
 
 def _check_libp2p_origin_auth_gap() -> None:
-    """sp1010 — startup guard for the un-authenticated libp2p transport.
+    """sp1010/sp1246 — startup advisory for the libp2p transport (Residual A).
 
-    The libp2p gossip/discovery handlers carry none of the origin-authentication
-    the WebSocket stack has (sp934/937/941/1005), so libp2p is vulnerable to
-    peer-exchange eclipse + index poisoning (see
-    docs/2026-06-04-p2p-substrate-hunt-residuals.md, Residual A). The path is
-    latent on the Linux fleet (its native library is absent), but
-    transport_backend defaults to "libp2p", so this guard ensures the unhardened
-    path cannot ship silently: it always logs CRITICAL, and hard-refuses when the
-    operator opts into enforcement via PRSM_FORBID_UNAUTHENTICATED_LIBP2P.
+    Origin-authentication is now PORTED to libp2p: discovery announces self-verify
+    their data (sp1086/1087 attestation + sp1097 replay/cap) and the gossip layer
+    authenticates the message origin (sp1246: the same sp934 envelope attestation +
+    fallback the WebSocket GossipProtocol uses), so the eclipse / index-poisoning
+    vectors the WebSocket stack defends against are now covered on libp2p too.
+
+    libp2p nonetheless remains OPT-IN: transport_backend defaults to "websocket"
+    (config.py, sp1188) and the live fleet runs WebSocket exclusively; the native
+    library is also absent on the Linux fleet, so the path is latent. Two honest
+    residuals keep it opt-in until a live cross-host validation: there is still no
+    authenticated PEER-EXCHANGE relay path on libp2p (no DISCOVERY_PEER_REQUEST/
+    RESPONSE equivalent), and direct-message sender binding (the Noise-authenticated
+    PeerID → node_id cross-check) is a deferred follow-on. This advisory logs WARNING
+    and still hard-refuses when an operator opts into strict enforcement via
+    PRSM_FORBID_UNAUTHENTICATED_LIBP2P. See
+    docs/2026-06-04-p2p-substrate-hunt-residuals.md (Residual A).
     """
     msg = (
-        "transport_backend=libp2p selected, but the libp2p gossip/discovery path "
-        "lacks the origin-authentication the WebSocket stack carries "
-        "(sp934/937/941/1005) — it is vulnerable to peer-exchange eclipse and "
-        "content-index poisoning. Do NOT use libp2p in production until the "
-        "attestation is ported; prefer PRSM_TRANSPORT_BACKEND=websocket. See "
-        "docs/2026-06-04-p2p-substrate-hunt-residuals.md (Residual A)."
+        "transport_backend=libp2p selected. Origin-authentication IS ported "
+        "(discovery sp1086/1087/1097 + gossip-layer sp1246), so eclipse / index "
+        "poisoning are covered — but libp2p is still OPT-IN: no authenticated "
+        "peer-exchange relay path yet and direct-message sender-binding is a "
+        "deferred follow-on, so prefer PRSM_TRANSPORT_BACKEND=websocket until a live "
+        "cross-host validation. See docs/2026-06-04-p2p-substrate-hunt-residuals.md "
+        "(Residual A)."
     )
-    logger.critical("SECURITY: %s", msg)
+    logger.warning("SECURITY: %s", msg)
     if os.environ.get("PRSM_FORBID_UNAUTHENTICATED_LIBP2P", "").strip().lower() in (
         "1", "true", "yes", "on",
     ):

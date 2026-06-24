@@ -155,12 +155,19 @@ class Libp2pDiscovery:
     code can swap implementations without changes.
     """
 
-    # Sprint 1085 — the libp2p gossip path does NOT authenticate a peer's claimed
-    # node_id (sp1010 Residual A: it trusts a payload-supplied node_id without the
-    # sha256(pubkey)==node_id + signature check the WebSocket PeerDiscovery enforces).
-    # The DHT pool provider reads this to refuse honoring an attestation-derived
-    # hardware tier from a libp2p-discovered peer (the sp1083 binding is void without an
-    # authenticated node_id). Flip to True when libp2p origin-auth is ported.
+    # Sprint 1085/1246 — the COARSE transport-level authentication default. The DHT
+    # pool provider (dht_backed_pool_provider) reads it ONLY as the fallback for an
+    # entry whose PER-ENTRY ``PeerInfo.node_id_authenticated`` is None; a per-entry
+    # marker (True for an attested capability/shard announce :1195 / verified bootstrap
+    # credential :575, False for a credential-less bootstrap entry) always overrides it.
+    #
+    # It DELIBERATELY stays False even though libp2p gossip origin-auth is now ported
+    # (sp1086/1087 data attestation + sp1246 gossip-layer sp934 envelope auth + sp1097
+    # replay/cap): the only entries that reach the pool provider with per-entry None are
+    # the UNAUTHENTICATED connectivity paths — peer_join hydration and DHT find_providers
+    # stubs (both now explicitly node_id_authenticated=False). Flipping this to True would
+    # grant THOSE entries tier-trust while giving attested peers nothing (they already
+    # carry per-entry True), so the flip is all risk and no benefit — keep it False.
     node_id_authenticated: bool = False
 
     def __init__(
@@ -676,6 +683,10 @@ class Libp2pDiscovery:
                             address=endpoint,
                             last_seen=time.time(),
                             last_capability_update=time.time(),
+                            # sp1246 — a peer_join carries only id+endpoint (no
+                            # attestation); mark it unauthenticated so the pool
+                            # provider never grants it a tier on the class default.
+                            node_id_authenticated=False,
                         ),
                     )
                     self._bootstrap_status["peer_join_events"] += 1
@@ -1021,6 +1032,9 @@ class Libp2pDiscovery:
                         address="",
                         last_seen=time.time(),
                         last_capability_update=time.time(),
+                        # sp1246 — a DHT find_providers stub has no attestation;
+                        # mark it unauthenticated so it can never be tier-trusted.
+                        node_id_authenticated=False,
                     )
                 )
 
