@@ -24,6 +24,7 @@ from pydantic import BaseModel
 from sqlalchemy import text
 
 from prsm.core.config import get_settings
+from prsm.core.redis_client import resolve_async_redis  # sp1248
 
 logger = structlog.get_logger(__name__)
 settings = get_settings()
@@ -521,10 +522,15 @@ class JWTHandler:
         """
         try:
             # Tier 1: Check Redis cache (fast path)
-            if self.redis_client:
+            # sp1248 — resolve the inner async Redis (self.redis_client is the
+            # RedisClient wrapper, which has no .get; the wrapper bug made this cache
+            # ALWAYS miss → every revocation check fell through to PostgreSQL. Safe
+            # but pointless caching — now the fast path actually works.)
+            _redis = resolve_async_redis(self.redis_client)
+            if _redis is not None:
                 try:
                     cache_key = f"token_revoked:{token_hash[:16]}"
-                    cached_status = await self.redis_client.get(cache_key)
+                    cached_status = await _redis.get(cache_key)
 
                     if cached_status is not None:
                         is_revoked = cached_status in (b"1", "1", True, b"true", "true")
@@ -552,10 +558,11 @@ class JWTHandler:
                     is_revoked = result.scalar() is not None
 
                     # Cache the result in Redis for future lookups
-                    if self.redis_client:
+                    _redis = resolve_async_redis(self.redis_client)  # sp1248
+                    if _redis is not None:
                         try:
                             cache_key = f"token_revoked:{token_hash[:16]}"
-                            await self.redis_client.setex(
+                            await _redis.setex(
                                 cache_key,
                                 REVOCATION_CACHE_TTL,
                                 "1" if is_revoked else "0"
@@ -624,10 +631,11 @@ class JWTHandler:
                     await session.commit()
 
             # Immediately update Redis cache
-            if self.redis_client:
+            _redis = resolve_async_redis(self.redis_client)  # sp1248
+            if _redis is not None:
                 try:
                     cache_key = f"token_revoked:{token_hash[:16]}"
-                    await self.redis_client.setex(
+                    await _redis.setex(
                         cache_key,
                         86400,  # 24 hour TTL for revoked tokens
                         "1"
@@ -709,10 +717,11 @@ class JWTHandler:
                         })
 
                         # Update Redis cache
-                        if self.redis_client:
+                        _redis = resolve_async_redis(self.redis_client)  # sp1248
+                        if _redis is not None:
                             try:
                                 cache_key = f"token_revoked:{token_row.token_hash[:16]}"
-                                await self.redis_client.setex(cache_key, 86400, "1")
+                                await _redis.setex(cache_key, 86400, "1")
                             except Exception:
                                 pass  # Cache update failure is non-critical, database is authoritative
 
