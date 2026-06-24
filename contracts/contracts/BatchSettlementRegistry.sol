@@ -199,6 +199,12 @@ contract BatchSettlementRegistry is Ownable2Step, Pausable {
         address stakeBondAtCommit;
         address signatureVerifierAtCommit;
         string  metadataURI;          // optional IPFS pointer (see §10.7 of design)
+        // sp1240 (TEE Tier-3 roadmap F) — optional commitment to this batch's
+        // TEE attestation tier/measurement (off-chain-computed, stored verbatim).
+        // APPENDED at the struct end so the existing field layout is unchanged.
+        // bytes32(0) = no attestation (legacy commitBatch path). NEVER part of
+        // batchId or merkleRoot — pure metadata, zero consensus impact (sp1238).
+        bytes32 attestationCommitment;
     }
 
     /// @dev Challenge window in seconds. Governance-adjustable.
@@ -362,6 +368,16 @@ contract BatchSettlementRegistry is Ownable2Step, Pausable {
         string metadataURI
     );
 
+    /// @dev sp1240 (TEE Tier-3 roadmap F) — emitted ALONGSIDE BatchCommitted
+    /// (a SEPARATE event so BatchCommitted's topic0 + decoders stay unchanged)
+    /// only when a batch carries a non-zero TEE attestation commitment. Lets
+    /// indexers/auditors correlate a batch with its committed attestation tier.
+    event BatchAttestationCommitted(
+        bytes32 indexed batchId,
+        address indexed provider,
+        bytes32 attestationCommitment
+    );
+
     event BatchFinalized(
         bytes32 indexed batchId,
         address indexed provider,
@@ -445,15 +461,20 @@ contract BatchSettlementRegistry is Ownable2Step, Pausable {
      * @param metadataURI optional off-chain pointer (e.g., ipfs://...)
      * @return batchId deterministic identifier for the committed batch
      */
-    function commitBatch(
+    // sp1240 — shared commit core. Both the legacy commitBatch (attestation =
+    // bytes32(0)) and commitBatchWithAttestation delegate here so they can NEVER
+    // drift. batchId derivation below is byte-identical regardless of
+    // attestationCommitment — it is NOT in the keccak preimage.
+    function _commitBatch(
         address requester,
         bytes32 merkleRoot,
         uint256 receiptCount,
         uint256 totalValueFTNS,
         uint16 tierSlashRateBps,
         bytes32 consensusGroupId,
-        string calldata metadataURI
-    ) external whenNotPaused returns (bytes32 batchId) {
+        string calldata metadataURI,
+        bytes32 attestationCommitment
+    ) internal returns (bytes32 batchId) {
         if (requester == address(0)) revert ZeroRequester();
         if (merkleRoot == bytes32(0)) revert EmptyMerkleRoot();
         if (receiptCount == 0) revert ZeroReceiptCount();
@@ -507,6 +528,7 @@ contract BatchSettlementRegistry is Ownable2Step, Pausable {
         b.stakeBondAtCommit = address(stakeBond);
         b.signatureVerifierAtCommit = address(signatureVerifier);
         b.metadataURI = metadataURI;
+        b.attestationCommitment = attestationCommitment;  // sp1240 (default bytes32(0))
         // L4 self-audit INFO-5 (D-06) fix: write `status = PENDING` LAST
         // so any future addition that introduces an external call
         // (currently none) cannot observe a half-initialised batch in
@@ -541,6 +563,56 @@ contract BatchSettlementRegistry is Ownable2Step, Pausable {
             totalValueFTNS,
             uint64(block.timestamp),
             metadataURI
+        );
+        // sp1240 — separate additive event, only for attested batches, so
+        // BatchCommitted's topic0 + decoders stay unchanged.
+        if (attestationCommitment != bytes32(0)) {
+            emit BatchAttestationCommitted(batchId, msg.sender, attestationCommitment);
+        }
+    }
+
+    /**
+     * @notice Commit a batch (no TEE attestation). Selector + behavior unchanged
+     *         — un-upgraded clients keep working. Delegates to _commitBatch with
+     *         a zero attestation commitment.
+     */
+    function commitBatch(
+        address requester,
+        bytes32 merkleRoot,
+        uint256 receiptCount,
+        uint256 totalValueFTNS,
+        uint16 tierSlashRateBps,
+        bytes32 consensusGroupId,
+        string calldata metadataURI
+    ) external whenNotPaused returns (bytes32 batchId) {
+        return _commitBatch(
+            requester, merkleRoot, receiptCount, totalValueFTNS,
+            tierSlashRateBps, consensusGroupId, metadataURI, bytes32(0)
+        );
+    }
+
+    /**
+     * @notice sp1240 (TEE Tier-3 roadmap F) — commit a batch WITH an on-chain
+     *         commitment to its TEE attestation tier/measurement. Identical to
+     *         commitBatch in every consensus-relevant way (same batchId, same
+     *         merkleRoot, same challenge/finalize/slash semantics); the only
+     *         additions are the stored attestationCommitment + the
+     *         BatchAttestationCommitted event. attestationCommitment is
+     *         off-chain-computed + stored verbatim (the chain never re-hashes it).
+     */
+    function commitBatchWithAttestation(
+        address requester,
+        bytes32 merkleRoot,
+        uint256 receiptCount,
+        uint256 totalValueFTNS,
+        uint16 tierSlashRateBps,
+        bytes32 consensusGroupId,
+        string calldata metadataURI,
+        bytes32 attestationCommitment
+    ) external whenNotPaused returns (bytes32 batchId) {
+        return _commitBatch(
+            requester, merkleRoot, receiptCount, totalValueFTNS,
+            tierSlashRateBps, consensusGroupId, metadataURI, attestationCommitment
         );
     }
 
