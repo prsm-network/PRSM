@@ -84,6 +84,60 @@ def tee_attestation_audit_dict(
     return d
 
 
+def attestation_tier_from_audit_dict(d: Any) -> Any:
+    """Sprint 1241 — map a tee_attestation audit dict (sp1238) to an
+    AttestationTier. The audit dict carries tee_type + is_dev_only + is_multi_stage
+    but NOT vendor_verified, so a real hardware quote maps to HARDWARE_UNVERIFIED
+    (the on-chain ceiling) — an auditor re-verifies off-chain against the committed
+    measurement. Lazy import keeps compute decoupled from enterprise."""
+    from prsm.enterprise.tee_policy import AttestationTier
+    if not d or not isinstance(d, dict):
+        return AttestationTier.NONE
+    if d.get("is_dev_only"):
+        return AttestationTier.SOFTWARE  # DEV-ONLY software stub
+    tee_type = (d.get("tee_type") or "").lower()
+    if tee_type in ("sgx", "tdx", "sev", "secure_enclave"):
+        return AttestationTier.HARDWARE_UNVERIFIED
+    if tee_type == "software":
+        return AttestationTier.SOFTWARE
+    return AttestationTier.NONE
+
+
+def batch_attestation_commitment(audit_dicts: Any) -> bytes:
+    """Sprint 1241 (TEE Tier-3 roadmap F off-chain) — deterministic bytes32
+    commitment over a batch's per-receipt tee_attestation audit dicts, for the
+    on-chain ``commitBatchWithAttestation``. WEAKEST-LINK: the batch tier is the
+    LOWEST across receipts (one un-attested receipt collapses the batch). Returns
+    ``bytes32(0)`` when no receipt carries an attestation (→ legacy commitBatch).
+
+    Canonical encoding — auditors MUST reproduce it EXACTLY (the chain stores the
+    bytes verbatim, never re-hashing):
+      per-receipt triple = [tier_rank:int, tee_type:str, is_multi_stage:bool]
+      measurement = keccak256(utf8(json.dumps(sorted(triples), separators=(',',':'))))
+      commitment  = keccak256(abi.encode(['uint8','bytes32','bool'],
+                              [min_tier_rank, measurement, all_multi_stage]))
+    """
+    import json
+    from eth_abi import encode as _abi_encode
+    from prsm.enterprise.tee_policy import tier_rank
+    dicts = list(audit_dicts or [])
+    if not dicts or all(not d for d in dicts):
+        return b"\x00" * 32
+    triples = sorted(
+        [tier_rank(attestation_tier_from_audit_dict(d)),
+         ((d or {}).get("tee_type") or ""),
+         bool((d or {}).get("is_multi_stage"))]
+        for d in dicts
+    )
+    measurement = keccak(
+        json.dumps(triples, separators=(",", ":")).encode("utf-8"))
+    min_tier_rank = min(t[0] for t in triples)
+    all_multi_stage = all(t[2] for t in triples)
+    return keccak(_abi_encode(
+        ["uint8", "bytes32", "bool"],
+        [min_tier_rank, measurement, all_multi_stage]))
+
+
 def settlement_job_id(request_id: str, *, streamed: bool) -> str:
     """Deterministic settlement ``job_id`` for an inference, derived purely from
     its ``request_id``.

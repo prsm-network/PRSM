@@ -65,6 +65,30 @@ BATCH_SETTLEMENT_REGISTRY_ABI = [
         "outputs": [{"name": "batchId", "type": "bytes32"}],
     },
     {
+        # sp1241 — commit a batch WITH an on-chain TEE attestation commitment
+        # (only present on the upgraded registry; the client capability-probes).
+        "type": "function", "name": "commitBatchWithAttestation", "stateMutability": "nonpayable",
+        "inputs": [
+            {"name": "requester", "type": "address"},
+            {"name": "merkleRoot", "type": "bytes32"},
+            {"name": "receiptCount", "type": "uint256"},
+            {"name": "totalValueFTNS", "type": "uint256"},
+            {"name": "tierSlashRateBps", "type": "uint16"},
+            {"name": "consensusGroupId", "type": "bytes32"},
+            {"name": "metadataURI", "type": "string"},
+            {"name": "attestationCommitment", "type": "bytes32"},
+        ],
+        "outputs": [{"name": "batchId", "type": "bytes32"}],
+    },
+    {
+        "type": "event", "name": "BatchAttestationCommitted", "anonymous": False,
+        "inputs": [
+            {"name": "batchId", "type": "bytes32", "indexed": True},
+            {"name": "provider", "type": "address", "indexed": True},
+            {"name": "attestationCommitment", "type": "bytes32", "indexed": False},
+        ],
+    },
+    {
         "type": "function", "name": "finalizeBatch", "stateMutability": "nonpayable",
         "inputs": [{"name": "batchId", "type": "bytes32"}], "outputs": [],
     },
@@ -131,6 +155,7 @@ class Web3SettlementContractClient:
         rpc_url: str,
         contract_address: str,
         private_key: Optional[str] = None,
+        supports_attestation: bool = False,
     ) -> None:
         if not HAS_WEB3:
             raise RuntimeError(
@@ -143,6 +168,11 @@ class Web3SettlementContractClient:
             abi=BATCH_SETTLEMENT_REGISTRY_ABI,
         )
         self._account = Account.from_key(private_key) if private_key else None
+        # sp1241 — whether the DEPLOYED registry exposes commitBatchWithAttestation.
+        # Operator-set after deploying the upgraded contract (the legacy contract
+        # lacks the function). Default OFF → always route through legacy
+        # commitBatch, so an un-upgraded deployment can never get a failed tx.
+        self._supports_attestation = bool(supports_attestation)
 
         from prsm.economy.web3.tx_lock_registry import TX_LOCK_REGISTRY
         if self._account is not None:
@@ -166,15 +196,17 @@ class Web3SettlementContractClient:
         tier_slash_rate_bps: int,
         consensus_group_id: bytes,
         metadata_uri: str,
+        attestation_commitment: bytes = b"",
     ) -> Tuple[bytes, int]:
         # provider_address is intentionally NOT forwarded — the contract uses
         # msg.sender for the provider. Kept in the signature for the Protocol +
-        # audit logging only.
+        # audit logging only. sp1241 — attestation_commitment routes to
+        # commitBatchWithAttestation when non-zero AND the registry supports it.
         return await asyncio.to_thread(
             self._commit_batch_sync,
             requester_address, merkle_root, int(receipt_count),
             int(total_value_ftns), int(tier_slash_rate_bps),
-            consensus_group_id, metadata_uri,
+            consensus_group_id, metadata_uri, attestation_commitment,
         )
 
     async def is_finalizable(self, batch_id: bytes) -> bool:
@@ -399,14 +431,30 @@ class Web3SettlementContractClient:
     def _commit_batch_sync(
         self, requester_address, merkle_root, receipt_count,
         total_value_ftns, tier_slash_rate_bps, consensus_group_id, metadata_uri,
+        attestation_commitment: bytes = b"",
     ) -> Tuple[bytes, int]:
         if not self._account:
             raise RuntimeError("private_key required for write calls (commitBatch)")
+        # sp1241 — route to commitBatchWithAttestation ONLY when a non-zero
+        # commitment is supplied AND the deployed registry supports it; otherwise
+        # the legacy commitBatch (so an un-upgraded deployment never gets a failed
+        # tx, and a zero commitment costs nothing extra). Both emit BatchCommitted.
+        _att = bytes(attestation_commitment or b"")
+        _use_att = (
+            self._supports_attestation and _att and _att != b"\x00" * 32
+        )
         with self._tx_lock:
-            tx = self.contract.functions.commitBatch(
-                requester_address, merkle_root, receipt_count, total_value_ftns,
-                tier_slash_rate_bps, consensus_group_id, metadata_uri,
-            ).build_transaction(self._tx_overrides())
+            if _use_att:
+                fn = self.contract.functions.commitBatchWithAttestation(
+                    requester_address, merkle_root, receipt_count, total_value_ftns,
+                    tier_slash_rate_bps, consensus_group_id, metadata_uri, _att,
+                )
+            else:
+                fn = self.contract.functions.commitBatch(
+                    requester_address, merkle_root, receipt_count, total_value_ftns,
+                    tier_slash_rate_bps, consensus_group_id, metadata_uri,
+                )
+            tx = fn.build_transaction(self._tx_overrides())
             receipt = self._sign_send_wait(tx)
 
         logs = self.contract.events.BatchCommitted().process_receipt(receipt)
