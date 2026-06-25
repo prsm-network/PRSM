@@ -15,13 +15,16 @@ Features:
 Note: Requires Ollama to be installed and running locally.
 """
 
+import ipaddress
 import json
 import logging
+import os
+import socket
 import time
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Union
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 from pydantic import BaseModel, Field
@@ -32,6 +35,60 @@ from ..models.integration_models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# sp1268 — cloud metadata endpoints (the classic SSRF target).
+_METADATA_IPS = {"169.254.169.254", "fd00:ec2::254"}
+
+
+def assert_safe_outbound_url(url: str) -> None:
+    """SSRF guard for a user-supplied connector base URL. Raises ValueError if `url` is not a
+    safe outbound target.
+
+    Policy: scheme must be http/https; the host is RESOLVED and EVERY resolved address is
+    checked. Link-local (incl. 169.254.169.254 cloud metadata), reserved, multicast and
+    unspecified addresses are ALWAYS rejected; private (LAN) addresses are rejected unless the
+    host is allowlisted via PRSM_CONNECTOR_ALLOW_INTERNAL_HOSTS (comma-separated); loopback is
+    allowed (a local model server is the connector's legitimate default). Resolving on each
+    call (callers re-invoke before requests) defeats DNS-rebinding.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"connector URL scheme must be http/https, got {parsed.scheme!r}")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("connector URL has no host")
+
+    allowlist = {h.strip().lower() for h in
+                 os.getenv("PRSM_CONNECTOR_ALLOW_INTERNAL_HOSTS", "").split(",") if h.strip()}
+    host_allowed = host.lower() in allowlist
+
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as e:
+        raise ValueError(f"connector URL host {host!r} does not resolve: {e}")
+
+    for info in infos:
+        ip_str = info[4][0].split("%", 1)[0]  # strip any IPv6 zone id
+        try:
+            addr = ipaddress.ip_address(ip_str)
+        except ValueError:
+            raise ValueError(f"connector URL host {host!r} resolved to a non-IP {ip_str!r}")
+        # Loopback (127.0.0.0/8, ::1) is the connector's legitimate default (a local model
+        # server) — allow it before any block check (IPv6 ::1 also classifies as reserved).
+        if addr.is_loopback:
+            continue
+        # Always-blocked classes (never a legitimate outbound target).
+        if (addr.is_link_local or addr.is_reserved or addr.is_multicast
+                or addr.is_unspecified or ip_str in _METADATA_IPS):
+            raise ValueError(
+                f"connector URL host {host!r} resolves to a blocked address {ip_str} "
+                f"(link-local/metadata/reserved)")
+        # Private LAN: needs an explicit allowlist entry.
+        if addr.is_private and not host_allowed:
+            raise ValueError(
+                f"connector URL host {host!r} resolves to a private address {ip_str}; add it "
+                f"to PRSM_CONNECTOR_ALLOW_INTERNAL_HOSTS to permit an internal target")
 
 
 class OllamaModelInfo(BaseModel):
@@ -60,6 +117,9 @@ class OllamaConnector(BaseConnector):
         
         # Ollama configuration
         self.base_url = config.custom_settings.get("base_url", "http://localhost:11434")
+        # sp1268 — SSRF guard: reject a base_url that targets cloud metadata / internal hosts
+        # at construction (the connector registration path is reachable by untrusted input).
+        assert_safe_outbound_url(self.base_url)
         self.timeout = config.custom_settings.get("timeout", 30)
         self.api_version = config.custom_settings.get("api_version", "v1")
         
@@ -401,6 +461,7 @@ class OllamaConnector(BaseConnector):
     async def _stream_pull_request(self, model_name: str, progress_callback: Optional[callable] = None) -> bool:
         """Stream model pull request with progress updates"""
         try:
+            assert_safe_outbound_url(self.base_url)  # sp1268 — SSRF guard (re-resolve)
             url = f"{self.base_url}/api/pull"
             data = {"name": model_name, "stream": True}
             
@@ -517,9 +578,17 @@ class OllamaConnector(BaseConnector):
         if not self.session:
             logger.error("HTTP session not initialized")
             return None
-        
+
+        # sp1268 — re-validate before each request (re-resolves the host → defeats DNS
+        # rebinding between construction and now).
+        try:
+            assert_safe_outbound_url(self.base_url)
+        except ValueError as exc:
+            logger.error(f"Refusing Ollama request to unsafe base_url: {exc}")
+            return None
+
         url = urljoin(self.base_url, endpoint)
-        
+
         try:
             request_start = time.time()
             
