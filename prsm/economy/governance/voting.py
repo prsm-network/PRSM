@@ -8,6 +8,7 @@ Based on execution_plan.md Phase 3, Week 17-18 requirements.
 """
 
 import asyncio
+import os
 import statistics
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
@@ -275,7 +276,18 @@ class TokenWeightedVoting:
                     return False
                 
                 proposal = self.proposals[proposal_id]
-                
+
+                # sp1275 — a CONCLUDED proposal must not accept further votes. A proposal can
+                # conclude EARLY (_should_conclude_voting_early → _conclude_voting sets status
+                # to approved/rejected) while still inside the nominal window; the time-window
+                # check alone would then keep accepting votes on an already-decided proposal.
+                if getattr(proposal, "status", None) != "active":
+                    self.logger.warning(
+                        "Vote rejected — proposal is not active",
+                        proposal_id=str(proposal_id),
+                        status=getattr(proposal, "status", None))
+                    return False
+
                 # Check voting period
                 current_time = datetime.now(timezone.utc)
                 if current_time < proposal.voting_starts or current_time > proposal.voting_ends:
@@ -897,10 +909,28 @@ class TokenWeightedVoting:
     
     
     async def _calculate_total_eligible_voting_power(self) -> float:
-        """Calculate total eligible voting power in the system"""
-        # This is a simplified calculation
-        # In production, this would query all token holders
-        return 1000000.0  # Assume 1M FTNS total eligible voting power
+        """Total eligible voting power — the quorum denominator.
+
+        sp1275 — was a hardcoded 1_000_000.0, a fixed quorum a proposer could size their vote
+        against. This in-memory governance object can't enumerate on-chain FTNS holders, so
+        the operator supplies the real staked-supply figure via
+        PRSM_GOVERNANCE_TOTAL_ELIGIBLE_POWER; we fall back to the legacy default. (A future
+        improvement is to sum staked balances from the on-chain stake registry directly.)
+        """
+        env_val = (os.getenv("PRSM_GOVERNANCE_TOTAL_ELIGIBLE_POWER", "") or "").strip()
+        if env_val:
+            try:
+                value = float(env_val)
+                if value > 0:
+                    return value
+                self.logger.warning(
+                    "PRSM_GOVERNANCE_TOTAL_ELIGIBLE_POWER must be > 0; using default",
+                    value=env_val)
+            except ValueError:
+                self.logger.warning(
+                    "invalid PRSM_GOVERNANCE_TOTAL_ELIGIBLE_POWER; using default",
+                    value=env_val)
+        return 1000000.0  # default eligible-power estimate (operator should set the env)
     
     
     async def _get_approval_threshold(self, proposal_category: str) -> float:
