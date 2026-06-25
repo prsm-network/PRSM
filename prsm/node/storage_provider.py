@@ -621,9 +621,31 @@ class StorageProvider:
             except Exception as e:
                 logger.error(f"Challenge cleanup loop error: {e}")
 
+    async def _compute_trusted_merkle_root(self, cid: str):
+        """sp1253 — recompute the TRUSTED merkle root for a CID from the LOCAL content
+        so proof verification binds to content we actually hold, NOT the
+        provider-supplied (attacker-controllable) root. Returns None when the content
+        isn't locally available → the verifier then fails closed. Uses the same
+        MerkleProofGenerator (default chunk_size) the prover uses, so a genuine proof's
+        root matches. Never raises (must not break the challenge loop)."""
+        try:
+            prover = self._storage_prover
+            client = getattr(prover, "content_client", None) if prover else None
+            if client is None or not hasattr(client, "get_content"):
+                return None
+            content = await client.get_content(cid)
+            if not content:
+                return None
+            from prsm.node.storage_proofs import MerkleProofGenerator
+            return MerkleProofGenerator().build_merkle_tree(content).root_hash
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("sp1253: trusted merkle root unavailable for %s: %s",
+                         (cid or "?")[:16], exc)
+            return None
+
     async def _self_challenge_pinned_content(self) -> None:
         """Challenge ourselves to prove storage of pinned content.
-        
+
         This ensures we can generate valid proofs for content we claim to store.
         """
         now = time.time()
@@ -658,10 +680,14 @@ class StorageProvider:
                     proof = await self._storage_prover.answer_challenge(challenge)
                     
                     if proof:
-                        # Verify our own proof
+                        # sp1253 — verify against a root recomputed from the LOCAL
+                        # content (not the provider-supplied root) so a proof can't be
+                        # forged with an arbitrary tree.
+                        expected_root = await self._compute_trusted_merkle_root(cid)
                         is_valid, error_msg = await self._proof_verifier.verify_proof(
                             proof=proof,
                             challenge=challenge,
+                            expected_merkle_root=expected_root,
                         )
                         
                         if is_valid:
@@ -929,10 +955,17 @@ class StorageProvider:
                 
             # Deserialize and verify the proof
             proof = StorageProof.from_dict(proof_data)
-            
+
+            # sp1253 — bind to a root recomputed from LOCAL content if we hold this
+            # CID; else None → the verifier fails closed (we cannot independently verify
+            # storage of content we have no trusted root for, so we must NOT grant a
+            # forged-proof VERIFIED on the remote path).
+            expected_root = await self._compute_trusted_merkle_root(
+                record.challenge.shard_hash)
             is_valid, error_msg = await self._proof_verifier.verify_proof(
                 proof=proof,
                 challenge=record.challenge,
+                expected_merkle_root=expected_root,
             )
             
             if is_valid:

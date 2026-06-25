@@ -110,10 +110,11 @@ def test_legit_merkle_proof_still_verifies():
     v = _verifier()
     ch = _challenge(v, ProofType.MERKLE)
     merkle = MerkleProofGenerator()
-    _tree, merkle_proof, chunk_data = merkle.generate_challenge_proof(
+    tree, merkle_proof, chunk_data = merkle.generate_challenge_proof(
         content=CONTENT, nonce=ch.nonce, difficulty=ch.difficulty)
     p = _proof(ch, proof_type=ProofType.MERKLE, proof_data=chunk_data, merkle_proof=merkle_proof)
-    ok, err = _run(v.verify_proof(p, ch))
+    # sp1253 — a legit MERKLE proof verifies only when bound to the trusted root.
+    ok, err = _run(v.verify_proof(p, ch, expected_merkle_root=tree.root_hash))
     assert ok is True, err
 
 

@@ -383,9 +383,10 @@ class TestStorageProofVerifier:
             merkle_proof=merkle_proof,
         )
         
-        # Verify proof
-        is_valid, error = await proof_verifier.verify_proof(proof, challenge)
-        
+        # Verify proof (sp1253 — bound to the independently-trusted root)
+        is_valid, error = await proof_verifier.verify_proof(
+            proof, challenge, expected_merkle_root=tree.root_hash)
+
         assert is_valid is True
         assert error == ""
     
@@ -954,12 +955,13 @@ class TestConvenienceFunctions:
             merkle_proof=merkle_proof,
         )
         
-        # Verify
+        # Verify (sp1253 — bound to the trusted root)
         is_valid, error = await verify_storage_proof(
             proof=proof,
             challenge=challenge,
+            expected_merkle_root=tree.root_hash,
         )
-        
+
         assert is_valid is True
 
 
@@ -998,13 +1000,16 @@ class TestIntegration:
         
         assert proof is not None
         
-        # 3. Challenger verifies proof
+        # 3. Challenger verifies proof (sp1253 — against the root recomputed from the
+        # content it holds)
         is_valid, error = await verifier.verify_proof(
             proof=proof,
             challenge=challenge,
             provider_public_key=provider_identity.public_key_bytes,
+            expected_merkle_root=MerkleProofGenerator().build_merkle_tree(
+                sample_content).root_hash,
         )
-        
+
         assert is_valid is True
         
         # 4. Process reward
@@ -1046,9 +1051,11 @@ class TestIntegration:
             )
             proofs.append(proof)
         
-        # Verify all proofs
+        # Verify all proofs (sp1253 — bound to the content's trusted root)
+        trusted_root = MerkleProofGenerator().build_merkle_tree(sample_content).root_hash
         for challenge, proof in zip(challenges, proofs):
-            is_valid, _ = await verifier.verify_proof(proof, challenge)
+            is_valid, _ = await verifier.verify_proof(
+                proof, challenge, expected_merkle_root=trusted_root)
             assert is_valid is True
     
     @pytest.mark.asyncio
@@ -1078,10 +1085,14 @@ class TestIntegration:
             assert proof is not None
             assert proof.proof_type == proof_type
 
-            # sp1252 — the prover can ANSWER all three types, but only MERKLE verifies;
-            # RANGE/FULL now fail closed (their no-op verifiers were forgeable
-            # fail-opens; content-binding is unimplemented).
-            is_valid, _ = await verifier.verify_proof(proof, challenge)
+            # sp1252/1253 — the prover can ANSWER all three types, but only MERKLE
+            # verifies (and only when bound to the content's trusted root); RANGE/FULL
+            # fail closed (no-op verifiers were forgeable fail-opens).
+            expected_root = (
+                MerkleProofGenerator().build_merkle_tree(sample_content).root_hash
+                if proof_type == ProofType.MERKLE else None)
+            is_valid, _ = await verifier.verify_proof(
+                proof, challenge, expected_merkle_root=expected_root)
             assert is_valid is (proof_type == ProofType.MERKLE)
 
 

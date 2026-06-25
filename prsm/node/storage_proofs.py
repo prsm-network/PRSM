@@ -572,14 +572,20 @@ class StorageProofVerifier:
         proof: StorageProof,
         challenge: Optional[StorageChallenge] = None,
         provider_public_key: Optional[bytes] = None,
+        expected_merkle_root: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """Verify a storage proof against a challenge.
-        
+
         Args:
             proof: Proof to verify
             challenge: Challenge being answered (looked up if not provided)
             provider_public_key: Provider's public key for signature verification
-            
+            expected_merkle_root: sp1253 — the TRUSTED merkle root the caller has
+                independently established for the challenged content (recomputed from
+                the actual content it holds, or a stored commitment). MERKLE proofs are
+                verified against THIS, not the provider-supplied (attacker-controllable)
+                root. When None, a MERKLE proof cannot be trusted and FAILS CLOSED.
+
         Returns:
             Tuple of (is_valid, error_message)
         """
@@ -635,7 +641,7 @@ class StorageProofVerifier:
 
         # Verify proof based on type
         if proof.proof_type == ProofType.MERKLE:
-            return self._verify_merkle_proof(proof, challenge)
+            return self._verify_merkle_proof(proof, challenge, expected_merkle_root)
         elif proof.proof_type == ProofType.RANGE:
             return self._verify_range_proof(proof, challenge)
         elif proof.proof_type == ProofType.FULL:
@@ -660,34 +666,47 @@ class StorageProofVerifier:
         self,
         proof: StorageProof,
         challenge: StorageChallenge,
+        expected_merkle_root: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """Verify a Merkle proof.
-        
+
         Args:
             proof: Proof to verify
             challenge: Challenge being answered
-            
+            expected_merkle_root: the TRUSTED root to bind the proof to (sp1253)
+
         Returns:
             Tuple of (is_valid, error_message)
         """
         if proof.merkle_proof is None:
             return False, "Merkle proof missing"
-        
-        # Verify the Merkle proof structure
+
+        # sp1253 — BIND the proof to a TRUSTED root. proof.merkle_proof.root_hash is
+        # ATTACKER-SUPPLIED (the provider builds its own tree), so verifying internal
+        # leaf→root consistency up to it proves NOTHING about whether the provider
+        # actually stores the challenged content — a provider storing nothing could
+        # fabricate a self-consistent tree with its own root and pass. The caller must
+        # supply the root it independently trusts (recomputed from the content it
+        # holds, or a stored commitment). Absent a trusted root the proof is
+        # UNVERIFIABLE → FAIL CLOSED rather than accept the provider's root.
+        if not expected_merkle_root:
+            return False, (
+                "Merkle proof has no trusted root to verify against — fail closed "
+                "(sp1253; caller must supply expected_merkle_root)"
+            )
+        if proof.merkle_proof.root_hash != expected_merkle_root:
+            return False, "Merkle root does not match the trusted root"
+
+        # Verify the Merkle proof structure (leaf→root internal consistency)
         if not self._merkle.verify_proof(proof.merkle_proof):
             return False, "Merkle proof verification failed"
-        
+
         # Verify the proof data matches the leaf hash
         # The proof_data should contain the chunk that hashes to leaf_hash
         computed_hash = hashlib.sha256(proof.proof_data).hexdigest()
         if computed_hash != proof.merkle_proof.leaf_hash:
             return False, "Proof data does not match Merkle leaf"
-        
-        # Verify the nonce was used correctly to select the chunk
-        nonce_hash = hashlib.sha256(challenge.nonce.encode()).hexdigest()
-        # We can't fully verify without knowing the total number of chunks
-        # but we can verify the proof is valid
-        
+
         self._update_challenge_status(proof.challenge_id, ChallengeStatus.VERIFIED)
         return True, ""
     
@@ -1315,16 +1334,20 @@ async def verify_storage_proof(
     proof: StorageProof,
     challenge: StorageChallenge,
     provider_public_key: Optional[bytes] = None,
+    expected_merkle_root: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """Verify a storage proof.
-    
+
     Args:
         proof: Proof to verify
         challenge: Challenge being answered
         provider_public_key: Provider's public key
-        
+        expected_merkle_root: trusted root for MERKLE binding (sp1253; required for a
+            MERKLE proof to verify — None fails closed)
+
     Returns:
         Tuple of (is_valid, error_message)
     """
     verifier = StorageProofVerifier()
-    return await verifier.verify_proof(proof, challenge, provider_public_key)
+    return await verifier.verify_proof(
+        proof, challenge, provider_public_key, expected_merkle_root)
