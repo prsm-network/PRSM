@@ -684,6 +684,25 @@ def require_auth(user: User = Depends(get_current_user)) -> User:
     return user
 
 
+async def resolve_user_role(user_id) -> UserRole:
+    """sp1264 — fetch a user's REAL role by id for an authorization check, FAIL-SAFE to the
+    LOWEST privilege (UserRole.USER) on unknown user / malformed id / lookup error.
+
+    Call sites that only hold a user_id MUST use this instead of hardcoding a role into
+    EnhancedAuthorizationManager.check_permission — a hardcoded ``UserRole.ADMIN`` short-
+    circuits the permission check to ``return True`` and silently grants every authenticated
+    caller admin access (the round-4 audit's hardcoded-ADMIN bypass).
+    """
+    try:
+        user = await auth_manager._get_user_by_id(UUID(str(user_id)))
+        if user is not None and getattr(user, "role", None) is not None:
+            return user.role
+    except Exception as e:  # noqa: BLE001 — never grant privilege on a lookup failure
+        logger.warning("resolve_user_role failed; defaulting to USER (deny)",
+                       user_id=str(user_id), error=str(e))
+    return UserRole.USER
+
+
 def require_permission(permission: Permission):
     """
     FastAPI dependency factory to require specific permission

@@ -342,8 +342,10 @@ async def get_system_credential_status(
         # Check admin permissions for credential system access
         auth_manager = get_enhanced_auth_manager()
         has_permission = await auth_manager.check_permission(
-            user_id=current_user,
-            user_role=UserRole.ADMIN,  # Would fetch actual role from database
+            user_id=str(getattr(current_user, "id", current_user)),
+            # sp1264 — use the authenticated user's REAL role; hardcoding UserRole.ADMIN
+            # short-circuited check_permission to True for ANY authenticated caller.
+            user_role=getattr(current_user, "role", UserRole.USER),
             resource_type="system_credentials",
             action="read"
         )
@@ -354,30 +356,35 @@ async def get_system_credential_status(
                 detail="Admin role required for credential system access"
             )
         
-        # Get secure configuration status
-        status = await secure_config_manager.get_secure_configuration_status()
-        
+        # Get secure configuration status. NB: must NOT be named `status` — that shadows the
+        # imported FastAPI `status` module, so `status.HTTP_403_FORBIDDEN` in the deny branch
+        # above would UnboundLocalError (this was masked while the hardcoded-ADMIN bypass kept
+        # has_permission always True; sp1264 made the deny branch reachable).
+        config_status = await secure_config_manager.get_secure_configuration_status()
+
         # Calculate statistics
-        platform_count = len(status.get("platform_credentials", {}))
+        platform_count = len(config_status.get("platform_credentials", {}))
         platforms_with_creds = sum(
-            1 for creds in status.get("platform_credentials", {}).values()
+            1 for creds in config_status.get("platform_credentials", {}).values()
             if creds.get("credentials_available", False)
         )
-        
+
         return SystemCredentialStatusResponse(
-            migration_completed=status.get("migration_completed", False),
-            system_secrets_secure=status.get("system_secrets_secure", False),
-            platform_credentials=status.get("platform_credentials", {}),
-            credential_manager_available=status.get("credential_manager_available", False),
+            migration_completed=config_status.get("migration_completed", False),
+            system_secrets_secure=config_status.get("system_secrets_secure", False),
+            platform_credentials=config_status.get("platform_credentials", {}),
+            credential_manager_available=config_status.get("credential_manager_available", False),
             total_platforms=platform_count,
             platforms_with_credentials=platforms_with_creds
         )
-        
+
+    except HTTPException:
+        raise  # sp1264 — let the 403 (and any deliberate HTTP error) surface; don't mask it as 500
     except Exception as e:
         logger.error("Failed to get system credential status",
                     user_id=current_user,
                     error=str(e))
-        
+
         raise HTTPException(
             status_code=500,
             detail="Internal server error getting system credential status"
@@ -400,8 +407,9 @@ async def initialize_secure_configuration_endpoint(
         # Check admin permissions for secure configuration initialization
         auth_manager = get_enhanced_auth_manager()
         has_permission = await auth_manager.check_permission(
-            user_id=current_user,
-            user_role=UserRole.ADMIN,  # Would fetch actual role from database
+            user_id=str(getattr(current_user, "id", current_user)),
+            # sp1264 — use the authenticated user's REAL role (see /system/status above).
+            user_role=getattr(current_user, "role", UserRole.USER),
             resource_type="secure_configuration",
             action="create"
         )
@@ -430,7 +438,9 @@ async def initialize_secure_configuration_endpoint(
             "message": "Secure configuration initialization completed" if success else "Secure configuration initialization failed",
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
-        
+
+    except HTTPException:
+        raise  # sp1264 — let the 403 surface; don't mask the auth denial as a 500
     except Exception as e:
         logger.error("Failed to initialize secure configuration",
                     user_id=current_user,

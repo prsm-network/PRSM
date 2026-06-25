@@ -439,12 +439,18 @@ class WebSocketAuthManager:
         try:
             # Import auth manager to check admin permissions
             from prsm.core.security.enhanced_authorization import get_enhanced_auth_manager
-            from prsm.core.auth.models import UserRole
-            
+            # `from <submodule> import <fn>` resolves the real module (dodges the package
+            # __init__ re-export that shadows the submodule name with the singleton instance).
+            from prsm.core.auth.auth_manager import resolve_user_role
+
+            # sp1264 — resolve the caller's REAL role (fail-safe to USER/deny). Hardcoding
+            # UserRole.ADMIN here short-circuited check_permission to True, granting any
+            # authenticated user system-wide conversation access (IDOR).
+            real_role = await resolve_user_role(user_id)
             auth_manager = get_enhanced_auth_manager()
             has_admin_permission = await auth_manager.check_permission(
                 user_id=user_id,
-                user_role=UserRole.ADMIN,  # Would fetch actual role from database
+                user_role=real_role,
                 resource_type="conversations",
                 action="read_all"
             )
