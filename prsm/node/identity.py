@@ -128,33 +128,41 @@ def generate_node_identity(display_name: str = "prsm-node") -> NodeIdentity:
     )
 
 
-def save_node_identity(identity: NodeIdentity, path: Path) -> None:
-    """Save identity to a JSON file with OWNER-ONLY permissions.
+def write_owner_only_file(path: Path, content: str) -> None:
+    """Atomically write text to ``path`` with OWNER-ONLY (0o600) perms + a 0o700 parent,
+    with NO world-readable window for a NEW file.
 
-    sp942 — the identity JSON contains the node's ed25519 PRIVATE key, so it is
-    written 0o600 (and its parent dir 0o700). The previous ``path.write_text``
-    left the key world-readable (default 0o644), exposing the node's signing key
-    to any other local user / co-tenant container process. The file is created
-    with 0o600 BEFORE the key bytes are written (no world-readable window for a
-    new file); a chmod afterwards also tightens a pre-existing file.
+    sp1266 — canonical secret-file writer. ``Path.write_text`` then ``chmod`` leaves a brief
+    0o644 window between creation and the chmod that a co-tenant / other local user could
+    read a secret (private key, JWT, API key) through — the TOCTOU the round-4 audit flagged
+    across several CLI/node paths. ``os.open(..., 0o600)`` sets perms atomically on creation;
+    the mode arg is ignored for a pre-existing file, so we chmod afterwards to tighten one.
     """
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         path.parent.chmod(0o700)
     except OSError:  # pragma: no cover — non-POSIX / permission-denied; best-effort
         pass
-    payload = json.dumps(identity.to_dict(), indent=2)
-    # os.open with mode 0o600 sets perms atomically on a NEW file (no 0o644
-    # window); for a pre-existing file the mode arg is ignored, so chmod after.
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         with os.fdopen(fd, "w") as f:
-            f.write(payload)
+            f.write(content)
     finally:
         try:
             path.chmod(0o600)
         except OSError:  # pragma: no cover
             pass
+
+
+def save_node_identity(identity: NodeIdentity, path: Path) -> None:
+    """Save identity to a JSON file with OWNER-ONLY permissions.
+
+    sp942 — the identity JSON contains the node's ed25519 PRIVATE key, so it is
+    written 0o600 (and its parent dir 0o700) with no world-readable window
+    (sp1266 centralized this as ``write_owner_only_file``).
+    """
+    write_owner_only_file(path, json.dumps(identity.to_dict(), indent=2))
 
 
 def load_node_identity(path: Path) -> Optional[NodeIdentity]:

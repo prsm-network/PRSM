@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 from prsm.enterprise.recipient_encryption import (
@@ -77,12 +78,32 @@ def _cmd_encrypt(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_recipient_privkey(args: argparse.Namespace) -> str:
+    """sp1266 — resolve the recipient private key WITHOUT requiring it on argv (a plaintext
+    CLI argument leaks via the process list / shell history). Priority:
+    PRSM_ENTERPRISE_RECIPIENT_PRIVKEY env > --privkey-file > --privkey (legacy/discouraged)."""
+    env_key = (os.environ.get("PRSM_ENTERPRISE_RECIPIENT_PRIVKEY") or "").strip()
+    if env_key:
+        return env_key
+    key_file = getattr(args, "privkey_file", None)
+    if key_file:
+        return open(key_file, "r", encoding="utf-8").read().strip()
+    argv_key = getattr(args, "privkey", None)
+    if argv_key:
+        sys.stderr.write(
+            "WARNING: --privkey on the command line is visible in the process list / shell "
+            "history; prefer PRSM_ENTERPRISE_RECIPIENT_PRIVKEY or --privkey-file.\n")
+        return argv_key
+    raise SystemExit(
+        "decrypt requires a recipient private key: set PRSM_ENTERPRISE_RECIPIENT_PRIVKEY, "
+        "or pass --privkey-file PATH (preferred over --privkey).")
+
+
 def _cmd_decrypt(args: argparse.Namespace) -> int:
-    if not args.privkey:
-        raise SystemExit("decrypt requires --privkey")
+    privkey = _resolve_recipient_privkey(args)
     blob = sys.stdin.read()
     payload = EncryptedPayload.from_dict(json.loads(blob))
-    plaintext = decrypt_for_recipient(payload, args.privkey)
+    plaintext = decrypt_for_recipient(payload, privkey)
     sys.stdout.buffer.write(plaintext)
     return 0
 
@@ -126,7 +147,13 @@ def main(argv: list[str] | None = None) -> int:
             "to stdout."
         ),
     )
-    p_dec.add_argument("--privkey", required=True)
+    # sp1266 — the key is resolved by _resolve_recipient_privkey (env / file / argv); --privkey
+    # is no longer required on argv (it leaks via the process list / shell history).
+    p_dec.add_argument("--privkey", required=False, default=None,
+                       help="DISCOURAGED: visible in the process list. Prefer "
+                            "PRSM_ENTERPRISE_RECIPIENT_PRIVKEY or --privkey-file.")
+    p_dec.add_argument("--privkey-file", required=False, default=None,
+                       help="Path to a file containing the recipient private key (b64).")
 
     args = parser.parse_args(argv)
     if args.command == "keypair-gen":

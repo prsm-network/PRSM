@@ -144,9 +144,10 @@ def _load_credentials() -> Optional[dict]:
 def _save_credentials(data: dict) -> None:
     """Write credentials to disk with restricted permissions (owner-only read)."""
     import json
-    _CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _CREDENTIALS_FILE.write_text(json.dumps(data, indent=2))
-    _CREDENTIALS_FILE.chmod(0o600)
+    from prsm.node.identity import write_owner_only_file
+    # sp1266 — atomic 0o600 write (no world-readable window between create + chmod, the
+    # TOCTOU the round-4 audit flagged for this JWT credentials file).
+    write_owner_only_file(_CREDENTIALS_FILE, json.dumps(data, indent=2))
 
 
 def _clear_credentials() -> None:
@@ -13718,8 +13719,10 @@ def join_testnet(force: bool, no_print_key: bool):
         "",
     ])
 
-    env_path.write_text(env_content)
-    env_path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 600
+    # sp1266 — atomic 0o600 write of the wallet env file (it holds the burner PRIVATE key);
+    # write_text-then-chmod left a world-readable TOCTOU window.
+    from prsm.node.identity import write_owner_only_file
+    write_owner_only_file(env_path, env_content)
 
     console.print(f"\n[bold green]✓ Testnet wallet created[/bold green]")
     console.print(f"\nAddress:    [bold]{address}[/bold]")

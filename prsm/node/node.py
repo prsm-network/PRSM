@@ -1253,25 +1253,37 @@ def ensure_public_bind_api_key(*, api_host, key_path=None, env=None):
                     reason, path)
         return persisted
     # action == "generate"
+    import hashlib as _hashlib
     key = _secrets.token_urlsafe(32)
+    persisted = False
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(key, encoding="utf-8")
-        try:
-            path.chmod(0o600)
-        except Exception:  # noqa: BLE001 — best-effort perms (e.g. Windows)
-            pass
+        from prsm.node.identity import write_owner_only_file
+        # sp1266 — atomic 0o600 write (no world-readable window for the API key file).
+        write_owner_only_file(path, key)
         persisted_note = f"persisted to {path} (0600)"
+        persisted = True
     except Exception as exc:  # noqa: BLE001 — persist failed → still authenticate this run
         logger.warning("Sprint 1195 — could not persist the auto-provisioned API key to "
                        "%s (%s); using it for THIS process only (will regenerate on "
                        "restart).", path, exc)
         persisted_note = "NOT persisted (write failed) — ephemeral for this process"
     e["PRSM_NODE_API_KEY"] = key
-    logger.warning(
-        "Sprint 1195 — auto-provisioned a node API key for the public bind (%s). "
-        "Use it as the Bearer token / X-API-Key for protected endpoints:\n"
-        "    PRSM_NODE_API_KEY=%s\n  (%s)", reason, key, persisted_note)
+    if persisted:
+        # sp1266 — do NOT log the raw key (it leaks the credential to log sinks). Point the
+        # operator to the 0600 file + a short fingerprint to confirm which key is active.
+        _fp = _hashlib.sha256(key.encode()).hexdigest()[:12]
+        logger.warning(
+            "Sprint 1195 — auto-provisioned a node API key for the public bind (%s). "
+            "Read it from %s (0600); fingerprint sha256:%s. Use it as the Bearer token / "
+            "X-API-Key for protected endpoints.", reason, path, _fp)
+    else:
+        # Ephemeral fallback: the file write failed, so the log is the ONLY way to surface the
+        # key this run. Emit it with a strong warning (still better than an unusable node).
+        logger.warning(
+            "Sprint 1195 — auto-provisioned an EPHEMERAL node API key for the public bind "
+            "(%s); could not persist it, so it is shown ONCE here (set PRSM_NODE_API_KEY "
+            "explicitly to avoid logging secrets):\n    PRSM_NODE_API_KEY=%s\n  (%s)",
+            reason, key, persisted_note)
     return key
 
 
