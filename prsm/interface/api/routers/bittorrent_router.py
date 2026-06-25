@@ -6,6 +6,7 @@ FastAPI router for BitTorrent torrent management.
 All endpoints require JWT authentication.
 """
 
+import os
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 
@@ -19,6 +20,58 @@ from prsm.core.bittorrent_client import (
 )
 
 router = APIRouter(prefix="/api/v1/torrents", tags=["BitTorrent"])
+
+
+# ── sp1269 — path confinement (audit round 5) ──────────────────────────────────
+# create/add seeded an arbitrary local content_path to the PUBLIC swarm (exfiltrate the
+# node's private keys); add/download wrote to an arbitrary save_path. Confine both to an
+# allowed torrent data root, rejecting traversal / symlink escape.
+
+def _bt_data_roots() -> List[Path]:
+    """Allowed roots for torrent content + downloads. Override via PRSM_BT_DATA_ROOT
+    (os.pathsep-separated); else the node's <data_dir>/torrents; else ~/.prsm/torrents."""
+    roots: List[Path] = []
+    for part in os.getenv("PRSM_BT_DATA_ROOT", "").split(os.pathsep):
+        part = part.strip()
+        if part:
+            roots.append(Path(part).expanduser())
+    if not roots:
+        try:
+            from prsm.node.node import get_node
+            node = get_node()
+            data_dir = getattr(getattr(node, "config", None), "data_dir", None)
+            if data_dir:
+                roots.append(Path(data_dir) / "torrents")
+        except Exception:  # noqa: BLE001 — node not up / no config → fall through to default
+            pass
+    if not roots:
+        roots.append(Path.home() / ".prsm" / "torrents")
+    return roots
+
+
+def _safe_bt_path(user_path: str, *, must_exist: bool) -> Path:
+    """Resolve ``user_path`` (FOLLOWING symlinks) and confine it to an allowed BT data root.
+
+    Raises HTTP 403 on traversal / symlink escape outside every allowed root, 400 when
+    ``must_exist`` and the resolved path is absent. realpath collapses ``..`` and resolves
+    symlinks, so a symlink planted inside a root that points outside it is rejected.
+    """
+    if not user_path:
+        raise HTTPException(status_code=400, detail="path is required")
+    roots = [Path(os.path.realpath(r)) for r in _bt_data_roots()]
+    for r in roots:
+        try:
+            r.mkdir(parents=True, exist_ok=True)
+        except Exception:  # noqa: BLE001 — best-effort; confinement check still runs
+            pass
+    resolved = Path(os.path.realpath(Path(user_path).expanduser()))
+    if not any(resolved == r or r in resolved.parents for r in roots):
+        raise HTTPException(
+            status_code=403,
+            detail="path must be within an allowed torrent data root (PRSM_BT_DATA_ROOT)")
+    if must_exist and not resolved.exists():
+        raise HTTPException(status_code=400, detail="path does not exist")
+    return resolved
 
 
 # ── Request/Response Models ──────────────────────────────────────────────────
@@ -145,7 +198,7 @@ async def create_torrent(
         )
 
     manifest = await node.bt_provider.seed_content(
-        path=Path(request.content_path),
+        path=_safe_bt_path(request.content_path, must_exist=True),  # sp1269 — confine + no escape
         name=request.name,
         provenance_id=request.provenance_id,
         piece_length=request.piece_length,
@@ -196,17 +249,21 @@ async def add_torrent(
         # Magnet URI — bt_client.add_torrent accepts it directly
         pass  # intentional: source remains the magnet URI string
     else:
-        # Assume it's a file path, read the torrent bytes
+        # Assume it's a .torrent file path — confine it (sp1269: was an arbitrary-file read)
+        safe_source = _safe_bt_path(source, must_exist=True)
         try:
-            with open(source, "rb") as f:
+            with open(safe_source, "rb") as f:
                 source = f.read()
-        except Exception as e:
+        except HTTPException:
+            raise
+        except Exception:
+            # sp1269 — do NOT echo file contents / raw errors back to the caller
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Failed to read torrent file: {e}"
+                detail="Failed to read torrent file"
             )
 
-    save_path = Path(request.save_path) if request.save_path else None
+    save_path = _safe_bt_path(request.save_path, must_exist=False) if request.save_path else None
 
     result = await bt_client.add_torrent(
         source=source,
@@ -322,7 +379,7 @@ async def start_download(
 
     result = await node.bt_requester.request_content(
         infohash=infohash,
-        save_path=Path(request.save_path),
+        save_path=_safe_bt_path(request.save_path, must_exist=False),  # sp1269 — confine writes
         timeout=request.timeout,
     )
 
