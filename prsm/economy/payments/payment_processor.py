@@ -631,7 +631,21 @@ class PaymentProcessor:
                 
                 if not transaction or transaction.crypto_currency != "FTNS":
                     return
-                
+
+                # sp1251 — idempotency guard: credit at most ONCE per transaction. A
+                # replayed/retried (valid, signed) webhook would otherwise re-enter
+                # transfer_tokens → DOUBLE-credit FTNS. The marker lives in the
+                # transaction's JSONB additional_data (no migration) and is persisted
+                # ONLY after a successful transfer, so a genuinely-failed credit can
+                # still retry. (Sequential replay/provider-retry is the dominant vector;
+                # strict concurrent dedup would need row-locking / an event table —
+                # tracked as a follow-on.)
+                _extra = dict(transaction.additional_data or {})
+                if _extra.get("tokens_distributed"):
+                    logger.info("FTNS already distributed — idempotent webhook skip",
+                                transaction_id=transaction_id)
+                    return
+
                 if self.token_distribution_enabled and transaction.crypto_amount:
                     # Distribute FTNS tokens
                     success = await self.ftns_service.transfer_tokens(
@@ -647,8 +661,14 @@ class PaymentProcessor:
                     )
                     
                     if success:
-                        logger.info("FTNS tokens distributed", 
-                                  transaction_id=transaction_id, 
+                        # sp1251 — persist the idempotency marker BEFORE anything else
+                        # (JSONB reassign so SQLAlchemy detects the change) so a
+                        # replay/retry of this webhook can never re-credit.
+                        _extra["tokens_distributed"] = True
+                        transaction.additional_data = _extra
+                        session.commit()
+                        logger.info("FTNS tokens distributed",
+                                  transaction_id=transaction_id,
                                   amount=transaction.crypto_amount)
                         
                         # Log successful conversion
