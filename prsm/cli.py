@@ -694,6 +694,30 @@ def _get_version():
             return "unknown"
 
 
+def _prsm_appears_configured() -> bool:
+    """sp1258 — True once the user is past the brand-new, never-touched state, so the
+    "Run: prsm setup" nudge is suppressed.
+
+    ``~/.prsm/config.yaml`` is the canonical marker, BUT it is not the only way to be
+    configured: a node identity (``~/.prsm/identity.json``, written on first
+    ``node start``) or explicit PRSM_*/wallet env means the user is actively running
+    PRSM — env-driven deploys and SSH-driven node runs never write config.yaml yet work
+    fine, and the nudge was firing on EVERY working command (faucet/deposit/pay-infer/
+    infer), undermining confidence. Genuinely-fresh users (no config, no identity, no
+    env) still get nudged."""
+    import os
+    home = Path.home() / ".prsm"
+    if (home / "config.yaml").exists() or (home / "identity.json").exists():
+        return True
+    return any(
+        (os.environ.get(v) or "").strip()
+        for v in (
+            "PRSM_NETWORK", "PRSM_INFERENCE_EXECUTOR", "FTNS_WALLET_PRIVATE_KEY",
+            "PRIVATE_KEY", "PRSM_NODE_API_KEY", "PRSM_OPERATOR_ADDRESS",
+        )
+    )
+
+
 @click.group()
 @click.version_option(version=_get_version(), prog_name="PRSM")
 @click.pass_context
@@ -713,9 +737,10 @@ def main(ctx):
     except Exception:
         pass  # never block CLI startup on migration issues
 
-    # First-run auto-detection: nudge unconfigured users toward setup
-    config_path = Path.home() / ".prsm" / "config.yaml"
-    if not config_path.exists():
+    # First-run auto-detection: nudge GENUINELY-unconfigured users toward setup.
+    # sp1258 — suppress once the user is past the brand-new state (node identity or
+    # PRSM_*/wallet env present), so the nudge stops firing on working commands.
+    if not _prsm_appears_configured():
         # Don't nag on setup, help, or version invocations
         invoked = ctx.invoked_subcommand or ""
         safe_commands = {"setup", None}  # None = no subcommand (shows help)
