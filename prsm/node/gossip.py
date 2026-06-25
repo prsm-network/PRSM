@@ -193,6 +193,11 @@ GOSSIP_DIGEST_RESPONSE = "digest_response"
 # retention window. Generous cap (legit ~4-7); env-tunable for headroom.
 _MAX_DIGEST_REQUEST_SUBTYPES = 32
 _DIGEST_REQUEST_MAX_LOOKBACK_SEC = 86400.0  # 24h — the gossip-log retention
+# sp1270 — cap the catch-up messages we'll process from a single digest RESPONSE. A legit
+# responder caps its list at 100 (the request-path max_messages); each message triggers a
+# ledger dedup scan, so an unbounded peer-controlled list is a DoS amplifier. 200 = generous
+# slack over the legit 100.
+_MAX_DIGEST_RESPONSE_MESSAGES = 200
 
 
 # sp1008 — gossip-layer replay barrier. The transport dedups nonces only within
@@ -766,11 +771,25 @@ class GossipProtocol:
         """
         data = msg.payload.get("data", {})
         messages = data.get("messages", [])
-        
+
         if not messages:
             logger.debug(f"Received empty digest response from {msg.sender_id[:8]}...")
             return
-        
+
+        # sp1270 — bound the peer-controlled list BEFORE the per-message dedup/auth loop. Each
+        # message triggers a ledger scan via _is_duplicate; an unbounded response would be a
+        # DoS amplifier (one ledger scan per attacker-supplied entry). Legit responses are
+        # capped at 100 by the request path, so truncating to 200 never drops honest data.
+        if not isinstance(messages, list):
+            logger.warning(f"Digest response from {msg.sender_id[:8]}... had a non-list "
+                           f"'messages' field — ignoring")
+            return
+        if len(messages) > _MAX_DIGEST_RESPONSE_MESSAGES:
+            logger.warning(f"Digest response from {msg.sender_id[:8]}... carried "
+                           f"{len(messages)} messages (> cap {_MAX_DIGEST_RESPONSE_MESSAGES}) "
+                           f"— truncating to the cap")
+            messages = messages[:_MAX_DIGEST_RESPONSE_MESSAGES]
+
         logger.info(f"Processing {len(messages)} catch-up messages from {msg.sender_id[:8]}...")
         
         processed = 0
