@@ -19,6 +19,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, status
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import Field
 
 from prsm.core.integrations.core.integration_manager import integration_manager
@@ -94,10 +95,32 @@ integration_router = APIRouter(
 
 # === Dependency Functions ===
 
-async def get_current_user() -> str:
-    """Get current user ID (placeholder for actual auth)"""
-    # This would integrate with PRSM's authentication system
-    return "default_user"
+_integration_security = HTTPBearer(auto_error=True)
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(_integration_security),
+) -> str:
+    """Authenticate the caller via the canonical JWT verifier and return their user id.
+
+    sp1272 (audit round 5): was a stub returning "default_user", which left the entire
+    /integrations/* router (connector registration, import submission, import history)
+    effectively UNAUTHENTICATED. jwt_handler.verify_token enforces signature, expiry, required
+    claims, and revocation; we additionally reject non-access tokens. Returns the user id as a
+    string to preserve the endpoints' existing contract.
+    """
+    from prsm.core.auth.jwt_handler import jwt_handler
+
+    try:
+        token_data = await jwt_handler.verify_token(credentials.credentials)
+    except HTTPException:
+        raise
+    except Exception:  # noqa: BLE001 — never authenticate on a verifier error
+        raise HTTPException(status_code=401, detail="Authentication failed")
+
+    if token_data is None or token_data.token_type != "access":
+        raise HTTPException(status_code=401, detail="Invalid or missing access token")
+    return str(token_data.user_id)
 
 
 async def validate_platform_support(platform: IntegrationPlatform) -> bool:
