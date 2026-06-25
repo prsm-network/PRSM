@@ -103,6 +103,28 @@ class TestAuthMiddlewareResponse:
         assert resp.status_code == 200
 
 
+class TestConstantTimeKeyCompare:
+    """Sprint 1271 (audit round 5) — the API-key check uses hmac.compare_digest. Both
+    operands are fixed-length SHA256 hex digests, so compare_digest's equal-length
+    requirement always holds even when the SUPPLIED key differs wildly in length."""
+
+    def test_wrong_key_of_very_different_length_rejected(self):
+        client = _app_with_auth("real-key")
+        for bad in ("x", "y" * 500, ""):
+            resp = client.get(
+                "/admin/webhook-history",
+                headers={"Authorization": f"Bearer {bad}"} if bad else {},
+            )
+            assert resp.status_code in (401, 403)  # never 500 / never accepted
+
+    def test_uses_constant_time_compare(self):
+        # the module imports hmac and the dispatch path calls compare_digest
+        import inspect
+        import prsm.api.auth_middleware as m
+        assert hasattr(m, "hmac")
+        assert "compare_digest" in inspect.getsource(m.NodeAuthMiddleware.dispatch)
+
+
 class TestNewProtectedPrefixes:
     def test_transactions_is_protected(self):
         """Sprint 183 — /transactions added to PROTECTED_PREFIXES

@@ -7,6 +7,7 @@ Protects settler, content economy, and other sensitive routes.
 """
 
 import hashlib
+import hmac
 import logging
 import os
 import re
@@ -212,7 +213,10 @@ class NodeAuthMiddleware(BaseHTTPMiddleware):
                     },
                 )
 
-            if hash_api_key(api_key) != self._api_key_hash:
+            # sp1271 — constant-time compare of the key hashes (audit round 5, LOW): avoids a
+            # timing side-channel on the digest comparison. compare_digest needs equal-length
+            # inputs; both are fixed-length hex SHA256 digests.
+            if not hmac.compare_digest(hash_api_key(api_key), self._api_key_hash):
                 return JSONResponse(
                     status_code=403,
                     content={"detail": "Invalid API key."},
