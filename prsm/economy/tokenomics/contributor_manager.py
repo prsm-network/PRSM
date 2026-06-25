@@ -25,6 +25,7 @@ import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import os
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 
@@ -281,12 +282,15 @@ class ContributorManager:
         if not all(field in proof_data for field in required_fields):
             raise ValueError("Missing required data proof fields")
         
-        # Verify peer reviews
+        # Verify peer reviews. sp1265 — bind each review to the submitter context so a
+        # submitter can't fabricate their own "peer reviews" (self-authored or duplicated) to
+        # clear the min-2 gate; `seen` enforces DISTINCT reviewers within this submission.
         verified_reviews = []
+        seen_reviewers: set = set()
         for review in proof_data["peer_reviews"]:
-            if await self._verify_peer_review(review):
+            if await self._verify_peer_review(review, submitter_id=user_id, seen=seen_reviewers):
                 verified_reviews.append(review)
-        
+
         if len(verified_reviews) < 2:
             raise ValueError("Insufficient verified peer reviews (minimum 2 required)")
         
@@ -703,33 +707,66 @@ class ContributorManager:
         return proofs
     
     async def _verify_computation_hash(self, computation_hash: str, work_units: int) -> bool:
-        """Verify computation proof hash (simplified implementation)"""
-        
-        # This would integrate with a proof-of-work verification system
-        # For now, implement basic validation
-        
+        """Verify a compute-contribution proof hash.
+
+        sp1265: shape checks (SHA256 length, positive work_units) gate obvious junk, but they
+        do NOT bind the hash to work the system actually witnessed — the rubber-stamp
+        ("assume valid") let a forged 64-hex string mint contributor value. Real binding to
+        the node's signed §7 inference/compute receipts is a larger follow-on; until it
+        lands, PRSM_CONTRIBUTOR_PROOF_STRICT lets a money-live operator FAIL CLOSED (reject
+        any compute proof we cannot cryptographically bind) rather than accept unverifiable
+        work. Default keeps the prior behavior but warns loudly.
+        """
         if not computation_hash or len(computation_hash) != 64:  # SHA256 length
             return False
-            
+
         if work_units <= 0:
             return False
-            
-        # Additional validation logic would go here
-        # For demo purposes, assume valid
+
+        if os.getenv("PRSM_CONTRIBUTOR_PROOF_STRICT", "").strip().lower() in ("1", "true", "yes", "on"):
+            logger.error("compute proof rejected — PRSM_CONTRIBUTOR_PROOF_STRICT is on and "
+                         "the hash cannot be cryptographically bound to witnessed work "
+                         "(receipt-binding not yet wired)", computation_hash=computation_hash[:12])
+            return False
+
+        logger.warning("compute proof accepted on SHAPE ONLY — NOT cryptographically verified "
+                       "against witnessed work; do not gate real rewards on this until "
+                       "receipt-binding lands (or set PRSM_CONTRIBUTOR_PROOF_STRICT)",
+                       computation_hash=computation_hash[:12], work_units=work_units)
         return True
-    
-    async def _verify_peer_review(self, review: Dict) -> bool:
-        """Verify a peer review submission"""
-        
+
+    async def _verify_peer_review(self, review: Dict, *, submitter_id: str = None,
+                                  seen: set = None) -> bool:
+        """Verify a peer review submission.
+
+        sp1265: authenticate the review against the submitter context so a contributor can't
+        fabricate their own reviews. Reject self-reviews (reviewer is the submitter) and
+        duplicate reviewers within a submission (`seen`), and require a non-empty review hash.
+        (Full reviewer authentication — signature + a distinct registered/KYC'd identity — is
+        a follow-on; these checks close the concrete self-fabrication / padding vectors now.)
+        """
         required_fields = ["reviewer_id", "review_hash", "rating"]
         if not all(field in review for field in required_fields):
             return False
-            
-        # Additional verification logic
+
+        reviewer_id = review.get("reviewer_id")
+        if not reviewer_id or not str(review.get("review_hash") or "").strip():
+            return False
+
+        # A submitter cannot peer-review their own contribution.
+        if submitter_id is not None and str(reviewer_id) == str(submitter_id):
+            return False
+
+        # Distinct reviewers only — no padding the count with one repeated reviewer.
+        if seen is not None:
+            if str(reviewer_id) in seen:
+                return False
+            seen.add(str(reviewer_id))
+
         rating = review.get("rating", 0)
         if not (1 <= rating <= 5):
             return False
-            
+
         return True
     
     async def _verify_peer_approval(self, approval: Dict) -> bool:
