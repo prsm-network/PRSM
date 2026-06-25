@@ -43,6 +43,31 @@ def _insecure_payment_webhooks_allowed() -> bool:
         "1", "true", "yes", "on")
 
 
+# sp1260 — the five PayPal webhook transmission headers (lowercased) that
+# /v1/notifications/verify-webhook-signature requires, mapped to the verify-request field.
+_PAYPAL_TRANSMISSION_HEADERS = {
+    "transmission_id": "paypal-transmission-id",
+    "transmission_time": "paypal-transmission-time",
+    "cert_url": "paypal-cert-url",
+    "auth_algo": "paypal-auth-algo",
+    "transmission_sig": "paypal-transmission-sig",
+}
+
+
+def _paypal_transmission_headers(headers: Optional[Dict[str, str]]):
+    """Extract PayPal's 5 transmission headers (case-insensitive) as the verify-request
+    field dict. Returns None if ANY is missing/blank → caller must fail closed (we cannot
+    verify a PayPal webhook without the complete set)."""
+    norm = {str(k).lower(): v for k, v in (headers or {}).items()}
+    out: Dict[str, str] = {}
+    for field, header_key in _PAYPAL_TRANSMISSION_HEADERS.items():
+        value = (norm.get(header_key) or "").strip()
+        if not value:
+            return None
+        out[field] = value
+    return out
+
+
 class PaymentProcessor:
     """
     Production-grade payment processor for fiat-to-crypto conversion
@@ -280,9 +305,15 @@ class PaymentProcessor:
         provider: str,
         payload: Dict[str, Any],
         raw_body: bytes,
-        signature_header: str
+        signature_header: str,
+        headers: Optional[Dict[str, str]] = None,
     ) -> bool:
-        """Process webhook with signature verification"""
+        """Process webhook with signature verification.
+
+        sp1260: ``headers`` carries the full request header set so the PayPal verifier can
+        read its 5 transmission headers (the route only forwarded a single signature string
+        before, which made real PayPal verification impossible). Stripe still uses the
+        single ``signature_header`` (its HMAC needs only the body + secret)."""
         try:
             if provider == "stripe":
                 if not self._verify_stripe_signature(raw_body, signature_header):
@@ -290,7 +321,7 @@ class PaymentProcessor:
                     return False
                 return await self._process_stripe_webhook(payload)
             elif provider == "paypal":
-                if not self._verify_paypal_signature(raw_body, signature_header):
+                if not await self._verify_paypal_signature(payload, headers):
                     logger.warning("PayPal webhook signature verification failed")
                     return False
                 return await self._process_paypal_webhook(payload)
@@ -742,30 +773,101 @@ class PaymentProcessor:
             logger.error("Stripe signature verification error", error=str(e))
             return False
 
-    def _verify_paypal_signature(self, raw_body: bytes, signature_header: str) -> bool:
-        """Verify a PayPal webhook — FAIL CLOSED (sp1250).
+    def _paypal_async_client(self):
+        """An httpx.AsyncClient for the PayPal API calls. Isolated so tests can inject a
+        MockTransport. Timeout-bounded so a hung PayPal endpoint can't stall the worker."""
+        import httpx
+        timeout = float(os.getenv("PAYPAL_API_TIMEOUT_S", "10") or "10")
+        return httpx.AsyncClient(timeout=timeout)
 
-        Real PayPal verification requires POSTing the full transmission header set
-        (PAYPAL-TRANSMISSION-ID / -TIME / -SIG + CERT-URL + AUTH-ALGO) plus the
-        webhook_id and raw event to PayPal's
-        /v1/notifications/verify-webhook-signature endpoint and checking
-        verification_status == "SUCCESS". That flow is NOT yet wired through the
-        webhook route (it forwards only a single signature string), so we cannot
-        actually verify a PayPal event here. Returning True unconditionally (the prior
-        behavior) let an attacker forge a CHECKOUT.ORDER.APPROVED event on the
-        unauthenticated route and mint FTNS with no fiat charged — so until real
-        verification lands we REJECT PayPal webhooks. A configured PAYPAL_WEBHOOK_ID is
-        NOT verification and must never be mistaken for it. An explicit DEV-ONLY opt-in
-        preserves local testing.
+    async def _verify_paypal_signature(self, payload: Dict[str, Any],
+                                       headers: Optional[Dict[str, str]]) -> bool:
+        """Verify a PayPal webhook via the REAL verify-webhook-signature flow — FAIL CLOSED
+        (sp1260; supersedes the sp1250 reject-everything stub).
+
+        The webhook route is UNAUTHENTICATED, so a verified signature is the ONLY auth —
+        a forged CHECKOUT.ORDER.APPROVED would otherwise mint FTNS with no fiat charged.
+        We (1) require PAYPAL_WEBHOOK_ID + PAYPAL_CLIENT_ID + PAYPAL_CLIENT_SECRET and the
+        full 5-header transmission set, (2) obtain an OAuth client-credentials token, and
+        (3) POST the event to {PAYPAL_API_BASE}/v1/notifications/verify-webhook-signature,
+        accepting ONLY verification_status == "SUCCESS". Missing config/headers, OAuth
+        failure, a non-200 from either endpoint, a non-SUCCESS status, or ANY exception →
+        reject. PAYPAL_API_BASE defaults to live (https://api-m.paypal.com); set it to the
+        sandbox base for testing. The DEV-ONLY PRSM_ALLOW_INSECURE_PAYMENT_WEBHOOKS opt-in
+        still bypasses for local development only.
         """
         if _insecure_payment_webhooks_allowed():
             logger.warning("PRSM_ALLOW_INSECURE_PAYMENT_WEBHOOKS — ACCEPTING UNVERIFIED "
                            "PayPal webhook (DEV ONLY, never in prod)")
             return True
-        logger.error("PayPal webhook signature verification is not implemented — REJECTING "
-                     "webhook (fail closed). Wire PayPal verify-webhook-signature (with the "
-                     "full transmission headers) before enabling PayPal as a fiat on-ramp.")
-        return False
+
+        webhook_id = os.getenv("PAYPAL_WEBHOOK_ID", "").strip()
+        client_id = os.getenv("PAYPAL_CLIENT_ID", "").strip()
+        client_secret = os.getenv("PAYPAL_CLIENT_SECRET", "").strip()
+        if not (webhook_id and client_id and client_secret):
+            logger.error("PayPal webhook verification config incomplete "
+                         "(PAYPAL_WEBHOOK_ID / PAYPAL_CLIENT_ID / PAYPAL_CLIENT_SECRET) — "
+                         "REJECTING webhook (fail closed).")
+            return False
+
+        transmission = _paypal_transmission_headers(headers)
+        if transmission is None:
+            logger.error("PayPal webhook missing one or more required transmission headers "
+                         "(paypal-transmission-id/-time/-sig, paypal-cert-url, "
+                         "paypal-auth-algo) — REJECTING webhook (fail closed).")
+            return False
+
+        api_base = os.getenv("PAYPAL_API_BASE", "https://api-m.paypal.com").rstrip("/")
+        try:
+            async with self._paypal_async_client() as client:
+                # 1) OAuth client-credentials token.
+                token_resp = await client.post(
+                    f"{api_base}/v1/oauth2/token",
+                    data={"grant_type": "client_credentials"},
+                    auth=(client_id, client_secret),
+                    headers={"Accept": "application/json"},
+                )
+                if token_resp.status_code != 200:
+                    logger.error("PayPal OAuth token request failed (HTTP %s) — REJECTING "
+                                 "webhook (fail closed).", token_resp.status_code)
+                    return False
+                access_token = (token_resp.json() or {}).get("access_token")
+                if not access_token:
+                    logger.error("PayPal OAuth response carried no access_token — REJECTING "
+                                 "webhook (fail closed).")
+                    return False
+
+                # 2) Verify the event signature server-side.
+                verify_resp = await client.post(
+                    f"{api_base}/v1/notifications/verify-webhook-signature",
+                    json={
+                        "transmission_id": transmission["transmission_id"],
+                        "transmission_time": transmission["transmission_time"],
+                        "cert_url": transmission["cert_url"],
+                        "auth_algo": transmission["auth_algo"],
+                        "transmission_sig": transmission["transmission_sig"],
+                        "webhook_id": webhook_id,
+                        "webhook_event": payload,
+                    },
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": "application/json",
+                    },
+                )
+                if verify_resp.status_code != 200:
+                    logger.error("PayPal verify-webhook-signature failed (HTTP %s) — "
+                                 "REJECTING webhook (fail closed).", verify_resp.status_code)
+                    return False
+                verification_status = (verify_resp.json() or {}).get("verification_status")
+                if verification_status == "SUCCESS":
+                    return True
+                logger.warning("PayPal verification_status=%s (not SUCCESS) — REJECTING "
+                               "webhook (fail closed).", verification_status)
+                return False
+        except Exception as exc:  # noqa: BLE001 — any error → fail closed, never mint on doubt
+            logger.error("PayPal webhook verification error — REJECTING webhook "
+                         "(fail closed): %s", exc)
+            return False
 
     async def _process_stripe_webhook(self, payload: Dict[str, Any]) -> bool:
         """Process Stripe webhook"""

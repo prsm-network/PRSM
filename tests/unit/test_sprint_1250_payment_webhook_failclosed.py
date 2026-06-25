@@ -40,7 +40,8 @@ def proc():
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     # default to the SECURE posture: no dev opt-in, no secrets, unless a test sets them
-    for k in (INSECURE, "STRIPE_WEBHOOK_SECRET", "PAYPAL_WEBHOOK_ID"):
+    for k in (INSECURE, "STRIPE_WEBHOOK_SECRET", "PAYPAL_WEBHOOK_ID",
+              "PAYPAL_CLIENT_ID", "PAYPAL_CLIENT_SECRET", "PAYPAL_API_BASE"):
         monkeypatch.delenv(k, raising=False)
 
 
@@ -84,20 +85,27 @@ def test_stripe_replay_old_timestamp_rejected(proc, monkeypatch):
 
 # ── PayPal ───────────────────────────────────────────────────────────────────
 
-def test_paypal_fails_closed_by_default(proc):
-    # unconditional return True is gone — reject until real verification is wired.
-    assert proc._verify_paypal_signature(b'{"event_type":"CHECKOUT.ORDER.APPROVED"}', "sig") is False
+# sp1260 made _verify_paypal_signature async with the real verify-webhook-signature flow,
+# signature (payload_dict, headers). The fail-closed posture below is preserved; sp1260's
+# suite covers the full success/failure HTTP flow against a MockTransport.
+_EVENT = {"event_type": "CHECKOUT.ORDER.APPROVED"}
 
 
-def test_paypal_fails_closed_even_with_webhook_id(proc, monkeypatch):
-    # a configured PAYPAL_WEBHOOK_ID must NOT be mistaken for verification.
+async def test_paypal_fails_closed_by_default(proc):
+    # no PayPal config at all → reject (never attempts a network call).
+    assert await proc._verify_paypal_signature(_EVENT, {}) is False
+
+
+async def test_paypal_fails_closed_even_with_webhook_id(proc, monkeypatch):
+    # a configured PAYPAL_WEBHOOK_ID alone (no client creds, no transmission headers, no
+    # real verify) must NOT be mistaken for verification.
     monkeypatch.setenv("PAYPAL_WEBHOOK_ID", "WH-123")
-    assert proc._verify_paypal_signature(b'{"event_type":"CHECKOUT.ORDER.APPROVED"}', "sig") is False
+    assert await proc._verify_paypal_signature(_EVENT, {}) is False
 
 
-def test_paypal_dev_optin_allows(proc, monkeypatch):
+async def test_paypal_dev_optin_allows(proc, monkeypatch):
     monkeypatch.setenv(INSECURE, "1")
-    assert proc._verify_paypal_signature(b'{"event_type":"CHECKOUT.ORDER.APPROVED"}', "sig") is True
+    assert await proc._verify_paypal_signature(_EVENT, {}) is True
 
 
 # ── end-to-end: the forged-webhook exploit is now blocked ────────────────────

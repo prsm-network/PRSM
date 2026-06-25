@@ -474,15 +474,20 @@ async def process_webhook(
         raw_body = await request.body()
         signature = request.headers.get("stripe-signature", "") or \
                     request.headers.get("paypal-transmission-sig", "")
+        # sp1260 — forward the FULL header set so the PayPal verifier can read its 5
+        # transmission headers (paypal-transmission-id/-time/-sig, cert-url, auth-algo);
+        # real verify-webhook-signature needs all of them, not just the single sig.
+        headers = {k.lower(): v for k, v in request.headers.items()}
         payload = await request.json()
-        
+
         # Process webhook in background
         background_tasks.add_task(
             payment_processor.process_webhook,
             provider,
             payload,
             raw_body,
-            signature
+            signature,
+            headers,
         )
         
         return PaymentApiResponse(
