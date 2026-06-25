@@ -298,6 +298,72 @@ def _should_warn_no_inference_backend(any_real_backend: bool, executor: Any) -> 
     return True
 
 
+def _operator_wallet_preflight() -> PreflightCheckResult:
+    """Wallet-config diagnostic — reports the resolved operator on-chain address.
+
+    Mirrors ``resolve_operator_address()``'s real precedence so the preflight tells the
+    truth for BOTH operator models: explicit ``PRSM_OPERATOR_ADDRESS`` (requester-payment /
+    read-only operator) wins, else derive from ``FTNS_WALLET_PRIVATE_KEY``. Catches stale
+    env / wrong-key misconfigurations before any on-chain action. Optional + fail-soft.
+    """
+    explicit = os.environ.get("PRSM_OPERATOR_ADDRESS", "").strip()
+    pk = os.environ.get("FTNS_WALLET_PRIVATE_KEY", "").strip()
+    try:
+        from prsm.node.operator_address import resolve_operator_address
+        addr = resolve_operator_address()
+    except Exception as exc:  # noqa: BLE001 — resolve is fail-soft, but never crash preflight
+        return PreflightCheckResult(
+            name="Wallet config (optional)",
+            status=PREFLIGHT_WARN,
+            required=False,
+            details=f"Address derivation failed: {exc}",
+            remediation="Check FTNS_WALLET_PRIVATE_KEY / PRSM_OPERATOR_ADDRESS format.",
+        )
+
+    if addr:
+        source = (
+            "PRSM_OPERATOR_ADDRESS"
+            if explicit
+            else "derived from FTNS_WALLET_PRIVATE_KEY"
+        )
+        return PreflightCheckResult(
+            name="Wallet config (optional)",
+            status=PREFLIGHT_PASS,
+            required=False,
+            details=f"Operator address: {addr[:8]}...{addr[-6:]} ({source})",
+            remediation="None",
+        )
+
+    if pk:
+        # Key present but resolve_operator_address() returned None → unparseable key
+        # (and no explicit override to fall back on).
+        return PreflightCheckResult(
+            name="Wallet config (optional)",
+            status=PREFLIGHT_WARN,
+            required=False,
+            details="FTNS_WALLET_PRIVATE_KEY set but malformed",
+            remediation=(
+                "Verify private key is 0x-prefixed 32 bytes of hex, or set "
+                "PRSM_OPERATOR_ADDRESS explicitly. Bad key won't crash startup but "
+                "all on-chain operations will fail."
+            ),
+        )
+
+    # Neither source configured.
+    return PreflightCheckResult(
+        name="Wallet config (optional)",
+        status=PREFLIGHT_WARN,
+        required=False,
+        details="operator address not configured",
+        remediation=(
+            "Set PRSM_OPERATOR_ADDRESS (explicit on-chain EOA — requester-payment / "
+            "read-only operators) or FTNS_WALLET_PRIVATE_KEY (derives the address and "
+            "enables royalty claim / heartbeat / distribution triggers). Read-only "
+            "paths work without either."
+        ),
+    )
+
+
 def _node_preflight_diagnostics(config: "NodeConfig") -> List[PreflightCheckResult]:
     """Run non-breaking node startup diagnostics with required/optional classification."""
 
@@ -422,66 +488,11 @@ def _node_preflight_diagnostics(config: "NodeConfig") -> List[PreflightCheckResu
         )
     )
 
-    # Wallet config diagnostic. Operators see derived on-chain
-    # address pre-startup so they can confirm they're running with
-    # the wallet they expect. Catches stale env / wrong-key
-    # misconfigurations before any on-chain action.
-    pk = os.environ.get("FTNS_WALLET_PRIVATE_KEY", "").strip()
-    if not pk:
-        checks.append(
-            PreflightCheckResult(
-                name="Wallet config (optional)",
-                status=PREFLIGHT_WARN,
-                required=False,
-                details="FTNS_WALLET_PRIVATE_KEY not set",
-                remediation=(
-                    "Set FTNS_WALLET_PRIVATE_KEY for on-chain "
-                    "operations (royalty claim, heartbeat trigger, "
-                    "distribution trigger). Read-only paths work "
-                    "without it."
-                ),
-            )
-        )
-    else:
-        try:
-            from prsm.node.operator_address import (
-                resolve_operator_address,
-            )
-            addr = resolve_operator_address()
-            if addr:
-                checks.append(
-                    PreflightCheckResult(
-                        name="Wallet config (optional)",
-                        status=PREFLIGHT_PASS,
-                        required=False,
-                        details=f"Operator address: {addr[:8]}...{addr[-6:]}",
-                        remediation="None",
-                    )
-                )
-            else:
-                checks.append(
-                    PreflightCheckResult(
-                        name="Wallet config (optional)",
-                        status=PREFLIGHT_WARN,
-                        required=False,
-                        details="FTNS_WALLET_PRIVATE_KEY set but malformed",
-                        remediation=(
-                            "Verify private key is 0x-prefixed 32 bytes "
-                            "of hex. Bad key won't crash startup but "
-                            "all on-chain operations will fail."
-                        ),
-                    )
-                )
-        except Exception as exc:
-            checks.append(
-                PreflightCheckResult(
-                    name="Wallet config (optional)",
-                    status=PREFLIGHT_WARN,
-                    required=False,
-                    details=f"Address derivation failed: {exc}",
-                    remediation="Check FTNS_WALLET_PRIVATE_KEY format.",
-                )
-            )
+    # Wallet config diagnostic. Operators see the resolved on-chain operator address
+    # pre-startup (from PRSM_OPERATOR_ADDRESS or derived from FTNS_WALLET_PRIVATE_KEY)
+    # so they can confirm they're running with the wallet they expect, and catch stale
+    # env / wrong-key misconfigurations before any on-chain action.
+    checks.append(_operator_wallet_preflight())
 
     # ── Sprint 1198 — day-one-live readiness: will a REAL user get REAL results? ──
     # These aggregate the front-door work (sp1183-1197) into the pre-start verdict so

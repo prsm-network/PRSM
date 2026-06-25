@@ -38,20 +38,41 @@ def _wallet_check(checks):
 
 
 class TestWalletPreflight:
-    def test_no_pk_warns(self):
+    def test_no_source_warns(self):
+        # sp1259: with NEITHER FTNS_WALLET_PRIVATE_KEY nor PRSM_OPERATOR_ADDRESS, the
+        # check WARNs and its remediation must point at BOTH ways to configure one.
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("FTNS_WALLET_PRIVATE_KEY", None)
+            os.environ.pop("PRSM_OPERATOR_ADDRESS", None)
             checks = _node_preflight_diagnostics(_config())
         wc = _wallet_check(checks)
         assert wc is not None
         assert wc.status == "WARN"
-        assert "not set" in wc.details
+        assert "not configured" in wc.details
+        assert "PRSM_OPERATOR_ADDRESS" in wc.remediation
+        assert "FTNS_WALLET_PRIVATE_KEY" in wc.remediation
+
+    def test_explicit_operator_address_passes_without_wallet_key(self):
+        # sp1259 regression: the requester-payment / read-only operator model sets only
+        # PRSM_OPERATOR_ADDRESS — it must PASS, not WARN "FTNS_WALLET_PRIVATE_KEY not set".
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FTNS_WALLET_PRIVATE_KEY", None)
+            os.environ["PRSM_OPERATOR_ADDRESS"] = (
+                "0xC09bAbCdEf0123456789AbCdEf0123456789aBcD"
+            )
+            checks = _node_preflight_diagnostics(_config())
+        wc = _wallet_check(checks)
+        assert wc is not None
+        assert wc.status == "PASS"
+        assert "Operator address:" in wc.details
+        assert "PRSM_OPERATOR_ADDRESS" in wc.details
 
     def test_valid_pk_shows_address(self):
         with patch.dict(
             os.environ, {"FTNS_WALLET_PRIVATE_KEY": _TEST_PK},
             clear=False,
         ):
+            os.environ.pop("PRSM_OPERATOR_ADDRESS", None)  # exercise the derived path
             checks = _node_preflight_diagnostics(_config())
         wc = _wallet_check(checks)
         assert wc is not None
@@ -66,6 +87,7 @@ class TestWalletPreflight:
             {"FTNS_WALLET_PRIVATE_KEY": "definitely-not-a-key"},
             clear=False,
         ):
+            os.environ.pop("PRSM_OPERATOR_ADDRESS", None)  # no explicit fallback
             checks = _node_preflight_diagnostics(_config())
         wc = _wallet_check(checks)
         assert wc is not None
