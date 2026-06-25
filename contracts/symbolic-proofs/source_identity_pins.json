@@ -1,7 +1,7 @@
 {
   "version": 1,
   "pins": {
-    "contracts/contracts/BatchSettlementRegistry.sol:898-944": "ae4f2ef55e7bda452f9719d5f6c24c49c0f961b0ad62b943ec7ae54d79c8c058",
+    "contracts/contracts/BatchSettlementRegistry.sol:970-1016": "ae4f2ef55e7bda452f9719d5f6c24c49c0f961b0ad62b943ec7ae54d79c8c058",
     "contracts/contracts/CreatorStakeRegistry.sol:116-126": "b955f6ab9c865d50ccd6febca69358470dcb2486aec56283b3a49bccbb781ebf",
     "contracts/contracts/CreatorStakeRegistry.sol:132-145": "86a75117989aa74a8bba0bec6a25c24a87631c8fe63b1b7bdcecb26306997c00",
     "contracts/contracts/CreatorStakeRegistry.sol:148-161": "4e340e6195eafd0273acc90d43c3a507c9e099f4d4adf73cf821cc6d23beea1a",
@@ -15,12 +15,12 @@
     "contracts/contracts/StakeBond.sol:464-470": "5829a59c1c7bde1a36afa0d3fad8ecf5e4826960fff846a62a9d43886d0b4e42",
     "contracts/contracts/StorageSlashing.sol:258-267": "88359ec14f057c00f4830e06573cd69afabde6e613858d2a4a1f76991df7e0e2",
     "contracts/contracts/StorageSlashing.sol:272-286": "d5ec0d9856615ebdc11a95654096155cdfa0f198673d45ee5074495bf7099067",
-    "prsm/compute/chain_rpc/client.py:1376-1384": "8258a61605a769004fa4300f2d2ba91bc25931fffe221883841e9c98d017cf05",
-    "prsm/compute/chain_rpc/client.py:1448": "9f620168c30b17229c6ad3be094272f46e07fcba6e89b3298839570cb6c63bea",
-    "prsm/compute/chain_rpc/client.py:1480-1483": "26bb991b79cc3b97e5943b057be0b6164e1be773fa59b3bb2f64eac1b2e58929",
+    "prsm/compute/chain_rpc/client.py:1492-1500": "8258a61605a769004fa4300f2d2ba91bc25931fffe221883841e9c98d017cf05",
+    "prsm/compute/chain_rpc/client.py:1564": "9f620168c30b17229c6ad3be094272f46e07fcba6e89b3298839570cb6c63bea",
+    "prsm/compute/chain_rpc/client.py:1596-1599": "26bb991b79cc3b97e5943b057be0b6164e1be773fa59b3bb2f64eac1b2e58929",
     "prsm/compute/chain_rpc/kv_cache.py:201-249": "6b74b4b0d511d19a106406529a93127f4208f3be69245ccdc24d1aefa4d6f859",
-    "prsm/compute/chain_rpc/protocol.py:1001-1043": "cafae563dbdbb059721db3b177054c2ef83005841f496ce2362d4985a75f8b27",
-    "prsm/compute/chain_rpc/server.py:2183-2217": "bce32e9d09d2a9a8e161ca903c264f9d69a0af0d95aac81aa51919af92a90679",
+    "prsm/compute/chain_rpc/protocol.py:1069-1111": "cafae563dbdbb059721db3b177054c2ef83005841f496ce2362d4985a75f8b27",
+    "prsm/compute/chain_rpc/server.py:2297-2331": "bce32e9d09d2a9a8e161ca903c264f9d69a0af0d95aac81aa51919af92a90679",
     "prsm/data/dedup/thresholds.py:55-99": "be7ac6d5b92b0a87a4a13510c2fa6e186783d789d879abed25c2a828bd912168"
   }
 }

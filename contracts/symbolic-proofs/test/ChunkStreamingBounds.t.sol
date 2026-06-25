@@ -11,9 +11,9 @@ pragma solidity ^0.8.22;
 ///         malicious peer ships excess chunks past the manifest.
 ///
 /// @dev STRUCTURAL EQUIVALENCE (audit-visible):
-///   prsm/compute/chain_rpc/server.py:2183-2217 —
+///   prsm/compute/chain_rpc/server.py:2297-2331 —
 ///       `_reassemble_inbound_chunks`. The load-bearing line is
-///       the early-exit raise at 2185-2189:
+///       the early-exit raise at 2299-2303:
 ///         if len(out) >= expected_total_chunks:
 ///             raise ActivationCodecError("excess chunks")
 ///       The post-fix check is `>=` not `>`, so post-state
@@ -21,7 +21,7 @@ pragma solidity ^0.8.22;
 ///       on the upper end.
 ///
 ///   Per-chunk request_id binding (the relay-defense invariant)
-///   at server.py:2206-2210 is similarly modeled: every accepted
+///   at server.py:2320-2324 is similarly modeled: every accepted
 ///   chunk MUST match expected_request_id; mismatches throw.
 ///
 /// @dev The chunked-streaming subsystem is off-chain Python.
@@ -45,9 +45,9 @@ contract ChunkStreamingBounds {
         uint256 incoming,
         uint256 expected_total_chunks
     ) external pure returns (uint256 accepted) {
-        // Bounded loop — mirrors server.py:2184-2216.
+        // Bounded loop — mirrors server.py:2298-2330.
         for (uint256 i = 0; i < incoming; i++) {
-            // Mirrors line 2185: pre-append bound check.
+            // Mirrors line 2299: pre-append bound check.
             if (accepted >= expected_total_chunks) {
                 revert("excess chunks");
             }

@@ -15,9 +15,9 @@ pragma solidity ^0.8.22;
 ///         critical fix was specifically to the rollback math.
 ///
 /// @dev STRUCTURAL EQUIVALENCE (audit-visible):
-///   rollback math      → prsm/compute/chain_rpc/client.py:1448
+///   rollback math      → prsm/compute/chain_rpc/client.py:1564
 ///                        cached_extra = (k_round + 1) - len(emitted)
-///   adaptive-K bounds  → prsm/compute/chain_rpc/client.py:1480-1483
+///   adaptive-K bounds  → prsm/compute/chain_rpc/client.py:1596-1599
 ///                        if rate < 0.25: k = max(1, k // 2)
 ///                        elif rate > 0.75: k = min(k_max, k * 2)
 ///
@@ -35,7 +35,7 @@ pragma solidity ^0.8.22;
 contract SpeculationRollbackMath {
     uint256 public constant MAX_VERIFY_BATCH_TOKENS = 8;
 
-    /// Mirrors client.py:1448 — the POST-FIX correct formula.
+    /// Mirrors client.py:1564 — the POST-FIX correct formula.
     /// For any k_round (this round's K) and len_emitted (number of
     /// tokens we actually committed + showed to the user), the
     /// rollback distance is exactly (k_round + 1) - len_emitted.
@@ -49,7 +49,7 @@ contract SpeculationRollbackMath {
         return (k_round + 1) - len_emitted;
     }
 
-    /// Mirrors client.py:1480-1483 — adaptive K state transition
+    /// Mirrors client.py:1596-1599 — adaptive K state transition
     /// based on rolling-window accept rate. Rate input is in bps
     /// (0-10000) instead of float to keep the math integer-clean.
     function adaptiveK(

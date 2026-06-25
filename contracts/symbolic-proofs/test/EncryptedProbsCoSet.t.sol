@@ -12,7 +12,7 @@ pragma solidity ^0.8.22;
 ///           (4) non-empty when set
 ///
 /// @dev STRUCTURAL EQUIVALENCE (audit-visible):
-///   prsm/compute/chain_rpc/protocol.py:1001-1043 —
+///   prsm/compute/chain_rpc/protocol.py:1069-1111 —
 ///     RunLayerSliceRequest.validate() encrypted-probs branch.
 ///   The Solidity mirror models the four boolean / length
 ///   checks as a single validate() function that reverts on
