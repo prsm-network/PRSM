@@ -127,51 +127,33 @@ settings = get_settings()
 
 async def get_current_user(token: HTTPAuthorizationCredentials = Depends(security)) -> str:
     """
-    Get current user from JWT token with proper signature verification.
+    Get current user from JWT token via the CANONICAL verifier.
 
-    SECURITY FIX: Previously used verify_signature=False which allowed token forgery.
-    Now properly verifies JWT signature using configured secret key.
+    sp1267 (audit round 5): the previous ad-hoc pyjwt.decode verified signature + exp but
+    NEVER checked token_type or revocation — so a 7-day REFRESH token (same HS256 secret,
+    carries sub+exp) worked as a full bearer credential on these wallet endpoints, and a
+    logged-out / revoked token still authenticated. Routing through
+    JWTHandler.verify_token enforces signature, expiry, required claims, REVOCATION, and lets
+    us reject any non-access token.
     """
-    import jwt as pyjwt
-    from prsm.core.auth.jwt_handler import ALLOWED_ALGORITHMS
+    from prsm.core.auth.jwt_handler import jwt_handler
 
     try:
-        # Get the JWT secret from settings
-        jwt_secret = settings.jwt_secret or settings.secret_key
-
-        if not jwt_secret:
-            logger.error("JWT secret not configured")
-            raise HTTPException(status_code=500, detail="Authentication not configured")
-
-        # Decode with signature verification ENABLED
-        payload = pyjwt.decode(
-            token.credentials,
-            jwt_secret,
-            algorithms=ALLOWED_ALGORITHMS,
-            options={
-                "verify_signature": True,  # CRITICAL: Must be True
-                "verify_exp": True,
-                "verify_iat": True,
-                "require": ["exp", "sub"]
-            }
-        )
-
-        user_id = payload.get("sub")
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token: missing subject")
-
-        return user_id
-
-    except pyjwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token has expired")
-    except pyjwt.InvalidAlgorithmError:
-        raise HTTPException(status_code=401, detail="Invalid token algorithm")
-    except pyjwt.InvalidTokenError as e:
-        logger.warning(f"Invalid JWT token: {e}")
-        raise HTTPException(status_code=401, detail="Invalid token")
-    except Exception as e:
+        token_data = await jwt_handler.verify_token(token.credentials)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001 — never authenticate on a verifier error
         logger.error(f"JWT verification error: {e}")
         raise HTTPException(status_code=401, detail="Authentication failed")
+
+    if token_data is None:
+        # invalid signature / expired / malformed / REVOKED
+        raise HTTPException(status_code=401, detail="Invalid or revoked token")
+    if token_data.token_type != "access":
+        # a refresh (or any non-access) token must NOT authenticate API requests
+        raise HTTPException(status_code=401, detail="Invalid token type (expected access token)")
+
+    return str(token_data.user_id)
 
 @router.post("/connect")
 async def connect_wallet(
