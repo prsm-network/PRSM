@@ -3168,7 +3168,8 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             )
             raise HTTPException(
                 status_code=502,
-                detail=f"coinbase onramp /token call failed: {exc}",
+                # sp1276 — static client detail; full error logged server-side above.
+                detail="coinbase onramp token call failed",
             )
         finally:
             onramp_client.close()
@@ -3824,7 +3825,9 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             )
             raise HTTPException(
                 status_code=502,
-                detail=f"Base RPC balance read failed: {exc}",
+                # sp1276 — do NOT echo the exception: it carries the Base RPC URL, which
+                # embeds the operator's RPC API key. Full error is logged above, server-side.
+                detail="upstream Base RPC balance read failed",
             )
         finally:
             reader.close()
@@ -3862,7 +3865,9 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             )
             raise HTTPException(
                 status_code=502,
-                detail=f"Base RPC balance read failed: {exc}",
+                # sp1276 — do NOT echo the exception: it carries the Base RPC URL, which
+                # embeds the operator's RPC API key. Full error is logged above, server-side.
+                detail="upstream Base RPC balance read failed",
             )
         finally:
             reader.close()
@@ -18672,7 +18677,10 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             raise
         except Exception as e:  # noqa: BLE001
             # FaucetMainnetRefusedError / broadcast / revert → surface, never 200-with-error.
-            raise HTTPException(status_code=502, detail=f"faucet dispense failed: {e}")
+            # sp1276 — log the full error server-side; return a static client detail (the
+            # exception can carry the RPC URL / faucet-signer internals).
+            logger.warning("faucet dispense failed: %s", e)
+            raise HTTPException(status_code=502, detail="faucet dispense failed")
 
     # ── Web Dashboard (served at /, /static, /api/) ──────────────────────────────
 
