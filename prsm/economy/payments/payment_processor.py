@@ -95,6 +95,18 @@ def _provider_name_for_payment_method(payment_method) -> str:
     return _METHOD_TO_PROVIDER.get(key, key)
 
 
+def _extract_paypal_reversal_order_id(payload: Optional[Dict[str, Any]]):
+    """sp1263 — best-effort extract the PayPal ORDER id (our transaction_id) from a refund /
+    reversal webhook. PayPal puts it under resource.supplementary_data.related_ids.order_id
+    for capture refunds/reversals. Events that don't carry it (e.g. disputes, which reference
+    a capture id we don't store) return None → the caller logs for manual review rather than
+    acting on the wrong transaction."""
+    resource = (payload or {}).get("resource") or {}
+    related = (resource.get("supplementary_data") or {}).get("related_ids") or {}
+    order_id = str(related.get("order_id") or "").strip()
+    return order_id or None
+
+
 class PaymentProcessor:
     """
     Production-grade payment processor for fiat-to-crypto conversion
@@ -679,6 +691,38 @@ class PaymentProcessor:
         except Exception as e:
             logger.error("Failed to sync transaction status", transaction_id=transaction_id, error=str(e))
     
+    async def _handle_payment_reversal(self, transaction_id: uuid.UUID, *,
+                                       event_type: str, reason: str) -> None:
+        """sp1263 — a refund / chargeback / dispute landed for a payment. Mark the
+        transaction REFUNDED and flag it (the flag hard-stops any future credit via
+        _process_crypto_conversion). If FTNS was ALREADY distributed, log CRITICAL — the user
+        received tokens AND got their fiat back, which requires a manual clawback review
+        (auto-clawback is a policy decision and the tokens may already be spent)."""
+        async with db_manager.session() as session:
+            transaction = session.query(PaymentTransaction).filter(
+                PaymentTransaction.transaction_id == transaction_id
+            ).first()
+            if not transaction:
+                logger.warning("payment reversal for unknown transaction",
+                               transaction_id=transaction_id, event_type=event_type)
+                return
+
+            _extra = dict(transaction.additional_data or {})
+            already_credited = bool(_extra.get("tokens_distributed"))
+            _extra["reversed"] = {"event_type": event_type, "reason": reason}
+            transaction.additional_data = _extra      # JSONB reassign → SQLAlchemy detects it
+            transaction.status = PaymentStatus.REFUNDED.value
+            session.commit()
+
+            if already_credited:
+                logger.critical(
+                    "PAYMENT REVERSED AFTER FTNS CREDIT — manual clawback review required",
+                    transaction_id=transaction_id, event_type=event_type, reason=reason,
+                    user_id=transaction.user_id, crypto_amount=str(transaction.crypto_amount))
+            else:
+                logger.warning("payment reversed before credit — transaction marked REFUNDED",
+                               transaction_id=transaction_id, event_type=event_type)
+
     async def _reconcile_payment(self, transaction) -> bool:
         """sp1261 — server-side reconciliation before crediting FTNS.
 
@@ -772,6 +816,13 @@ class PaymentProcessor:
                 if _extra.get("tokens_distributed"):
                     logger.info("FTNS already distributed — idempotent webhook skip",
                                 transaction_id=transaction_id)
+                    return
+
+                # sp1263 — a reversed (refunded/charged-back/disputed) transaction must NEVER
+                # be credited, even if a stale success event arrives after the reversal.
+                if _extra.get("reversed"):
+                    logger.error("transaction was REVERSED (refund/dispute) — NOT crediting FTNS",
+                                 transaction_id=transaction_id)
                     return
 
                 # sp1261 — server-side reconciliation gate: even a signature-verified webhook
@@ -991,13 +1042,27 @@ class PaymentProcessor:
             elif event_type == "payment_intent.payment_failed":
                 payment_intent = payload["data"]["object"]
                 transaction_id = payment_intent["id"]
-                
+
                 await self._update_transaction_status(uuid.UUID(transaction_id), PaymentStatus.FAILED)
-                
+
                 return True
-            
+
+            elif event_type in ("charge.refunded", "charge.dispute.created"):
+                # sp1263 — refund / chargeback. The PaymentIntent id (our transaction_id) is
+                # on the charge/dispute object as `payment_intent`.
+                obj = payload["data"]["object"]
+                pi = obj.get("payment_intent")
+                if pi:
+                    await self._handle_payment_reversal(
+                        uuid.UUID(pi), event_type=event_type,
+                        reason=str(obj.get("reason") or event_type))
+                else:
+                    logger.warning("Stripe reversal event without payment_intent — manual "
+                                   "review", event_type=event_type)
+                return True
+
             return True
-            
+
         except Exception as e:
             logger.error("Stripe webhook processing failed", error=str(e))
             return False
@@ -1019,13 +1084,29 @@ class PaymentProcessor:
             elif event_type == "CHECKOUT.ORDER.COMPLETED":
                 order = payload["resource"]
                 transaction_id = order["id"]
-                
+
                 await self._update_transaction_status(uuid.UUID(transaction_id), PaymentStatus.COMPLETED)
-                
+
                 return True
-            
+
+            elif event_type in ("PAYMENT.CAPTURE.REFUNDED", "PAYMENT.CAPTURE.REVERSED",
+                                "CUSTOMER.DISPUTE.CREATED"):
+                # sp1263 — refund / chargeback / dispute. Capture refunds/reversals carry the
+                # order id under resource.supplementary_data.related_ids.order_id; events that
+                # don't (e.g. disputes) can't be mapped to our order-keyed transaction → log
+                # for manual review rather than act on the wrong one.
+                order_id = _extract_paypal_reversal_order_id(payload)
+                if order_id:
+                    await self._handle_payment_reversal(
+                        uuid.UUID(order_id), event_type=event_type,
+                        reason=str(payload.get("summary") or event_type))
+                else:
+                    logger.warning("PayPal reversal event without a resolvable order_id — "
+                                   "manual review required", event_type=event_type)
+                return True
+
             return True
-            
+
         except Exception as e:
             logger.error("PayPal webhook processing failed", error=str(e))
             return False
