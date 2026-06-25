@@ -91,7 +91,12 @@ def test_honest_receipt_verifies_clean():
     # `reasons` should be empty when ok=true.
     assert result.reasons == []
     assert result.dp_noise_applied is True
-    assert result.multi_stage_envelope_present is True
+    # sp1256 — this fixture builds a SINGLE-stage receipt (tee_attestation is a stub,
+    # not a per-stage chain envelope), so multi_stage_envelope_present is correctly
+    # False. The original `is True` assertion reflected the pre-sp1236 permissive logic
+    # where ANY non-empty attestation counted as multi-stage; the TEE attestation work
+    # (sp1236+) tightened is_multi_stage_attestation to detect only real envelopes.
+    assert result.multi_stage_envelope_present is False
 
 
 def test_tampered_receipt_signature_fails():
