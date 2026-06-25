@@ -55,10 +55,14 @@ class TestCleanupStaleHappyPath:
     def test_cleans_expired_escrows(self):
         escrow = PaymentEscrow(
             ledger=_ledger(), node_id="test-node",
-            default_timeout=0.1,  # 100ms
+            # 30s window: the stale entries (1h old) are unambiguously expired, while the
+            # "fresh" entry created just below stays well within the window for the whole
+            # test (node + TestClient build + POST). A tight timeout here was flaky — the
+            # setup latency alone could exceed it, expiring the "fresh" escrow too.
+            default_timeout=30.0,
         )
         # Seed two stale + one fresh.
-        old = time.time() - 60.0
+        old = time.time() - 3600.0
         for jid in ("j1", "j2"):
             entry = EscrowEntry(
                 escrow_id=f"esc-{jid}", job_id=jid,

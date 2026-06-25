@@ -74,8 +74,16 @@ def test_embedding_only_raises_without_embed_key(tmp_path, monkeypatch):
 
 
 def _fake_tokenizer(ids):
+    # A BASE-model tokenizer (no chat_template): sp1230 routes encoding through
+    # _encode_prompt_tokens → should_use_chat_template(tok) → encode_for_generation.
+    # For a base model that calls `tokenizer(prompt, return_tensors="pt")` (the __call__),
+    # returning an enc mapping with input_ids. chat_template MUST be explicitly None — a
+    # bare MagicMock auto-creates a truthy `chat_template`, which would wrongly select the
+    # instruct apply_chat_template path and feed a MagicMock into the embedding lookup.
     tok = MagicMock()
-    tok.encode = MagicMock(return_value=torch.tensor([ids]))
+    tok.chat_template = None
+    tok.encode = MagicMock(return_value=torch.tensor([ids]))      # legacy path (back-compat)
+    tok.return_value = {"input_ids": torch.tensor([ids])}          # tok(prompt, return_tensors=…)
     return tok
 
 
