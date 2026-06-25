@@ -621,6 +621,18 @@ class StorageProofVerifier:
                 logger.warning(f"Signature verification failed: {e}")
                 return False, f"Signature verification failed: {e}"
         
+        # sp1252 — the answered proof_type MUST match the ISSUED challenge's type.
+        # Dispatch previously branched on the ATTACKER-controlled proof.proof_type
+        # with no check against challenge.proof_type, letting a provider DOWNGRADE an
+        # issued MERKLE challenge into the weaker RANGE/FULL verifiers. The honest
+        # prover always answers with challenge.proof_type (answer_challenge), so a
+        # mismatch is a forgery attempt → reject (fail closed).
+        if proof.proof_type != challenge.proof_type:
+            return False, (
+                f"proof_type {proof.proof_type} does not match challenge proof_type "
+                f"{challenge.proof_type} (downgrade rejected)"
+            )
+
         # Verify proof based on type
         if proof.proof_type == ProofType.MERKLE:
             return self._verify_merkle_proof(proof, challenge)
@@ -693,16 +705,16 @@ class StorageProofVerifier:
         Returns:
             Tuple of (is_valid, error_message)
         """
-        # Range proof: provider returns a range of bytes from the content
-        # We verify the range size matches difficulty
-        
-        if len(proof.proof_data) < challenge.difficulty:
-            return False, f"Proof data too small: {len(proof.proof_data)} < {challenge.difficulty}"
-        
-        # In a full implementation, we'd verify this range matches the content
-        # For now, we accept the proof if it has sufficient data
-        self._update_challenge_status(proof.challenge_id, ChallengeStatus.VERIFIED)
-        return True, ""
+        # sp1252 — FAIL CLOSED. A range proof must bind the returned bytes to the
+        # challenged content (the nonce must deterministically select a byte offset,
+        # and the verifier must compare proof_data to content[offset:offset+len]).
+        # That content-binding is NOT implemented — the prior code accepted ANY bytes
+        # of sufficient LENGTH as VERIFIED, a forgeable no-op (a provider storing
+        # nothing could submit random padding of the right size). Until real range
+        # verification exists, reject. The live system only ever ISSUES MERKLE
+        # challenges (storage_provider.py), so this rejects nothing legitimate; it only
+        # closes the proof-type-downgrade target.
+        return False, "range proof verification not implemented — fail closed (sp1252)"
     
     def _verify_full_proof(
         self,
@@ -718,17 +730,13 @@ class StorageProofVerifier:
         Returns:
             Tuple of (is_valid, error_message)
         """
-        # Full proof: provider returns entire content
-        # This is only practical for small content
-        
-        # Verify the proof data is not empty
-        if not proof.proof_data:
-            return False, "Empty proof data"
-        
-        # In a full implementation, we'd verify the CID matches
-        # For now, we accept the proof if it has data
-        self._update_challenge_status(proof.challenge_id, ChallengeStatus.VERIFIED)
-        return True, ""
+        # sp1252 — FAIL CLOSED. A full proof must recompute the content hash/CID over
+        # proof_data and compare it to challenge.shard_hash; that binding is NOT
+        # implemented — the prior code accepted ANY non-empty bytes as VERIFIED, a
+        # forgeable no-op. Until real full-content verification exists, reject. The
+        # live system only ever ISSUES MERKLE challenges, so this rejects nothing
+        # legitimate; it only closes the proof-type-downgrade target.
+        return False, "full proof verification not implemented — fail closed (sp1252)"
     
     def _update_challenge_status(
         self,

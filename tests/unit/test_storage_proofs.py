@@ -486,9 +486,14 @@ class TestStorageProofVerifier:
         )
         
         is_valid, error = await proof_verifier.verify_proof(proof, challenge)
-        
-        assert is_valid is True
-    
+
+        # sp1252 — range proofs now FAIL CLOSED. The prior no-op verifier accepted any
+        # sufficient-length bytes with NO content binding (a forgeable fail-open); real
+        # range verification is unimplemented, so even a genuine byte-slice is rejected
+        # until it lands. (The live system only issues MERKLE challenges.)
+        assert is_valid is False
+        assert "not implemented" in error.lower()
+
     @pytest.mark.asyncio
     async def test_verify_range_proof_too_small(
         self,
@@ -516,9 +521,11 @@ class TestStorageProofVerifier:
         )
         
         is_valid, error = await proof_verifier.verify_proof(proof, challenge)
-        
+
+        # sp1252 — still rejected (the security property holds), now for a STRONGER
+        # reason: range verification fails closed before the size check is reached.
         assert is_valid is False
-        assert "too small" in error.lower()
+        assert "not implemented" in error.lower()
     
     def test_cleanup_expired_challenges(self, proof_verifier, sample_cid, challenger_identity):
         """Test cleaning up expired challenges."""
@@ -1070,9 +1077,12 @@ class TestIntegration:
             
             assert proof is not None
             assert proof.proof_type == proof_type
-            
+
+            # sp1252 — the prover can ANSWER all three types, but only MERKLE verifies;
+            # RANGE/FULL now fail closed (their no-op verifiers were forgeable
+            # fail-opens; content-binding is unimplemented).
             is_valid, _ = await verifier.verify_proof(proof, challenge)
-            assert is_valid is True
+            assert is_valid is (proof_type == ProofType.MERKLE)
 
 
 # =============================================================================
