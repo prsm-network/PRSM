@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Any, Tuple
 from enum import Enum
 import structlog
 
-from prsm.core.redis_client import get_redis_client
+from prsm.core.redis_client import get_redis_client, resolve_async_redis
 from prsm.core.integrations.security.audit_logger import audit_logger
 
 logger = structlog.get_logger(__name__)
@@ -128,7 +128,7 @@ class RateLimiter:
         Returns:
             Tuple of (is_allowed, limit_info)
         """
-        if not self.redis_client:
+        if self._live_redis() is None:  # sp1249 — resolve the live inner client
             logger.warning("Rate limiter not initialized, allowing request")
             return True, {}
         
@@ -201,7 +201,7 @@ class RateLimiter:
         user_role: Optional[str] = None
     ):
         """Increment rate limit counters after successful request"""
-        if not self.redis_client:
+        if self._live_redis() is None:  # sp1249
             return
         
         try:
@@ -220,10 +220,11 @@ class RateLimiter:
         """Add IP to whitelist"""
         try:
             self.whitelisted_ips.add(ip)
-            
-            if self.redis_client:
-                await self.redis_client.sadd("rate_limit:whitelist", ip)
-                await self.redis_client.hset(
+
+            _redis = self._live_redis()  # sp1249
+            if _redis is not None:
+                await _redis.sadd("rate_limit:whitelist", ip)
+                await _redis.hset(
                     "rate_limit:whitelist_reasons",
                     ip,
                     f"{reason} - {datetime.now(timezone.utc).isoformat()}"
@@ -240,15 +241,16 @@ class RateLimiter:
         """Add IP to blacklist"""
         try:
             self.blacklisted_ips.add(ip)
-            
-            if self.redis_client:
+
+            _redis = self._live_redis()  # sp1249
+            if _redis is not None:
                 if duration:
                     # Temporary blacklist with expiration
-                    await self.redis_client.setex(f"rate_limit:blacklist:{ip}", duration, reason)
+                    await _redis.setex(f"rate_limit:blacklist:{ip}", duration, reason)
                 else:
                     # Permanent blacklist
-                    await self.redis_client.sadd("rate_limit:blacklist", ip)
-                    await self.redis_client.hset(
+                    await _redis.sadd("rate_limit:blacklist", ip)
+                    await _redis.hset(
                         "rate_limit:blacklist_reasons",
                         ip,
                         f"{reason} - {datetime.now(timezone.utc).isoformat()}"
@@ -263,7 +265,7 @@ class RateLimiter:
     
     async def get_rate_limit_status(self, identifier: str, user_id: Optional[str] = None) -> Dict[str, Any]:
         """Get current rate limit status for identifier"""
-        if not self.redis_client:
+        if self._live_redis() is None:  # sp1249
             return {}
         
         try:
@@ -291,7 +293,18 @@ class RateLimiter:
             return {}
     
     # Private helper methods
-    
+
+    def _live_redis(self):
+        """sp1249 — the live inner async Redis, or None when disconnected.
+
+        self.redis_client is the RedisClient WRAPPER (get_redis_client()), which
+        exposes NO raw Redis commands — calling .zadd/.zcard/.get/.setex on it raised
+        AttributeError, swallowed by each method's fail-open/fail-safe except, so this
+        whole limiter silently degraded (reputation always 1.0, windows never recorded,
+        blacklist writes lost). Centralizes the sp1247 resolve_async_redis() unwrap.
+        """
+        return resolve_async_redis(self.redis_client)
+
     def _rule_applies(self, rule: RateLimitRule, endpoint: str, user_role: Optional[str]) -> bool:
         """Check if rate limit rule applies to this request"""
         # Check endpoint pattern
@@ -328,19 +341,22 @@ class RateLimiter:
     async def _check_sliding_window(self, key: str, limit: int, window: int) -> Tuple[bool, int, int]:
         """Check sliding window rate limit"""
         try:
+            _redis = self._live_redis()  # sp1249
+            if _redis is None:
+                return True, 0, 0  # no live Redis → allow (matches the no-redis guard)
             current_time = int(time.time())
             window_start = current_time - window
-            
+
             # Remove old entries
-            await self.redis_client.zremrangebyscore(key, 0, window_start)
-            
+            await _redis.zremrangebyscore(key, 0, window_start)
+
             # Count current entries
-            current_count = await self.redis_client.zcard(key)
-            
+            current_count = await _redis.zcard(key)
+
             # Check if limit exceeded
             if current_count >= limit:
                 # Calculate time remaining in window
-                oldest_entry = await self.redis_client.zrange(key, 0, 0, withscores=True)
+                oldest_entry = await _redis.zrange(key, 0, 0, withscores=True)
                 if oldest_entry:
                     oldest_time = int(oldest_entry[0][1])
                     window_remaining = max(0, oldest_time + window - current_time)
@@ -358,13 +374,16 @@ class RateLimiter:
     async def _increment_sliding_window(self, key: str, window: int):
         """Increment sliding window counter"""
         try:
+            _redis = self._live_redis()  # sp1249
+            if _redis is None:
+                return
             current_time = time.time()
-            
+
             # Add current timestamp
-            await self.redis_client.zadd(key, {str(current_time): current_time})
-            
+            await _redis.zadd(key, {str(current_time): current_time})
+
             # Set expiration for cleanup
-            await self.redis_client.expire(key, window * 2)
+            await _redis.expire(key, window * 2)
             
         except Exception as e:
             logger.error("Sliding window increment error", error=str(e))
@@ -372,17 +391,20 @@ class RateLimiter:
     async def _get_sliding_window_status(self, key: str, window: int) -> Tuple[int, int]:
         """Get current sliding window status"""
         try:
+            _redis = self._live_redis()  # sp1249
+            if _redis is None:
+                return 0, 0
             current_time = int(time.time())
             window_start = current_time - window
-            
+
             # Remove old entries
-            await self.redis_client.zremrangebyscore(key, 0, window_start)
-            
+            await _redis.zremrangebyscore(key, 0, window_start)
+
             # Get current count
-            current_count = await self.redis_client.zcard(key)
-            
+            current_count = await _redis.zcard(key)
+
             # Calculate window remaining
-            oldest_entry = await self.redis_client.zrange(key, 0, 0, withscores=True)
+            oldest_entry = await _redis.zrange(key, 0, 0, withscores=True)
             if oldest_entry:
                 oldest_time = int(oldest_entry[0][1])
                 window_remaining = max(0, oldest_time + window - current_time)
@@ -398,17 +420,18 @@ class RateLimiter:
     async def _get_ip_reputation(self, ip: str) -> float:
         """Get IP reputation score (0-1, higher is better)"""
         try:
-            if not self.redis_client:
+            _redis = self._live_redis()  # sp1249
+            if _redis is None:
                 return 1.0
-            
+
             reputation_key = f"ip_reputation:{ip}"
-            score = await self.redis_client.get(reputation_key)
-            
+            score = await _redis.get(reputation_key)
+
             if score:
                 return max(0.0, min(1.0, float(score)))
             else:
                 # New IP starts with neutral reputation
-                await self.redis_client.setex(reputation_key, 86400, "0.7")  # 24 hour TTL
+                await _redis.setex(reputation_key, 86400, "0.7")  # 24 hour TTL
                 return 0.7
             
         except Exception as e:
@@ -418,14 +441,15 @@ class RateLimiter:
     async def _update_ip_reputation(self, ip: str, delta: float):
         """Update IP reputation score"""
         try:
-            if not self.redis_client:
+            _redis = self._live_redis()  # sp1249
+            if _redis is None:
                 return
-            
+
             reputation_key = f"ip_reputation:{ip}"
             current_score = await self._get_ip_reputation(ip)
             new_score = max(0.0, min(1.0, current_score + delta))
-            
-            await self.redis_client.setex(reputation_key, 86400, str(new_score))
+
+            await _redis.setex(reputation_key, 86400, str(new_score))
             
             # Log significant reputation changes
             if abs(delta) >= 0.1:
@@ -441,21 +465,22 @@ class RateLimiter:
     async def _load_ip_lists(self):
         """Load whitelist and blacklist from Redis"""
         try:
-            if not self.redis_client:
+            _redis = self._live_redis()  # sp1249
+            if _redis is None:
                 return
-            
+
             # Load whitelist
-            whitelist = await self.redis_client.smembers("rate_limit:whitelist")
+            whitelist = await _redis.smembers("rate_limit:whitelist")
             if whitelist:
                 self.whitelisted_ips = {ip.decode() if isinstance(ip, bytes) else ip for ip in whitelist}
-            
+
             # Load blacklist
-            blacklist = await self.redis_client.smembers("rate_limit:blacklist")
+            blacklist = await _redis.smembers("rate_limit:blacklist")
             if blacklist:
                 self.blacklisted_ips = {ip.decode() if isinstance(ip, bytes) else ip for ip in blacklist}
-            
+
             # Load temporary blacklisted IPs
-            temp_blacklist_keys = await self.redis_client.keys("rate_limit:blacklist:*")
+            temp_blacklist_keys = await _redis.keys("rate_limit:blacklist:*")
             for key in temp_blacklist_keys:
                 ip = key.decode().split(":")[-1] if isinstance(key, bytes) else key.split(":")[-1]
                 self.blacklisted_ips.add(ip)
