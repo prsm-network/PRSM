@@ -13,7 +13,7 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Dict, Optional, Any
 
 import structlog
@@ -66,6 +66,33 @@ def _paypal_transmission_headers(headers: Optional[Dict[str, str]]):
             return None
         out[field] = value
     return out
+
+
+def _payment_reconciliation_enabled() -> bool:
+    """sp1261 — opt-in server-side payment reconciliation. When ON, the FTNS credit is
+    gated on re-fetching the authoritative payment from the provider (confirm captured +
+    amount), and any mismatch/error fails closed. Default OFF preserves the prior
+    signature-verified-trust behavior (the broader fiat launch is externally gated, so this
+    is forward-looking hardening that operators flip on when they wire provider API creds)."""
+    return os.getenv("PRSM_PAYMENT_RECONCILIATION", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+# Map a stored PaymentTransaction.payment_method to the fiat_gateway provider key.
+_METHOD_TO_PROVIDER = {
+    "paypal": "paypal",
+    "credit_card": "stripe",
+    "debit_card": "stripe",
+    "stripe": "stripe",
+}
+
+
+def _provider_name_for_payment_method(payment_method) -> str:
+    """Resolve the fiat_gateway provider name for a transaction's payment_method
+    (e.g. credit_card → stripe, paypal → paypal). Unknown values pass through unchanged so
+    a misconfiguration surfaces as "provider not available" rather than a silent wrong pick."""
+    key = str(payment_method or "").strip().lower()
+    return _METHOD_TO_PROVIDER.get(key, key)
 
 
 class PaymentProcessor:
@@ -652,6 +679,76 @@ class PaymentProcessor:
         except Exception as e:
             logger.error("Failed to sync transaction status", transaction_id=transaction_id, error=str(e))
     
+    async def _reconcile_payment(self, transaction) -> bool:
+        """sp1261 — server-side reconciliation before crediting FTNS.
+
+        A signature-verified webhook proves the event is authentic, but NOT that funds were
+        actually captured at the expected amount: PayPal CHECKOUT.ORDER.APPROVED is buyer
+        approval (not capture), a stale/edge event may not reflect the final state, and the
+        amount could differ from what we recorded. So we re-fetch the authoritative payment
+        from the provider (reusing the fiat_gateway's get_payment_status) and require
+        status == COMPLETED with a matching amount + currency before minting.
+
+        Opt-in via PRSM_PAYMENT_RECONCILIATION. When ENABLED, ANY failure — no gateway,
+        provider error, non-COMPLETED status, amount/currency mismatch — fails CLOSED (no
+        credit). When DISABLED (default), we skip with a warning and preserve the prior
+        signature-verified-trust behavior (the broader fiat launch is externally gated).
+        """
+        if not _payment_reconciliation_enabled():
+            logger.warning("server-side payment reconciliation DISABLED "
+                           "(PRSM_PAYMENT_RECONCILIATION) — crediting on the verified webhook "
+                           "alone; enable it to confirm captured funds + amount before credit")
+            return True
+
+        gateway = getattr(self, "fiat_gateway", None)
+        if gateway is None:
+            logger.error("payment reconciliation enabled but no fiat_gateway is wired — "
+                         "REJECTING credit (fail closed).")
+            return False
+
+        provider_name = _provider_name_for_payment_method(
+            getattr(transaction, "payment_method", None))
+        try:
+            resp = await gateway.get_payment_status(
+                str(transaction.transaction_id), provider_name)
+        except Exception as exc:  # noqa: BLE001 — any error → fail closed, never mint on doubt
+            logger.error("payment reconciliation fetch error — REJECTING credit "
+                         "(fail closed): %s", exc)
+            return False
+
+        if not getattr(resp, "success", False) or resp.status != PaymentStatus.COMPLETED:
+            logger.error("payment reconciliation: provider status=%s (not COMPLETED) for %s — "
+                         "REJECTING credit (fail closed).",
+                         getattr(resp, "status", None), transaction.transaction_id)
+            return False
+
+        # Amount + currency must match what we recorded (provider is authoritative). Decimal
+        # equality is numeric, so 10 == 10.00.
+        try:
+            expected_amount = Decimal(str(transaction.fiat_amount))
+            actual_amount = Decimal(str(resp.fiat_amount))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            logger.error("payment reconciliation: un-parseable amount — REJECTING credit "
+                         "(fail closed): %s", exc)
+            return False
+        if actual_amount != expected_amount:
+            logger.error("payment reconciliation: provider amount %s != expected %s for %s — "
+                         "REJECTING credit (fail closed).",
+                         actual_amount, expected_amount, transaction.transaction_id)
+            return False
+
+        actual_currency = str(getattr(resp.fiat_currency, "value", resp.fiat_currency)).upper()
+        expected_currency = str(transaction.fiat_currency).upper()
+        if actual_currency != expected_currency:
+            logger.error("payment reconciliation: provider currency %s != expected %s for %s — "
+                         "REJECTING credit (fail closed).",
+                         actual_currency, expected_currency, transaction.transaction_id)
+            return False
+
+        logger.info("payment reconciliation passed", transaction_id=transaction.transaction_id,
+                    amount=str(actual_amount), currency=actual_currency)
+        return True
+
     async def _process_crypto_conversion(self, transaction_id: uuid.UUID):
         """Process cryptocurrency conversion and distribution"""
         try:
@@ -675,6 +772,14 @@ class PaymentProcessor:
                 if _extra.get("tokens_distributed"):
                     logger.info("FTNS already distributed — idempotent webhook skip",
                                 transaction_id=transaction_id)
+                    return
+
+                # sp1261 — server-side reconciliation gate: even a signature-verified webhook
+                # is not trusted for the final credit. Confirm with the provider that the
+                # payment is actually CAPTURED at the expected amount before minting FTNS.
+                if not await self._reconcile_payment(transaction):
+                    logger.error("payment reconciliation failed — NOT crediting FTNS",
+                                 transaction_id=transaction_id)
                     return
 
                 if self.token_distribution_enabled and transaction.crypto_amount:
