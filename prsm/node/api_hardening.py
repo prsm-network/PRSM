@@ -455,20 +455,25 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # Try authenticated user first
         if hasattr(request.state, "user_id") and request.state.user_id:
             return f"user:{request.state.user_id}"
-        
-        # Fall back to IP address
-        forwarded_for = request.headers.get("x-forwarded-for")
-        if forwarded_for:
-            return f"ip:{forwarded_for.split(',')[0].strip()}"
-        
-        real_ip = request.headers.get("x-real-ip")
-        if real_ip:
-            return f"ip:{real_ip}"
-        
-        if request.client:
-            return f"ip:{request.client.host}"
-        
-        return "ip:unknown"
+
+        client = getattr(request, "client", None)
+        host = getattr(client, "host", "") if client else ""
+
+        # sp1274 — only trust proxy-forwarded headers when the IMMEDIATE socket peer is a
+        # trusted (loopback) reverse proxy. On a directly-exposed node these headers are
+        # attacker-controlled, so trusting them lets a client rotate X-Forwarded-For to get a
+        # fresh rate-limit bucket per request and defeat the cap (sp1103 parity for the global
+        # limiter). Use the RIGHTMOST hop — the one the trusted proxy appended.
+        from prsm.node.api import _host_is_loopback  # lazy: avoid api<->api_hardening cycle
+        if host and _host_is_loopback(host):
+            forwarded_for = request.headers.get("x-forwarded-for")
+            if forwarded_for and forwarded_for.split(",")[-1].strip():
+                return f"ip:{forwarded_for.split(',')[-1].strip()}"
+            real_ip = request.headers.get("x-real-ip")
+            if real_ip and real_ip.strip():
+                return f"ip:{real_ip.strip()}"
+
+        return f"ip:{host}" if host else "ip:unknown"
     
     def _add_rate_limit_headers(self, response: Response, result: RateLimitResult) -> None:
         """Add rate limit information headers to response."""
