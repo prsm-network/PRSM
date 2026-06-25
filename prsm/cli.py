@@ -7568,9 +7568,11 @@ def compute_models_cli(
     "directly compatible).",
 )
 @click.option(
-    "--pubkey-b64", "pubkey_b64", required=True,
-    help="Base64-encoded Ed25519 public key of the expected "
-    "signer (the operator's published pubkey).",
+    "--pubkey-b64", "pubkey_b64", required=False, default=None,
+    help="Base64-encoded Ed25519 public key of the expected signer. OPTIONAL "
+    "(sp1255): if omitted, the key EMBEDDED in the receipt is used and is bound "
+    "to settler_node_id (node_id == sha256(pubkey)[:32]) so it can't be swapped. "
+    "Pass it explicitly to additionally pin the signer to a key you already trust.",
 )
 @click.option(
     "--format", "output_format",
@@ -7650,6 +7652,17 @@ def compute_verify_receipt_cli(
             console.print(f"[red]{msg}[/red]")
         raise SystemExit(1)
 
+    # sp1255 — when no pubkey is supplied, verify against the key embedded in the
+    # receipt (bound to settler_node_id). Require the receipt to actually carry one.
+    _pk_source = "supplied" if pubkey_b64 else "embedded"
+    if not pubkey_b64 and not receipt.settler_pubkey_b64:
+        msg = ("Receipt carries no embedded settler pubkey (pre-sp1255 receipt); "
+               "pass --pubkey-b64 <the signer's published key> to verify.")
+        if output_format == "json":
+            click.echo(_json.dumps({"ok": False, "error": msg}))
+        else:
+            console.print(f"[red]{msg}[/red]")
+        raise SystemExit(1)
     try:
         ok = bool(_verify(receipt, public_key_b64=pubkey_b64))
     except Exception as exc:  # noqa: BLE001
@@ -7666,6 +7679,7 @@ def compute_verify_receipt_cli(
             "verified": ok,
             "job_id": receipt.job_id,
             "settler_node_id": receipt.settler_node_id,
+            "pubkey_source": _pk_source,
         }, indent=2))
         if not ok:
             raise SystemExit(1)
@@ -7675,12 +7689,13 @@ def compute_verify_receipt_cli(
         console.print(
             f"[green]Receipt verified[/green] — "
             f"job_id={receipt.job_id}, settler="
-            f"{receipt.settler_node_id[:16]}…"
+            f"{receipt.settler_node_id[:16]}… "
+            f"({_pk_source} pubkey)"
         )
         return
     console.print(
-        f"[red]Receipt verification failed[/red] — supplied "
-        f"pubkey does not match the signer for "
+        f"[red]Receipt verification failed[/red] — the {_pk_source} "
+        f"pubkey does not match/bind to the signer for "
         f"job_id={receipt.job_id}."
     )
     raise SystemExit(1)

@@ -144,6 +144,14 @@ class InferenceReceipt:
     cost_ftns: Decimal
     settler_signature: bytes = b""
     settler_node_id: str = ""
+    # Sprint 1255 — the settler's Ed25519 PUBLIC key (base64), embedded so a
+    # receipt is INDEPENDENTLY verifiable offline without an out-of-band pubkey
+    # lookup (the §7 "trust the math, not the provider" thesis). It is NOT part of
+    # signing_payload (canonical bytes stay byte-identical to pre-1255 receipts);
+    # it can't be swapped because verify_receipt binds it to settler_node_id
+    # (node_id == sha256(pubkey)[:32], which IS signed). Omitted from to_dict when
+    # None for pre-1255 byte-equivalence.
+    settler_pubkey_b64: Optional[str] = None
     # Phase 3.x.8: True iff the inference output was streamed
     # token-by-token (``RpcChainExecutor.execute_chain_streaming``)
     # rather than returned in one shot. The flag is part of the
@@ -225,6 +233,9 @@ class InferenceReceipt:
         # Sprint 1107 — omit when None for pre-1107 byte-equivalence.
         if self.stage_activation_chain is not None:
             d["stage_activation_chain"] = self.stage_activation_chain.to_dict()
+        # Sprint 1255 — omit when None for pre-1255 byte-equivalence.
+        if self.settler_pubkey_b64 is not None:
+            d["settler_pubkey_b64"] = self.settler_pubkey_b64
         return d
 
     @classmethod

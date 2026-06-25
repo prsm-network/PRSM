@@ -150,10 +150,14 @@ class TestVerifyReceiptRejection:
         # No signature on receipt → verify returns False
         assert not verify_receipt(unsigned_receipt, identity=identity)
 
-    def test_no_key_provided_rejected(self, unsigned_receipt, identity):
+    def test_no_key_falls_back_to_embedded_else_rejected(self, unsigned_receipt, identity):
+        # sp1255 — with no key supplied, verify falls back to the pubkey EMBEDDED in
+        # the receipt (bound to settler_node_id), so a genuine receipt verifies offline.
         signed = sign_receipt(unsigned_receipt, identity)
-        # Neither public_key_b64 nor identity provided
-        assert not verify_receipt(signed)
+        assert verify_receipt(signed) is True
+        # ...but a receipt with NO embedded pubkey AND no key supplied is rejected.
+        stripped = dataclasses.replace(signed, settler_pubkey_b64=None)
+        assert not verify_receipt(stripped)
 
     def test_wrong_public_key_rejected(
         self, unsigned_receipt, identity, other_identity

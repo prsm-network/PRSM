@@ -61,10 +61,13 @@ def sign_receipt(
     signature_b64 = identity.sign(payload)
     signature_bytes = base64.b64decode(signature_b64)
 
-    # Step 3: produce final receipt with both fields populated
+    # Step 3: produce final receipt with both fields populated. sp1255 — also
+    # embed the settler PUBLIC key so the receipt is independently verifiable
+    # offline (verify_receipt binds it to settler_node_id, so it can't be swapped).
     return dataclasses.replace(
         intermediate,
         settler_signature=signature_bytes,
+        settler_pubkey_b64=identity.public_key_b64,
     )
 
 
@@ -92,17 +95,31 @@ def verify_receipt(
     """
     if not receipt.settler_signature:
         return False
-    if public_key_b64 is None and identity is None:
-        return False
 
     payload = receipt.signing_payload()
     signature_b64 = base64.b64encode(receipt.settler_signature).decode()
 
     if identity is not None:
         return identity.verify(payload, signature_b64)
-    # public_key_b64 is not None here per the early-return above
-    assert public_key_b64 is not None  # for type-checkers
-    return verify_signature(public_key_b64, payload, signature_b64)
+    if public_key_b64 is not None:
+        return verify_signature(public_key_b64, payload, signature_b64)
+
+    # sp1255 — no pubkey supplied: fall back to the key EMBEDDED in the receipt so
+    # it verifies independently/offline. The embedded key is untrusted input, so we
+    # MUST bind it to the signed settler_node_id (node_id == sha256(pubkey)[:32]);
+    # otherwise an attacker could embed their own key + signature while claiming a
+    # victim's node_id. With the binding, a forged pubkey either fails the binding
+    # or the signature.
+    embedded = receipt.settler_pubkey_b64
+    if not embedded:
+        return False
+    try:
+        from prsm.node.identity import node_id_for_public_key
+        if node_id_for_public_key(base64.b64decode(embedded)) != receipt.settler_node_id:
+            return False
+    except Exception:
+        return False
+    return verify_signature(embedded, payload, signature_b64)
 
 
 def is_signed(receipt: InferenceReceipt) -> bool:
