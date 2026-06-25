@@ -93,9 +93,15 @@ def test_ip_reputation_reads_inner_client():
     assert _run(rl._get_ip_reputation("1.2.3.4")) == pytest.approx(0.2)
 
 
-def test_ip_reputation_disconnected_returns_neutral_good():
+def test_ip_reputation_disconnected_returns_neutral_not_max():
+    # sp1262 — disconnected returns the NEUTRAL reputation (0.7), not the old MAX 1.0
+    # (a fail-open that elevated every IP to perfect trust on a backend outage). Neutral is
+    # >= the block threshold, so traffic still flows; it just isn't max-trusted.
+    from prsm.core.auth.rate_limiter import _NEUTRAL_REPUTATION
     rl = _limiter(_Wrapper(connected=False, inner=None))
-    assert _run(rl._get_ip_reputation("1.2.3.4")) == 1.0
+    score = _run(rl._get_ip_reputation("1.2.3.4"))
+    assert score == _NEUTRAL_REPUTATION
+    assert score != 1.0
 
 
 def test_live_redis_helper_resolves_inner_and_none():

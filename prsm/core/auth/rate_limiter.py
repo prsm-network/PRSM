@@ -3,6 +3,7 @@ Advanced Rate Limiting System
 Comprehensive rate limiting with Redis backend and intelligent protection
 """
 
+import os
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Tuple
@@ -11,6 +12,20 @@ import structlog
 
 from prsm.core.redis_client import get_redis_client, resolve_async_redis
 from prsm.core.integrations.security.audit_logger import audit_logger
+
+
+# sp1262 — neutral "unknown" IP reputation (matches the new-IP default). Returned when the
+# reputation backend is unavailable so an outage can't ELEVATE an IP to max trust (the old
+# `return 1.0` fail-open) while also not self-DoSing every IP (it's >= the block threshold).
+_NEUTRAL_REPUTATION = 0.7
+
+
+def _reputation_fail_closed() -> bool:
+    """sp1262 — opt-in HARD fail-closed: when the reputation backend is unavailable, BLOCK
+    (return a sub-threshold score) instead of allowing past the reputation gate. Default OFF
+    (graceful neutral) so a Redis blip doesn't take down all traffic on the reputation layer."""
+    return os.getenv("PRSM_RATE_LIMIT_REPUTATION_FAIL_CLOSED", "").strip().lower() in (
+        "1", "true", "yes", "on")
 
 logger = structlog.get_logger(__name__)
 
@@ -422,7 +437,9 @@ class RateLimiter:
         try:
             _redis = self._live_redis()  # sp1249
             if _redis is None:
-                return 1.0
+                # sp1262 — backend absent: don't grant MAX trust (was `return 1.0`, a
+                # fail-open). Neutral by default; sub-threshold (block) under strict opt-in.
+                return 0.0 if _reputation_fail_closed() else _NEUTRAL_REPUTATION
 
             reputation_key = f"ip_reputation:{ip}"
             score = await _redis.get(reputation_key)
@@ -431,12 +448,16 @@ class RateLimiter:
                 return max(0.0, min(1.0, float(score)))
             else:
                 # New IP starts with neutral reputation
-                await _redis.setex(reputation_key, 86400, "0.7")  # 24 hour TTL
-                return 0.7
-            
+                await _redis.setex(reputation_key, 86400, str(_NEUTRAL_REPUTATION))  # 24h TTL
+                return _NEUTRAL_REPUTATION
+
         except Exception as e:
             logger.error("IP reputation check error", error=str(e))
-            return 1.0  # Assume good reputation on error
+            # sp1262 — was `return 1.0` (MAX trust) on error → a fail-OPEN. We can't read the
+            # stored score with the backend down, so we can't distinguish a known-bad IP from
+            # a good one; default to NEUTRAL (not max) so an outage never elevates trust, and
+            # let strict operators hard-block via PRSM_RATE_LIMIT_REPUTATION_FAIL_CLOSED.
+            return 0.0 if _reputation_fail_closed() else _NEUTRAL_REPUTATION
     
     async def _update_ip_reputation(self, ip: str, delta: float):
         """Update IP reputation score"""
