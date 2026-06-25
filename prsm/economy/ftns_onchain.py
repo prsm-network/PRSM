@@ -248,6 +248,30 @@ def scan_inbound_transfers_chunked(
     return out
 
 
+# Base Sepolia's public RPC (sepolia.base.org) caps eth_getLogs at 2000 blocks per
+# request — far tighter than Base mainnet's ~10k. sp1257 — the inbound-transfer scan
+# must pick a window that fits the ACTIVE chain's cap or it 400s with
+# "query exceeds max block range 2000" (seen in `wallet info` on testnet).
+_BASE_SEPOLIA_CHAIN_ID = 84532
+_GETLOGS_WINDOW_SEPOLIA = 1_900   # safety margin under the 2000-block cap
+_GETLOGS_WINDOW_DEFAULT = 9_000   # Base mainnet (~10k cap)
+
+
+def getlogs_window_for_chain(chain_id) -> int:
+    """sp1257 — the safe ``eth_getLogs`` block-window for a chain's public-RPC cap.
+
+    Base Sepolia (chainId 84532) caps at 2000 blocks/request; everything else uses
+    the wider ~9000 default. Pass to ``scan_inbound_transfers_chunked(max_window=...)``
+    so the inbound scan never over-runs the cap. Fails SAFE (smallest window) on a
+    non-int chain_id."""
+    try:
+        if int(chain_id) == _BASE_SEPOLIA_CHAIN_ID:
+            return _GETLOGS_WINDOW_SEPOLIA
+        return _GETLOGS_WINDOW_DEFAULT
+    except (TypeError, ValueError):
+        return _GETLOGS_WINDOW_SEPOLIA
+
+
 def _gas_status_for_eth(eth: float) -> str:
     """Pure helper — shared between startup log, endpoint,
     /health/detailed, and the periodic monitor. One source

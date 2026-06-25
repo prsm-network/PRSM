@@ -4385,6 +4385,7 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             )
         try:
             from prsm.economy.ftns_onchain import (
+                getlogs_window_for_chain,
                 scan_inbound_transfers_chunked,
             )
             if from_block == 0:
@@ -4408,6 +4409,7 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 recipient=addr,
                 from_block=start,
                 to_block=end,
+                max_window=getlogs_window_for_chain(w3.eth.chain_id),  # sp1257
             )
             return {
                 "recipient": addr,
@@ -4451,6 +4453,7 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             )
         try:
             from prsm.economy.ftns_onchain import (
+                getlogs_window_for_chain,
                 scan_inbound_transfers_chunked,
             )
             if from_block == 0:
@@ -4472,6 +4475,7 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             transfers = scan_inbound_transfers_chunked(
                 token, recipient=addr,
                 from_block=start, to_block=end,
+                max_window=getlogs_window_for_chain(w3.eth.chain_id),  # sp1257
             )
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
