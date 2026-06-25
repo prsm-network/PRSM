@@ -41,8 +41,9 @@ generate (yielding interleaved with token production) is a Phase
 
 from __future__ import annotations
 
+import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, List, Optional, Tuple
 
 import numpy as np
@@ -72,6 +73,19 @@ __all__ = [
 # SamplingDefaults
 # ──────────────────────────────────────────────────────────────────────────
 
+_DEFAULT_MAX_TOKENS_CEILING = 4096
+
+
+def _resolve_max_tokens_ceiling() -> int:
+    """sp1273 — the hard max_tokens ceiling for the distributed generation loop, from
+    PRSM_INFERENCE_MAX_TOKENS_CEILING (default 4096). Fail-safe to the default on bad input;
+    floored at 1."""
+    try:
+        return max(1, int(os.getenv("PRSM_INFERENCE_MAX_TOKENS_CEILING",
+                                    str(_DEFAULT_MAX_TOKENS_CEILING))))
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_TOKENS_CEILING
+
 
 @dataclass(frozen=True)
 class SamplingDefaults:
@@ -89,6 +103,11 @@ class SamplingDefaults:
     temperature: float = 1.0
     top_k: int = 50
     top_p: float = 0.95
+    # sp1273 — HARD operator ceiling for the distributed/parallax generation loop. A
+    # caller-supplied max_tokens is clamped to this in _effective_max_tokens, so a single
+    # cheap request can't drive unbounded GPU compute (escrow cost is independent of length).
+    # Mirrors local_inference's _MAX_TOKENS_CEILING; env-overridable.
+    max_tokens_ceiling: int = field(default_factory=lambda: _resolve_max_tokens_ceiling())
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -365,16 +384,15 @@ class AutoregressiveStreamingRunner:
     def _effective_max_tokens(
         self, request: Any,
     ) -> int:
-        """Resolve max_tokens from the request, falling back to
-        the runner's default. ``request.max_tokens`` may be None
-        (caller didn't specify) — fall back. If specified, use it
-        directly (no min/max clamping; operators control the
-        ceiling via the runner's default + the request validator
-        upstream)."""
+        """Resolve max_tokens from the request, falling back to the runner's default, then
+        CLAMP to the operator ceiling (sp1273). ``request.max_tokens`` may be None (fall
+        back). A caller-supplied value is bounded to [1, max_tokens_ceiling] so one request
+        can't drive unbounded GPU generation (escrow cost is independent of length)."""
+        ceiling = self._defaults.max_tokens_ceiling
         rmax = getattr(request, "max_tokens", None)
         if rmax is None:
-            return self._defaults.max_tokens
-        return int(rmax)
+            return min(self._defaults.max_tokens, ceiling)
+        return max(1, min(int(rmax), ceiling))
 
     def _effective_temperature(
         self, request: Any,
@@ -684,10 +702,12 @@ class EmbedderBackedStreamingRunner:
         self._defaults = sampling_defaults or SamplingDefaults()
 
     def _effective_max_tokens(self, request: Any) -> int:
+        # sp1273 — clamp to the operator ceiling (see AutoregressiveStreamingRunner).
+        ceiling = self._defaults.max_tokens_ceiling
         rmax = getattr(request, "max_tokens", None) if request else None
         if rmax is None:
-            return self._defaults.max_tokens
-        return int(rmax)
+            return min(self._defaults.max_tokens, ceiling)
+        return max(1, min(int(rmax), ceiling))
 
     def _effective_temperature(self, request: Any) -> float:
         rtemp = getattr(request, "temperature", None) if request else None
