@@ -5822,8 +5822,8 @@ class PRSMNode:
             f"Dashboard: http://127.0.0.1:{self.config.api_port}/"
         )
         logger.info(
-            "Node onboarding UI available",
-            url=f"http://127.0.0.1:{self.config.api_port}/onboarding/"
+            "Node onboarding UI available: http://127.0.0.1:%s/onboarding/",
+            self.config.api_port,
         )
 
     def _build_query_orchestrator_or_none(self):
