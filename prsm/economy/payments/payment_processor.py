@@ -34,6 +34,15 @@ from .payment_models import (
 logger = structlog.get_logger(__name__)
 
 
+def _insecure_payment_webhooks_allowed() -> bool:
+    """sp1250 — explicit DEV-ONLY opt-in to ACCEPT UNVERIFIED payment webhooks
+    (default OFF → secure). The webhook route is UNAUTHENTICATED, so a verified
+    signature is the ONLY authentication; production MUST verify. Never set
+    PRSM_ALLOW_INSECURE_PAYMENT_WEBHOOKS outside local development."""
+    return os.getenv("PRSM_ALLOW_INSECURE_PAYMENT_WEBHOOKS", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 class PaymentProcessor:
     """
     Production-grade payment processor for fiat-to-crypto conversion
@@ -679,8 +688,17 @@ class PaymentProcessor:
         """Verify Stripe webhook signature using HMAC-SHA256"""
         webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET", "")
         if not webhook_secret:
-            logger.warning("STRIPE_WEBHOOK_SECRET not set — skipping signature verification")
-            return True  # Allow in dev; block in prod via separate check
+            # sp1250 — FAIL CLOSED. The route is unauthenticated; without the secret
+            # we cannot verify the HMAC, so a forged event would otherwise mint FTNS
+            # with no fiat charged. Reject unless an operator explicitly opts into
+            # the DEV-ONLY insecure mode.
+            if _insecure_payment_webhooks_allowed():
+                logger.warning("STRIPE_WEBHOOK_SECRET unset + PRSM_ALLOW_INSECURE_PAYMENT_WEBHOOKS "
+                               "— ACCEPTING UNVERIFIED Stripe webhook (DEV ONLY, never in prod)")
+                return True
+            logger.error("STRIPE_WEBHOOK_SECRET not set — REJECTING webhook (fail closed). "
+                         "Set STRIPE_WEBHOOK_SECRET to enable Stripe webhook processing.")
+            return False
 
         try:
             # Stripe signature format: "t=timestamp,v1=hash"
@@ -705,16 +723,29 @@ class PaymentProcessor:
             return False
 
     def _verify_paypal_signature(self, raw_body: bytes, signature_header: str) -> bool:
-        """Verify PayPal webhook signature"""
-        # PayPal uses a different verification scheme (PAYPAL-TRANSMISSION-SIG header)
-        # requiring a call to PayPal's /v1/notifications/verify-webhook-signature endpoint.
-        # For now, verify the webhook ID is set and log a warning if not.
-        webhook_id = os.getenv("PAYPAL_WEBHOOK_ID", "")
-        if not webhook_id:
-            logger.warning("PAYPAL_WEBHOOK_ID not set — skipping PayPal signature verification")
+        """Verify a PayPal webhook — FAIL CLOSED (sp1250).
+
+        Real PayPal verification requires POSTing the full transmission header set
+        (PAYPAL-TRANSMISSION-ID / -TIME / -SIG + CERT-URL + AUTH-ALGO) plus the
+        webhook_id and raw event to PayPal's
+        /v1/notifications/verify-webhook-signature endpoint and checking
+        verification_status == "SUCCESS". That flow is NOT yet wired through the
+        webhook route (it forwards only a single signature string), so we cannot
+        actually verify a PayPal event here. Returning True unconditionally (the prior
+        behavior) let an attacker forge a CHECKOUT.ORDER.APPROVED event on the
+        unauthenticated route and mint FTNS with no fiat charged — so until real
+        verification lands we REJECT PayPal webhooks. A configured PAYPAL_WEBHOOK_ID is
+        NOT verification and must never be mistaken for it. An explicit DEV-ONLY opt-in
+        preserves local testing.
+        """
+        if _insecure_payment_webhooks_allowed():
+            logger.warning("PRSM_ALLOW_INSECURE_PAYMENT_WEBHOOKS — ACCEPTING UNVERIFIED "
+                           "PayPal webhook (DEV ONLY, never in prod)")
             return True
-        # Full async verification would require calling PayPal API — flag for future implementation
-        return True
+        logger.error("PayPal webhook signature verification is not implemented — REJECTING "
+                     "webhook (fail closed). Wire PayPal verify-webhook-signature (with the "
+                     "full transmission headers) before enabling PayPal as a fiat on-ramp.")
+        return False
 
     async def _process_stripe_webhook(self, payload: Dict[str, Any]) -> bool:
         """Process Stripe webhook"""
