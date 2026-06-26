@@ -18,6 +18,8 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from prsm.core.auth import get_current_user
+
 router = APIRouter(prefix="/content-economy", tags=["Content Economy"])
 
 
@@ -150,20 +152,26 @@ class RoyaltyInfoResponse(BaseModel):
 async def process_content_access(
     request: ContentAccessRequest,
     economy = Depends(get_content_economy),
+    current_user = Depends(get_current_user),
 ):
     """Process FTNS payment for content access.
-    
+
     Flow:
     1. Lock FTNS in escrow
     2. Distribute royalties to creator chain
     3. Record payment completion
-    
+
     Returns payment details including royalty distributions.
+
+    sp1279 (audit round 7): requires authentication, and the PAYER (accessor_id) is bound to
+    the authenticated caller — the body's accessor_id is IGNORED, so a caller can no longer
+    charge another user's FTNS by spoofing it.
     """
+    accessor_id = str(getattr(current_user, "id", current_user))
     try:
         payment = await economy.process_content_access(
             content_id=request.cid,
-            accessor_id=request.accessor_id,
+            accessor_id=accessor_id,
             content_metadata={
                 "royalty_rate": request.royalty_rate,
                 "creator_id": request.creator_id,
