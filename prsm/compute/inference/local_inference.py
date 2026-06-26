@@ -77,6 +77,27 @@ def _resolve_offline(explicit: Optional[bool]) -> bool:
     return (os.environ.get(_OFFLINE_ENV, "") or "").strip().lower() in _TRUTHY
 
 
+def resolve_model_revision(model_id: str) -> Optional[str]:
+    """sp1285 — pin a model's HuggingFace artifacts to an IMMUTABLE commit.
+
+    PRSM_MODEL_REVISIONS is a JSON object {model_id: revision}; this returns the pinned
+    revision (commit sha / tag) for ``model_id``, or None (the default branch — prior
+    behavior). Pinning a revision is the supply-chain defense: from_pretrained otherwise
+    fetches whatever the model repo's default branch currently points at, so a hijacked or
+    retagged HF repo could serve poisoned weights to the node."""
+    raw = (os.environ.get("PRSM_MODEL_REVISIONS", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        import json
+        mapping = json.loads(raw)
+        rev = mapping.get(model_id) if isinstance(mapping, dict) else None
+        return rev if isinstance(rev, str) and rev.strip() else None
+    except (ValueError, TypeError):
+        logger.warning("PRSM_MODEL_REVISIONS is not valid JSON — ignoring (no revision pin)")
+        return None
+
+
 # ── sp1204: real inference quality (GPU + instruct model, greedy/§7-deterministic) ────
 _DEVICE_ENV = "PRSM_LOCAL_INFERENCE_DEVICE"      # cuda | mps | cpu | auto (default auto)
 _DTYPE_ENV = "PRSM_LOCAL_INFERENCE_DTYPE"        # float16 | bfloat16 | float32 | auto
@@ -236,18 +257,24 @@ class LocalHuggingFaceChainExecutor:
                        "float32": torch.float32}[dtype_str]
         # local_files_only=self._offline: False → allow a one-time hub download; True →
         # offline-only, deterministic, no network round-trip.
-        tok = AutoTokenizer.from_pretrained(self._model_id, local_files_only=self._offline)
+        # sp1285 — pin to an immutable HF commit when configured (supply-chain: don't trust
+        # the model repo's mutable default branch). None = default branch (prior behavior).
+        _revision = resolve_model_revision(self._model_id)
+        tok = AutoTokenizer.from_pretrained(
+            self._model_id, local_files_only=self._offline, revision=_revision)
         # sp1206 — use the dtype kwarg the installed transformers expects (v5 renamed
         # torch_dtype→dtype). An ignored dtype loads fp32 → a 7B OOMs a 24GB A10.
         import transformers as _tf
         _dtype_kw = dtype_kwarg_for_transformers(getattr(_tf, "__version__", "4"))
         try:
             model = AutoModelForCausalLM.from_pretrained(
-                self._model_id, local_files_only=self._offline, **{_dtype_kw: torch_dtype})
+                self._model_id, local_files_only=self._offline, revision=_revision,
+                **{_dtype_kw: torch_dtype})
         except TypeError:  # version-detect missed → try the other kwarg name
             _other = "torch_dtype" if _dtype_kw == "dtype" else "dtype"
             model = AutoModelForCausalLM.from_pretrained(
-                self._model_id, local_files_only=self._offline, **{_other: torch_dtype})
+                self._model_id, local_files_only=self._offline, revision=_revision,
+                **{_other: torch_dtype})
         model.eval()
         model.to(device)
         if tok.pad_token_id is None:

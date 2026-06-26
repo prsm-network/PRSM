@@ -14417,9 +14417,13 @@ def node_infer_cli(
             f"[dim]Loading {model} for tokenize + embed...[/dim]"
         )
     try:
-        tok = _AutoTok.from_pretrained(model)
+        # sp1285 — pin to an immutable HF commit when PRSM_MODEL_REVISIONS configures one
+        # (supply-chain: don't trust the model repo's mutable default branch).
+        from prsm.compute.inference.local_inference import resolve_model_revision
+        _rev = resolve_model_revision(model)
+        tok = _AutoTok.from_pretrained(model, revision=_rev)
         hf_model = _AutoModel.from_pretrained(
-            model, torch_dtype=_torch.float32,
+            model, torch_dtype=_torch.float32, revision=_rev,
         ).eval()
     except Exception as exc:
         console.print(
