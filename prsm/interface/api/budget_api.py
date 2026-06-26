@@ -253,6 +253,18 @@ async def create_session_budget(
         raise HTTPException(status_code=500, detail=f"Budget creation failed: {str(e)}")
 
 
+async def _assert_budget_owner(budget_manager, budget_id, current_user) -> dict:
+    """sp1282 (audit round 7) — IDOR guard: a budget may only be read/spent/expanded by the
+    authenticated user who owns it. Returns the budget status (so callers can reuse it). 404
+    when the budget doesn't exist; 403 when it belongs to another user."""
+    status = await budget_manager.get_budget_status(budget_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="Budget not found")
+    if str(status.get("user_id")) != str((current_user or {}).get("user_id")):
+        raise HTTPException(status_code=403, detail="Not authorized for this budget")
+    return status
+
+
 @router.get("/status/{budget_id}", response_model=BudgetResponse)
 async def get_budget_status(
     budget_id: UUID,
@@ -267,15 +279,10 @@ async def get_budget_status(
     try:
         budget_manager = get_ftns_budget_manager()
         
-        # Get budget status
-        budget_status = await budget_manager.get_budget_status(budget_id)
-        
-        if not budget_status:
-            raise HTTPException(status_code=404, detail="Budget not found")
-        
-        # Verify user ownership (in production, add proper authorization)
-        # For now, simple check would go here
-        
+        # sp1282 — enforce ownership (was a TODO comment → any authed user could read any
+        # budget_id, an IDOR). Returns the status for reuse.
+        budget_status = await _assert_budget_owner(budget_manager, budget_id, current_user)
+
         response = BudgetResponse(
             budget_id=budget_status["budget_id"],
             session_id=budget_status["session_id"],
@@ -312,7 +319,10 @@ async def spend_from_budget(
     """
     try:
         budget_manager = get_ftns_budget_manager()
-        
+
+        # sp1282 — IDOR guard: only the budget's owner may spend from it.
+        await _assert_budget_owner(budget_manager, budget_id, current_user)
+
         # Spend from budget
         success = await budget_manager.spend_budget_amount(
             budget_id=budget_id,
@@ -361,7 +371,10 @@ async def request_budget_expansion(
     """
     try:
         budget_manager = get_ftns_budget_manager()
-        
+
+        # sp1282 — IDOR guard: only the budget's owner may request expansion.
+        await _assert_budget_owner(budget_manager, budget_id, current_user)
+
         # Create expansion request
         expand_request = await budget_manager.request_budget_expansion(
             budget_id=budget_id,
