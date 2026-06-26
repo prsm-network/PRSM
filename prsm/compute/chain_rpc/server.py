@@ -2452,6 +2452,20 @@ class LayerStageServer:
                 "wired (operator must pass kv_cache_manager= when "
                 "speculative decode is enabled)",
             )
+        # sp1284 — same owner enforcement as evict (sp1283): RollbackCacheRequest also carried
+        # no auth + keyed on a cleartext request_id, so an observer could truncate another
+        # session's cache. When enforcement is on (+ anchor wired), require a settler-signed
+        # token bound to this request_id; default OFF preserves prior behavior.
+        if _enforce_cache_owner() and self._anchor is not None:
+            tok = request.upstream_token
+            if (tok is None or not tok.verify_with_anchor(self._anchor)
+                    or tok.request_id != request.request_id):
+                return self._error(
+                    request.request_id,
+                    StageErrorCode.INVALID_TOKEN,
+                    "rollback_cache: a settler-signed token bound to this request_id is "
+                    "required (PRSM_CHAIN_RPC_ENFORCE_CACHE_OWNER is on)",
+                )
         if self._sharded_runner is None:
             return self._error(
                 request.request_id,

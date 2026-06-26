@@ -1846,6 +1846,19 @@ class RpcChainExecutor:
         """
         if self._rollback_cache_send is None or n_positions_to_drop <= 0:
             return
+        # sp1284 — mint a settler-signed token bound to this request_id (same as the evict
+        # broadcast) so a server with cache-owner enforcement accepts the legitimate rollback
+        # and rejects forged ones. Best-effort; harmless / omitted when enforcement is off.
+        rollback_token = None
+        if self._settler is not None:
+            try:
+                rollback_token = HandoffToken.sign(
+                    identity=self._settler, request_id=request_id,
+                    chain_stage_index=0, chain_total_stages=max(1, len(chain.stages)),
+                    deadline_unix=time.time() + 300.0,
+                )
+            except Exception:  # noqa: BLE001 — tokenless rollback still works when enforcement off
+                rollback_token = None
         # Phase 3.x.11.q.y' — per-stage encoding (each stage gets
         # its own ciphertext blob with stage-bound AAD when the
         # cipher is wired). When no cipher AND no prefix, fall
@@ -1864,6 +1877,7 @@ class RpcChainExecutor:
                     RollbackCacheRequest(
                         request_id=request_id,
                         n_positions_to_drop=int(n_positions_to_drop),
+                        upstream_token=rollback_token,  # sp1284
                     ),
                 )
             except Exception as exc:  # noqa: BLE001
@@ -1935,6 +1949,7 @@ class RpcChainExecutor:
                                 if encrypted_prefix is not None
                                 else None
                             ),
+                            upstream_token=rollback_token,  # sp1284
                         ),
                     )
                 else:

@@ -2553,6 +2553,11 @@ class RollbackCacheRequest:
     # the server can't decrypt). Range [0, 255] mirrors the
     # ProbsCipher AAD validator.
     target_stage_index: Optional[int] = None
+    # sp1284 — optional settler-signed token bound to this request_id (same as EvictCache,
+    # sp1283). Under PRSM_CHAIN_RPC_ENFORCE_CACHE_OWNER (+ anchor) a rollback is honored only
+    # with a valid token for this request_id, closing the unauthenticated cross-session cache
+    # truncation (round-7 #2, rollback variant).
+    upstream_token: Optional["HandoffToken"] = None
     protocol_version: int = CHAIN_RPC_PROTOCOL_VERSION
 
     MESSAGE_TYPE: str = ChainRpcMessageType.ROLLBACK_CACHE_REQUEST.value
@@ -2661,6 +2666,11 @@ class RollbackCacheRequest:
                     f"target_stage_index must be in [0, 255], "
                     f"got {self.target_stage_index}"
                 )
+        if self.upstream_token is not None and not isinstance(self.upstream_token, HandoffToken):
+            raise ChainRpcMalformedError(  # sp1284
+                f"upstream_token must be HandoffToken or None, got "
+                f"{type(self.upstream_token).__name__}"
+            )
         _validate_version(self.protocol_version)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -2682,6 +2692,8 @@ class RollbackCacheRequest:
             ).hex()
         if self.target_stage_index is not None:
             out["target_stage_index"] = int(self.target_stage_index)
+        if self.upstream_token is not None:
+            out["upstream_token"] = self.upstream_token.to_dict()  # sp1284
         return out
 
     @classmethod
@@ -2728,12 +2740,14 @@ class RollbackCacheRequest:
                     f"{type(target_raw).__name__}"
                 )
             target_idx = int(target_raw)
+        token_raw = data.get("upstream_token")  # sp1284
         return cls(
             request_id=_required_str(data, "request_id"),
             n_positions_to_drop=int(n_raw),
             replay_accepted_prefix=replay_tuple,
             encrypted_replay_accepted_prefix=enc_bytes,
             target_stage_index=target_idx,
+            upstream_token=HandoffToken.from_dict(token_raw) if token_raw else None,
             protocol_version=_required_int(data, "protocol_version"),
         )
 
