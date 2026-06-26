@@ -20,7 +20,7 @@
     "prsm/compute/chain_rpc/client.py:1617-1620": "26bb991b79cc3b97e5943b057be0b6164e1be773fa59b3bb2f64eac1b2e58929",
     "prsm/compute/chain_rpc/kv_cache.py:201-249": "6b74b4b0d511d19a106406529a93127f4208f3be69245ccdc24d1aefa4d6f859",
     "prsm/compute/chain_rpc/protocol.py:1069-1111": "cafae563dbdbb059721db3b177054c2ef83005841f496ce2362d4985a75f8b27",
-    "prsm/compute/chain_rpc/server.py:2297-2331": "bce32e9d09d2a9a8e161ca903c264f9d69a0af0d95aac81aa51919af92a90679",
+    "prsm/compute/chain_rpc/server.py:2308-2342": "bce32e9d09d2a9a8e161ca903c264f9d69a0af0d95aac81aa51919af92a90679",
     "prsm/data/dedup/thresholds.py:55-99": "be7ac6d5b92b0a87a4a13510c2fa6e186783d789d879abed25c2a828bd912168"
   }
 }
