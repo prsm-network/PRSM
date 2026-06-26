@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Any
 
 from fastapi import APIRouter, HTTPException, Depends, status, BackgroundTasks
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import Field
 
 from ..security.security_orchestrator import security_orchestrator, SecurityAssessment
@@ -90,9 +91,31 @@ security_router = APIRouter(
 
 # === Dependency Functions ===
 
-async def get_current_user() -> str:
-    """Get current user ID (placeholder for actual auth)"""
-    return "default_user"
+_security_api_bearer = HTTPBearer(auto_error=True)
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(_security_api_bearer),
+) -> str:
+    """Authenticate via the canonical JWT verifier; return the user id as a string.
+
+    sp1278 (audit round 7): was a stub returning "default_user", leaving this security router
+    (incl. POST /policies/update, which can globally disable security scanning) effectively
+    UNAUTHENTICATED — same pattern fixed in sp1272/sp1268. jwt_handler.verify_token enforces
+    signature, expiry, required claims, and revocation; non-access tokens are rejected.
+    """
+    from prsm.core.auth.jwt_handler import jwt_handler
+
+    try:
+        token_data = await jwt_handler.verify_token(credentials.credentials)
+    except HTTPException:
+        raise
+    except Exception:  # noqa: BLE001 — never authenticate on a verifier error
+        raise HTTPException(status_code=401, detail="Authentication failed")
+
+    if token_data is None or token_data.token_type != "access":
+        raise HTTPException(status_code=401, detail="Invalid or missing access token")
+    return str(token_data.user_id)
 
 
 # === Security Scanning Endpoints ===
