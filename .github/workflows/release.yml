@@ -171,7 +171,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
       
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0 (sp1246: pin mutable @release/v1 branch ref to an immutable release SHA — supply-chain audit #9)
         with:
           skip-existing: true
       
@@ -204,7 +204,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
       
       - name: Publish to TestPyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0 (sp1246: pin mutable @release/v1 branch ref to an immutable release SHA — supply-chain audit #9)
         with:
           repository-url: https://test.pypi.org/legacy/
           password: ${{ secrets.TESTPYPI_API_TOKEN }}
@@ -281,7 +281,7 @@ jobs:
             VCS_REF=${{ github.sha }}
       
       - name: Scan image for vulnerabilities
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0 (sp1246: pin mutable @master branch ref to an immutable release SHA — supply-chain audit #9)
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate.outputs.version }}
           format: 'sarif'
