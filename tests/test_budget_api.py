@@ -180,6 +180,7 @@ class TestBudgetAPI:
             
             mock_budget_manager.get_budget_status.return_value = {
                 "budget_id": str(budget_id),
+                "user_id": "test_api_user_001",   # sp1282 — caller (dependency-override user) owns this budget
                 "session_id": str(uuid4()),
                 "status": "active",
                 "total_budget": 100.0,
@@ -235,6 +236,7 @@ class TestBudgetAPI:
             # Mock spending success
             mock_budget_manager.spend_budget_amount.return_value = True
             mock_budget_manager.get_budget_status.return_value = {
+                "user_id": "test_api_user_001",   # sp1282 — caller (dependency-override user) owns this budget
                 "available_budget": 75.0,
                 "utilization_percentage": 25.0
             }
@@ -296,7 +298,13 @@ class TestBudgetAPI:
             mock_expand_request.expires_at = datetime(2024, 1, 1, 1, 0, 0, tzinfo=_tz.utc)
             
             mock_budget_manager.request_budget_expansion.return_value = mock_expand_request
-            
+            # sp1282 — ownership gate reads get_budget_status; caller owns this budget
+            mock_budget_manager.get_budget_status.return_value = {
+                "user_id": "test_api_user_001",   # sp1282 — dependency-override user owns it
+                "available_budget": 15.0,
+                "utilization_percentage": 85.0,
+            }
+
             # Make API request
             request_data = {
                 "requested_amount": 50.0,
