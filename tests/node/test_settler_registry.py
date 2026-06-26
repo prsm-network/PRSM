@@ -167,7 +167,15 @@ class TestSettlerUnbonding:
 
 class TestMultiSigBatchApproval:
     """Tests for multi-signature batch approval."""
-    
+
+    @pytest.fixture(autouse=True)
+    def _allow_unsigned(self, monkeypatch):
+        # sp1277 — these tests exercise the QUORUM mechanics (counts, threshold, duplicate,
+        # settled), not signature verification, using placeholder signatures. Opt into the
+        # DEV-ONLY unsigned path so they keep testing quorum; the real signature-verification
+        # contract is covered by test_sprint_1277_settler_signature_verification.
+        monkeypatch.setenv("PRSM_ALLOW_UNSIGNED_SETTLER_BATCH", "1")
+
     @pytest.mark.asyncio
     async def test_propose_batch(self, registry):
         """Test batch proposal."""

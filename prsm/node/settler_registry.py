@@ -22,6 +22,7 @@ Security Model:
 import asyncio
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
@@ -43,6 +44,14 @@ def verify_settler_signature(public_key_b64: str, message: bytes, signature_b64:
         return verify_signature(public_key_b64, message, signature_b64)
     except Exception:
         return False
+
+
+def _allow_unsigned_settler_batch() -> bool:
+    """sp1277 — DEV-ONLY opt-in to accept a batch signature from a settler that registered no
+    public key (the pre-fix forgeable behavior). Default OFF → production fails closed: a
+    settler MUST register a key and produce a real signature to approve a batch."""
+    return os.getenv("PRSM_ALLOW_UNSIGNED_SETTLER_BATCH", "").strip().lower() in (
+        "1", "true", "yes", "on")
 
 
 # === Configuration ===
@@ -69,6 +78,10 @@ class Settler:
     address: str                      # 0x Ethereum address
     bond_amount: float
     staked_at: datetime
+    # sp1277 — Ed25519 public key (base64) the settler signs batch approvals with. Without it,
+    # sign_batch can't verify a signature and fails closed (the multi-sig was forgeable while
+    # this field didn't exist and the verify branch was dead code).
+    public_key_b64: Optional[str] = None
     status: SettlerStatus = SettlerStatus.ACTIVE
     unbonding_at: Optional[datetime] = None
     total_settled: int = 0
@@ -196,6 +209,7 @@ class SettlerRegistry:
         settler_id: str,
         address: str,
         bond_amount: float,
+        public_key_b64: Optional[str] = None,
     ) -> Settler:
         """
         Register a new settler with staked bond.
@@ -263,6 +277,7 @@ class SettlerRegistry:
                 address=address.lower(),
                 bond_amount=bond_amount,
                 staked_at=datetime.now(timezone.utc),
+                public_key_b64=public_key_b64,
                 status=SettlerStatus.ACTIVE,
             )
             
@@ -448,13 +463,24 @@ class SettlerRegistry:
             if settler_id in batch.signer_ids:
                 raise ValueError(f"Settler {settler_id} already signed this batch")
             
-            # Verify signature if settler has a public key registered
+            # sp1277 — MANDATORY signature verification. Previously this only verified when
+            # `public_key_b64` was set, but that field didn't exist on Settler → the branch was
+            # dead and every signature was accepted, making the 3-of-N multi-sig forgeable by
+            # any caller. Now: with a key, verify (fail closed on a bad sig); WITHOUT a key,
+            # REJECT — a settler that registered no key cannot approve a batch — unless the
+            # DEV-ONLY PRSM_ALLOW_UNSIGNED_SETTLER_BATCH opt-in is set (legacy/local testing).
             settler = self._settlers.get(settler_id)
-            if settler and getattr(settler, 'public_key_b64', None):
+            pubkey = getattr(settler, "public_key_b64", None) if settler else None
+            if pubkey:
                 expected_msg = f"PRSM:{batch.batch_hash}:{settler_id}".encode()
-                if not verify_settler_signature(settler.public_key_b64, expected_msg, signature):
+                if not verify_settler_signature(pubkey, expected_msg, signature):
                     raise ValueError(f"Invalid signature from settler {settler_id}")
-            # If no public key registered, accept signature (backward compatibility)
+            elif not _allow_unsigned_settler_batch():
+                raise ValueError(
+                    f"Settler {settler_id} has no registered public key; its batch signature "
+                    f"cannot be verified (set PRSM_ALLOW_UNSIGNED_SETTLER_BATCH for DEV-ONLY "
+                    f"legacy behavior)"
+                )
             
             batch_sig = BatchSignature(
                 settler_id=settler_id,
