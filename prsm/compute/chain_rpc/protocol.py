@@ -2417,26 +2417,41 @@ class EvictCacheRequest:
 
     request_id: str
     protocol_version: int = CHAIN_RPC_PROTOCOL_VERSION
+    # sp1283 — optional settler-signed token bound to this request_id. When the server runs
+    # with cache-owner enforcement on (PRSM_CHAIN_RPC_ENFORCE_CACHE_OWNER + an anchor wired),
+    # only an evict carrying a valid token for this request_id may drop the cache — so a peer
+    # that merely observed the cleartext request_id can't wipe another session's KV-cache.
+    upstream_token: Optional["HandoffToken"] = None
 
     MESSAGE_TYPE: str = ChainRpcMessageType.EVICT_CACHE_REQUEST.value
 
     def __post_init__(self) -> None:
         _validate_str_field("request_id", self.request_id)
         _validate_version(self.protocol_version)
+        if self.upstream_token is not None and not isinstance(self.upstream_token, HandoffToken):
+            raise ChainRpcMalformedError(
+                f"upstream_token must be HandoffToken or None, got "
+                f"{type(self.upstream_token).__name__}"
+            )
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        out = {
             "type": self.MESSAGE_TYPE,
             "protocol_version": self.protocol_version,
             "request_id": self.request_id,
         }
+        if self.upstream_token is not None:
+            out["upstream_token"] = self.upstream_token.to_dict()
+        return out
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "EvictCacheRequest":
         _expect_type(data, ChainRpcMessageType.EVICT_CACHE_REQUEST)
+        token_raw = data.get("upstream_token")
         return cls(
             request_id=_required_str(data, "request_id"),
             protocol_version=_required_int(data, "protocol_version"),
+            upstream_token=HandoffToken.from_dict(token_raw) if token_raw else None,
         )
 
 

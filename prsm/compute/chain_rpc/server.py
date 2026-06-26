@@ -32,6 +32,7 @@ wiring (Task 6 wraps Phase 2 Ring 8's ``TensorParallelExecutor``).
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, List, Optional, Protocol, Tuple
@@ -76,6 +77,16 @@ from prsm.node.identity import NodeIdentity
 
 
 logger = logging.getLogger(__name__)
+
+
+def _enforce_cache_owner() -> bool:
+    """sp1283 — True iff PRSM_CHAIN_RPC_ENFORCE_CACHE_OWNER is on. When enabled (and the
+    server has an anchor wired), EvictCacheRequest must carry a settler-signed token bound to
+    its request_id, closing the unauthenticated cross-session KV-cache eviction (round-7 #2).
+    Default OFF preserves the prior behavior on the proven multi-host path until operators
+    flip it on (the client always sends the token, so enabling is friction-free)."""
+    return os.environ.get("PRSM_CHAIN_RPC_ENFORCE_CACHE_OWNER", "").strip().lower() in (
+        "1", "true", "yes", "on")
 
 
 def _tier_gate_advisory_enabled() -> bool:
@@ -2385,6 +2396,22 @@ class LayerStageServer:
                 "(operator must pass kv_cache_manager= when sharded "
                 "decode is enabled)",
             )
+        # sp1283 — opt-in cache-owner enforcement. EvictCacheRequest carries no auth and keys
+        # on a request_id transmitted in cleartext to every stage, so any peer that observed it
+        # could wipe another session's in-flight KV-cache (cross-session DoS). When enforcement
+        # is on (PRSM_CHAIN_RPC_ENFORCE_CACHE_OWNER) and an anchor is wired, an evict must carry
+        # a settler-signed token bound to this exact request_id; otherwise it's rejected (the
+        # TTL sweeper still bounds the leak window). Default OFF preserves prior behavior.
+        if _enforce_cache_owner() and self._anchor is not None:
+            tok = request.upstream_token
+            if (tok is None or not tok.verify_with_anchor(self._anchor)
+                    or tok.request_id != request.request_id):
+                return self._error(
+                    request.request_id,
+                    StageErrorCode.INVALID_TOKEN,
+                    "evict_cache: a settler-signed token bound to this request_id is required "
+                    "(PRSM_CHAIN_RPC_ENFORCE_CACHE_OWNER is on)",
+                )
         evicted = self._kv_cache_manager.evict(request.request_id)
         return encode_message(
             EvictCacheResponse(

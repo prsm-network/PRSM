@@ -2122,9 +2122,25 @@ class RpcChainExecutor:
         """
         if self._cache_evict_send is None:
             return
+        # sp1283 — mint a settler-signed token bound to this request_id so a server running
+        # with cache-owner enforcement (PRSM_CHAIN_RPC_ENFORCE_CACHE_OWNER) accepts the
+        # legitimate evict while rejecting forged ones from peers that merely observed the
+        # cleartext request_id. Best-effort: harmless (and omitted) when enforcement is off.
+        evict_token = None
+        if self._settler is not None:
+            try:
+                evict_token = HandoffToken.sign(
+                    identity=self._settler,
+                    request_id=request_id,
+                    chain_stage_index=0,
+                    chain_total_stages=max(1, len(chain.stages)),
+                    deadline_unix=time.time() + 300.0,
+                )
+            except Exception:  # noqa: BLE001 — tokenless evict still works when enforcement off
+                evict_token = None
         try:
             evict_request_bytes = encode_message(
-                EvictCacheRequest(request_id=request_id),
+                EvictCacheRequest(request_id=request_id, upstream_token=evict_token),
             )
         except Exception as exc:  # noqa: BLE001
             # Encoding shouldn't realistically fail (request_id is
