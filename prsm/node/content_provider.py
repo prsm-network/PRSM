@@ -29,7 +29,8 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from prsm.node.transport import MSG_DIRECT, P2PMessage, PeerConnection, WebSocketTransport
 from prsm.node.gossip import GOSSIP_CONTENT_ADVERTISE, GOSSIP_CONTENT_ACCESS, GossipProtocol
@@ -193,6 +194,126 @@ def _max_chunked_transfer_bytes() -> int:
     except (ValueError, TypeError):
         return _DEFAULT_MAX_CHUNKED_TRANSFER_BYTES
     return val if val > 0 else _DEFAULT_MAX_CHUNKED_TRANSFER_BYTES
+
+
+# sp1290 — STREAMING transfer ceiling. Content ABOVE the in-memory CHUNKED ceiling
+# (_max_chunked_transfer_bytes) and at/under this bound is served by streaming ordered
+# 256 KiB frames from the provider's on-disk staged file — with NO full-content
+# materialization on EITHER side: the sender reads frame-by-frame from disk
+# (_send_chunked_from_path), the requester writes frames straight to a destination file
+# (request_content_to_file). This replaces the previously-DEAD GATEWAY response
+# (prsm://content/{cid}, which nothing actually served) for large content, keeping big
+# transfers decentralized + bounded + CID-verified. Tunable via
+# PRSM_MAX_STREAMING_TRANSFER_BYTES (defaults to the 2 GiB gateway-fetch ceiling).
+_DEFAULT_MAX_STREAMING_TRANSFER_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+
+
+def _max_streaming_transfer_bytes() -> int:
+    """sp1290 — upper bound (bytes) for the disk-streaming CHUNKED path, read at call
+    time. Content above the in-memory CHUNKED ceiling and at/under this bound streams
+    from/to disk; above it the GATEWAY fallback still applies. Falls back to the 2 GiB
+    default on missing / non-positive / unparseable values. Always treated as at least
+    the in-memory CHUNKED ceiling so the streaming band can never be empty/inverted."""
+    raw = os.environ.get("PRSM_MAX_STREAMING_TRANSFER_BYTES", "").strip()
+    val = _DEFAULT_MAX_STREAMING_TRANSFER_BYTES
+    if raw:
+        try:
+            parsed = int(raw)
+            if parsed > 0:
+                val = parsed
+        except (ValueError, TypeError):
+            pass
+    return max(val, _max_chunked_transfer_bytes())
+
+
+class _StreamingSink:
+    """sp1290 — receive-side sink that writes CHUNKED (or a single INLINE) frame
+    straight to a destination file, bounded, with NO full-content buffering. Backs
+    ``ContentProvider.request_content_to_file`` so content too large to hold in memory
+    (the previously-dead >64 MiB GATEWAY case) transfers end-to-end over the P2P
+    substrate. Frame validation mirrors the in-memory ``_accumulate_chunk`` guards
+    (per-frame size cap, declared-count ceiling, pinned total, in-range index). The
+    CID/hash check is run by the async caller AFTER completion via a streaming read,
+    not here, so the (synchronous) message handler never blocks re-hashing a multi-GiB
+    file. Frames are written at their ``index * chunk_size`` offset, so out-of-order
+    delivery is handled."""
+
+    def __init__(self, dest_path: Path, chunk_size: int, ceiling: int):
+        self.dest_path = dest_path
+        self.chunk_size = chunk_size
+        self.ceiling = ceiling
+        self.total: Optional[int] = None
+        self.received: Set[int] = set()
+        self.bytes_written = 0
+        self.closed = False
+        self._fh = open(dest_path, "wb")
+
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+
+    def _fail(self) -> str:
+        self.close()
+        try:
+            self.dest_path.unlink()
+        except OSError:
+            pass
+        return "error"
+
+    def add_inline(self, data: bytes) -> str:
+        """Write a single-frame (INLINE) body and complete."""
+        if len(data) > self.ceiling:
+            return self._fail()
+        try:
+            self._fh.seek(0)
+            self._fh.write(data)
+        except OSError:
+            return self._fail()
+        self.bytes_written = len(data)
+        self.close()
+        return "complete"
+
+    def add_frame(self, response) -> str:
+        """Write one CHUNKED frame. Returns 'pending' | 'complete' | 'error'."""
+        total = response.total_chunks
+        index = response.chunk_index
+        data = response.data
+        if (not isinstance(total, int) or total <= 0
+                or not isinstance(index, int) or not (0 <= index < total)
+                or data is None):
+            return self._fail()
+        # Per-frame size cap (disk-amplification defense): a legitimate frame never
+        # exceeds the protocol chunk size.
+        if len(data) > self.chunk_size:
+            return self._fail()
+        # Declared COUNT must not imply a body over the streaming ceiling.
+        if total * self.chunk_size > self.ceiling + self.chunk_size:
+            return self._fail()
+        if self.total is None:
+            self.total = total
+        elif self.total != total:
+            # total is pinned by the first frame; a disagreeing total is malformed.
+            return self._fail()
+        if index in self.received:
+            # Duplicate frame — idempotent, don't double-count bytes.
+            return "complete" if len(self.received) >= self.total else "pending"
+        try:
+            self._fh.seek(index * self.chunk_size)
+            self._fh.write(data)
+        except OSError:
+            return self._fail()
+        self.received.add(index)
+        self.bytes_written += len(data)
+        if self.bytes_written > self.ceiling:
+            return self._fail()
+        if len(self.received) >= self.total:
+            self.close()
+            return "complete"
+        return "pending"
 
 
 class ContentStatus(str, Enum):
@@ -553,6 +674,12 @@ class ContentProvider:
         # Cleaned up alongside _pending_requests when the request completes.
         self._pending_chunks: Dict[str, Dict[str, Any]] = {}
 
+        # sp1290 — receive-side streaming-to-file sinks, keyed by request_id, populated
+        # only for our own request_content_to_file calls (a frame for an unknown
+        # request_id is dropped). Each writes frames straight to disk instead of the
+        # in-memory _pending_chunks buffer, so large content never materializes here.
+        self._streaming_sinks: Dict[str, "_StreamingSink"] = {}
+
         # Semaphore to limit concurrent requests
         self._request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
@@ -603,6 +730,9 @@ class ContentProvider:
                 future.cancel()
         self._pending_requests.clear()
         self._pending_chunks.clear()  # sp1020 — drop any in-flight reassembly buffers
+        for _sink in self._streaming_sinks.values():  # sp1290 — close any open file sinks
+            _sink.close()
+        self._streaming_sinks.clear()
     
     # ── Local Content Registration ─────────────────────────────────────
     
@@ -702,58 +832,79 @@ class ContentProvider:
             return
         
         try:
-            content_bytes = await self._fetch_local(cid)
-            if content_bytes is None:
-                response = ContentResponseMessage.error_response(
-                    request_id, cid, "Failed to retrieve from ContentStore"
-                )
-                await self._send_response(peer.peer_id, response)
-                self._telemetry["requests_failed"] += 1
-                return
-            
-            size = len(content_bytes)
-            
-            # Apply bandwidth throttling before sending content
-            if self.bandwidth_limiter:
-                await self.bandwidth_limiter.throttle_upload(size)
-            
-            # Determine transfer mode
-            if size <= MAX_INLINE_SIZE:
-                # Send inline (base64 encoded) — single frame.
-                response = ContentResponseMessage(
-                    request_id=request_id,
-                    cid=cid,
-                    status=ContentStatus.FOUND,
-                    data=content_bytes,
-                    size=size,
-                    transfer_mode=TransferMode.INLINE,
-                    content_hash=content_info.get("content_hash"),
-                    filename=content_info.get("filename"),
-                )
-                await self._send_response(peer.peer_id, response)
-            elif size <= _max_chunked_transfer_bytes():
-                # sp1020 — CHUNKED: split into ordered 256 KiB frames over the
-                # same P2P substrate (no libtorrent, no HTTP gateway). The
-                # requester reassembles + re-verifies against the CID/hash.
-                await self._send_chunked_response(
-                    peer.peer_id, request_id, cid, content_bytes, content_info,
-                )
-            else:
-                # Beyond the chunked ceiling — provide a gateway URL (a real HTTP
-                # gateway / libtorrent swarm is the right path for huge content).
-                gateway_url = f"prsm://content/{cid}"
-                response = ContentResponseMessage(
-                    request_id=request_id,
-                    cid=cid,
-                    status=ContentStatus.FOUND,
-                    size=size,
-                    transfer_mode=TransferMode.GATEWAY,
-                    gateway_url=gateway_url,
-                    content_hash=content_info.get("content_hash"),
-                    filename=content_info.get("filename"),
-                )
-                await self._send_response(peer.peer_id, response)
-            
+            # sp1290 — LARGE content with an on-disk staged copy streams from disk in
+            # CHUNKED frames WITHOUT materializing the whole file in memory (this is the
+            # case that previously returned the dead prsm://content/{cid} GATEWAY URL).
+            # The common path below (<= the in-memory CHUNKED ceiling, or no streamable
+            # path) is unchanged — INLINE/CHUNKED/GATEWAY behave byte-identically.
+            served = False
+            size = 0
+            stream_info = self._local_stream_info(cid)
+            if stream_info is not None:
+                spath, ssize = stream_info
+                if _max_chunked_transfer_bytes() < ssize <= _max_streaming_transfer_bytes():
+                    if self.bandwidth_limiter:
+                        await self.bandwidth_limiter.throttle_upload(ssize)
+                    await self._send_chunked_from_path(
+                        peer.peer_id, request_id, cid, spath, ssize, content_info,
+                    )
+                    size = ssize
+                    served = True
+
+            if not served:
+                content_bytes = await self._fetch_local(cid)
+                if content_bytes is None:
+                    response = ContentResponseMessage.error_response(
+                        request_id, cid, "Failed to retrieve from ContentStore"
+                    )
+                    await self._send_response(peer.peer_id, response)
+                    self._telemetry["requests_failed"] += 1
+                    return
+
+                size = len(content_bytes)
+
+                # Apply bandwidth throttling before sending content
+                if self.bandwidth_limiter:
+                    await self.bandwidth_limiter.throttle_upload(size)
+
+                # Determine transfer mode
+                if size <= MAX_INLINE_SIZE:
+                    # Send inline (base64 encoded) — single frame.
+                    response = ContentResponseMessage(
+                        request_id=request_id,
+                        cid=cid,
+                        status=ContentStatus.FOUND,
+                        data=content_bytes,
+                        size=size,
+                        transfer_mode=TransferMode.INLINE,
+                        content_hash=content_info.get("content_hash"),
+                        filename=content_info.get("filename"),
+                    )
+                    await self._send_response(peer.peer_id, response)
+                elif size <= _max_chunked_transfer_bytes():
+                    # sp1020 — CHUNKED: split into ordered 256 KiB frames over the
+                    # same P2P substrate (no libtorrent, no HTTP gateway). The
+                    # requester reassembles + re-verifies against the CID/hash.
+                    await self._send_chunked_response(
+                        peer.peer_id, request_id, cid, content_bytes, content_info,
+                    )
+                else:
+                    # Beyond BOTH the in-memory chunked ceiling AND the disk-streaming
+                    # band (or no on-disk staged copy to stream) — fall back to the
+                    # gateway URL (a real HTTP gateway / libtorrent swarm).
+                    gateway_url = f"prsm://content/{cid}"
+                    response = ContentResponseMessage(
+                        request_id=request_id,
+                        cid=cid,
+                        status=ContentStatus.FOUND,
+                        size=size,
+                        transfer_mode=TransferMode.GATEWAY,
+                        gateway_url=gateway_url,
+                        content_hash=content_info.get("content_hash"),
+                        filename=content_info.get("filename"),
+                    )
+                    await self._send_response(peer.peer_id, response)
+
             # Process payment for content access (Phase 4)
             if self.content_economy:
                 try:
@@ -861,7 +1012,78 @@ class ContentProvider:
                 total_chunks=total_chunks,
             )
             await self._send_response(peer_id, response)
-    
+
+    def _local_stream_info(self, cid: str) -> Optional[Tuple[Path, int]]:
+        """sp1290 — return (path, size) of a locally-staged on-disk file for ``cid``
+        WITHOUT reading it into memory, or None if no streamable single-file copy
+        exists. Drives the disk-streaming send path for large content. Only the
+        publisher's staged-file path qualifies (the libtorrent-free LocalContentPublisher
+        / ContentPublisher staging that ``_fetch_local_via_bt`` already trusts); a
+        ContentStore-only blob has no stable single-file path here and keeps the
+        in-memory path."""
+        pub = getattr(self, "content_publisher", None)
+        if pub is None:
+            return None
+        try:
+            staged = pub.local_publish_path(cid)
+        except Exception:  # noqa: BLE001 — path probing must never break a request
+            return None
+        if staged is None:
+            return None
+        try:
+            p = Path(staged)
+            if p.is_file():
+                return p, p.stat().st_size
+        except OSError:
+            return None
+        return None
+
+    async def _send_chunked_from_path(
+        self,
+        peer_id: str,
+        request_id: str,
+        cid: str,
+        path: Path,
+        size: int,
+        content_info: Dict[str, Any],
+    ) -> None:
+        """sp1290 — serve a large local file as ordered CHUNKED frames streamed from
+        disk, WITHOUT materializing the whole file in memory. The frame wire format is
+        identical to ``_send_chunked_response`` (256 KiB slices + chunk_index +
+        total_chunks + size/hash), so an in-memory requester reassembles it the same
+        way and a ``request_content_to_file`` requester writes it straight to disk.
+        Disk reads run in the default executor so the event loop is never blocked on
+        IO; only one 256 KiB frame is resident at a time."""
+        chunk_size = GATEWAY_FETCH_CHUNK_BYTES
+        total_chunks = (size + chunk_size - 1) // chunk_size
+        content_hash = content_info.get("content_hash")
+        filename = content_info.get("filename")
+        loop = asyncio.get_event_loop()
+
+        fh = await loop.run_in_executor(None, lambda: open(path, "rb"))
+        try:
+            index = 0
+            while index < total_chunks:
+                data = await loop.run_in_executor(None, fh.read, chunk_size)
+                if not data:
+                    break
+                response = ContentResponseMessage(
+                    request_id=request_id,
+                    cid=cid,
+                    status=ContentStatus.FOUND,
+                    data=data,
+                    size=size,
+                    transfer_mode=TransferMode.CHUNKED,
+                    content_hash=content_hash,
+                    filename=filename,
+                    chunk_index=index,
+                    total_chunks=total_chunks,
+                )
+                await self._send_response(peer_id, response)
+                index += 1
+        finally:
+            await loop.run_in_executor(None, fh.close)
+
     # ── Content Request (Client Side) ───────────────────────────────────
     
     async def request_content(
@@ -1207,6 +1429,17 @@ class ContentProvider:
             # attacker from buffering CHUNKED frames under a request_id we never
             # issued (unbounded-memory defense).
             self._pending_chunks.pop(request_id, None)
+            self._streaming_sinks.pop(request_id, None)
+            return
+
+        # sp1290 — a request_content_to_file request routes its frames straight to a
+        # disk sink (bounded, no in-memory buffering) instead of the _accumulate_chunk
+        # path below. The future resolves with the dest Path on completion (the async
+        # caller then streaming-verifies the CID/hash), or None on a malformed/failed
+        # transfer. Non-streaming requests are unaffected.
+        sink = self._streaming_sinks.get(request_id)
+        if sink is not None:
+            self._route_to_sink(request_id, response, sink, future)
             return
 
         if response.transfer_mode == TransferMode.CHUNKED:
@@ -1305,7 +1538,192 @@ class ContentProvider:
         if len(buf["chunks"]) < total:
             return None
         return b"".join(buf["chunks"][i] for i in range(total))
-    
+
+    def _route_to_sink(self, request_id, response, sink, future) -> None:
+        """sp1290 — feed one response frame to a streaming-to-file sink and resolve the
+        request's future when the transfer completes (with the dest Path) or fails (with
+        None). Cleans up the sink registration on any terminal outcome."""
+        if response.status != ContentStatus.FOUND:
+            sink.close()
+            try:
+                sink.dest_path.unlink()
+            except OSError:
+                pass
+            self._streaming_sinks.pop(request_id, None)
+            if not future.done():
+                future.set_result(None)
+            return
+
+        if response.transfer_mode == TransferMode.CHUNKED:
+            status = sink.add_frame(response)
+        elif response.transfer_mode == TransferMode.INLINE and response.data is not None:
+            status = sink.add_inline(response.data)
+        else:
+            # GATEWAY (or an unexpected mode) — a streaming sink can't consume it.
+            status = sink._fail()
+
+        if status == "pending":
+            return
+        self._streaming_sinks.pop(request_id, None)
+        if not future.done():
+            future.set_result(sink.dest_path if status == "complete" else None)
+
+    async def request_content_to_file(
+        self,
+        cid: str,
+        dest_path,
+        timeout: Optional[float] = None,
+        verify_hash: bool = True,
+        preferred_peer: Optional[str] = None,
+    ) -> Optional[Path]:
+        """sp1290 — like ``request_content`` but streams the body to ``dest_path``
+        instead of returning it in memory, so content too large to buffer (the
+        previously-dead >64 MiB GATEWAY case) transfers end-to-end over the P2P
+        substrate without materializing on either side. Returns the destination Path on
+        success (CID/hash re-verified by a streaming read) or None on failure. The
+        partial file is removed on any failure."""
+        timeout = timeout or self.default_timeout
+        dest_path = Path(dest_path)
+
+        # Local shortcut: if we hold a streamable on-disk copy, stream-copy it.
+        stream_info = self._local_stream_info(cid)
+        if stream_info is not None:
+            spath, _ = stream_info
+            try:
+                await self._copy_file_streaming(spath, dest_path)
+            except OSError:
+                dest_path.unlink(missing_ok=True)
+            else:
+                if await self._verify_file_cid(cid, dest_path, verify_hash):
+                    logger.debug("Streamed %s locally → %s", cid[:12], dest_path)
+                    return dest_path
+                dest_path.unlink(missing_ok=True)
+
+        providers = self._find_providers(cid)
+        providers.discard(self.identity.node_id)
+        if not providers:
+            logger.debug("No providers found for %s (to-file)", cid[:12])
+            return None
+        if preferred_peer and preferred_peer in providers:
+            providers_list = [preferred_peer] + [p for p in providers if p != preferred_peer]
+        else:
+            providers_list = list(providers)
+
+        expected_hash = self._get_content_hash(cid) if verify_hash else None
+        for provider_id in providers_list:
+            result = await self._request_to_file_from_provider(
+                cid, provider_id, timeout, dest_path, expected_hash, verify_hash,
+            )
+            if result is not None:
+                self._telemetry["requests_fulfilled"] += 1
+                return result
+        return None
+
+    async def _request_to_file_from_provider(
+        self, cid, provider_id, timeout, dest_path, expected_hash, verify_hash,
+    ) -> Optional[Path]:
+        """sp1290 — send a content request to one provider and stream the response to
+        ``dest_path`` via a _StreamingSink; verify (streaming) before returning."""
+        self._telemetry["requests_sent"] += 1
+        request = ContentRequestMessage(
+            cid=cid, timeout=int(timeout), requester_id=self.identity.node_id,
+        )
+        request_id = request.request_id
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future = loop.create_future()
+        self._pending_requests[request_id] = future
+        self._streaming_sinks[request_id] = _StreamingSink(
+            dest_path, GATEWAY_FETCH_CHUNK_BYTES, _max_streaming_transfer_bytes(),
+        )
+
+        result_path: Optional[Path] = None
+        try:
+            msg = P2PMessage(
+                msg_type=MSG_DIRECT,
+                sender_id=self.identity.node_id,
+                payload=request.to_payload(),
+            )
+            sent = await self.transport.send_to_peer(provider_id, msg)
+            if not sent:
+                logger.debug("Failed to send to-file request to %s", provider_id[:8])
+            else:
+                result_path = await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._telemetry["requests_timed_out"] += 1
+            logger.debug("To-file request to %s timed out for %s", provider_id[:8], cid[:12])
+        except Exception as e:  # noqa: BLE001
+            logger.debug("To-file request to %s failed: %s", provider_id[:8], e)
+        finally:
+            self._pending_requests.pop(request_id, None)
+            leftover = self._streaming_sinks.pop(request_id, None)
+            if leftover is not None:
+                leftover.close()
+
+        if result_path is None:
+            Path(dest_path).unlink(missing_ok=True)
+            return None
+        if await self._verify_file_cid(cid, dest_path, verify_hash, expected_hash):
+            return Path(dest_path)
+        logger.warning("Streamed %s failed CID/hash verification — discarding", cid[:12])
+        Path(dest_path).unlink(missing_ok=True)
+        return None
+
+    async def _copy_file_streaming(self, src: Path, dest: Path) -> None:
+        """sp1290 — copy src→dest in 1 MiB blocks off the event loop (no full read)."""
+        loop = asyncio.get_event_loop()
+
+        def _copy():
+            with open(src, "rb") as fin, open(dest, "wb") as fout:
+                for block in iter(lambda: fin.read(1024 * 1024), b""):
+                    fout.write(block)
+
+        await loop.run_in_executor(None, _copy)
+
+    async def _verify_file_cid(
+        self, cid: str, path, verify_hash: bool, expected_hash: Optional[str] = None,
+    ) -> bool:
+        """sp1290 — streaming CID/hash verification of a received file (executor read,
+        never blocks the loop, never materializes the body). Verifies the file's sha256
+        against (a) a canonical sha256-family ContentHash CID — the strongest anchor,
+        the requester chose the CID — else (b) the gossip-supplied ``expected_hash``
+        when present. Accepts when neither anchor is available (e.g. a BitTorrent
+        infohash CID, whose streaming re-derivation is a documented follow-on) — matching
+        how unknown-hash content is treated elsewhere. Returns False on any IO error."""
+        if not verify_hash:
+            return True
+        loop = asyncio.get_event_loop()
+
+        def _sha256() -> Optional[str]:
+            try:
+                h = hashlib.sha256()
+                with open(path, "rb") as fh:
+                    for block in iter(lambda: fh.read(1024 * 1024), b""):
+                        h.update(block)
+                return h.hexdigest()
+            except OSError:
+                return None
+
+        digest = await loop.run_in_executor(None, _sha256)
+        if digest is None:
+            return False
+
+        # (a) canonical sha256-family ContentHash CID → the file's sha256 must equal
+        # the CID's embedded digest (the sp1003 anchor, streaming-friendly).
+        try:
+            from prsm.storage import ContentHash
+            parsed = ContentHash.from_hex(cid)
+            if parsed.hex() == cid:
+                algo = getattr(parsed, "algorithm", "") or ""
+                if "sha256" in str(algo).lower() or parsed.digest.hex() == digest:
+                    return parsed.digest.hex() == digest
+        except Exception:  # noqa: BLE001 — not a ContentHash CID, fall through
+            pass
+
+        # (b) gossip-supplied expected hash, when known.
+        if expected_hash:
+            return digest == expected_hash
+        return True
+
     # ── Gossip Handlers ─────────────────────────────────────────────────
     
     async def _on_content_advertise(
