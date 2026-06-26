@@ -128,17 +128,19 @@ def generate_node_identity(display_name: str = "prsm-node") -> NodeIdentity:
     )
 
 
-def write_owner_only_file(path: Path, content: str) -> None:
-    """Atomically write text to ``path`` with OWNER-ONLY (0o600) perms + a 0o700 parent,
-    with NO world-readable window for a NEW file.
+def write_owner_only_file(path: Path, content) -> None:
+    """Atomically write ``content`` (str OR bytes) to ``path`` with OWNER-ONLY (0o600) perms
+    + a 0o700 parent, with NO world-readable window for a NEW file.
 
     sp1266 — canonical secret-file writer. ``Path.write_text`` then ``chmod`` leaves a brief
     0o644 window between creation and the chmod that a co-tenant / other local user could
     read a secret (private key, JWT, API key) through — the TOCTOU the round-4 audit flagged
     across several CLI/node paths. ``os.open(..., 0o600)`` sets perms atomically on creation;
     the mode arg is ignored for a pre-existing file, so we chmod afterwards to tighten one.
+    sp1281 — accepts bytes (write mode 'wb') for binary secrets like a Fernet master key.
     """
     path = Path(path)
+    is_bytes = isinstance(content, (bytes, bytearray))
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         path.parent.chmod(0o700)
@@ -146,7 +148,7 @@ def write_owner_only_file(path: Path, content: str) -> None:
         pass
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "wb" if is_bytes else "w") as f:
             f.write(content)
     finally:
         try:

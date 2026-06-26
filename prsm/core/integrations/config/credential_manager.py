@@ -125,14 +125,12 @@ class CredentialManager:
             else:
                 # Generate new master key
                 self.master_key = Fernet.generate_key()
-                
-                # Save master key securely
-                with open(self.master_key_file, 'wb') as f:
-                    f.write(self.master_key)
-                
-                # Set restrictive permissions
-                os.chmod(self.master_key_file, 0o600)
-                
+
+                # sp1281 — atomic 0o600 write (no world-readable window between create + chmod;
+                # this is the Fernet master key that decrypts every stored credential).
+                from prsm.node.identity import write_owner_only_file
+                write_owner_only_file(self.master_key_file, self.master_key)
+
                 print("🔑 Generated new master encryption key")
             
             self.cipher = Fernet(self.master_key)
