@@ -1,9 +1,0 @@
- Ran phase 1, here's the output:
-
-  network=testnet chainId=84532 rpc=https://sepolia.base.org
-  signer=0xCCAc7b21695De068979b1ca47B0cfBD328654220 (self-pay: requester==provider==recipient)
-  depositing 1.0 FTNS + committing batch …
-    deposit_tx=0x0f839bc602629c3d322736026d8f857db49aac9d337d56ee4035a7de10aa311e
-    batch_id=8cf2f39aed6ddfa15fc3935a1d5f4ddc5fef1b3295d55eadd66fe6bcc735864f
-    escrow_balance=1000000000000000000 wei
-  PHASE 1 done. Re-run with --phase finalize after the challenge window (~3 days, or sooner if you lowered it before committing).
