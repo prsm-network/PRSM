@@ -221,6 +221,27 @@ class StageOutcome:
 #                      layer.
 
 
+def _stream_token_cap(requested_max_tokens) -> int:
+    """sp1280 — absolute cap on TokenFrames the requester will consume from an UNTRUSTED tail
+    stage. Returns the requester's max_tokens when set+positive (bounded by the operator
+    inference ceiling), else the ceiling — NEVER unbounded. A malicious tail stage that streams
+    past this is rejected, so it can't drive an unbounded generator / memory growth on the
+    requester. Mirrors the cap the honest server enforces locally (which the untrusted tail
+    can't be trusted to honor)."""
+    try:
+        from prsm.compute.inference.autoregressive_runner import _resolve_max_tokens_ceiling
+        ceiling = _resolve_max_tokens_ceiling()
+    except Exception:  # noqa: BLE001
+        ceiling = 4096
+    try:
+        rmax = int(requested_max_tokens)
+        if rmax > 0:
+            return min(rmax, ceiling)
+    except (TypeError, ValueError):
+        pass
+    return ceiling
+
+
 def _build_stage_activation_chain(request_id: str, outcomes: List["StageOutcome"]):
     """sp1110 (Domain-03 F1/F2, brick 4) — assemble a StageActivationChain from the
     per-stage proofs captured during execution. Returns the chain ONLY when every stage
@@ -2261,6 +2282,8 @@ class RpcChainExecutor:
         # Iterate response frames. Track sequence + joined text for
         # the integrity check against the signed StreamFinalFrame.
         expected_seq = 0
+        # sp1280 — absolute ceiling on tokens consumed from the (untrusted) tail stage.
+        _token_cap = _stream_token_cap(getattr(request, "max_tokens", None))
         joined_parts: List[str] = []
         final_frame: Optional[StreamFinalFrame] = None
 
@@ -2324,6 +2347,19 @@ class RpcChainExecutor:
                                 f"TokenFrame sequence_index="
                                 f"{msg.sequence_index} (expected "
                                 f"{expected_seq})"
+                            ),
+                        )
+                    # sp1280 — an UNTRUSTED tail stage must not stream more than the
+                    # authorized number of tokens (the honest server caps locally; the
+                    # requester re-enforces it since the tail is untrusted).
+                    if expected_seq >= _token_cap:
+                        raise ChainExecutionError(
+                            stage_index=stage_index,
+                            stage_node_id=stage_node_id,
+                            code=ExecutorErrorCode.MALFORMED_RESPONSE,
+                            message=(
+                                f"tail stage streamed more than the authorized "
+                                f"{_token_cap} tokens (possible unbounded stream)"
                             ),
                         )
                     expected_seq += 1
