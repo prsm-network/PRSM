@@ -402,9 +402,35 @@ systemctl start docker
 systemctl enable docker
 usermod -a -G docker ec2-user
 
-# Install Docker Compose
-curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-chmod +x /usr/local/bin/docker-compose
+# Install Docker Compose (sp1247: pin the version + verify an out-of-band SHA256
+# before making the binary executable — supply-chain audit #7. The previous line
+# pulled from a floating releases/latest URL with NO integrity check straight into
+# /usr/local/bin and chmod +x'd it as root, so a MITM or a compromised release asset
+# would run arbitrary root code on every bootstrap node. A checksum fetched from the
+# same release can't protect against a compromised release, so the expected digests
+# are hardcoded here and pinned to a specific version. The old URL also built the v1
+# asset name docker-compose-Linux-x86_64, which 404s against v2+'s lowercase
+# docker-compose-linux-x86_64 — this also fixes that latent break.)
+# NOTE: an if/elif ladder is used rather than `case` on purpose — this whole block
+# is captured inside a `$(cat << 'USERDATA' ... )` command substitution, and `case`
+# pattern terminators (`x86_64)`) are bare `)` that the outer $() parser miscounts as
+# closing the substitution. if/elif keeps every paren balanced.
+DOCKER_COMPOSE_VERSION="v5.2.0"
+DC_ARCH_M="$(uname -m)"
+if [ "$DC_ARCH_M" = "x86_64" ]; then
+  DC_ARCH="x86_64";  DC_SHA256="018f9612ecabc5f2d7aaa53d6f5f44453a87611e2d72c8ef84d7b1eca070e719"
+elif [ "$DC_ARCH_M" = "aarch64" ] || [ "$DC_ARCH_M" = "arm64" ]; then
+  DC_ARCH="aarch64"; DC_SHA256="739de570a0adf5eab12830db980f549fb5f44ad6b266e1e43e20f6f9df7cbcca"
+else
+  echo "FATAL: unsupported arch $DC_ARCH_M for the docker-compose checksum pin" >&2
+  exit 1
+fi
+DC_URL="https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-linux-${DC_ARCH}"
+curl -fSL "$DC_URL" -o /tmp/docker-compose
+echo "${DC_SHA256}  /tmp/docker-compose" | sha256sum -c - \
+  || { echo "FATAL: docker-compose checksum mismatch — refusing to install" >&2; rm -f /tmp/docker-compose; exit 1; }
+install -m 0755 /tmp/docker-compose /usr/local/bin/docker-compose
+rm -f /tmp/docker-compose
 
 # Install AWS CLI (already installed on Amazon Linux 2)
 # Install jq
