@@ -1,4 +1,4 @@
-"""Sprint 1248 — dependency hash-pinned lockfile (supply-chain audit #8).
+"""Sprint 1289 — dependency hash-pinned lockfile (supply-chain audit #8).
 
 requirements.txt declares dependencies with RANGE specifiers (`fastapi>=0.104.0`), so
 `pip install -r requirements.txt` resolves whatever satisfies the range at install

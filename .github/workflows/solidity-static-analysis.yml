@@ -74,7 +74,7 @@ jobs:
         run: npm ci
 
       - name: Run Slither
-        uses: crytic/slither-action@f197989dea5b53e986d0f88c60a034ddd77ec9a8 # v0.4.0 (sp1246: pin mutable tag to an immutable SHA — supply-chain audit #9; bump deliberately, v0.4.2 available)
+        uses: crytic/slither-action@f197989dea5b53e986d0f88c60a034ddd77ec9a8 # v0.4.0 (sp1287: pin mutable tag to an immutable SHA — supply-chain audit #9; bump deliberately, v0.4.2 available)
         id: slither
         with:
           target: contracts/

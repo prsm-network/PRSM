@@ -59,7 +59,7 @@ jobs:
           echo "✅ Version: $VERSION"
       
       - name: Install git-cliff
-        uses: orhun/git-cliff-action@b946ed27a675d653b308f29a7bbad813b85bf7aa # v3 (sp1246: pin mutable major-version tag to an immutable SHA — supply-chain audit #9; bump deliberately, v4 available)
+        uses: orhun/git-cliff-action@b946ed27a675d653b308f29a7bbad813b85bf7aa # v3 (sp1287: pin mutable major-version tag to an immutable SHA — supply-chain audit #9; bump deliberately, v4 available)
         with:
           version: 'latest'
           config: 'pyproject.toml'

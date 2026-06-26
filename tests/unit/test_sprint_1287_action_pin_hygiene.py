@@ -1,14 +1,14 @@
-"""Sprint 1246 — GitHub Actions supply-chain pin hygiene (supply-chain audit #9).
+"""Sprint 1287 — GitHub Actions supply-chain pin hygiene (supply-chain audit #9).
 
 A workflow that does `uses: <third-party>@master` runs whatever that branch HEAD is
 *at run time*, inside CI, with the job's secrets/permissions. A compromised or
-retagged upstream action therefore executes in our pipeline. The fix (sp1246) pins
+retagged upstream action therefore executes in our pipeline. The fix (sp1287) pins
 every third-party action to an immutable 40-hex commit SHA (with a `# version`
 comment so Dependabot — already configured for the github-actions ecosystem — can
 propose bumps).
 
 This is the regression guard: a mutable BRANCH ref must never reappear, and the
-specific third-party actions sp1246 pinned must stay SHA-pinned.
+specific third-party actions sp1287 pinned must stay SHA-pinned.
 
 (Sibling supply-chain items: #7 AWS-bootstrap binary checksum, #8 dependency
 hash-lockfile remain — see the audit topic memory.)
@@ -38,7 +38,7 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 # be SHA-pinned.
 _FIRST_PARTY_OWNERS = {"actions", "github"}
 
-# The specific third-party actions sp1246 pinned — assert they stay pinned.
+# The specific third-party actions sp1287 pinned — assert they stay pinned.
 _MUST_BE_SHA_PINNED = {
     "aquasecurity/trivy-action",
     "orhun/git-cliff-action",
@@ -90,8 +90,8 @@ def test_third_party_actions_with_slash_refs_are_sha_pinned():
     )
 
 
-def test_sp1246_pinned_actions_stay_sha_pinned():
-    """The four third-party actions sp1246 hardened must remain SHA-pinned everywhere they appear."""
+def test_sp1287_pinned_actions_stay_sha_pinned():
+    """The four third-party actions sp1287 hardened must remain SHA-pinned everywhere they appear."""
     seen = {name: [] for name in _MUST_BE_SHA_PINNED}
     for wf, action, ref in _iter_uses():
         if action in _MUST_BE_SHA_PINNED:
@@ -100,7 +100,7 @@ def test_sp1246_pinned_actions_stay_sha_pinned():
         assert occurrences, f"expected {action} to be referenced by a workflow"
         for wf, ref in occurrences:
             assert _SHA_RE.match(ref), (
-                f"{wf}: {action}@{ref} is not SHA-pinned (sp1246 regression)"
+                f"{wf}: {action}@{ref} is not SHA-pinned (sp1287 regression)"
             )
 
 

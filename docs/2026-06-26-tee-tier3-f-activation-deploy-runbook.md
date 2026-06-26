@@ -1,6 +1,6 @@
 # TEE Tier-3 Roadmap F — On-Chain Attestation Commitment Activation Runbook
 
-**Sprint lineage:** sp1240 (contract) · sp1241 (weakest-link commitment + client ABI routing) · sp1242 (commit glue) · this runbook (sp1245 deploy-prep)
+**Sprint lineage:** sp1240 (contract) · sp1241 (weakest-link commitment + client ABI routing) · sp1242 (commit glue) · this runbook (sp1286 deploy-prep)
 **Status:** PREP COMPLETE. The mainnet activation is a **gated Foundation ceremony** — the assistant does **not** sign or broadcast. This runbook + the validated verification script (`contracts/scripts/verify-attestation-commitment-deployment.js`) are the operator-facing deliverables.
 **Author of prep:** automated (Claude). **Owner of execution:** PRSM Foundation 2-of-3 multisig signers.
 

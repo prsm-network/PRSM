@@ -3,13 +3,13 @@
 # This file extracts production dependencies from pyproject.toml
 # for compatibility with CI/CD systems and Docker builds
 #
-# SUPPLY-CHAIN NOTE (sp1248): for a hash-verified, fully reproducible install use the
+# SUPPLY-CHAIN NOTE (sp1289): for a hash-verified, fully reproducible install use the
 # generated lockfile instead of this range-pinned file:
 #     pip install --require-hashes -r requirements.lock
 # requirements.lock pins every transitive dependency to an exact version + sha256
 # (generated via `uv pip compile requirements.txt --universal --generate-hashes`).
 # Regenerate it whenever you change a dependency below; the lock is consistency-checked
-# by tests/unit/test_sprint_1248_dependency_hash_lockfile.py. Switching CI/Docker to the
+# by tests/unit/test_sprint_1289_dependency_hash_lockfile.py. Switching CI/Docker to the
 # --require-hashes path is the operator adoption step (gate it on a green suite run).
 
 # Core Framework

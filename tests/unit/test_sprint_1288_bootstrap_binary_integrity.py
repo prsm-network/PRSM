@@ -1,4 +1,4 @@
-"""Sprint 1247 — AWS bootstrap binary integrity (supply-chain audit #7).
+"""Sprint 1288 — AWS bootstrap binary integrity (supply-chain audit #7).
 
 scripts/deploy_bootstrap_aws.sh runs a cloud-init user-data script as root on every
 bootstrap EC2 node. It used to fetch the docker-compose binary from a floating
@@ -10,7 +10,7 @@ a compromised release) BEFORE the binary is made executable, failing closed on
 mismatch.
 
 This is the regression guard. (Sibling: #8 dependency hash-lockfile remains — disruptive,
-deferred. #9 GitHub Action SHA pinning shipped in sp1246.)
+deferred. #9 GitHub Action SHA pinning shipped in sp1287.)
 """
 from __future__ import annotations
 

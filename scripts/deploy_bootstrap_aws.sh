@@ -402,7 +402,7 @@ systemctl start docker
 systemctl enable docker
 usermod -a -G docker ec2-user
 
-# Install Docker Compose (sp1247: pin the version + verify an out-of-band SHA256
+# Install Docker Compose (sp1288: pin the version + verify an out-of-band SHA256
 # before making the binary executable — supply-chain audit #7. The previous line
 # pulled from a floating releases/latest URL with NO integrity check straight into
 # /usr/local/bin and chmod +x'd it as root, so a MITM or a compromised release asset
