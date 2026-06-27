@@ -195,9 +195,23 @@ against the fresh, unpaused mainnet registry.
      AUDIT_BUNDLE_MANIFEST=$MAN \
      npx hardhat run scripts/transfer-ownership.js --network base
    ```
-2. **Foundation Safe (2-of-3, gated):** batch-call `acceptOwnership()` on each of the 3 new contracts
-   (pattern: `contracts/deployments/safe-batch-acceptOwnership-mainnet-2026-05-07.json`). After
-   acceptance, re-run §4.4 with `EXPECTED_OWNER=0x91b0e6F8…5791` to confirm `owner()` == Safe.
+2. **Generate the Safe batch (sp1291, offline — no key, no RPC):** turn the deploy manifest into a
+   ready-to-import Safe{Wallet} Transaction Builder bundle of the three `acceptOwnership()` calls.
+   ```bash
+   node scripts/build-f-activation-safe-txs.js \
+     --manifest $MAN \
+     --safe-address 0x91b0e6F85A371D82De94eD13A3812d9f5A4E5791
+   #   → deployments/safe-batch-acceptOwnership-f-activation-<network>-<ts>.json
+   ```
+   It auto-fills the 3 Ownable addresses from the manifest (Registry/EscrowPool/StakeBond — the
+   verifier is not Ownable), verifies the `acceptOwnership()` selector `0x79ba5097`, and warns if the
+   Safe ≠ the known Foundation 2-of-3 on Base mainnet. The full deploy→generate→transferOwnership→
+   accept→`owner()`==Safe ceremony was **dress-rehearsed end-to-end on a local node** (executing the
+   generated txs from the Safe completes the Ownable2Step handoff on all 3).
+3. **Foundation Safe (2-of-3, gated):** import that JSON in the Safe UI → Transaction Builder and sign
+   + execute the batch (`acceptOwnership()` on each of the 3 new contracts; same shape as the proven
+   `contracts/deployments/safe-batch-acceptOwnership-mainnet-2026-05-07.json`). After acceptance,
+   re-run §4.4 with `EXPECTED_OWNER=0x91b0e6F8…5791` to confirm `owner()` == Safe.
 
 ### 4.6 Cutover
 
@@ -217,6 +231,10 @@ against the fresh, unpaused mainnet registry.
 - Authored + **validated** `scripts/verify-attestation-commitment-deployment.js` end-to-end on a
   local node — positive deploy → exit 0 with on-chain invariance proof; non-registry → exit 1.
 - Confirmed `deploy-audit-bundle.js` already emits the sp1240-capable registry (no script change).
+- Authored + **validated** `scripts/build-f-activation-safe-txs.js` (sp1291) — the offline generator
+  that turns a deploy manifest into the Foundation's importable Safe `acceptOwnership` batch.
+  Dress-rehearsed the FULL ownership ceremony end-to-end on a local node (deploy → generate →
+  transferOwnership → execute the generated txs from the Safe → `owner()`==Safe on all 3).
 - Authored this runbook, including the immutable-cross-wire finding and the E-before-F sequencing.
 
 **Gated (Foundation / hardware — assistant must NOT do autonomously):**
