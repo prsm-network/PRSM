@@ -157,6 +157,14 @@ deltas specific to F are called out.
 
 ### 4.3 Mainnet deploy (deployer hot key)
 
+**Precondition (review C1):** broadcast to mainnet ONLY via `--network base` (name `base`, chainId
+`8453`). NEVER use a fork/alias network whose `url` points at a live RPC — fork rehearsals run
+`hardhat node --fork $BASE_RPC_URL` then deploy with `--network localhost`. sp1293 hardened
+`deploy-audit-bundle.js` + `transfer-ownership.js` to key the mainnet guards off the CONNECTED chainId
+(not the network name) and to **fail closed** on a real-mainnet chainId under a non-mainnet, non-local
+name — so a `base-fork`-style slip can no longer silently disable the mock-verifier ban / foundation≠
+deployer check / production-verifier default. Confirm the connected chainId is `8453` before signing.
+
 ```bash
 cd contracts
 export PRIVATE_KEY="0x…"                     # deployer hot key 0xF7d88c94…11c2
@@ -195,6 +203,14 @@ against the fresh, unpaused mainnet registry.
      AUDIT_BUNDLE_MANIFEST=$MAN \
      npx hardhat run scripts/transfer-ownership.js --network base
    ```
+   **(review M3) Run this IMMEDIATELY before the scheduled Foundation signing slot — transfer + accept
+   in the same short session, not days apart.** `transferOwnership` only sets `pendingOwner`; the
+   deployer hot key STILL fully owns all 3 contracts (pause / setFoundationReserveWallet / slash-routing)
+   until `owner()`==Safe is reconfirmed in step 3. Let the 7-day unbond + pending-batch drain elapse
+   while ownership is simply deployer-owned (its natural pre-handoff state); minimise the
+   post-transfer/pre-accept hot-key window. If the Safe ceremony is delayed/aborted after this step,
+   treat the hot key as load-bearing and, if it's suspected lost, immediately re-`transferOwnership` to
+   a fresh deployer-controlled holding address to invalidate the prior `pendingOwner`.
 2. **Generate the Safe batch (sp1291, offline — no key, no RPC):** turn the deploy manifest into a
    ready-to-import Safe{Wallet} Transaction Builder bundle of the three `acceptOwnership()` calls.
    ```bash
@@ -215,23 +231,46 @@ against the fresh, unpaused mainnet registry.
 
 ### 4.6 Cutover
 
-- **Gate cutover on the old-registry drain (sp1292, read-only):** confirm the OLD registry has ZERO
-  PENDING (unsettled) batches before re-pointing clients / draining the old escrow — cutting over
-  with unsettled value would strand it.
-  ```bash
-  OLD_REGISTRY_ADDRESS=0x48fFab641b9D638F312FFA776818756a326F995B \
-    FROM_BLOCK=<old registry deploy block> \
-    npx hardhat run scripts/verify-f-activation-cutover-readiness.js --network base
-  #   exit 0 = drained (safe) ; exit 1 = pending batches remain (finalize the window-elapsed ones
-  #   with finalizeBatch + wait out the rest first)
-  ```
-- Finalize/expire old-registry pending batches; confirm old escrow drained (the check above must exit 0).
-- Confirm new-bond stake quorum re-established.
-- Push the new addresses to all settlement clients **and** flip `supports_attestation` on so clients
-  route `commitBatchWithAttestation` (sp1241). With E live, the committed measurement is now a real
-  hardware quote.
-- (Optional, F's headline payoff) wire an indexer/Forta filter on `BatchAttestationCommitted` topic0
-  `0xec923112ccc386fa91e7116abfe5da0211d8908195bb5d41e644c8a0c79222e3`.
+Order matters — **re-point + SOAK on the new bundle BEFORE retiring the old one**, so the old bundle
+stays a hot fallback until the new path is proven (review M5). The steps below close the review's H1/H2
++ M1/M2/M5 gaps; they need no contract change (both old contracts are Pausable + Foundation-owned).
+
+1. **Stop new old-registry work + stop old-pool deposits (M2).** Disable the deposit code path/UI for
+   the OLD EscrowPool and announce the freeze to clients + integration partners. Keep `withdraw()`
+   OPEN. Do NOT `pause()` the EscrowPool (that would also block `withdraw()` and trap funds).
+2. **Drain legit pending, THEN freeze the old registry (H1).** Finalize/expire all legitimately-PENDING
+   old batches first (`finalizeBatch` is `whenNotPaused`), then the **Foundation 2-of-3 calls
+   `pause()` on the OLD registry** (`0x48fFab…995B`). A paused registry rejects new `commitBatch`, so
+   the drain reading becomes DURABLE — no new PENDING batch can appear after the scan (closes the
+   TOCTOU). `_effectiveElapsed` credits paused time, so the pause never robs a challenger of their window.
+3. **Gate on the drain check (sp1292 + sp1294 hardening).** Now durable:
+   ```bash
+   OLD_REGISTRY_ADDRESS=0x48fFab641b9D638F312FFA776818756a326F995B \
+     FROM_BLOCK=45687572 \
+     BASE_RPC_URL=<PAYG endpoint> \
+     npx hardhat run scripts/verify-f-activation-cutover-readiness.js --network base
+   # exit 0 REQUIRES: 0 PENDING + scan-complete (provider-sequence reconciled) + old registry PAUSED.
+   ```
+4. **Account for residual escrow (H2) — NOT a hard gate.** The old EscrowPool has NO admin drain (by
+   design — anti owner-drain, L2 HIGH-6), so `totalEscrowedBalance()` may be non-zero and that value is
+   **recoverable-not-stranded**: each depositor recovers it via their own `withdraw()`. So snapshot
+   residual depositors (the check prints the balance + you can enumerate `Deposited`/`Withdrawn`
+   events), run a self-service-withdraw comms campaign, and **keep the old EscrowPool UNPAUSED forever**
+   so recovery stays available. Do NOT block cutover on a zero escrow balance, and do NOT add an admin
+   drain (it would reintroduce L2 HIGH-6).
+5. **Re-stake with OVERLAP (M1).** Providers bond on the NEW StakeBond and have it ACTIVE before
+   `requestUnbond` on the old bond; the old registry must already be paused (step 2) before any
+   old-bond withdraw, so no batch can be committed against now-un-slashable stake (avoids the
+   `SlashSwallowed` window during the 7-day unbond).
+6. **Re-point clients + SOAK (M5).** Push the new addresses to all settlement clients atomically
+   (config push, not a straddling rolling deploy). Run a mainnet canary — commit+finalize one batch
+   through the new bundle, assert identical settlement — and soak healthy BEFORE retiring the old
+   bundle. The old bundle stays a hot fallback; if the new bundle misbehaves, revert the client config
+   to the old (still-owned, still-functional) bundle.
+7. **Flip `supports_attestation` on (LAST)** so clients route `commitBatchWithAttestation` (sp1241).
+   With E live, the committed measurement is now a real hardware quote.
+8. (Optional, F's headline payoff) wire an indexer/Forta filter on `BatchAttestationCommitted` topic0
+   `0xec923112ccc386fa91e7116abfe5da0211d8908195bb5d41e644c8a0c79222e3`.
 
 ---
 
@@ -248,6 +287,17 @@ against the fresh, unpaused mainnet registry.
 - Authored + **validated** `scripts/verify-f-activation-cutover-readiness.js` (sp1292) — the read-only
   pre-cutover gate that scans the old registry for unsettled PENDING batches (validated on a local
   node: 2 pending→exit 1, 1→exit 1, 0→exit 0 drained).
+- **Dress-rehearsed the FULL ceremony against a Base MAINNET FORK** (real live FTNS token + real
+  Foundation Safe): deploy → both verify scripts → Safe-tx generation → transferOwnership →
+  impersonated-Safe `acceptOwnership` → `owner()`==Safe on all 3. Strictly stronger than Sepolia
+  (real contracts). Confirmed the live registry `0x48fFab…995B` is pre-sp1240 (upgrade needed).
+- **Ran an adversarial pre-mainnet review** of the whole migration (6 dimensions → 12 confirmed / 16
+  dismissed). Verdict: NO-GO as-written → GO-WITH-FIXES; contract layer + sp1240 consensus-neutrality
+  sound. Landed all confirmed fixes (script/config only, no contract change): C1 chainId-based deploy
+  guards + base-fork landmine (sp1293), H3 EscrowPool verify args (sp1293), H1 pause-durable cutover
+  gate + H2 escrow-balance read + M4 FROM_BLOCK/completeness (sp1294), and M1/M2/M3/M5 procedure
+  (this runbook: freeze-before-scan, recoverable-not-stranded escrow, transfer+accept same session,
+  soak-before-retire, rollback). E-before-F sequencing confirmed + strengthened.
 - Authored this runbook, including the immutable-cross-wire finding and the E-before-F sequencing.
 
 **Gated (Foundation / hardware — assistant must NOT do autonomously):**
@@ -266,4 +316,14 @@ against the fresh, unpaused mainnet registry.
 - Old-registry PENDING batches cannot all be finalized/expired before the window → **postpone**
   cutover; never drain the old escrow with unsettled value.
 - E hardware-validation not yet complete → **do not run Track B**; Track A (Sepolia) only.
+- (review C1) Connected chainId is a real mainnet (8453/1/137) under a non-`base`/non-local network
+  name, OR the network name is `base`/`mainnet` but the chainId is not mainnet → **abort** (the deploy
+  scripts now throw on this; do not override).
+- (review H1) The cutover drain check (§4.6 step 3) reports the old registry is NOT paused at scan time
+  → **abort** the cutover; pause the old registry first so the drain reading is durable.
+- (review M5) The new bundle fails its post-cutover soak/canary (§4.6 step 6) → **roll back**: revert
+  client config to the old (still-owned, still-functional) bundle; do NOT drain the old escrow or
+  start old-bond unbonding until the new path has soaked healthy. Because the new bundle's cross-wires
+  are immutable, a botched new bundle is repaired by re-deploying a fresh bundle (back to §4.3), not in
+  place — keeping the old bundle live as a fallback until then is mandatory.
 ```
