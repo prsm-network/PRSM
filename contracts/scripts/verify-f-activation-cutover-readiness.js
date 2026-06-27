@@ -20,6 +20,11 @@
  *   FROM_BLOCK             event-scan start block (default 0; set to the registry's
  *                          deploy block to scan faster on mainnet)
  *   SCAN_CHUNK_BLOCKS      blocks per queryFilter page (default 50000)
+ *                          NOTE: public free-tier RPCs (e.g. https://mainnet.base.org)
+ *                          cap eth_getLogs at ~10 blocks — scanning the full history
+ *                          there is infeasible. Point BASE_RPC_URL at a PAYG endpoint
+ *                          (Alchemy/Infura/QuickNode) and set FROM_BLOCK to the
+ *                          registry's deploy block for a fast, complete scan.
  *   ALLOW_PENDING=1        report-only: exit 0 even if PENDING batches remain
  *
  * Usage:
