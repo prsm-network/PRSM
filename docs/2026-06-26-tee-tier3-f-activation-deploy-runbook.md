@@ -215,7 +215,17 @@ against the fresh, unpaused mainnet registry.
 
 ### 4.6 Cutover
 
-- Finalize/expire old-registry pending batches; confirm old escrow drained.
+- **Gate cutover on the old-registry drain (sp1292, read-only):** confirm the OLD registry has ZERO
+  PENDING (unsettled) batches before re-pointing clients / draining the old escrow — cutting over
+  with unsettled value would strand it.
+  ```bash
+  OLD_REGISTRY_ADDRESS=0x48fFab641b9D638F312FFA776818756a326F995B \
+    FROM_BLOCK=<old registry deploy block> \
+    npx hardhat run scripts/verify-f-activation-cutover-readiness.js --network base
+  #   exit 0 = drained (safe) ; exit 1 = pending batches remain (finalize the window-elapsed ones
+  #   with finalizeBatch + wait out the rest first)
+  ```
+- Finalize/expire old-registry pending batches; confirm old escrow drained (the check above must exit 0).
 - Confirm new-bond stake quorum re-established.
 - Push the new addresses to all settlement clients **and** flip `supports_attestation` on so clients
   route `commitBatchWithAttestation` (sp1241). With E live, the committed measurement is now a real
@@ -235,6 +245,9 @@ against the fresh, unpaused mainnet registry.
   that turns a deploy manifest into the Foundation's importable Safe `acceptOwnership` batch.
   Dress-rehearsed the FULL ownership ceremony end-to-end on a local node (deploy → generate →
   transferOwnership → execute the generated txs from the Safe → `owner()`==Safe on all 3).
+- Authored + **validated** `scripts/verify-f-activation-cutover-readiness.js` (sp1292) — the read-only
+  pre-cutover gate that scans the old registry for unsettled PENDING batches (validated on a local
+  node: 2 pending→exit 1, 1→exit 1, 0→exit 0 drained).
 - Authored this runbook, including the immutable-cross-wire finding and the E-before-F sequencing.
 
 **Gated (Foundation / hardware — assistant must NOT do autonomously):**
