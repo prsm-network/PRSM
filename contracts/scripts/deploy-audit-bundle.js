@@ -75,7 +75,38 @@ async function main() {
   // by default. Operator can override with SIGNATURE_VERIFIER_ADDRESS (e.g., to
   // share a verifier across multiple registries). USE_MOCK_VERIFIER=1 is an
   // escape hatch only valid on non-mainnet networks.
-  const isMainnet = network === "base" || network === "mainnet";
+  //
+  // sp1293 (C1, F-migration review): key the mainnet guards off the CONNECTED
+  // chainId, not the network NAME. A fork/alias network entry (e.g. `base-fork`
+  // has chainId 8453 + a live RPC url) would otherwise run with isMainnet=false
+  // against REAL mainnet, silently disabling the mock-verifier ban + the
+  // foundation≠deployer check + the production-verifier default. Fail closed: a
+  // real-mainnet chainId under a non-mainnet network name is a footgun → abort;
+  // a mainnet name under a non-mainnet chainId is equally inconsistent → abort.
+  const MAINNET_CHAIN_IDS = new Set([8453n, 1n, 137n]); // Base, Ethereum, Polygon
+  const isMainnetByChainId = MAINNET_CHAIN_IDS.has(chainId);
+  const isNamedMainnet = network === "base" || network === "mainnet";
+  // localhost/hardhat are LOCAL nodes (incl. `hardhat node --fork`, which may report a
+  // forked chainId like 8453) — they can never reach a live chain, so they're the
+  // sanctioned fork-rehearsal path: allowed, and treated as mainnet so the rehearsal
+  // exercises the production path. A mainnet chainId under any OTHER non-mainnet name
+  // means a named alias is pointed at a live RPC (the base-fork footgun) → fail closed.
+  const isLocalNode = network === "localhost" || network === "hardhat";
+  if (isMainnetByChainId && !isNamedMainnet && !isLocalNode) {
+    throw new Error(
+      `Refusing to deploy: connected to mainnet chainId ${chainId} under non-mainnet ` +
+      `network name "${network}" (fork/alias footgun). For a fork rehearsal use ` +
+      `\`hardhat node --fork $BASE_RPC_URL\` + --network localhost, never a named ` +
+      `network whose url points at a live RPC.`
+    );
+  }
+  if (isNamedMainnet && !isMainnetByChainId) {
+    throw new Error(
+      `Network name "${network}" implies mainnet but the connected chainId is ${chainId}. ` +
+      `Refusing to deploy under an inconsistent name↔chainId.`
+    );
+  }
+  const isMainnet = isMainnetByChainId || isNamedMainnet;
   const useMockVerifier = process.env.USE_MOCK_VERIFIER === "1";
   if (isMainnet && useMockVerifier) {
     throw new Error(
@@ -253,7 +284,11 @@ async function main() {
   if (verifyEnabled && isBase) {
     console.log("\nVerifying on Basescan…");
     const targets = [
-      { name: "EscrowPool", address: deployments.EscrowPool, args: [deployer.address, ftnsChecksum, hre.ethers.ZeroAddress] },
+      // sp1293 (H3, F-migration review): the 3rd ctor arg is the REGISTRY (immutable
+      // settlementRegistry), not ZeroAddress — the constructor reverts on a zero
+      // registry, so the wrong arg makes the Basescan source-verification silently fail
+      // (the creation bytecode can never match). Must mirror the actual deploy (L137-141).
+      { name: "EscrowPool", address: deployments.EscrowPool, args: [deployer.address, ftnsChecksum, deployments.BatchSettlementRegistry] },
       { name: "BatchSettlementRegistry", address: deployments.BatchSettlementRegistry, args: [deployer.address, challengeWindow] },
       { name: "StakeBond", address: deployments.StakeBond, args: [deployer.address, ftnsChecksum, unbondDelay] },
     ];

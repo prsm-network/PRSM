@@ -193,7 +193,26 @@ async function main() {
   console.log(`Deployer:          ${deployer.address}`);
   console.log(`Deployer balance:  ${hre.ethers.formatEther(balance)} ETH`);
 
-  const isMainnet = network === "base" || network === "mainnet";
+  // sp1293 (C1, F-migration review): key mainnet guards off the CONNECTED chainId,
+  // not the network NAME, so a fork/alias entry (e.g. base-fork: chainId 8453 + live
+  // RPC) can't escape the multisig≠deployer + multisig-is-contract checks. Fail closed
+  // on a name↔chainId mismatch.
+  const chainId = (await hre.ethers.provider.getNetwork()).chainId;
+  const MAINNET_CHAIN_IDS = new Set([8453n, 1n, 137n]);
+  const isMainnetByChainId = MAINNET_CHAIN_IDS.has(chainId);
+  const isNamedMainnet = network === "base" || network === "mainnet";
+  const isLocalNode = network === "localhost" || network === "hardhat";
+  if (isMainnetByChainId && !isNamedMainnet && !isLocalNode) {
+    throw new Error(
+      `Refusing to run: connected to mainnet chainId ${chainId} under non-mainnet ` +
+      `network name "${network}" (fork/alias footgun). Use a local forked node + ` +
+      `--network localhost for rehearsals.`,
+    );
+  }
+  if (isNamedMainnet && !isMainnetByChainId) {
+    throw new Error(`Network name "${network}" implies mainnet but chainId is ${chainId}.`);
+  }
+  const isMainnet = isMainnetByChainId || isNamedMainnet;
   if (
     isMainnet
     && multisigChecksum.toLowerCase() === deployer.address.toLowerCase()

@@ -134,13 +134,19 @@ module.exports = {
     },
 
     // Base Fork (dry-run)
+    // sp1293 (C1, F-migration review): base-fork connects to a LOCAL forked node, NOT
+    // the live RPC. Hardhat honors the `forking` key ONLY for the built-in `hardhat`
+    // network; a custom named network with a `url` gets a plain HttpProvider — so the
+    // previous `url: https://mainnet.base.org` + `chainId: 8453` made `--network
+    // base-fork` BROADCAST real mainnet txs while escaping every name-based mainnet
+    // guard. Fork rehearsals MUST run a local node first:
+    //   npx hardhat node --fork $BASE_RPC_URL    (then deploy with --network localhost)
+    // This entry is kept only as a localhost alias with a sentinel (non-mainnet)
+    // chainId so any stray tx can never reach a live chain + the chainId-based deploy
+    // guards (sp1293) treat it as non-mainnet.
     "base-fork": {
-      url: process.env.BASE_RPC_URL || "https://mainnet.base.org",
-      forking: {
-        url: process.env.BASE_RPC_URL || "https://mainnet.base.org",
-      },
-      accounts: pkAccounts(),
-      chainId: 8453,
+      url: "http://127.0.0.1:8545",
+      chainId: 31337,
     },
 
     // Ethereum Mainnet Fork (dry-run)
