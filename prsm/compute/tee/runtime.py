@@ -118,6 +118,14 @@ class TEEHardwareUnavailableError(RuntimeError):
 _SNP_REPORT_REQ_USER_DATA_LEN = 64
 _SNP_REPORT_RESP_DATA_OFFSET = 32     # report body starts after the 32-byte resp header
 _SNP_GET_REPORT_IOCTL = 0xC0205300    # _IOWR('S', 0x0, 32-byte ioctl struct)
+# Sprint 1296 — ATTESTATION_REPORT (v2) layout + AMD KDS, for SevSnpTEERuntime quote-gen.
+_SNP_REPORT_LEN = 0x4A0               # 1184 — fixed-size report (signed region ends at 0x2A0)
+_SNP_REPORTED_TCB_OFF = 0x180         # 8-byte REPORTED_TCB: [bl, tee, rsvd*4, snp, ucode]
+_SNP_CHIPID_OFF, _SNP_CHIPID_LEN = 0x1A0, 64
+# AMD Key Distribution Service — VCEK leaf (DER) + ASK/ARK cert_chain (PEM) for the
+# report's signing key. {product} = EPYC gen (Milan/Genoa/Turin); the 4 SPLs come from
+# the report's REPORTED_TCB.
+_AMD_KDS_BASE = "https://kdsintf.amd.com/vcek/v1"
 
 
 class _HardwareTEERuntime(TEERuntime):
@@ -192,30 +200,130 @@ class _HardwareTEERuntime(TEERuntime):
 
 
 class SevSnpTEERuntime(_HardwareTEERuntime):
-    """AMD SEV-SNP. ``get_attestation_bytes`` returns the ``PRSMSNP1`` envelope
-    the ``AMDSEVSNPBackend`` verifies. HARDWARE-VALIDATION-PENDING (sprint E)."""
+    """AMD SEV-SNP. ``get_attestation_bytes`` returns the ``PRSMSNP1`` envelope the
+    ``AMDSEVSNPBackend`` verifies.
+
+    Sprint 1296 — quote generation is now IMPLEMENTED (SNP_GET_REPORT ioctl + AMD KDS
+    VCEK/ASK fetch + envelope). The pure pieces (report parse, KDS URL build, envelope
+    assembly) are unit-tested round-tripping through the real verifier; the two impure
+    primitives — the ``/dev/sev-guest`` ioctl (``_snp_get_report``) and the KDS HTTP
+    fetch (``_http_get``) — are HARDWARE/NETWORK-validation-pending until run on a real
+    AMD SEV-SNP confidential VM (sprint E)."""
 
     _DEVICE_PATHS = ("/dev/sev-guest", "/dev/sev")
     _TEE_TYPE = TEEType.SEV
     _NAME = "sev-snp"
 
-    def _generate_quote(self, report_data: bytes) -> bytes:  # pragma: no cover - hardware
-        # Platform sequence (run on a real AMD SEV-SNP confidential VM):
-        #  1. SNP_GET_REPORT ioctl(/dev/sev-guest) with snp_report_req.user_data =
-        #     report_data[:64] → snp_report_resp; the ATTESTATION_REPORT begins at
-        #     _SNP_REPORT_RESP_DATA_OFFSET (it carries report_data, measurement,
-        #     chip_id, reported TCB, and the VCEK signature at offset 0x2A0).
-        #  2. Read chip_id + reported TCB from the report.
-        #  3. Fetch VCEK (+ ASK/ARK) from the AMD KDS for that chip_id/TCB.
-        #  4. Assemble: b"PRSMSNP1" | uint32_le(len(report)) | report | (VCEK||ASK PEM).
-        # The verifier (prsm.compute.inference.amd_sev_snp.AMDSEVSNPBackend) is
-        # complete + tested; only this generation half awaits hardware validation.
-        raise NotImplementedError(
-            "SEV-SNP quote generation (SNP_GET_REPORT ioctl + AMD KDS VCEK fetch "
-            "+ PRSMSNP1 envelope) is hardware-validation-pending — must be run + "
-            "verified on a real AMD SEV-SNP confidential VM (sprint E). The "
-            "verifier side (AMDSEVSNPBackend) is already complete + tested."
-        )
+    def _generate_quote(self, report_data: bytes) -> bytes:
+        # 1. ATTESTATION_REPORT via the SNP guest ioctl, REPORT_DATA = node binding.
+        report = self._snp_get_report(report_data)
+        # 2. The report's REPORTED_TCB + chip_id select the VCEK at the AMD KDS.
+        tcb = self._parse_reported_tcb(report)
+        chip_id = report[_SNP_CHIPID_OFF:_SNP_CHIPID_OFF + _SNP_CHIPID_LEN]
+        product = self._kds_product()
+        vcek_pem = self._fetch_vcek_pem(product, chip_id, tcb)
+        ask_pem = self._fetch_ask_pem(product)
+        # 3. Bundle exactly as AMDSEVSNPBackend.verify expects.
+        return self._assemble_envelope(report, vcek_pem, ask_pem)
+
+    def _snp_get_report(self, report_data: bytes) -> bytes:  # pragma: no cover - hardware
+        """SNP_GET_REPORT ioctl(/dev/sev-guest) → the 1184-byte ATTESTATION_REPORT, with
+        report_data[:64] embedded as REPORT_DATA[:64] (the sp1083 node binding)."""
+        import ctypes
+        import fcntl
+        import os
+
+        class _Req(ctypes.Structure):       # struct snp_report_req (96 B)
+            _fields_ = [("user_data", ctypes.c_uint8 * 64),
+                        ("vmpl", ctypes.c_uint32),
+                        ("rsvd", ctypes.c_uint8 * 28)]
+
+        class _Resp(ctypes.Structure):      # struct snp_report_resp
+            _fields_ = [("data", ctypes.c_uint8 * 4000)]
+
+        class _Ioctl(ctypes.Structure):     # snp_guest_request_ioctl — natural align = 32 B (_IOWR size 0x20)
+            _fields_ = [("msg_version", ctypes.c_uint8),
+                        ("req_data", ctypes.c_uint64),
+                        ("resp_data", ctypes.c_uint64),
+                        ("fw_err", ctypes.c_uint64)]
+
+        req = _Req()
+        ctypes.memmove(req.user_data, bytes(report_data[:64]).ljust(64, b"\x00"), 64)
+        resp = _Resp()
+        call = _Ioctl()
+        call.msg_version = 1
+        call.req_data = ctypes.addressof(req)
+        call.resp_data = ctypes.addressof(resp)
+        dev = next((p for p in self._DEVICE_PATHS if os.path.exists(p)), self._DEVICE_PATHS[0])
+        fd = os.open(dev, os.O_RDWR | os.O_CLOEXEC)
+        try:
+            fcntl.ioctl(fd, _SNP_GET_REPORT_IOCTL, call)
+        finally:
+            os.close(fd)
+        if call.fw_err != 0:
+            raise TEEHardwareUnavailableError(
+                f"SNP_GET_REPORT returned firmware error 0x{call.fw_err:x}")
+        body = bytes(resp.data)[_SNP_REPORT_RESP_DATA_OFFSET:
+                                _SNP_REPORT_RESP_DATA_OFFSET + _SNP_REPORT_LEN]
+        if len(body) != _SNP_REPORT_LEN:
+            raise TEEHardwareUnavailableError("short SNP report from ioctl")
+        return body
+
+    @staticmethod
+    def _parse_reported_tcb(report: bytes) -> dict:
+        """REPORTED_TCB (8 B @0x180): byte0=bootloader, byte1=tee, [2..5] reserved,
+        byte6=snp, byte7=microcode — the SPLs the KDS VCEK URL needs."""
+        tcb = report[_SNP_REPORTED_TCB_OFF:_SNP_REPORTED_TCB_OFF + 8]
+        return {"blSPL": tcb[0], "teeSPL": tcb[1], "snpSPL": tcb[6], "ucodeSPL": tcb[7]}
+
+    @staticmethod
+    def _kds_product() -> str:
+        """EPYC generation for the KDS path. Overridable via PRSM_SEV_SNP_PRODUCT;
+        defaults to Milan (Azure DCas/ECas_v5 = 3rd-gen EPYC). Genoa/Turin for v6+."""
+        import os
+        return (os.environ.get("PRSM_SEV_SNP_PRODUCT", "").strip() or "Milan")
+
+    @classmethod
+    def _vcek_url(cls, product: str, chip_id: bytes, tcb: dict) -> str:
+        return (f"{_AMD_KDS_BASE}/{product}/{chip_id.hex()}"
+                f"?blSPL={tcb['blSPL']}&teeSPL={tcb['teeSPL']}"
+                f"&snpSPL={tcb['snpSPL']}&ucodeSPL={tcb['ucodeSPL']}")
+
+    @classmethod
+    def _chain_url(cls, product: str) -> str:
+        return f"{_AMD_KDS_BASE}/{product}/cert_chain"
+
+    @staticmethod
+    def _http_get(url: str) -> bytes:  # pragma: no cover - network
+        import urllib.request
+        with urllib.request.urlopen(url, timeout=30) as r:  # noqa: S310 - fixed AMD KDS host
+            return r.read()
+
+    @classmethod
+    def _fetch_vcek_pem(cls, product: str, chip_id: bytes, tcb: dict) -> bytes:
+        """KDS serves the VCEK as DER; convert to PEM for the envelope."""
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+        der = cls._http_get(cls._vcek_url(product, chip_id, tcb))
+        return x509.load_der_x509_certificate(der).public_bytes(serialization.Encoding.PEM)
+
+    @classmethod
+    def _fetch_ask_pem(cls, product: str) -> bytes:
+        """KDS cert_chain returns ASK then ARK (PEM); the envelope carries the ASK (the
+        VCEK's issuer) — the ARK is the verifier's CONFIGURED trust root, not bundled."""
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+        certs = x509.load_pem_x509_certificates(cls._http_get(cls._chain_url(product)))
+        if not certs:
+            raise TEEHardwareUnavailableError("KDS cert_chain returned no certificates")
+        return certs[0].public_bytes(serialization.Encoding.PEM)  # ASK
+
+    @staticmethod
+    def _assemble_envelope(report: bytes, vcek_pem: bytes, ask_pem: bytes) -> bytes:
+        """b"PRSMSNP1" | report_len(u32 LE) | report | (VCEK PEM || ASK PEM) — the exact
+        shape AMDSEVSNPBackend.verify parses."""
+        import struct
+        return b"PRSMSNP1" + struct.pack("<I", len(report)) + report + vcek_pem + ask_pem
 
 
 class SgxTEERuntime(_HardwareTEERuntime):

@@ -69,10 +69,12 @@ def test_get_attestation_raises_loudly_without_device_NO_fallback():
 
 
 def test_get_attestation_never_emits_unvalidated_quote_even_with_device():
-    # even when the device is "present", quote-gen is hardware-validation-pending
-    # → it raises rather than fabricate/dev-only (no silent unvalidated quote).
+    # The hardware runtimes NEVER fall back to a dev-only blob. SGX quote-gen is still
+    # unimplemented → NotImplementedError. SEV-SNP quote-gen is implemented (sp1296) but
+    # fails closed on a host without the real SNP device — faking os.path.exists can't
+    # satisfy the actual /dev/sev-guest ioctl → it raises rather than emit anything.
     with patch("os.path.exists", side_effect=lambda p: p == "/dev/sev-guest"):
-        with pytest.raises(NotImplementedError):
+        with pytest.raises((TEEHardwareUnavailableError, OSError)):
             SevSnpTEERuntime(node_id="n").get_attestation_bytes()
     with patch("os.path.exists", side_effect=lambda p: p == "/dev/sgx_enclave"):
         with pytest.raises(NotImplementedError):
