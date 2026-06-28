@@ -47,7 +47,7 @@ def _mk_cert(subj, issuer, subj_pub, issuer_priv, *, ca, not_before=None, not_af
 
 
 def build_sev_snp_envelope(*, ark_priv=None, measurement=b"\x5a" * 48,
-                           report_data=b"\x11" * 64, chip_id=b"\x3c" * 64):
+                           report_data=b"\x11" * 64, chip_id=b"\x3c" * 64, version=2):
     if ark_priv is None:
         ark_priv = ec.generate_private_key(ec.SECP384R1())
     ask_priv = ec.generate_private_key(ec.SECP384R1())
@@ -57,7 +57,7 @@ def build_sev_snp_envelope(*, ark_priv=None, measurement=b"\x5a" * 48,
     vcek = _mk_cert("AMD VCEK", "AMD ASK", vcek_priv.public_key(), ask_priv, ca=False)
 
     report = bytearray(_REPORT_LEN)
-    struct.pack_into("<I", report, 0, 2)             # version 2
+    struct.pack_into("<I", report, 0, version)       # report version (default 2)
     report[_MEAS_OFF:_MEAS_OFF + 48] = measurement
     report[_RDATA_OFF:_RDATA_OFF + 64] = report_data
     report[_CHIPID_OFF:_CHIPID_OFF + 64] = chip_id
@@ -162,14 +162,12 @@ def test_sev_snp_handles_truncated_envelope():
 
 
 def test_sev_snp_rejects_unsupported_version():
-    """sp1049 review — a non-v2 report (different field layout) must be rejected,
-    not silently mis-parsed (parity with Intel's version gate)."""
+    """sp1049 review / sp1297 — a report version ABOVE the validated range (v6+) must be
+    rejected at the version gate, not silently mis-parsed at the v2 offsets. (v2–v5 share
+    those offsets + the signed region and are now accepted; see test_sprint_1297.)"""
     from prsm.compute.inference.amd_sev_snp import AMDSEVSNPBackend
-    env, ark_pem, _ = build_sev_snp_envelope()
-    b = bytearray(env)
-    # report version field is at: 8 (magic) + 4 (len) + 0
-    struct.pack_into("<I", b, 8 + 4 + 0, 3)   # claim v3
-    res = AMDSEVSNPBackend(trusted_root_pem=ark_pem).verify(bytes(b))
+    env, ark_pem, _ = build_sev_snp_envelope(version=6)   # properly signed v6
+    res = AMDSEVSNPBackend(trusted_root_pem=ark_pem).verify(env)
     assert res.vendor_verified is False
     assert res.error and "version" in res.error.lower()
 

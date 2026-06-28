@@ -49,6 +49,11 @@ _MEAS_OFF, _MEAS_LEN = 0x90, 48
 _RDATA_OFF, _RDATA_LEN = 0x50, 64
 _CHIPID_OFF, _CHIPID_LEN = 0x1A0, 64
 _MIN_REPORT_LEN = _SIG_OFF + 2 * _COMPONENT   # need the signed region + r + s
+# sp1297 — highest accepted SEV-SNP report version. Offsets the verifier reads + the
+# signed region report[:0x2A0] are identical across v2–v5 (AMD appends only into reserved
+# bytes); validated on real hardware (GCP N2D Milan emits v5). Bump only after confirming
+# a newer version keeps those offsets.
+_MAX_SNP_REPORT_VERSION = 5
 
 
 def _err(msg: str, structural: bool = False) -> AttestationVerificationResult:
@@ -152,13 +157,17 @@ class AMDSEVSNPBackend:
         report = blob[off:off + report_len]
         chain_pem = blob[off + report_len:]
 
-        # Version-gate (parity with Intel's v3 gate): the field offsets below are
-        # the SEV-SNP v2 ABI. A v3+ report can shift previously-reserved fields, so
-        # reject rather than silently mis-parse measurement/report_data/chip_id.
+        # Version-gate: the field offsets below + the signed region report[:0x2A0] are
+        # STABLE across SEV-SNP report versions 2–5 — AMD only appends new fields into
+        # previously-reserved bytes (cpuid in v3, more in v5), none of which move
+        # report_data / measurement / chip_id / reported_tcb / signature. Validated on
+        # REAL hardware (GCP N2D Milan emits v5; sprint 1297). v6+ stays gated so a future
+        # ABI change can't be silently mis-parsed at the v2 offsets.
         (version,) = struct.unpack("<I", report[:4])
-        if version != 2:
+        if version < 2 or version > _MAX_SNP_REPORT_VERSION:
             return _err(f"unsupported SEV-SNP report version={version} (this backend "
-                        f"parses v2; v3 layout is a follow-on)", structural=True)
+                        f"parses v2–v{_MAX_SNP_REPORT_VERSION}; newer layouts are a "
+                        f"follow-on)", structural=True)
 
         measurement = report[_MEAS_OFF:_MEAS_OFF + _MEAS_LEN]
         report_data = report[_RDATA_OFF:_RDATA_OFF + _RDATA_LEN]
