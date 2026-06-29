@@ -102,10 +102,20 @@ MAINNET = NetworkConfig(
     # (agent-teams self-audit + Slither static pass + OZ Pausable +
     # TVL caps off-chain). Deployer hot key: 0xF7d8...11c2.
     # Total deploy spend: ~$0.25.
-    escrow_pool="0x526D40C08524670846ab811C95691845374122aF",
-    stake_bond="0xD4C6584BB69d1cc46B32502c57124Df12D8979Ed",
-    settlement_registry="0x48fFab641b9D638F312FFA776818756a326F995B",
-    signature_verifier="0xac6a73b270A49Fb62985AbA6bFD6a949577032E5",  # production Ed25519Verifier
+    # sp1300 — F-activation cutover (2026-06-29): the canonical audit-bundle is now the
+    # TEE Tier-3 roadmap-F bundle (sp1240 commitBatchWithAttestation), live on Base mainnet
+    # + Foundation-owned (2-of-3 acceptOwnership) + Basescan-verified. The PRE-F bundle is
+    # RETIRED: drain check passed (0 PENDING batches; 1 historical finalized canary), so no
+    # value was migrated. Its EscrowPool holds 1.0 FTNS recoverable residual — depositor
+    # recovers via withdraw(); the OLD EscrowPool stays unpaused forever for that.
+    #   RETIRED  escrow_pool         0x526D40C08524670846ab811C95691845374122aF
+    #   RETIRED  stake_bond          0xD4C6584BB69d1cc46B32502c57124Df12D8979Ed (0 stake)
+    #   RETIRED  settlement_registry 0x48fFab641b9D638F312FFA776818756a326F995B
+    #   RETIRED  signature_verifier  0xac6a73b270A49Fb62985AbA6bFD6a949577032E5
+    escrow_pool="0x4e93a04b3A0C5063FE584980e6c2B1429495EEa1",
+    stake_bond="0x21B5de0f65B9273A715C6a02b7085a8ABE8adA72",
+    settlement_registry="0x12a01F6C487d765af389bC7D95D90b3136a391F2",
+    signature_verifier="0x9d369312bf3b502Bc07c5859a18f7158c22A31e1",  # production Ed25519Verifier (F bundle)
     emission_controller="0x13A0D76895c196B795b94fe843F76B6e145AeaAE",
     compensation_distributor="0xa9551F5a3AeAB39cc8315AcD8caC2886Bd04f244",
     storage_slashing="0x0e9cAfadCCCe0987C773B5FdFF295c2Aa6F03337",
