@@ -1,0 +1,43 @@
+{
+  "bundle": "ownership-transfer",
+  "network": "base-sepolia",
+  "chainId": "84532",
+  "timestamp": "2026-06-28T18:13:26.778Z",
+  "deployer": "0xCCAc7b21695De068979b1ca47B0cfBD328654220",
+  "foundationMultisig": "0xCb4Bfa18E5B166C2E13c18007b4F4E1b2CE8A889",
+  "sourceManifests": {
+    "auditBundle": "deployments/audit-bundle-base-sepolia-1782670272670.json",
+    "phase8": null,
+    "phase7Storage": null
+  },
+  "transferred": [
+    {
+      "contractName": "EscrowPool",
+      "address": "0x0147eE3Bfe90932Ef277862CC2c06F554a973d69",
+      "oldOwner": "0xCCAc7b21695De068979b1ca47B0cfBD328654220",
+      "pendingOwner": "0xCb4Bfa18E5B166C2E13c18007b4F4E1b2CE8A889",
+      "txHash": "0xb95b689bb9e138dd744f28b0c2ed67cd8c364457329a7dd88201281494c326d6",
+      "blockNumber": 43451057,
+      "note": "pending — multisig must acceptOwnership"
+    },
+    {
+      "contractName": "BatchSettlementRegistry",
+      "address": "0xeF490f01398f567a0D74Ced4336033176fB4640e",
+      "oldOwner": "0xCCAc7b21695De068979b1ca47B0cfBD328654220",
+      "pendingOwner": "0xCb4Bfa18E5B166C2E13c18007b4F4E1b2CE8A889",
+      "txHash": "0xec436789b1ee88dfd20b0b15f820250891491b38e284fec4588481610e8eaddf",
+      "blockNumber": 43451058,
+      "note": "pending — multisig must acceptOwnership"
+    },
+    {
+      "contractName": "StakeBond",
+      "address": "0x6A48013808F61287B39B2F423Ae05933B0fe2bE9",
+      "oldOwner": "0xCCAc7b21695De068979b1ca47B0cfBD328654220",
+      "pendingOwner": "0xCb4Bfa18E5B166C2E13c18007b4F4E1b2CE8A889",
+      "txHash": "0xb945bd5d047b2cd533df51252918cf124a48af0d57151a013209b148bc4ea351",
+      "blockNumber": 43451059,
+      "note": "pending — multisig must acceptOwnership"
+    }
+  ],
+  "skipped": []
+}

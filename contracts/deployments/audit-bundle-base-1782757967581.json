@@ -1,0 +1,31 @@
+{
+  "bundle": "audit-bundle",
+  "phases": [
+    "3.1",
+    "7",
+    "7.1"
+  ],
+  "network": "base",
+  "chainId": "8453",
+  "timestamp": "2026-06-29T18:32:47.580Z",
+  "deployer": "0xF7d88c943B048dAd2e5178E40DaaD545dB3311c2",
+  "params": {
+    "challengeWindowSeconds": "86400",
+    "unbondDelaySeconds": "604800",
+    "verifierKind": "ed25519"
+  },
+  "contracts": {
+    "BatchSettlementRegistry": "0x12a01F6C487d765af389bC7D95D90b3136a391F2",
+    "EscrowPool": "0x4e93a04b3A0C5063FE584980e6c2B1429495EEa1",
+    "SignatureVerifier": "0x9d369312bf3b502Bc07c5859a18f7158c22A31e1",
+    "StakeBond": "0x21B5de0f65B9273A715C6a02b7085a8ABE8adA72",
+    "FTNSToken": "0x5276a3756C85f2E9e46f6D34386167a209aa16e5",
+    "FoundationReserveWallet": "0x91b0e6F85A371D82De94eD13A3812d9f5A4E5791"
+  },
+  "crossWireTxHashes": {
+    "registry_setEscrowPool": "0x8313c08ab6e6d3527c8d90330185bd99f95ad0d7de9cdefee894df8ac8d6fae8",
+    "registry_setSignatureVerifier": "0x9caef8c92ba7e1725f36aa0800c6d75b8f9836701f6f08a6d760a86854fedb44",
+    "registry_setStakeBond": "0xef3c35efe7d6332517517a9cfb9ce68247164fc0564d6f14d316992cfabe6546",
+    "stakeBond_setFoundationReserveWallet": "0x2fcab94eb3f025ff408f7a8382207dc86faf09868097c3b62958c0f3595b9337"
+  }
+}

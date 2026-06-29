@@ -308,6 +308,40 @@ stays a hot fallback until the new path is proven (review M5). The steps below c
 
 ---
 
+## 5.5 ★ LIVE MAINNET EXECUTION RECORD (2026-06-29)
+
+Roadmap E hardware-validation completed first (real AMD SEV-SNP on a GCP N2D Milan
+Confidential VM — real 5408B quote verified to the genuine AMD ARK, `vendor_verified=True`,
+node-bound; sp1296/sp1297). With E satisfied, the gated mainnet F migration was executed live
+on Base mainnet (chainId 8453). Phases 1–3 are **complete**; Phase 4 (cutover) remains scheduled.
+
+**New F-capable bundle (sp1240-inclusive), live on Base mainnet** — manifest
+`deployments/audit-bundle-base-1782757967581.json`:
+- BatchSettlementRegistry: `0x12a01F6C487d765af389bC7D95D90b3136a391F2`
+- EscrowPool:              `0x4e93a04b3A0C5063FE584980e6c2B1429495EEa1`
+- StakeBond:               `0x21B5de0f65B9273A715C6a02b7085a8ABE8adA72`
+- Ed25519Verifier:         `0x9d369312bf3b502Bc07c5859a18f7158c22A31e1`
+- Deployer (hot key):      `0xF7d88c943B048dAd2e5178E40DaaD545dB3311c2`
+- Foundation 2-of-3 Safe:  `0x91b0e6F85A371D82De94eD13A3812d9f5A4E5791`
+- Live FTNS:               `0x5276a3756C85f2E9e46f6D34386167a209aa16e5`
+- Old (pre-sp1240) registry: `0x48fFab641b9D638F312FFA776818756a326F995B` (still owned/live — Phase-4 fallback)
+
+- **Phase 1 — deploy ✅** (§4.3). All 4 contracts deployed + cross-wired; `owner()`==deployer (pre-handoff).
+- **Phase 2 — verify ✅** (§4.4). Cross-wires match; sp1240 surface present; on-chain `batchId`
+  invariance dry run `0xfeb5f4a2eced…` (`commitBatch` == `commitBatchWithAttestation` → zero
+  consensus impact). All 4 contracts **Basescan source-verified**. (sp1298 fixed StakeBond verify args.)
+- **Phase 3 — ownership handoff ✅** (§4.5). `transfer-ownership.js` set `pendingOwner`==Safe on all 3
+  (`ownership-transfer-base-1782758519227.json`):
+  EscrowPool `0x617a4940…e468e`, Registry `0xf7cafd04…105f1`, StakeBond `0xb15cda34…b003`.
+  Foundation 2-of-3 executed the generated `acceptOwnership` batch
+  (`deployments/f-activation-safe-acceptownership-base.json`, selector `0x79ba5097`).
+  Post-accept read-only verify: `owner()`==Safe on all 3, `pendingOwner` cleared on all 3.
+- **Phase 4 — cutover ⏳ GATED/SCHEDULED** (§4.6). Pause old registry → drain PENDING batches (needs a
+  PAYG RPC for the `eth_getLogs` scan) → re-stake with 7-day unbond → re-point clients → soak →
+  flip `supports_attestation`. Keep the old bundle live as fallback until the new path soaks healthy.
+
+---
+
 ## 6. Abort criteria
 
 - §4.4 verification fails (cross-wire mismatch OR invariance dry run shows differing `batchId`) →

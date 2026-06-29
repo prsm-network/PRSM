@@ -1,0 +1,51 @@
+{
+  "version": "1.0",
+  "chainId": "8453",
+  "createdAt": 1782758696000,
+  "meta": {
+    "name": "PRSM TEE Tier-3 F-activation acceptOwnership",
+    "description": "Foundation Safe (2-of-3) accepts Ownable2Step pendingOwner for the TEE Tier-3 roadmap-F audit-bundle re-deploy (BatchSettlementRegistry + EscrowPool + StakeBond). Run AFTER the deployer hot key called transferOwnership(safe) on each (transfer-ownership.js). Verify each contract's pendingOwner == 0x91b0e6F85A371D82De94eD13A3812d9f5A4E5791 before signing. Manifest: audit-bundle-base-1782757967581.json.",
+    "txBuilderVersion": "1.16.5",
+    "createdFromSafeAddress": "0x91b0e6F85A371D82De94eD13A3812d9f5A4E5791",
+    "createdFromOwnerAddress": "",
+    "checksum": ""
+  },
+  "transactions": [
+    {
+      "to": "0x12a01F6C487d765af389bC7D95D90b3136a391F2",
+      "value": "0",
+      "data": "0x79ba5097",
+      "contractMethod": {
+        "inputs": [],
+        "name": "acceptOwnership",
+        "payable": false
+      },
+      "contractInputsValues": null,
+      "_comment": "BatchSettlementRegistry"
+    },
+    {
+      "to": "0x4e93a04b3A0C5063FE584980e6c2B1429495EEa1",
+      "value": "0",
+      "data": "0x79ba5097",
+      "contractMethod": {
+        "inputs": [],
+        "name": "acceptOwnership",
+        "payable": false
+      },
+      "contractInputsValues": null,
+      "_comment": "EscrowPool"
+    },
+    {
+      "to": "0x21B5de0f65B9273A715C6a02b7085a8ABE8adA72",
+      "value": "0",
+      "data": "0x79ba5097",
+      "contractMethod": {
+        "inputs": [],
+        "name": "acceptOwnership",
+        "payable": false
+      },
+      "contractInputsValues": null,
+      "_comment": "StakeBond"
+    }
+  ]
+}

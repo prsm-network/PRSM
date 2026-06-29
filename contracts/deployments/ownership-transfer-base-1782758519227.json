@@ -1,0 +1,43 @@
+{
+  "bundle": "ownership-transfer",
+  "network": "base",
+  "chainId": "8453",
+  "timestamp": "2026-06-29T18:41:59.227Z",
+  "deployer": "0xF7d88c943B048dAd2e5178E40DaaD545dB3311c2",
+  "foundationMultisig": "0x91b0e6F85A371D82De94eD13A3812d9f5A4E5791",
+  "sourceManifests": {
+    "auditBundle": "deployments/audit-bundle-base-1782757967581.json",
+    "phase8": null,
+    "phase7Storage": null
+  },
+  "transferred": [
+    {
+      "contractName": "EscrowPool",
+      "address": "0x4e93a04b3A0C5063FE584980e6c2B1429495EEa1",
+      "oldOwner": "0xF7d88c943B048dAd2e5178E40DaaD545dB3311c2",
+      "pendingOwner": "0x91b0e6F85A371D82De94eD13A3812d9f5A4E5791",
+      "txHash": "0x617a4940acd067a6a76570670371f3ca53029464693fa4c2b4ae4335fb1e468e",
+      "blockNumber": 47984584,
+      "note": "pending — multisig must acceptOwnership"
+    },
+    {
+      "contractName": "BatchSettlementRegistry",
+      "address": "0x12a01F6C487d765af389bC7D95D90b3136a391F2",
+      "oldOwner": "0xF7d88c943B048dAd2e5178E40DaaD545dB3311c2",
+      "pendingOwner": "0x91b0e6F85A371D82De94eD13A3812d9f5A4E5791",
+      "txHash": "0xf7cafd041764c0ba3892819ae5b400496d635f37e69d3cac91046b89af6105f1",
+      "blockNumber": 47984585,
+      "note": "pending — multisig must acceptOwnership"
+    },
+    {
+      "contractName": "StakeBond",
+      "address": "0x21B5de0f65B9273A715C6a02b7085a8ABE8adA72",
+      "oldOwner": "0xF7d88c943B048dAd2e5178E40DaaD545dB3311c2",
+      "pendingOwner": "0x91b0e6F85A371D82De94eD13A3812d9f5A4E5791",
+      "txHash": "0xb15cda340e134865b91901d481a6fe2ec5f0e9b82ec49cd9d0d1bada5cf1b003",
+      "blockNumber": 47984586,
+      "note": "pending — multisig must acceptOwnership"
+    }
+  ],
+  "skipped": []
+}
