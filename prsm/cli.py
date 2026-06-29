@@ -3622,6 +3622,83 @@ def node_doctor_cli(
         raise SystemExit(exit_code)
 
 
+@node.command("inference-status")
+@click.option(
+    "--api-url", "api_url_override", default=None,
+    help="Override daemon URL",
+)
+@click.option(
+    "--format", "output_format",
+    type=click.Choice(["text", "json"]), default="text",
+    help="Output format",
+)
+def node_inference_status_cli(
+    api_url_override: Optional[str], output_format: str,
+) -> None:
+    """Sprint 1304 — is real inference ready to serve? ONE command.
+
+    Reads the daemon's readiness probe (/readyz) and surfaces whether the node can
+    serve inference and — for the local executor — whether the model is actually
+    LOADED yet (sp1302 pre-warms it in the background, so there's a window where the
+    executor is wired but still warming). Exit codes:
+      0 — ready to serve inference
+      1 — NOT ready (no executor wired / inference disabled)
+      2 — daemon unreachable at /readyz
+    """
+    import json as _json
+    import httpx as _httpx
+    url = _api_url_from_creds(api_url_override)
+
+    try:
+        r = _httpx.get(f"{url}/readyz", timeout=5.0)
+    except Exception as exc:
+        msg = f"daemon unreachable at {url}/readyz: {exc}"
+        if output_format == "json":
+            click.echo(_json.dumps({"ready": False, "error": msg}))
+        else:
+            console.print(f"[red]{msg}[/red]")
+        raise SystemExit(2)
+
+    try:
+        detail = r.json()
+    except Exception:
+        detail = {}
+    ready = bool(detail.get("ready"))
+    inf = detail.get("inference_detail") or {}
+
+    if output_format == "json":
+        click.echo(_json.dumps(detail))
+    else:
+        console.print(
+            f"Inference: [{'green' if ready else 'red'}]"
+            f"{'READY' if ready else 'NOT READY'}[/]"
+        )
+        if inf.get("enabled"):
+            loaded = bool(inf.get("loaded"))
+            console.print(f"  executor: {inf.get('kind', 'local')}")
+            console.print(f"  model:    {inf.get('model_id', '?')}")
+            console.print(
+                f"  loaded:   [{'green' if loaded else 'yellow'}]{loaded}[/]"
+                + ("" if loaded else "  (pre-warming — first request will load it)")
+            )
+            if loaded and inf.get("device"):
+                console.print(f"  device:   {inf['device']}")
+        else:
+            # non-local executor (parallax/mock) or none — readiness 'ready' still
+            # authoritative; the loaded-state surface is local-executor specific.
+            kind = inf.get("kind")
+            console.print(
+                f"  executor: {kind if kind else '(none — not a local executor)'}"
+            )
+        if not ready and detail.get("reason"):
+            # escape: the reason can contain bracketed text (e.g. ".[ml]") that rich
+            # would otherwise parse as a style tag and strip.
+            from rich.markup import escape as _rich_escape
+            console.print(f"  [dim]{_rich_escape(str(detail['reason']))}[/dim]")
+
+    raise SystemExit(0 if ready else 1)
+
+
 @node.command("output-cache-stats")
 @click.option(
     "--api-url", "api_url_override", default=None,
