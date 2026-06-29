@@ -326,7 +326,7 @@ stays a hot fallback until the new path is proven (review M5). The steps below c
 Roadmap E hardware-validation completed first (real AMD SEV-SNP on a GCP N2D Milan
 Confidential VM — real 5408B quote verified to the genuine AMD ARK, `vendor_verified=True`,
 node-bound; sp1296/sp1297). With E satisfied, the gated mainnet F migration was executed live
-on Base mainnet (chainId 8453). Phases 1–3 are **complete**; Phase 4 (cutover) remains scheduled.
+on Base mainnet (chainId 8453). **All 4 phases are complete (2026-06-29)** — roadmap F is live on the canonical path.
 
 **New F-capable bundle (sp1240-inclusive), live on Base mainnet** — manifest
 `deployments/audit-bundle-base-1782757967581.json`:
@@ -349,9 +349,18 @@ on Base mainnet (chainId 8453). Phases 1–3 are **complete**; Phase 4 (cutover)
   Foundation 2-of-3 executed the generated `acceptOwnership` batch
   (`deployments/f-activation-safe-acceptownership-base.json`, selector `0x79ba5097`).
   Post-accept read-only verify: `owner()`==Safe on all 3, `pendingOwner` cleared on all 3.
-- **Phase 4 — cutover ⏳ GATED/SCHEDULED** (§4.6). Pause old registry → drain PENDING batches (needs a
-  PAYG RPC for the `eth_getLogs` scan) → re-stake with 7-day unbond → re-point clients → soak →
-  flip `supports_attestation`. Keep the old bundle live as fallback until the new path soaks healthy.
+- **Phase 4 — cutover ✅ DONE (2026-06-29).** The old bundle was effectively unused: the drain check
+  (`verify-f-activation-cutover-readiness.js` via a PAYG RPC) returned **0 PENDING batches**, scan
+  complete, **1 historical finalized canary**, **StakeBond stake 0** → no value to migrate, no re-stake,
+  no 7-day unbond. The old EscrowPool holds **1.0 FTNS recoverable-not-stranded** residual (depositor
+  recovers via `withdraw()`; old pool kept UNPAUSED forever). **Re-point (sp1300, `3cc80a34`):**
+  `prsm/config/networks.py` MAINNET + `operator-parallax.env` now point at the F bundle (registry/escrow/
+  bond/verifier); old addresses retained as RETIRED. **Old registry RETIRED:** Foundation 2-of-3 executed
+  `pause()` on `0x48fFab…995B` → `paused()==true` (read-only confirmed; reversible via `unpause()`).
+  **`supports_attestation` flip + a state-changing canary are deferred to first settlement activation**
+  (needs the funded settler-key ceremony, never run): the new bundle is verified-ready (Phase 2 batchId
+  invariance) and the flip is a config toggle (`PRSM_SETTLEMENT_SUPPORTS_ATTESTATION`, sp1299, fail-safe).
+  ★ Roadmap F is functionally LIVE on the canonical path.
 
 ---
 
