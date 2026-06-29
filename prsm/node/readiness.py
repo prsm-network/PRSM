@@ -37,6 +37,17 @@ def compute_readiness(node: Any) -> Tuple[bool, Dict[str, Any]]:
     }
     ready = inference
     detail: Dict[str, Any] = {"ready": ready, "subsystems": subsystems}
+    # sp1303 — surface the local-inference model-LOADED state (sp1302 pre-warm). The
+    # ``ready`` gate stays on WIRED (not loaded): a wired-but-warming node can still
+    # serve (it just lazy-loads on the first request), so it must not drain traffic
+    # mid-pre-warm. ``inference_detail.loaded`` lets an operator / smart LB see whether
+    # the model is actually resident yet. Additive + fail-soft (never changes ``ready``).
+    try:
+        from prsm.compute.inference.local_inference import local_inference_readiness
+        detail["inference_detail"] = local_inference_readiness(
+            getattr(node, "inference_executor", None))
+    except Exception:  # noqa: BLE001 — readiness must stay cheap + never raise
+        pass
     if not ready:
         detail["reason"] = (
             "inference_executor_unavailable — the node cannot serve inference "

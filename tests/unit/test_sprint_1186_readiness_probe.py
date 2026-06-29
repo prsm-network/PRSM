@@ -76,6 +76,44 @@ def test_settlement_reads_real_node_attr_not_legacy_name():
     assert detail2["subsystems"]["settlement"] is True
 
 
+# ── sp1303: inference_detail surfaces the model-LOADED state ─────────────────────────
+
+def test_inference_detail_for_local_executor_not_loaded():
+    """A wired local executor that hasn't warmed yet → inference_detail shows
+    loaded=False, but the node is still READY (ready gates on wired, not loaded —
+    a warming node serves lazily, so it must not drain traffic mid-pre-warm)."""
+    from prsm.compute.inference.local_inference import LocalHuggingFaceChainExecutor
+    ex = LocalHuggingFaceChainExecutor(model_id="distilgpt2")
+    node = SimpleNamespace(inference_executor=ex, _onchain_settlement_client=None,
+                           ftns_ledger=None)
+    ready, detail = compute_readiness(node)
+    assert ready is True                       # wired → ready, even though not loaded
+    assert detail["inference_detail"] == {
+        "enabled": True, "kind": "local", "model_id": "distilgpt2",
+        "loaded": False, "device": None, "offline": ex._offline, "max_tokens": 32}
+
+
+def test_inference_detail_reports_loaded_after_warm():
+    from prsm.compute.inference.local_inference import LocalHuggingFaceChainExecutor
+    ex = LocalHuggingFaceChainExecutor(model_id="gpt2")
+    ex._model = object()                       # simulate warm (no torch)
+    node = SimpleNamespace(inference_executor=ex, _onchain_settlement_client=None,
+                           ftns_ledger=None)
+    _, detail = compute_readiness(node)
+    assert detail["inference_detail"]["loaded"] is True
+
+
+def test_inference_detail_for_non_local_executor():
+    """A non-local (e.g. parallax/mock) executor is still ready, with a
+    {enabled: False, kind: None} inference_detail (the loaded-state surface is
+    local-executor specific)."""
+    node = SimpleNamespace(inference_executor=object(),
+                           _onchain_settlement_client=None, ftns_ledger=None)
+    ready, detail = compute_readiness(node)
+    assert ready is True
+    assert detail["inference_detail"] == {"enabled": False, "kind": None}
+
+
 # ── endpoints: 200/503 + ungated ─────────────────────────────────────────────────────
 
 def _client(*, inference):
