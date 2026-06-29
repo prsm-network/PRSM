@@ -290,7 +290,11 @@ async function main() {
       // (the creation bytecode can never match). Must mirror the actual deploy (L137-141).
       { name: "EscrowPool", address: deployments.EscrowPool, args: [deployer.address, ftnsChecksum, deployments.BatchSettlementRegistry] },
       { name: "BatchSettlementRegistry", address: deployments.BatchSettlementRegistry, args: [deployer.address, challengeWindow] },
-      { name: "StakeBond", address: deployments.StakeBond, args: [deployer.address, ftnsChecksum, unbondDelay] },
+      // sp1298 (H3 sibling, surfaced on the mainnet F deploy): StakeBond's constructor
+      // is (owner, ftns, unbondDelay, REGISTRY) — the 4th arg (immutable slasher) was
+      // missing here, so Basescan verification failed with "constructor has 4 parameters".
+      // Must mirror the actual deploy (L154-159).
+      { name: "StakeBond", address: deployments.StakeBond, args: [deployer.address, ftnsChecksum, unbondDelay, deployments.BatchSettlementRegistry] },
     ];
     if (verifierKind === "ed25519") {
       targets.push({ name: "Ed25519Verifier", address: verifierAddress, args: [] });
