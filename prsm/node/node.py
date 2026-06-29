@@ -2878,6 +2878,7 @@ class PRSMNode:
             from prsm.compute.inference.local_inference import (
                 DEFAULT_LOCAL_MODEL,
                 build_local_inference_executor,
+                start_local_prewarm,
             )
             _local_model = (
                 os.environ.get("PRSM_LOCAL_INFERENCE_MODEL", "").strip()
@@ -2902,6 +2903,20 @@ class PRSMNode:
                 "hardware-confidential — do not use for Tier B/C secrets.",
                 _local_model,
             )
+            # sp1302 — pre-warm the model OFF the request path so the FIRST
+            # /compute/inference returns real tokens fast instead of paying the
+            # cold-load cost (~350MB download + load on a fresh install) inline,
+            # which looks like a hang/timeout. Background daemon thread, fail-soft;
+            # PRSM_LOCAL_INFERENCE_PREWARM=0 disables (lazy first-request load).
+            try:
+                if start_local_prewarm(self.inference_executor) is not None:
+                    logger.info(
+                        "local inference: pre-warming model %s in the background "
+                        "so the first request skips the cold-load cost "
+                        "(PRSM_LOCAL_INFERENCE_PREWARM=0 to disable).",
+                        _local_model)
+            except Exception as _pw_exc:  # noqa: BLE001 — never block startup
+                logger.debug("local inference pre-warm dispatch skipped: %s", _pw_exc)
         elif _exec_kind == "parallax":
             # Sprint 558 — opt-in production wiring path for the
             # real ParallaxScheduledExecutor. The builder reads

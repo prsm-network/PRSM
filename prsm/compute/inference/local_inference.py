@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -65,7 +66,19 @@ _MAX_TOKENS_CEILING = 256
 _SOFTWARE_ATTESTATION = b"local-hf-runner-software-attestation"
 
 _OFFLINE_ENV = "PRSM_LOCAL_INFERENCE_OFFLINE"
+_PREWARM_ENV = "PRSM_LOCAL_INFERENCE_PREWARM"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _prewarm_enabled(explicit: Optional[bool]) -> bool:
+    """sp1302 — resolve whether to pre-warm the model at startup. Explicit arg wins;
+    else PRSM_LOCAL_INFERENCE_PREWARM (default TRUE = load the model OFF the request
+    path so the first /compute/inference doesn't pay the cold-load cost: ~350MB
+    download + load on a fresh install). 0/off/false/no disables."""
+    if explicit is not None:
+        return bool(explicit)
+    raw = (os.environ.get(_PREWARM_ENV, "") or "").strip().lower()
+    return True if raw == "" else raw in _TRUTHY
 
 
 def _resolve_offline(explicit: Optional[bool]) -> bool:
@@ -286,6 +299,39 @@ class LocalHuggingFaceChainExecutor:
             "local inference loaded model=%s device=%s dtype=%s chat_template=%s",
             self._model_id, device, dtype_str,
             should_use_chat_template(tok, enabled=self._use_chat_template))
+
+    @property
+    def is_loaded(self) -> bool:
+        """True once the model + tokenizer are resident (after warm()/first use)."""
+        return self._model is not None
+
+    def warm(self) -> bool:
+        """sp1302 — idempotently load the model OFF the request path (startup
+        pre-warm) so the first /compute/inference doesn't pay the cold-load cost
+        (~350MB download + load on a fresh install). FAIL-SOFT: a load error (no
+        network, missing [ml], bad model id) is logged and returns False — the lazy
+        ``_ensure_loaded`` on the first real request is unchanged, so pre-warm can
+        never break serving or crash startup."""
+        if self._model is not None:
+            return True
+        try:
+            self._ensure_loaded()
+            return True
+        except Exception as exc:  # noqa: BLE001 — pre-warm must never crash startup
+            logger.warning(
+                "local inference pre-warm failed for model=%s (%s); the model will "
+                "load lazily on the first request instead.", self._model_id, exc)
+            return False
+
+    def describe(self) -> Dict[str, Any]:
+        """Readiness snapshot for status/health surfaces. Never triggers a load."""
+        return {
+            "model_id": self._model_id,
+            "loaded": self._model is not None,
+            "device": self._device if self._model is not None else None,
+            "offline": self._offline,
+            "max_tokens": self._default_max_tokens,
+        }
 
     def _resolve_max_tokens(self, request: Any) -> int:
         mt = getattr(request, "max_tokens", None)
@@ -582,3 +628,47 @@ def build_local_inference_executor(
             model_id=model_id, max_tokens=max_tokens, offline=offline),
         node_identity=node_identity,
     )
+
+
+def _find_local_chain_executor(
+    executor: Any,
+) -> Optional["LocalHuggingFaceChainExecutor"]:
+    """Reach the inner LocalHuggingFaceChainExecutor from a ParallaxScheduledExecutor
+    (``._chain_executor``) or accept a chain executor passed directly. Returns None
+    when neither is a warmable local executor."""
+    if isinstance(executor, LocalHuggingFaceChainExecutor):
+        return executor
+    inner = getattr(executor, "_chain_executor", None)
+    if isinstance(inner, LocalHuggingFaceChainExecutor):
+        return inner
+    return None
+
+
+def start_local_prewarm(
+    executor: Any, *, enabled: Optional[bool] = None,
+) -> Optional[threading.Thread]:
+    """sp1302 — kick off a background daemon thread that ``warm()``s the local model
+    so the first /compute/inference is fast instead of a 10–30s cold-load hang.
+
+    Returns the started Thread, or None when pre-warm is disabled
+    (``PRSM_LOCAL_INFERENCE_PREWARM=0``), the executor is already loaded, or it is
+    not a local executor. Model load is BLOCKING (torch), so a thread — not an
+    asyncio task — keeps it off both the event loop and the startup path. Fail-soft:
+    ``warm()`` swallows its own errors, so the thread can never crash the node."""
+    inner = _find_local_chain_executor(executor)
+    if inner is None or not _prewarm_enabled(enabled) or inner.is_loaded:
+        return None
+    t = threading.Thread(
+        target=inner.warm, name="local-inference-prewarm", daemon=True)
+    t.start()
+    return t
+
+
+def local_inference_readiness(executor: Any) -> Dict[str, Any]:
+    """sp1302 — readiness snapshot for status/health surfaces. Returns
+    ``{enabled: True, kind: "local", ...describe()}`` for a local executor, else
+    ``{enabled: False, kind: None}``. Never triggers a model load."""
+    inner = _find_local_chain_executor(executor)
+    if inner is None:
+        return {"enabled": False, "kind": None}
+    return {"enabled": True, "kind": "local", **inner.describe()}
