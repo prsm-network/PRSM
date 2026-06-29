@@ -55,6 +55,50 @@ def _resolve_state_store(environ) -> Optional[SettlementStateStore]:
     return SettlementStateStore(path)
 
 
+def _commit_with_attestation_selector_hex() -> str:
+    """The 4-byte selector for ``commitBatchWithAttestation`` (sp1241), DERIVED
+    from the registry ABI so it can never drift from the contract — the same
+    ABI-independent existence check the on-chain
+    ``verify-attestation-commitment-deployment.js`` gate uses. Lowercase, no 0x.
+    """
+    from eth_utils import function_abi_to_4byte_selector
+
+    from prsm.economy.web3.batch_settlement_contract_client import (
+        BATCH_SETTLEMENT_REGISTRY_ABI,
+    )
+    for entry in BATCH_SETTLEMENT_REGISTRY_ABI:
+        if (
+            entry.get("type") == "function"
+            and entry.get("name") == "commitBatchWithAttestation"
+        ):
+            return function_abi_to_4byte_selector(entry).hex().lower()
+    raise KeyError("commitBatchWithAttestation missing from the registry ABI")
+
+
+def _bytecode_exposes_selector(code_hex: str, selector_hex: str) -> bool:
+    """Solidity's external-function dispatcher embeds each 4-byte selector as a
+    PUSH4 literal in the deployed runtime bytecode, so the selector hex appearing
+    in the code is a reliable, ABI-independent existence check (pure helper for
+    testability — no network)."""
+    return bool(selector_hex) and selector_hex.lower() in (code_hex or "").lower()
+
+
+def _registry_supports_attestation(rpc_url: str, address: str) -> bool:
+    """FAIL-SAFE probe: does the DEPLOYED registry expose
+    ``commitBatchWithAttestation``? ANY error → ``False`` — we must NEVER enable
+    the attestation-commit path against a registry we can't confirm supports it,
+    because a missing function would make every ``commitBatch`` write revert and
+    stall the settlement cycle (escrow already locked, commit never lands)."""
+    try:
+        from web3 import Web3  # local import: web3 is an optional dependency
+        sel = _commit_with_attestation_selector_hex()
+        w3 = Web3(Web3.HTTPProvider(rpc_url))
+        code = w3.eth.get_code(Web3.to_checksum_address(address))
+        return _bytecode_exposes_selector(code.hex(), sel)
+    except Exception:  # noqa: BLE001 — unconfirmable → fail safe to OFF
+        return False
+
+
 def build_onchain_settlement_client_or_none(
     *,
     provider_address: Optional[str],
@@ -120,10 +164,37 @@ def build_onchain_settlement_client_or_none(
         from prsm.settlement.accumulator import ReceiptAccumulator
         from prsm.settlement.client import BatchSettlementClient
 
+        # sp1299 — make the TEE Tier-3 attestation-commit path (sp1241) a CONFIG
+        # flip, not a code change: the Phase-4 cutover's final + most consequential
+        # step ("flip supports_attestation") is now PRSM_SETTLEMENT_SUPPORTS_ATTESTATION.
+        # Default OFF → legacy commitBatch, byte-for-byte unchanged on the live path.
+        # When requested, FAIL-SAFE verify the deployed registry actually exposes
+        # commitBatchWithAttestation BEFORE enabling — flipping it against an
+        # un-upgraded registry would make every commit tx revert and stall settlement.
+        supports_attestation = False
+        if (environ.get("PRSM_SETTLEMENT_SUPPORTS_ATTESTATION", "") or "").strip()\
+                .lower() in ("1", "true", "yes", "on"):
+            supports_attestation = _registry_supports_attestation(rpc_url, registry)
+            if supports_attestation:
+                logger.info(
+                    "on-chain settlement: attestation-commit ENABLED — registry %s "
+                    "exposes commitBatchWithAttestation (TEE Tier-3 roadmap F).",
+                    registry,
+                )
+            else:
+                logger.warning(
+                    "PRSM_SETTLEMENT_SUPPORTS_ATTESTATION is set, but registry %s "
+                    "does not expose commitBatchWithAttestation (or it could not be "
+                    "confirmed); attestation-commit stays OFF (legacy commitBatch). "
+                    "Point PRSM_SETTLEMENT_REGISTRY_ADDRESS at the sp1240 bundle first.",
+                    registry,
+                )
+
         contract_client = Web3SettlementContractClient(
             rpc_url=rpc_url,
             contract_address=registry,
             private_key=key or None,   # None → view-only (commit/finalize defer)
+            supports_attestation=supports_attestation,
         )
         # sp1039 (brick 2.5) — durable post-commit state, ON by default whenever
         # settlement is opted in: committed batches + the broadcast-but-unconfirmed

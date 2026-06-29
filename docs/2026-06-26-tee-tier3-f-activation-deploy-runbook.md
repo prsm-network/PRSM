@@ -262,12 +262,25 @@ stays a hot fallback until the new path is proven (review M5). The steps below c
    `requestUnbond` on the old bond; the old registry must already be paused (step 2) before any
    old-bond withdraw, so no batch can be committed against now-un-slashable stake (avoids the
    `SlashSwallowed` window during the 7-day unbond).
-6. **Re-point clients + SOAK (M5).** Push the new addresses to all settlement clients atomically
-   (config push, not a straddling rolling deploy). Run a mainnet canary — commit+finalize one batch
-   through the new bundle, assert identical settlement — and soak healthy BEFORE retiring the old
-   bundle. The old bundle stays a hot fallback; if the new bundle misbehaves, revert the client config
-   to the old (still-owned, still-functional) bundle.
-7. **Flip `supports_attestation` on (LAST)** so clients route `commitBatchWithAttestation` (sp1241).
+6. **Re-point clients + SOAK (M5).** Both the registry re-point and the attestation flip are pure
+   **config** (sp1299) — no code change, no redeploy. Push the new registry to all settlement clients
+   atomically (config push, not a straddling rolling deploy):
+   ```bash
+   PRSM_SETTLEMENT_REGISTRY_ADDRESS=0x12a01F6C487d765af389bC7D95D90b3136a391F2   # new bundle
+   # (and, for any consumer that reads them) PRSM_ESCROW_POOL_ADDRESS / PRSM_STAKE_BOND_ADDRESS
+   ```
+   then restart the daemon (the address resolves once at startup). Run a mainnet canary —
+   commit+finalize one batch through the new bundle, assert identical settlement — and soak healthy
+   BEFORE retiring the old bundle. The old bundle stays a hot fallback; if the new bundle misbehaves,
+   revert `PRSM_SETTLEMENT_REGISTRY_ADDRESS` to the old (still-owned, still-functional) bundle.
+7. **Flip `supports_attestation` on (LAST)** so clients route `commitBatchWithAttestation` (sp1241):
+   ```bash
+   PRSM_SETTLEMENT_SUPPORTS_ATTESTATION=1   # sp1299 — config flip, default OFF
+   ```
+   This is FAIL-SAFE: `client_wiring` confirms the bound registry actually exposes
+   `commitBatchWithAttestation` (selector `0xfa4ce156`, ABI-derived bytecode probe) before enabling;
+   if it can't confirm (e.g. the registry env still points at the OLD bundle), it logs a warning and
+   stays on legacy `commitBatch` rather than sending reverting txs. So do step 6 (re-point) first.
    With E live, the committed measurement is now a real hardware quote.
 8. (Optional, F's headline payoff) wire an indexer/Forta filter on `BatchAttestationCommitted` topic0
    `0xec923112ccc386fa91e7116abfe5da0211d8908195bb5d41e644c8a0c79222e3`.
