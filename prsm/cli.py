@@ -7668,6 +7668,136 @@ def compute_pay_infer_cli(
     console.print()
 
 
+@compute.command("pay-infer-multistage")
+@click.option("--prompt", "prompt", required=True, help="Prompt text.")
+@click.option("--model", "model_id", required=True,
+              help="model_id (a big model that shards cross-host, e.g. Qwen/Qwen2.5-7B-Instruct)")
+@click.option("--max-tokens", "max_tokens", default=8, type=int, help="Max output tokens (default: 8)")
+@click.option("--budget", "budget_ftns", default=1.0, type=float,
+              help="FTNS spending CAP (default: 1.0). The quote returns the deterministic price; "
+                   "a price above this is not settleable.")
+@click.option("--privacy-tier", "privacy_tier",
+              type=click.Choice(["none", "standard", "high", "maximum"]), default="none")
+@click.option("--content-tier", "content_tier", type=click.Choice(["A", "B", "C"]), default="A")
+@click.option("--network", "network_name", type=click.Choice(["mainnet", "testnet"]),
+              default="testnet", help="Network for chain_id (testnet=Base Sepolia 84532, mainnet=8453)")
+@click.option("--api-url", "api_url_override", default=None, help="Override daemon URL")
+@click.option("--verify-pubkey-b64", "verify_pubkey_b64", default=None,
+              help="Base64 operator public key — verify the returned receipt inline.")
+@click.option("--quote-only", "quote_only", is_flag=True, default=False,
+              help="Preview the multi-stage quote (price + payees) and STOP — sign + POST nothing.")
+@click.option("--format", "output_format", type=click.Choice(["text", "json"]), default="text")
+def compute_pay_infer_multistage_cli(
+    prompt: str, model_id: str, max_tokens: int, budget_ftns: float,
+    privacy_tier: str, content_tier: str, network_name: str,
+    api_url_override: Optional[str], verify_pubkey_b64: Optional[str],
+    quote_only: bool, output_format: str,
+) -> None:
+    """Sprint 1330 (S5) — pay for a big-model MULTI-STAGE (cross-host sliced) inference.
+
+    Wraps the SDK ``pay_and_infer_multistage``: quotes the planned stage→node payee set + the
+    deterministic price, signs ONE per-stage PaymentAuthorization over it, and POSTs the paid
+    request so each stage node self-settles its share from your escrow (Design A). For a request
+    that routes to a single node, use ``pay-infer`` instead.
+
+    \b
+    Key source (signs the auth): PRIVATE_KEY env, else FTNS_WALLET_PRIVATE_KEY. NEVER on the CLI.
+    \b
+    Example:
+        export PRIVATE_KEY=0x...
+        prsm wallet deposit --amount 5 --network testnet
+        prsm compute pay-infer-multistage --prompt "Hi" --model Qwen/Qwen2.5-7B-Instruct --network testnet
+
+    Exit 0 success, 1 daemon/authorization/not-settleable error, 2 unreachable.
+    """
+    import json as _json
+    from prsm.sdk.client import PRSMClient
+    url = _api_url_from_creds(api_url_override)
+    chain_id = 84532 if network_name == "testnet" else 8453
+
+    if quote_only:
+        async def _q():
+            client = PRSMClient(base_url=url, api_key=(os.environ.get("PRSM_NODE_API_KEY") or "").strip())
+            try:
+                return await client._post("/compute/inference/quote-multistage", {
+                    "model_id": model_id, "prompt": prompt,
+                    "max_tokens": max_tokens, "budget_ftns": budget_ftns})
+            finally:
+                await client.close()
+        try:
+            q = _run_async(_q()) or {}
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"❌ cannot reach daemon at {url}: {exc}", style="red")
+            raise SystemExit(2)
+        if output_format == "json":
+            click.echo(_json.dumps(q)); return
+        console.print(f"[bold]multi-stage quote[/bold] (multi_stage={q.get('multi_stage')}, "
+                      f"settleable={q.get('settleable')})")
+        if q.get("price_ftns") is not None:
+            console.print(f"  price: {q['price_ftns']} FTNS | budget cap: {budget_ftns} | "
+                          f"stages: {q.get('stage_count')}")
+        for a, s in (q.get("payees") or []):
+            console.print(f"  payee {a}: {int(s)/1e18} FTNS")
+        if q.get("reason"):
+            console.print(f"  reason: {q['reason']}")
+        return
+
+    ctx = _wallet_load_signer(network_name)
+    requester_key = ctx.get("private_key")
+    if not requester_key:
+        console.print("❌ no signing key — set PRIVATE_KEY (or FTNS_WALLET_PRIVATE_KEY).", style="red")
+        raise SystemExit(1)
+
+    async def _go():
+        client = PRSMClient(base_url=url, api_key=(os.environ.get("PRSM_NODE_API_KEY") or "").strip())
+        try:
+            return await client.pay_and_infer_multistage(
+                prompt, requester_key=requester_key, model_id=model_id,
+                max_tokens=max_tokens, budget_ftns=budget_ftns,
+                privacy_tier=privacy_tier, content_tier=content_tier,
+                chain_id=chain_id, verify_pubkey_b64=verify_pubkey_b64)
+        finally:
+            await client.close()
+
+    try:
+        result = _run_async(_go())
+    except ValueError as exc:
+        # not multi-stage / not settleable / price>budget — actionable
+        console.print(f"❌ {exc}", style="red")
+        raise SystemExit(1)
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        if any(s in msg.lower() for s in ("connect", "refused", "unreachable", "timeout")):
+            console.print(f"❌ cannot reach daemon at {url}: {exc}", style="red")
+            raise SystemExit(2)
+        console.print(f"❌ pay-infer-multistage failed: {exc}", style="red")
+        raise SystemExit(1)
+
+    result = result or {}
+    succeeded = bool(result.get("success")) or ("output" in result)
+    if not succeeded:
+        detail = result.get("detail") or result.get("error") or result
+        if output_format == "json":
+            click.echo(_json.dumps({"ok": False, "detail": detail}))
+        else:
+            console.print("[red]Paid multi-stage inference rejected:[/red]")
+            console.print(f"   {detail}")
+        raise SystemExit(1)
+
+    if output_format == "json":
+        click.echo(_json.dumps(result)); return
+    console.print(f"\n[bold]{result.get('output', '')}[/bold]")
+    mq = result.get("multistage_quote") or {}
+    if mq.get("price_ftns") is not None:
+        console.print(f"\n[dim]settled {mq['price_ftns']} FTNS across {mq.get('stage_count')} "
+                      f"stage node(s) from your escrow[/dim]")
+    if "receipt_verified" in result:
+        ok = result["receipt_verified"]
+        console.print(f"[dim]receipt_verified: "
+                      f"{'[green]yes[/green]' if ok else '[red]no[/red]'}[/dim]")
+    console.print()
+
+
 @compute.command("models")
 @click.option(
     "--api-url", "api_url_override", default=None,

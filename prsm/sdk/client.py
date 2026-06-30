@@ -285,6 +285,92 @@ class PRSMClient:
                 result["receipt_verified"] = False
         return result
 
+    async def pay_and_infer_multistage(
+        self,
+        prompt: str,
+        *,
+        requester_key: str,
+        model_id: str,
+        max_tokens: int = 8,
+        budget_ftns: float = 1.0,
+        privacy_tier: str = "none",
+        content_tier: str = "A",
+        chain_id: int = 8453,
+        expiry_unix: Optional[int] = None,
+        verify_pubkey_b64: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Sprint 1330 (S5) — pay for a big-model MULTI-STAGE (cross-host sliced) inference,
+        end-to-end. The client glue that makes the proven Design-A paid path callable.
+
+        Runs the full flow: (1) POST ``/compute/inference/quote-multistage`` to learn the
+        planned stage→node payee set + the DETERMINISTIC price (sp1328); (2) sign ONE per-stage
+        PaymentAuthorization over the quoted payees (``build_per_stage_payment_authorization``,
+        sp1312) so each stage node can self-settle its share from your escrow; (3) POST
+        ``/compute/inference`` with that auth. The provider serves the cross-host chain and each
+        node commits its own share on-chain (msg.sender == provider).
+
+        Raises ``ValueError`` (clearly) when the request doesn't route multi-stage (use
+        ``pay_and_infer`` for the single-node case) or isn't settleable (e.g. a stage node has no
+        on-chain payee, or the quoted price exceeds ``budget_ftns``). ``chain_id`` MUST match the
+        network (8453 mainnet / 84532 Base Sepolia). You must hold escrow ≥ the quoted price (see
+        ``deposit_escrow``). Returns the server result with the quote attached under
+        ``result["multistage_quote"]``; ``verify_pubkey_b64`` runs inline receipt verification."""
+        import time
+        from decimal import Decimal
+
+        from prsm.settlement.payment_client import (
+            build_per_stage_payment_authorization,
+        )
+
+        _max_tokens = int(max_tokens or 0)
+        quote = await self._post("/compute/inference/quote-multistage", {
+            "model_id": model_id, "prompt": prompt,
+            "max_tokens": _max_tokens, "budget_ftns": budget_ftns,
+        })
+        if not quote.get("multi_stage"):
+            raise ValueError(
+                "request does not route multi-stage (single node) — use pay_and_infer: "
+                + str(quote.get("reason", "")))
+        if not quote.get("settleable"):
+            raise ValueError(
+                "multi-stage request not settleable: " + str(quote.get("reason", "")))
+
+        if expiry_unix is None:
+            expiry_unix = int(time.time()) + 300
+        # wei → FTNS for the auth builder; the quote's shares ARE the price-based shares the
+        # serve will settle (sp1328), so the signed payee_set_hash matches the settle.
+        payees_ftns = [
+            (addr, Decimal(str(share)) / (Decimal(10) ** 18))
+            for addr, share in quote.get("payees", [])
+        ]
+        auth = build_per_stage_payment_authorization(
+            requester_key=requester_key, payees=payees_ftns,
+            model_id=model_id, prompt=prompt, max_tokens=_max_tokens,
+            privacy_tier=privacy_tier, content_tier=content_tier,
+            expiry_unix=int(expiry_unix), chain_id=chain_id,
+        )
+        result = await self._post("/compute/inference", {
+            "prompt": prompt, "model_id": model_id, "budget_ftns": budget_ftns,
+            "privacy_tier": privacy_tier, "content_tier": content_tier,
+            "max_tokens": _max_tokens, "per_stage_payment_authorization": auth,
+        })
+        result["multistage_quote"] = {
+            "price_ftns": quote.get("price_ftns"),
+            "stage_count": quote.get("stage_count"),
+            "payees": quote.get("payees"),
+            "payee_set_hash": quote.get("payee_set_hash"),
+        }
+        if verify_pubkey_b64:
+            try:
+                from prsm.compute.inference.models import InferenceReceipt
+                from prsm.compute.inference.receipt import verify_receipt
+                receipt = InferenceReceipt.from_dict(result.get("receipt") or {})
+                result["receipt_verified"] = bool(
+                    verify_receipt(receipt, public_key_b64=verify_pubkey_b64))
+            except Exception:
+                result["receipt_verified"] = False
+        return result
+
     async def relayed_infer(
         self,
         prompt: str,
