@@ -184,6 +184,38 @@ def test_deliver_unmapped_node_undelivered(monkeypatch):
     assert by_node[nb].delivered is False and "no resolvable endpoint" in by_node[nb].reason
 
 
+def test_deliver_self_task_ingested_in_process(monkeypatch, tmp_path):
+    """sp1327 — the orchestrator's OWN stage task is ingested IN-PROCESS (local receiver store),
+    NOT self-HTTP-POSTed (that re-entrant POST to localhost:8000 deadlocked inside the inference
+    request handler during the live GO). Only FOREIGN tasks go over HTTP."""
+    monkeypatch.setenv("PRSM_MULTISTAGE_SETTLEMENT", "1")
+    monkeypatch.setenv("PRSM_MULTISTAGE_ENDPOINT_SCHEME", "http")
+    from prsm.settlement.per_stage_receiver_store import PerStageReceiverStore
+    ir, wallet, auth, na, nb = _settled_with_auth()
+    store = PerStageReceiverStore(tmp_path / "rx.json")
+    node = SimpleNamespace(
+        identity=SimpleNamespace(node_id=na),                 # the orchestrator IS the head
+        transport=_FakeTransport({nb: "10.0.0.2:8000"}),
+        _settlement_per_stage_receiver_store=store)
+    posted = []
+
+    def _post(url, *, json, timeout):
+        posted.append(url)
+        return _Resp({"accepted": True, "reason": "ok",
+                      "local_escrow_id": json["task"]["batched_receipt"]["local_escrow_id"]})
+
+    out = deliver_for_settled_receipt(
+        node, receipt=ir, total_value_wei=_TOTAL, requester_address=_REQ_ADDR,
+        per_stage_authorization=auth, wallet_map=wallet, http_post=_post)
+    by_node = {r.node_id: r for r in out}
+    # head (na): ingested in-process, accepted, staged locally — NOT posted
+    assert by_node[na].accepted is True and "in-process" in by_node[na].reason
+    assert [s.task.node_id for s in store.all_staged()] == [na]
+    # worker (nb): the only HTTP delivery
+    assert posted == ["http://10.0.0.2:8000/settlement/per-stage-task"]
+    assert by_node[nb].delivered is True
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
