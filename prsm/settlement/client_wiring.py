@@ -709,6 +709,42 @@ def deliver_for_settled_receipt(
         http_post=http_post, timeout=timeout)
 
 
+async def run_per_stage_commit_cycle(node: Any, environ=os.environ) -> dict:
+    """sp1322 (S3b-3b) — drive ONE per-stage commit cycle on this node: drain the receiver store
+    + commit each staged (authorized) share-batch on the node's OWN settlement client
+    (``msg.sender == node == provider``, Design A). The node-side counterpart of the orchestrator
+    delivery (S3b-2c) — run from the settlement poll loop alongside ``run_settlement_poll_cycle``.
+
+    GATED + fail-soft (NEVER raises):
+      - ``skipped:disabled`` when ``PRSM_MULTISTAGE_SETTLEMENT`` is off,
+      - ``skipped:no-store`` / ``skipped:no-client`` when the receiver store or the node's
+        on-chain settlement client is absent,
+      - ``ok:nothing-staged`` when nothing is staged,
+      - otherwise ``committed N/total`` (a non-committed task STAYS staged for the next cycle;
+        with the default VIEW-ONLY client every commit fail-softs → tasks simply accumulate until
+        a funded key is provisioned, exactly like the single-stage poll cycle)."""
+    if not multistage_settlement_enabled(environ):
+        return {"per_stage_commit": "skipped:disabled"}
+    store = resolve_per_stage_receiver_store(node, environ)
+    if store is None:
+        return {"per_stage_commit": "skipped:no-store"}
+    client = getattr(node, "_onchain_settlement_client", None)
+    if client is None:
+        return {"per_stage_commit": "skipped:no-client"}
+    staged = store.all_staged()
+    if not staged:
+        return {"per_stage_commit": "ok:nothing-staged"}
+    try:
+        from prsm.settlement.per_stage_receiver_store import drain_and_commit_staged
+        # In Design A this node commits ONLY its own staged shares → its single client.
+        results = await drain_and_commit_staged(
+            store, client_for_node=lambda _node_id: client)
+    except Exception as exc:  # noqa: BLE001 — the cycle never raises (loop isolation)
+        return {"per_stage_commit": f"error:{type(exc).__name__}"}
+    committed = sum(1 for r in results if r.committed)
+    return {"per_stage_commit": f"committed {committed}/{len(results)}"}
+
+
 async def run_settlement_poll_cycle(client: Any) -> dict:
     """Sprint 1038 (brick 2) — drive ONE commit/finalize/reconcile cycle of the
     on-chain settlement client.

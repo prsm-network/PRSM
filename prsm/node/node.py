@@ -6186,7 +6186,10 @@ class PRSMNode:
         Each cycle is isolated + never raises; the loop survives iteration errors
         and exits cleanly on cancellation."""
         import os as _os
-        from prsm.settlement.client_wiring import run_settlement_poll_cycle
+        from prsm.settlement.client_wiring import (
+            run_per_stage_commit_cycle,
+            run_settlement_poll_cycle,
+        )
         try:
             interval = float(
                 _os.environ.get("PRSM_SETTLEMENT_POLL_INTERVAL_S", "600"),
@@ -6200,6 +6203,14 @@ class PRSMNode:
                     self._onchain_settlement_client,
                 )
                 logger.debug("Sprint 1038 settlement poll cycle: %s", results)
+                # sp1322 (S3b-3b) — per-stage commit cycle: drain the receiver store + commit
+                # each staged share on this node's own client. GATED (PRSM_MULTISTAGE_SETTLEMENT,
+                # default-off → skipped:disabled) + fail-soft; inert on a view-only client.
+                try:
+                    ps_results = await run_per_stage_commit_cycle(self)
+                    logger.debug("Sprint 1322 per-stage commit cycle: %s", ps_results)
+                except Exception as _ps_exc:  # noqa: BLE001 — never break the loop
+                    logger.debug("sp1322 per-stage commit cycle skipped (%s)", _ps_exc)
                 # sp1140 (Brick E.2) — best-effort announce-after-commit. Only when
                 # the audit data plane is opted in AND an announcer exists; never
                 # raises, never broadcasts (gossips an UNTRUSTED availability ad only).
