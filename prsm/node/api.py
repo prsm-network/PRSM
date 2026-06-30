@@ -17058,7 +17058,29 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         from prsm.settlement.per_stage_settlement_split import (
             build_per_stage_payee_set,
         )
-        total_value_wei = int(_D(str(budget_ftns)) * (_D(10) ** 18))
+        # sp1328 — bind the quote to the DETERMINISTIC PRICE the serve will charge
+        # (``estimate_cost`` = cost_per_layer × num_layers = ``receipt.cost_ftns`` at settle),
+        # NOT the requester's budget. The per-stage auth commits to EXACT (payee, share) pairs; if
+        # the quote echoed ``budget_ftns`` but the serve settled the (deterministic, usually
+        # smaller) cost, the settle-time payee_set_hash wouldn't match the signed one and the gate
+        # would FAIL-CLOSED on every paid multi-stage inference unless budget==cost — the gap the
+        # 2026-06-30 cross-cloud testnet GO surfaced live. ``budget_ftns`` is the requester's
+        # spending CAP: a price above it is not settleable (mirrors the serve gate's
+        # budget<cost rejection). estimate_cost is pure (num_layers × cost_per_layer), so the
+        # quote and the serve compute the IDENTICAL value — no drift.
+        _budget = _D(str(budget_ftns))
+        try:
+            price = await executor.estimate_cost(req)
+        except Exception as e:  # noqa: BLE001
+            return {"multi_stage": True, "settleable": False,
+                    "stage_count": topology.stage_count,
+                    "reason": f"cost estimation failed: {e}"}
+        if price > _budget:
+            return {"multi_stage": True, "settleable": False,
+                    "stage_count": topology.stage_count,
+                    "price_ftns": str(price), "budget_ftns": str(_budget),
+                    "reason": "quoted price exceeds budget_ftns — raise the budget to settle"}
+        total_value_wei = int(price * (_D(10) ** 18))
         payees = build_per_stage_payee_set(
             receipt=SimpleNamespace(topology_assignment=topology),
             total_value_wei=total_value_wei,
@@ -17075,6 +17097,8 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             "multi_stage": True,
             "settleable": True,
             "stage_count": topology.stage_count,
+            "price_ftns": str(price),       # the deterministic price the serve will settle
+            "budget_ftns": str(_budget),    # the requester's cap (price <= budget)
             "total_value_wei": total_value_wei,
             "payee_set_hash": "0x" + compute_payee_set_hash(payees).hex(),
             "payees": [[addr, share] for addr, share in payees],

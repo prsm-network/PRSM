@@ -50,6 +50,13 @@ class _FakeExec:
     async def plan_topology(self, req):
         return self._t
 
+    async def estimate_cost(self, req):
+        # sp1328 — the quote now binds total_value_wei to the deterministic PRICE
+        # (estimate_cost), not budget_ftns. These tests quote at budget_ftns=1.0, so a price
+        # of 1.0 keeps their total==1e18 / 0.5-each assertions valid.
+        from decimal import Decimal
+        return Decimal("1.0")
+
 
 class _FakeWalletMap:
     def __init__(self, mapping):
