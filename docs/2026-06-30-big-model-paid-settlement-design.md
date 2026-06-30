@@ -253,9 +253,16 @@ Each ships behind the default-off flag, fully tested, money-path-gated.
           → POST each → 2 receiver nodes (real apps + stores) → gate → stage →
           `run_per_stage_commit_cycle` commits 1/1 + drains; plus the money-safety reject (auth
           signed over a different set → each node's gate fail-closes, nothing staged/committed).
-          This de-risks the live run. **Still gated, infra-dependent:** a **2-live-node testnet
-          go/no-go before mainnet** (the only piece the in-process test can't cover is a real
-          `BatchSettlementClient` broadcasting — already Sepolia-proven per-node by sp1160). The
+          This de-risks the live run. **REAL-EVM proof of the routed path ✅ DONE (sp1325,
+          0b46e91f):** `test_sp1325_per_stage_ROUTED_onchain_payout_e2e` (in the sp1159 local-EVM
+          bench) runs the DISTRIBUTED self-commit chain — S3a split → per-node gate+stage
+          (S3b-1/2) → `drain_and_commit_staged` on each node's OWN real `BatchSettlementClient`
+          (S3b-3a) → finalize — against real deployed contracts on a local hardhat chain, and
+          asserts self-commit (provider == own settler) + conservation + exact payout + escrow
+          drained by the total. So a REAL client broadcasting the routed path is now proven; the
+          live 2-host Base Sepolia run adds only real network hosts + a real testnet RPC over
+          this. **Still gated, infra-dependent:** a **2-live-node testnet go/no-go before
+          mainnet** (now low-risk — protocol + money path proven on a real EVM). The
           2-live-node deployment + the mainnet activation are user-gated (irreversible — the
           autonomous loop pauses there). **The operator go/no-go procedure is written:
           `docs/2026-06-30-big-model-paid-settlement-2node-testnet-runbook.md`** (topology + 3
