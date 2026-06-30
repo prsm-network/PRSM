@@ -11,6 +11,13 @@ Reuses the existing, tested bricks: ``split_receipt_to_per_node_batched_receipts
 conservation-guaranteed + per-node-signed leaves) and the sp1314-carried
 ``receipt.per_stage_settlement_signatures``. Pure: no I/O, no signing, no chain. Fail-closed
 ``None`` exactly where the splitter falls back to single-payee.
+
+Sprint 1316 (S3b-1) adds the NODE-SIDE RECEIVER gate. The requester signs the per-stage
+authorization over the WHOLE set's hash, but each node receives only its OWN task — so
+``payee_set_from_tasks`` derives the full ``(payee, share)`` set (the orchestrator holds every
+task) to route alongside each node's task, and ``verify_routed_settlement_task`` runs the tested
+sp1172 verifier fail-closed for the node's own membership BEFORE it accumulates/commits on-chain.
+Still pure (verify only — no transport, no commit; those are the rest of S3b).
 """
 from __future__ import annotations
 
@@ -18,6 +25,12 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from prsm.settlement.accumulator import BatchedReceipt
+from prsm.settlement.per_stage_payment_authorization import (
+    DEFAULT_CHAIN_ID,
+    InvalidSignatureFormat,
+    PerStageAuthorizationVerdict,
+    verify_per_stage_authorization,
+)
 from prsm.settlement.per_stage_settlement_split import (
     split_receipt_to_per_node_batched_receipts,
 )
@@ -101,3 +114,58 @@ def build_per_stage_settlement_tasks(
         )
         for s in shares
     ]
+
+
+def payee_set_from_tasks(
+    tasks: List[PerStageSettlementTask],
+) -> List[tuple]:
+    """The FULL ``(payee_address, share_wei)`` set a receiving node must verify against.
+
+    The requester's per-stage authorization commits to a ``payee_set_hash`` over the WHOLE
+    set of stage payees, but each node receives only its OWN task. To check its membership a
+    node needs the full set (``verify_per_stage_authorization`` takes ``payees`` = full set +
+    its own ``(payee, share)`` separately). The orchestrator holds every task, so it derives
+    the set here and routes it alongside each node's task. Order is irrelevant — the set hash
+    is order-independent."""
+    return [
+        (t.batched_receipt.provider_address, int(t.share_wei)) for t in tasks
+    ]
+
+
+def verify_routed_settlement_task(
+    task: PerStageSettlementTask,
+    *,
+    payees: List[tuple],
+    chain_id: int = DEFAULT_CHAIN_ID,
+    now_unix: Optional[float] = None,
+) -> PerStageAuthorizationVerdict:
+    """Node-side FAIL-CLOSED gate (S3b receiver): may THIS node commit the share it was routed?
+
+    A node, on receiving its ``PerStageSettlementTask`` (+ the full ``payees`` set from
+    ``payee_set_from_tasks``), confirms the requester's signed per-stage authorization actually
+    authorizes paying ITS OWN ``(provider_address, share_wei)`` as a member of the committed set
+    — BEFORE it accumulates/commits anything on-chain (brick 4). Reuses the tested sp1172
+    verifier so the on-chain commit and this pre-route check apply the IDENTICAL money-safety
+    invariants (signer, set-hash, membership, cap, expiry, request binding).
+
+    Returns an ``authorized=False`` verdict (NEVER raises) when: the task carries no
+    authorization, the auth payload is malformed, the signature SHAPE is bad, or any invariant
+    fails. The caller commits ONLY when ``verdict.authorized``."""
+    auth = task.payment_authorization
+    if not auth or "payload" not in auth or "signature" not in auth:
+        return PerStageAuthorizationVerdict(
+            False, "routed task carries no per-stage authorization (payload, signature) — "
+            "refusing to commit an unauthorized share (fail-closed)")
+    try:
+        return verify_per_stage_authorization(
+            auth["payload"], auth["signature"],
+            payees=payees,
+            payee=task.batched_receipt.provider_address,
+            share_wei=int(task.share_wei),
+            chain_id=chain_id, now_unix=now_unix,
+        )
+    except InvalidSignatureFormat as exc:
+        # A malformed signature SHAPE on the wire is a reject at the receiver, not a crash —
+        # the node must never raise its way past the gate.
+        return PerStageAuthorizationVerdict(
+            False, f"malformed per-stage authorization signature: {exc!s} (fail-closed)")
