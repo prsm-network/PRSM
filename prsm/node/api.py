@@ -16909,6 +16909,89 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             )
         return rec.to_dict()
 
+    @app.post("/compute/inference/quote-multistage")
+    async def compute_inference_quote_multistage(request: Request) -> Dict[str, Any]:
+        """Sprint 1313 (S1) — paid multi-stage QUOTE. Previews the planned stage→node topology
+        for a request + the ``(eth_payee, share_wei)`` SET the requester must authorize, so a
+        paying requester can sign a per-stage PaymentAuthorization
+        (``build_per_stage_payment_authorization``) for the EXACT set the serve will pay.
+
+        READ-ONLY: plans (filter→allocate→route) WITHOUT executing the model (no escrow, no
+        settlement). Returns ``{multi_stage: bool, ...}``:
+          - ``multi_stage: False`` — routes to a single node / no planning support → use the
+            single-payee ``pay_and_infer``.
+          - ``multi_stage: True, settleable: True`` — ``payees`` (eth, share_wei),
+            ``payee_set_hash``, ``total_value_wei``, ``stage_count``.
+          - ``multi_stage: True, settleable: False`` — a stage node has no registered on-chain
+            payee (fail-closed, mirrors the splitter).
+
+        Best-effort PREVIEW for the CURRENT pool; if the served topology drifts the settle-time
+        auth gate fails fail-closed (re-quote). The binding is enforced at SETTLE time (served
+        payees must equal the signed set), so the preview needs no provider signature for v1."""
+        from decimal import Decimal as _D
+        from types import SimpleNamespace
+
+        from prsm.compute.inference.models import InferenceRequest
+
+        executor = getattr(node, "inference_executor", None)
+        plan = getattr(executor, "plan_topology", None)
+        if executor is None or not callable(plan):
+            return {"multi_stage": False,
+                    "reason": "executor does not support multi-stage planning"}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        budget_ftns = body.get("budget_ftns", 1.0)
+        try:
+            req = InferenceRequest(
+                prompt=body.get("prompt", ""),
+                model_id=body.get("model_id", ""),
+                budget_ftns=_D(str(budget_ftns)),
+                privacy_tier=str(body.get("privacy_tier", "none")),
+                content_tier=str(body.get("content_tier", "A")),
+                max_tokens=body.get("max_tokens"),
+                requester_node_id=node.identity.node_id if node.identity else None,
+            )
+        except (ValueError, TypeError) as e:
+            raise HTTPException(status_code=400, detail=f"Invalid request: {e}")
+
+        topology = await plan(req)
+        if topology is None:
+            return {"multi_stage": False,
+                    "reason": "request routes to a single node (use pay_and_infer)"}
+
+        from prsm.node.compute_wallet_map import ComputeWalletMap
+        from prsm.settlement.per_stage_payment_authorization import (
+            compute_payee_set_hash,
+        )
+        from prsm.settlement.per_stage_settlement_split import (
+            build_per_stage_payee_set,
+        )
+        total_value_wei = int(_D(str(budget_ftns)) * (_D(10) ** 18))
+        payees = build_per_stage_payee_set(
+            receipt=SimpleNamespace(topology_assignment=topology),
+            total_value_wei=total_value_wei,
+            wallet_map=ComputeWalletMap.from_env(),
+        )
+        if payees is None:
+            return {
+                "multi_stage": True, "settleable": False,
+                "stage_count": topology.stage_count,
+                "reason": "one or more stage nodes have no registered on-chain payee "
+                          "(unmapped operator) — cannot quote a per-stage settlement",
+            }
+        return {
+            "multi_stage": True,
+            "settleable": True,
+            "stage_count": topology.stage_count,
+            "total_value_wei": total_value_wei,
+            "payee_set_hash": "0x" + compute_payee_set_hash(payees).hex(),
+            "payees": [[addr, share] for addr, share in payees],
+        }
+
 
     # ── Staking Endpoints ─────────────────────────────────────────
 

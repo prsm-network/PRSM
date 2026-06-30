@@ -134,6 +134,25 @@ class TopologyAssignment:
         return int(self.stable_hash()[:16], 16)
 
 
+def topology_from_chain_stages(stages: Any) -> "TopologyAssignment":
+    """Sprint 1313 (S1) — build the canonical per-inference ``TopologyAssignment`` from a
+    routed chain's ordered stage node_ids: position ``(stage_index, 0) → node_id``, one slot
+    per stage.
+
+    This is the SINGLE source for the stage→node positions, shared by
+    ``TopologyAwareChainExecutor`` (the SERVE path — records it on the receipt) and
+    ``ParallaxScheduledExecutor.plan_topology`` (the QUOTE path). Using one helper guarantees
+    a quote's payee set matches what a real serve produces for the SAME routed chain (no
+    quote/serve drift)."""
+    stage_list = list(stages or [])
+    positions = {(i, 0): node_id for i, node_id in enumerate(stage_list)}
+    return TopologyAssignment(
+        positions=positions,
+        stage_count=len(stage_list),
+        slots_per_stage=1,
+    )
+
+
 class TopologySelector:
     """Pool + dims + seed → TopologyAssignment via uniform
     random shuffle."""

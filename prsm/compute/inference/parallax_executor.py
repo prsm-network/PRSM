@@ -548,6 +548,31 @@ class ParallaxScheduledExecutor(InferenceExecutor):
             receipt=receipt,
         )
 
+    async def plan_topology(self, request: InferenceRequest) -> Optional[Any]:
+        """Sprint 1313 (S1) — run the SAME pre-execute pipeline (filter → allocate → route) a
+        real serve uses, WITHOUT executing the model, and return the planned
+        ``TopologyAssignment`` (stage → node).
+
+        The paid multi-stage QUOTE path feeds this to ``build_per_stage_payee_set`` so the
+        requester signs the EXACT payee set the serve will pay. DRIFT-SAFE: the topology is
+        built from the routed chain via the SAME helper the serve path uses
+        (``topology_from_chain_stages``), so for the same pool/cache the quoted topology ==
+        the served one. READ-ONLY: shares ``_pre_execute_gates`` with ``execute`` but never
+        runs the model, so the proven execute path is untouched.
+
+        Returns ``None`` when the request can't be served (a pre-execute gate fails) or the
+        routed chain has < 1 stage — the caller treats that as 'no multi-stage quote'."""
+        gate_outcome = await self._pre_execute_gates(request)
+        if gate_outcome.failure is not None or gate_outcome.chain is None:
+            return None
+        stages = list(getattr(gate_outcome.chain, "stages", []) or [])
+        if not stages:
+            return None
+        from prsm.compute.inference.topology_rotation import (
+            topology_from_chain_stages,
+        )
+        return topology_from_chain_stages(stages)
+
     async def execute_streaming(
         self, request: InferenceRequest,
     ) -> AsyncIterator[Union[InferenceTokenEvent, InferenceResult]]:

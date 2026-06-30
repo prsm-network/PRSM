@@ -47,7 +47,7 @@ from prsm.compute.inference.parallax_executor import (
     ChainExecutionResult,
 )
 from prsm.compute.inference.topology_rotation import (
-    TopologyAssignment,
+    topology_from_chain_stages,
 )
 
 
@@ -98,16 +98,9 @@ class TopologyAwareChainExecutor:
         if getattr(result, "topology_assignment", None) is not None:
             return result
 
-        # Build the assignment from chain.stages
-        positions = {
-            (stage_index, 0): node_id
-            for stage_index, node_id in enumerate(chain.stages)
-        }
-        topology = TopologyAssignment(
-            positions=positions,
-            stage_count=len(chain.stages),
-            slots_per_stage=1,
-        )
+        # Build the assignment from chain.stages — via the SHARED helper (sp1313) so the
+        # quote path (ParallaxScheduledExecutor.plan_topology) produces identical positions.
+        topology = topology_from_chain_stages(chain.stages)
 
         return replace(result, topology_assignment=topology)
 
