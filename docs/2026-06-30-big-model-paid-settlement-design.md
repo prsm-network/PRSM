@@ -232,14 +232,21 @@ Each ships behind the default-off flag, fully tested, money-path-gated.
           each staged share on the node's own client; wired into the node settlement poll loop
           (node.py) as an isolated never-raises step. Gated + fail-soft; INERT on a view-only
           client (tasks accumulate until a funded key, mirroring the single-stage cycle). 5 TDD.
-        - **REMAINING — paid-multi-stage request INGRESS + the orchestrator post-settle hook +
-          guard replacement.** The paid multi-stage request must carry the per-stage auth
-          (`per_stage_payment_authorization`), the serve path must verify it at serve-time against
-          the planned topology payee set + stash it (like `_record_paid_requester` for
-          single-stage), and the post-settle hook (api.py ~8700) must retrieve it + fire
-          `deliver_for_settled_receipt`; then flip `client_wiring.py:273-281`'s
-          `"skipped:multi-stage-deferred"` when the gate is on. This is money-path INGRESS — best
-          built with the testnet validation available.
+        - **Paid-multi-stage request INGRESS + post-settle delivery hook ✅ DONE (sp1324,
+          a5a9aff0).** A paid multi-stage request carries `per_stage_payment_authorization`;
+          `_resolve_paid_requester_or_402` (gate-on) authenticates the requester
+          (`recover_per_stage_signer == payload.requester`, 402 on mismatch/malformed) + carries
+          the auth in the paid info dict `{multi_stage, requester, max_spend_wei,
+          per_stage_authorization}`. The post-settle hook (api.py settle site) fires
+          `deliver_for_settled_receipt(node, ..., total_value_wei = release_to_operator * 1e18)`
+          — conservation-correct (release_to_operator is the FULL settled value; both the
+          off-chain split and the S3a splitter distribute it conservingly). The FULL money gate
+          runs fail-closed at each node's commit (sp1316), since the served payee set isn't known
+          until routed; FAIL-SOFT delivery. The `"skipped:multi-stage-deferred"` guard STAYS (it
+          correctly prevents single-payee over-booking) — its comment now flags the multi-stage
+          path as wired separately at the post-settle hook. 7 TDD + 60 regression
+          (single-stage sp1056 unchanged). **★ The big-model paid path is now wired end-to-end in
+          code.**
         - **VALIDATION.** **In-process end-to-end ✅ DONE (sp1323, 8a7185e1):**
           `tests/integration/test_sprint_1323_per_stage_e2e.py` wires the WHOLE chain over REAL
           HTTP (FastAPI TestClient) in one process — orchestrator split → `deliver_for_settled_receipt`
