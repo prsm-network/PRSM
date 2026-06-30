@@ -57,21 +57,30 @@ def _normalize_leaf(leaf_hash: str) -> str:
     return h
 
 
-def fetch_and_verify_receipt_for_leaf(
+@dataclass(frozen=True)
+class FetchedReceipt:
+    """The raw §7 artifacts a producer retained for a leaf (sp1305), reconstructed —
+    enough to run the verifier OR build a foreign WatchUnit (sp1308 cross-provider audit)."""
+
+    leaf_hash: str
+    inference_receipt: Any
+    settler_public_key_b64: str
+    stage_public_keys: Optional[Dict[str, str]]
+    settler_node_id: Optional[str]
+    retained_at: Optional[int]
+
+
+def fetch_retained_receipt(
     peer_url: str,
     leaf_hash: str,
     *,
     http_get: Optional[Callable[..., Any]] = None,
     timeout: float = 10.0,
-) -> FetchedReceiptVerification:
-    """Fetch the §7 receipt a peer retained for ``leaf_hash`` (sp1305 endpoint) and run
-    the §7 verifier on it.
-
-    ``peer_url`` is the producer node base URL (e.g. ``http://host:8000``). ``http_get``
-    defaults to ``httpx.get`` (injected in tests). Raises ``ReceiptFetchError`` on any
-    transport/HTTP/parse failure; otherwise returns a ``FetchedReceiptVerification`` whose
-    ``receipt_ok`` is False iff a fraud ground is proven. Does NOT submit a challenge.
-    """
+) -> FetchedReceipt:
+    """Fetch + reconstruct the §7 receipt a producer retained for ``leaf_hash`` (the sp1305
+    endpoint). Fail-LOUD: raises ``ReceiptFetchError`` on transport / non-200 / non-JSON /
+    missing-fields / served-leaf-mismatch / malformed-receipt. Does NOT verify — callers
+    either verify (``fetch_and_verify_receipt_for_leaf``) or build a WatchUnit (sp1308)."""
     leaf = _normalize_leaf(leaf_hash)
     url = f"{peer_url.rstrip('/')}/settlement/receipt/leaf/{leaf}"
 
@@ -121,14 +130,39 @@ def fetch_and_verify_receipt_for_leaf(
     if stage_keys is not None and not isinstance(stage_keys, dict):
         raise ReceiptFetchError("stage_public_keys must be an object or null")
 
-    report = verify_inference_receipt_for_challenge(
-        receipt,
+    return FetchedReceipt(
+        leaf_hash=leaf,
+        inference_receipt=receipt,
         settler_public_key_b64=body["settler_public_key_b64"],
         stage_public_keys=stage_keys,
-    )
-    return FetchedReceiptVerification(
-        leaf_hash=leaf,
-        report=report,
         settler_node_id=getattr(receipt, "settler_node_id", None),
         retained_at=body.get("retained_at"),
+    )
+
+
+def fetch_and_verify_receipt_for_leaf(
+    peer_url: str,
+    leaf_hash: str,
+    *,
+    http_get: Optional[Callable[..., Any]] = None,
+    timeout: float = 10.0,
+) -> FetchedReceiptVerification:
+    """Fetch a producer's retained §7 receipt (sp1305) and run the §7 verifier on it.
+
+    ``peer_url`` is the producer node base URL (e.g. ``http://host:8000``). ``http_get``
+    defaults to ``httpx.get`` (injected in tests). Raises ``ReceiptFetchError`` on any
+    transport/HTTP/parse failure; otherwise returns a ``FetchedReceiptVerification`` whose
+    ``receipt_ok`` is False iff a fraud ground is proven. NEVER submits a challenge.
+    """
+    fr = fetch_retained_receipt(peer_url, leaf_hash, http_get=http_get, timeout=timeout)
+    report = verify_inference_receipt_for_challenge(
+        fr.inference_receipt,
+        settler_public_key_b64=fr.settler_public_key_b64,
+        stage_public_keys=fr.stage_public_keys,
+    )
+    return FetchedReceiptVerification(
+        leaf_hash=fr.leaf_hash,
+        report=report,
+        settler_node_id=fr.settler_node_id,
+        retained_at=fr.retained_at,
     )

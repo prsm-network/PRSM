@@ -2406,6 +2406,8 @@ class PRSMNode:
         self._settlement_audit_task = None  # sp1140 brick E.2 (opt-in audit loop)
         self._compute_integrity_watcher = None  # sp1307 — §7 ChallengeWatcher (opt-in)
         self._compute_integrity_watcher_task = None  # sp1307
+        self._peer_compute_integrity_watcher = None  # sp1308 — cross-provider audit
+        self._peer_integrity_watcher_task = None  # sp1308
         self._settlement_audit_bundle = None  # sp1140 — None unless PRSM_SETTLEMENT_AUDIT
         self._collateral_refresh_task = None  # sp1081 — attestation collateral refresh
         self._metrics_collector = None  # sp1217 — opt-in runtime MetricsCollector
@@ -6381,6 +6383,8 @@ class PRSMNode:
         try:
             from prsm.settlement.settlement_audit_wiring import (
                 build_compute_integrity_watcher,
+                build_env_endpoint_resolver,
+                build_peer_compute_integrity_watcher,
             )
             watcher = build_compute_integrity_watcher(
                 published_batch_store=getattr(
@@ -6392,26 +6396,49 @@ class PRSMNode:
             if watcher is not None:
                 self._compute_integrity_watcher = watcher
                 self._compute_integrity_watcher_task = asyncio.create_task(
-                    self._compute_integrity_watcher_loop(max(5.0, interval)),
+                    self._compute_integrity_watcher_loop(
+                        watcher, max(5.0, interval), "self"),
                 )
                 logger.info(
                     "Sprint 1307 compute-integrity watcher launched (read-only, "
                     "never-broadcast; self-audits committed batches every %.0fs).",
                     max(5.0, interval),
                 )
+            # sp1308 — CROSS-PROVIDER audit: same watcher machinery, but the source pulls
+            # FOREIGN producers' §7 receipts (verified_batch_store + the sp1305 serve
+            # endpoint, fetched via sp1306) through an INJECTED endpoint resolver. Inert
+            # unless an operator configures PRSM_PEER_RECEIPT_ENDPOINTS (a JSON
+            # provider->url map); automatic endpoint discovery is a follow-on.
+            resolver = build_env_endpoint_resolver(_os.environ)
+            peer_watcher = build_peer_compute_integrity_watcher(
+                verified_batch_store=getattr(
+                    self, "_settlement_verified_batch_store", None),
+                endpoint_resolver=resolver,
+                dry_run_client=dry_run_client,
+            )
+            if peer_watcher is not None:
+                self._peer_compute_integrity_watcher = peer_watcher
+                self._peer_integrity_watcher_task = asyncio.create_task(
+                    self._compute_integrity_watcher_loop(
+                        peer_watcher, max(5.0, interval), "peer"),
+                )
+                logger.info(
+                    "Sprint 1308 CROSS-PROVIDER compute-integrity watcher launched "
+                    "(read-only; audits foreign producers' §7 receipts via "
+                    "PRSM_PEER_RECEIPT_ENDPOINTS every %.0fs).", max(5.0, interval),
+                )
         except Exception as _ciw_exc:  # noqa: BLE001 — never block the audit loop
-            logger.debug("sp1307 compute-integrity watcher not launched: %s", _ciw_exc)
+            logger.debug("compute-integrity watcher(s) not launched: %s", _ciw_exc)
 
-    async def _compute_integrity_watcher_loop(self, interval: float) -> None:
-        """Sprint 1307 — periodically scan this node's own committed batches for
-        COMPUTE-INTEGRITY fraud (a §7 receipt that fails
-        ``verify_inference_receipt_for_challenge``). The watcher is read-only + NEVER
-        broadcasts (it only dry-runs + surfaces actionable challenges). A surfaced
-        challenge is a TRIPWIRE: this node may be producing slashable §7 receipts — logged
-        at WARNING so an operator acts BEFORE it becomes an on-chain liability. The loop is
-        isolated (never raises), survives iteration errors, and exits cleanly on
-        cancellation."""
-        watcher = self._compute_integrity_watcher
+    async def _compute_integrity_watcher_loop(
+        self, watcher: Any, interval: float, label: str = "self",
+    ) -> None:
+        """Sprint 1307/1308 — periodically scan for COMPUTE-INTEGRITY fraud (a §7 receipt
+        that fails ``verify_inference_receipt_for_challenge``). ``label`` distinguishes the
+        'self' audit (sp1307 — this node's OWN committed batches, a TRIPWIRE on producing
+        slashable receipts) from the 'peer' audit (sp1308 — FOREIGN producers' receipts, a
+        surfaced cross-provider challenge). Read-only + NEVER broadcasts (dry-run + surface
+        only). Isolated: never raises, survives iteration errors, exits clean on cancel."""
         if watcher is None:
             return
         while True:
@@ -6419,28 +6446,31 @@ class PRSMNode:
                 result = await watcher.scan()
                 if result.actionable:
                     logger.warning(
-                        "Sprint 1307 compute-integrity watcher: %d ACTIONABLE "
-                        "challenge(s) surfaced over %d unit(s) — this node may have "
-                        "produced INVALID §7 receipt(s) (dry-run only, NOT broadcast): "
-                        "%s", len(result.actionable), result.units_scanned,
+                        "Sprint 1307/1308 compute-integrity watcher [%s]: %d ACTIONABLE "
+                        "challenge(s) over %d unit(s) — %s (dry-run only, NOT broadcast): "
+                        "%s", label, len(result.actionable), result.units_scanned,
+                        ("this node may have produced INVALID §7 receipt(s)"
+                         if label == "self"
+                         else "a FOREIGN producer's §7 receipt failed verification"),
                         [a.to_dict() for a in result.actionable],
                     )
                 elif result.errors:
                     logger.info(
-                        "Sprint 1307 compute-integrity watcher: %d unit(s) scanned, "
+                        "Sprint 1307/1308 compute-integrity watcher [%s]: %d scanned, "
                         "0 actionable, %d per-unit error(s).",
-                        result.units_scanned, len(result.errors),
+                        label, result.units_scanned, len(result.errors),
                     )
                 else:
                     logger.debug(
-                        "Sprint 1307 compute-integrity watcher: %d unit(s) clean.",
-                        result.units_scanned,
+                        "Sprint 1307/1308 compute-integrity watcher [%s]: %d unit(s) "
+                        "clean.", label, result.units_scanned,
                     )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 — keep the loop alive
                 logger.warning(
-                    "Sprint 1307 compute-integrity watcher iteration error: %s", exc,
+                    "Sprint 1307/1308 compute-integrity watcher [%s] iteration error: %s",
+                    label, exc,
                 )
             await asyncio.sleep(interval)
 
@@ -6607,6 +6637,7 @@ class PRSMNode:
             "_settlement_poll_task",  # sp1038
             "_settlement_audit_task",  # sp1140 (Brick E.2)
             "_compute_integrity_watcher_task",  # sp1307
+            "_peer_integrity_watcher_task",  # sp1308
             "_collateral_refresh_task",  # sp1081
         ):
             task = getattr(self, task_attr, None)

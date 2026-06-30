@@ -546,3 +546,106 @@ def build_compute_integrity_watcher(
                 )
 
     return ChallengeWatcher(source=_source, dry_run_client=dry_run_client)
+
+
+def build_env_endpoint_resolver(environ: Any) -> Any:
+    """Sprint 1308 — producer-endpoint resolver from ``PRSM_PEER_RECEIPT_ENDPOINTS``, a JSON
+    map ``{provider_address: receipt_serve_base_url}``. Returns a callable
+    ``(provider_address) -> base_url | None``, or ``None`` when the env is unset/empty (the
+    cross-provider audit then stays inert). Automatic endpoint discovery (anchor/gossip) is
+    a follow-on; this lets an operator audit a KNOWN set of peers today."""
+    import json
+    raw = (environ.get("PRSM_PEER_RECEIPT_ENDPOINTS", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        m = json.loads(raw)
+    except (ValueError, TypeError):
+        logger.warning("PRSM_PEER_RECEIPT_ENDPOINTS is not valid JSON — peer audit OFF")
+        return None
+    if not isinstance(m, dict):
+        return None
+    lm = {str(k).lower(): str(v) for k, v in m.items() if v}
+    if not lm:
+        return None
+
+    def _resolve(provider_address: str):
+        return lm.get(str(provider_address).lower())
+    return _resolve
+
+
+def build_peer_compute_integrity_watcher(
+    *,
+    verified_batch_store: Any,
+    endpoint_resolver: Any,
+    dry_run_client: Any,
+    http_get: Any = None,
+) -> Any:
+    """Sprint 1308 — CROSS-PROVIDER compute-integrity audit (the §7 counterpart that checks
+    OTHER providers, vs sp1307 which self-audits this node's own batches).
+
+    Assembles a ChallengeWatcher whose source iterates FOREIGN committed batches
+    (``verified_batch_store`` — the order-preserved receipt sets the audit engine retained,
+    sp1164) and, per leaf: recomputes the leaf hash, reads the producer from the
+    BatchedReceipt's ``provider_address``, resolves that producer's receipt-serve endpoint
+    via the INJECTED ``endpoint_resolver``, and FETCHES the producer's §7 receipt over the
+    sp1305 endpoint (``fetch_retained_receipt``, sp1306) — yielding a foreign ``WatchUnit``.
+    The existing ChallengeWatcher (sp1307) then verifies + assembles + DRY-RUNS uniformly, so
+    a foreign producer's invalid §7 receipt surfaces as an actionable cross-provider
+    challenge (read-only, NEVER broadcast).
+
+    Producer-endpoint discovery is a SEPARATE concern (injected), mirroring the watcher's
+    pluggable-source design. The source is fail-soft per leaf: a resolve-miss, fetch error,
+    or bad leaf is skipped (logged), never aborting the scan. Returns ``None`` when
+    ``verified_batch_store`` / ``endpoint_resolver`` / ``dry_run_client`` is absent."""
+    if (verified_batch_store is None or endpoint_resolver is None
+            or dry_run_client is None):
+        return None
+
+    from prsm.settlement.challenge_watcher import ChallengeWatcher, WatchUnit
+    from prsm.settlement.merkle import batched_receipt_to_leaf, hash_leaf
+    from prsm.settlement.receipt_challenge_client import (
+        ReceiptFetchError,
+        fetch_retained_receipt,
+    )
+
+    async def _source():
+        for pb in verified_batch_store.all_batches():
+            receipts = list(getattr(pb, "receipts", []) or [])
+            batch_id = getattr(pb, "batch_id", None)
+            if batch_id is None:
+                continue
+            for idx, br in enumerate(receipts):
+                try:
+                    leaf = hash_leaf(batched_receipt_to_leaf(br))
+                except Exception:  # noqa: BLE001 — malformed receipt: skip this leaf
+                    continue
+                provider = getattr(br, "provider_address", None)
+                if not provider:
+                    continue
+                try:
+                    base_url = endpoint_resolver(provider)
+                except Exception:  # noqa: BLE001
+                    base_url = None
+                if not base_url:
+                    continue  # producer endpoint unknown — can't fetch (skip, not fraud)
+                try:
+                    fr = fetch_retained_receipt(base_url, leaf.hex(), http_get=http_get)
+                except ReceiptFetchError as exc:
+                    logger.debug(
+                        "sp1308 peer-audit: fetch failed (leaf %s, provider %s): %s",
+                        leaf.hex(), provider, exc)
+                    continue
+                except Exception as exc:  # noqa: BLE001 — never break the scan
+                    logger.warning("sp1308 peer-audit: unexpected fetch error: %s", exc)
+                    continue
+                yield WatchUnit(
+                    batch_id=batch_id,
+                    inference_receipt=fr.inference_receipt,
+                    settler_public_key_b64=fr.settler_public_key_b64,
+                    batch_receipts=receipts,
+                    target_index=idx,
+                    stage_public_keys=fr.stage_public_keys,
+                )
+
+    return ChallengeWatcher(source=_source, dry_run_client=dry_run_client)
