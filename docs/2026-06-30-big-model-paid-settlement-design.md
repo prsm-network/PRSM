@@ -268,9 +268,15 @@ Each ships behind the default-off flag, fully tested, money-path-gated.
           cross-host dispatch — THE actual blocker, not the firewall), the head self-delivery
           re-entrancy (self-HTTP-POST deadlock → ingest in-process), and transport reconnect
           robustness (ping-timeout env + reconnect-replace for asymmetric-firewall fleets). Two
-          design findings: quote-vs-settled-value binding (exact-share auth needs budget==cost or
-          a binding/cap-based quote), and the 1.0 FTNS batch threshold being too high for small
-          per-stage shares. **REAL-EVM proof of the routed path ✅ DONE (sp1325, 0b46e91f):** `test_sp1325_per_stage_ROUTED_onchain_payout_e2e` (in the sp1159 local-EVM
+          design findings: **(1) quote-vs-settled-value binding ✅ FIXED (sp1328, b147a035)** — the
+          settled value is the DETERMINISTIC price `estimate_cost = cost_per_layer × num_layers ==
+          receipt.cost_ftns`, so the quote now returns that price as `total_value_wei` (+
+          `price_ftns`) with `budget_ftns` a CAP; the exact-share auth matches the settle for any
+          budget≥price (no cap-based crypto change). **(2) the 1.0 FTNS batch threshold too high
+          for small per-stage shares — STILL OPEN** (a 0.14 share never crossed it; the live GO
+          committed via a low-threshold client; the per-stage path should set a
+          per-stage-appropriate commit threshold / force-flush a single staged share).
+          **REAL-EVM proof of the routed path ✅ DONE (sp1325, 0b46e91f):** `test_sp1325_per_stage_ROUTED_onchain_payout_e2e` (in the sp1159 local-EVM
           bench) runs the DISTRIBUTED self-commit chain — S3a split → per-node gate+stage
           (S3b-1/2) → `drain_and_commit_staged` on each node's OWN real `BatchSettlementClient`
           (S3b-3a) → finalize — against real deployed contracts on a local hardhat chain, and

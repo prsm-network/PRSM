@@ -104,8 +104,16 @@ def build_onchain_settlement_client_or_none(
     provider_address: Optional[str],
     env: Optional[dict] = None,
     published_batch_store: Optional[Any] = None,
+    accumulator_config: Optional[Any] = None,
+    state_store: Optional[Any] = None,
 ) -> Optional[Any]:
     """Return a ``BatchSettlementClient`` or ``None`` (see module docstring).
+
+    sp1329 — ``accumulator_config`` overrides the default ``AccumulatorConfig`` (the per-stage
+    commit path passes ``count_threshold=1`` so a single small share-batch commits immediately
+    instead of waiting for the value/count threshold). ``state_store`` overrides the durable
+    state store (so a dedicated per-stage client doesn't collide with the single-stage client's
+    state file). Both default ``None`` → byte-for-byte the prior behavior.
 
     ``published_batch_store`` (sp1140 Brick E.2) is OPT-IN: passed only when the audit
     data plane is enabled (``PRSM_SETTLEMENT_AUDIT``). When None (the default) the client
@@ -201,12 +209,14 @@ def build_onchain_settlement_client_or_none(
         # quarantine represent escrow already locked on chain, so they MUST survive
         # a restart or the money strands. PRSM_SETTLEMENT_STATE_FILE overrides the
         # path; ":memory:" disables durability (in-memory only — for tests/diagnostics).
-        state_store = _resolve_state_store(environ)
+        _state = state_store if state_store is not None else _resolve_state_store(environ)
+        _acc = ReceiptAccumulator(accumulator_config) if accumulator_config is not None \
+            else ReceiptAccumulator()
         return BatchSettlementClient(
-            accumulator=ReceiptAccumulator(),
+            accumulator=_acc,
             contract_client=contract_client,
             provider_address=provider_address,
-            state_store=state_store,
+            state_store=_state,
             published_batch_store=published_batch_store,
         )
     except SettlementStateCorruptError as exc:
@@ -626,6 +636,50 @@ def resolve_per_stage_receiver_store(node: Any, environ=os.environ) -> Optional[
     return store
 
 
+def resolve_per_stage_settlement_client(node: Any, environ=os.environ) -> Optional[Any]:
+    """sp1329 — the node's DEDICATED per-stage settlement client, lazily built + cached.
+
+    Per-stage share-batches are committed INDIVIDUALLY (Design A: one batch per stage node per
+    job, each with its own requester/escrow), so unlike the single-stage client (which batches
+    small receipts up to a value threshold) the per-stage client uses ``count_threshold=1`` — a
+    single staged share is immediately ready + commits this cycle. Without this a small share
+    (e.g. 0.14 FTNS) never crosses the default value threshold and silently never settles (the
+    gap the 2026-06-30 testnet GO hit — it had to commit via a manual low-threshold client).
+
+    Uses a DISTINCT state file (``PRSM_MULTISTAGE_SETTLEMENT_STATE_FILE`` or
+    ``~/.prsm/per_stage_settlement_state.json``) so it doesn't collide with the single-stage
+    client's durable state. Returns ``None`` when off-chain settlement isn't active (no operator
+    address / no key / no network) — fail-soft, never raises."""
+    existing = getattr(node, "_onchain_per_stage_settlement_client", None)
+    if existing is not None:
+        return existing
+    op = getattr(node, "_operator_address", None)
+    if not op:
+        try:
+            from prsm.node.operator_address import resolve_operator_address
+            op = resolve_operator_address()
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        from pathlib import Path
+
+        from prsm.settlement.accumulator import AccumulatorConfig
+        from prsm.settlement.state_store import SettlementStateStore
+        state_path = (str(environ.get("PRSM_MULTISTAGE_SETTLEMENT_STATE_FILE", "")).strip()
+                      or str(Path.home() / ".prsm" / "per_stage_settlement_state.json"))
+        client = build_onchain_settlement_client_or_none(
+            provider_address=op, env=environ,
+            accumulator_config=AccumulatorConfig(count_threshold=1),
+            state_store=SettlementStateStore(Path(state_path)))
+    except Exception as exc:  # noqa: BLE001 — never crash the commit cycle on a build error
+        logger.warning("resolve_per_stage_settlement_client: build failed (%s: %s)",
+                       type(exc).__name__, exc)
+        return None
+    if client is not None:
+        node._onchain_per_stage_settlement_client = client
+    return client
+
+
 def build_per_stage_endpoint_resolver(node: Any, environ=os.environ):
     """sp1321 (S3b-3b) — a ``node_id -> Optional[base_url]`` resolver for delivering per-stage
     settlement tasks to their stage nodes.
@@ -764,7 +818,10 @@ async def run_per_stage_commit_cycle(node: Any, environ=os.environ) -> dict:
     store = resolve_per_stage_receiver_store(node, environ)
     if store is None:
         return {"per_stage_commit": "skipped:no-store"}
-    client = getattr(node, "_onchain_settlement_client", None)
+    # sp1329 — the DEDICATED per-stage client (count_threshold=1) so a single small share commits
+    # immediately, instead of the shared single-stage client whose value threshold a 0.14 FTNS
+    # share never crosses.
+    client = resolve_per_stage_settlement_client(node, environ)
     if client is None:
         return {"per_stage_commit": "skipped:no-client"}
     staged = store.all_staged()

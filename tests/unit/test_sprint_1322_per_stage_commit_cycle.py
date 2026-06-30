@@ -96,9 +96,11 @@ class _FakeClient:
 
 
 def _node(tmp_path, *, client):
+    # sp1329 — run_per_stage_commit_cycle now resolves a DEDICATED per-stage client
+    # (count_threshold=1) cached on _onchain_per_stage_settlement_client.
     store = PerStageReceiverStore(tmp_path / "rx.json")
     return SimpleNamespace(_settlement_per_stage_receiver_store=store,
-                           _onchain_settlement_client=client), store
+                           _onchain_per_stage_settlement_client=client), store
 
 
 # ── skip states ───────────────────────────────────────────────────────────────
