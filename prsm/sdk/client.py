@@ -385,6 +385,57 @@ class PRSMClient:
 
     # ── Sprint 820 — Streaming verifiable inference ─────────────
 
+    async def _stream_events(self, body: Dict[str, Any]):
+        """Sprint 820/1310 — POST ``body`` to /compute/inference/stream and yield the SSE
+        token/result/error events. Shared by ``infer_stream`` (self-pay) and
+        ``pay_and_infer_stream`` (paid) so the SSE parsing lives in one place. Non-200 →
+        a single ``error`` event then stop (sp827: surface the server detail instead of an
+        empty generator); iteration ends after the first ``result``/``error`` event (extra
+        frames from a misbehaving server are ignored)."""
+        await self._ensure_session()
+        import aiohttp as _aiohttp
+
+        async with self._session.post(
+            f"{self.base_url}/compute/inference/stream",
+            json=body,
+            headers=self._headers(),
+            timeout=_aiohttp.ClientTimeout(total=300),
+        ) as resp:
+            if resp.status != 200:
+                try:
+                    detail_text = (await resp.read()).decode("utf-8", "replace")
+                except Exception:
+                    detail_text = (
+                        f"<unable to read response body for status {resp.status}>"
+                    )
+                yield {"type": "error", "status": resp.status, "detail": detail_text}
+                return
+            # Parse SSE event/data frames from line-streamed bytes.
+            current_event = None
+            buffer = b""
+            async for chunk in resp.content:
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    line_text = line.decode("utf-8", "replace").rstrip("\r")
+                    if not line_text:
+                        current_event = None  # blank line = end of an event
+                        continue
+                    if line_text.startswith("event: "):
+                        current_event = line_text[len("event: "):].strip()
+                    elif line_text.startswith("data: "):
+                        if current_event is None:
+                            continue
+                        try:
+                            import json as _json
+                            payload = _json.loads(line_text[len("data: "):])
+                        except Exception:
+                            continue
+                        ev = {"type": current_event, **payload}
+                        yield ev
+                        if current_event in ("result", "error"):
+                            return
+
     async def infer_stream(
         self,
         prompt: str,
@@ -396,7 +447,7 @@ class PRSMClient:
         content_tier: str = "A",
     ):
         """Sprint 820 — async generator consuming SSE from
-        /compute/inference/stream.
+        /compute/inference/stream (self-pay).
 
         Yields events as dicts with a `type` discriminator:
           {"type": "token", "sequence_index": N, "text_delta",
@@ -405,22 +456,17 @@ class PRSMClient:
            "ftns_charged", "receipt", ...}
           {"type": "error", "detail"}
 
-        Iteration terminates after the first `result` or
-        `error` event — extra frames after a terminal event
-        are ignored (defense against misbehaving servers).
-
-        Defaults match sprint 819 .infer() so users can swap
-        between unary and streaming with one keyword.
+        Iteration terminates after the first `result` or `error` event.
+        Defaults match sprint 819 .infer() so users can swap between unary
+        and streaming with one keyword.
 
         Usage:
             async for ev in client.infer_stream(prompt="..."):
                 if ev["type"] == "token":
                     print(ev["text_delta"], end="", flush=True)
                 elif ev["type"] == "result":
-                    print()
                     print("Receipt:", ev["receipt"])
         """
-        await self._ensure_session()
         body = {
             "prompt": prompt,
             "model_id": model_id,
@@ -429,69 +475,83 @@ class PRSMClient:
             "content_tier": content_tier,
             "max_tokens": max_tokens,
         }
-        import aiohttp as _aiohttp
+        async for ev in self._stream_events(body):
+            yield ev
 
-        async with self._session.post(
-            f"{self.base_url}/compute/inference/stream",
-            json=body,
-            headers=self._headers(),
-            timeout=_aiohttp.ClientTimeout(total=300),
-        ) as resp:
-            # Sprint 827 — non-200 → yield an `error` event with the
-            # server's detail body and terminate. Pre-827 the SSE
-            # parser ignored resp.status; if the daemon returned a
-            # JSON error body (e.g. 503 "executor does not support
-            # streaming") the parser silently yielded zero events
-            # because the body had no `event:` lines, leaving SDK
-            # callers staring at an empty generator with no clue
-            # what went wrong. Symmetric to sprint 826's CLI fix.
-            if resp.status != 200:
+    async def pay_and_infer_stream(
+        self,
+        prompt: str,
+        *,
+        requester_key: str,
+        provider_address: Optional[str] = None,
+        model_id: str = "gpt2",
+        max_tokens: int = 8,
+        budget_ftns: float = 1.0,
+        max_spend_ftns=None,
+        privacy_tier: str = "none",
+        content_tier: str = "A",
+        chain_id: int = 8453,
+        expiry_unix: Optional[int] = None,
+        verify_pubkey_b64: Optional[str] = None,
+    ):
+        """Sprint 1310 — paid STREAMING inference: the streaming twin of ``pay_and_infer``.
+
+        Signs an EIP-712 PaymentAuthorization bound to this exact request and sends it to
+        /compute/inference/stream, which verifies it FAIL-CLOSED and settles A→B from your
+        escrow (the streaming server path already verifies + records + settles the requester,
+        sp1056). Yields the same token/result/error events as ``infer_stream``; when
+        ``verify_pubkey_b64`` is set, the terminal ``result`` event gains a
+        ``receipt_verified`` bool (parity with ``pay_and_infer``). Discovers the operator's
+        payee from GET /info when ``provider_address`` is absent; you need escrow balance ≥
+        the charge (see ``deposit_escrow``); ``chain_id`` MUST match the network."""
+        import time
+        from prsm.settlement.payment_client import build_payment_authorization
+
+        if provider_address is None:
+            info = await self._get("/info")
+            provider_address = (info or {}).get("operator_address")
+            if not provider_address:
+                raise ValueError(
+                    "operator published no payment address (operator_address absent from "
+                    "/info); supply provider_address explicitly"
+                )
+        if max_spend_ftns is None:
+            max_spend_ftns = budget_ftns
+        if expiry_unix is None:
+            expiry_unix = int(time.time()) + 300
+        _max_tokens = int(max_tokens or 0)
+        auth = build_payment_authorization(
+            requester_key=requester_key,
+            provider_address=provider_address,
+            model_id=model_id,
+            prompt=prompt,
+            max_tokens=_max_tokens,
+            privacy_tier=privacy_tier,
+            content_tier=content_tier,
+            max_spend_ftns=max_spend_ftns,
+            expiry_unix=int(expiry_unix),
+            chain_id=chain_id,
+        )
+        body = {
+            "prompt": prompt,
+            "model_id": model_id,
+            "budget_ftns": budget_ftns,
+            "privacy_tier": privacy_tier,
+            "content_tier": content_tier,
+            "max_tokens": _max_tokens,
+            "payment_authorization": auth,
+        }
+        async for ev in self._stream_events(body):
+            if ev.get("type") == "result" and verify_pubkey_b64:
                 try:
-                    detail_bytes = await resp.read()
-                    detail_text = detail_bytes.decode("utf-8", "replace")
+                    from prsm.compute.inference.models import InferenceReceipt
+                    from prsm.compute.inference.receipt import verify_receipt
+                    receipt = InferenceReceipt.from_dict(ev.get("receipt") or {})
+                    ev["receipt_verified"] = bool(
+                        verify_receipt(receipt, public_key_b64=verify_pubkey_b64))
                 except Exception:
-                    detail_text = (
-                        f"<unable to read response body for "
-                        f"status {resp.status}>"
-                    )
-                yield {
-                    "type": "error",
-                    "status": resp.status,
-                    "detail": detail_text,
-                }
-                return
-            # Parse SSE event/data frames from line-streamed bytes.
-            current_event = None
-            buffer = b""
-            terminal_seen = False
-            async for chunk in resp.content:
-                buffer += chunk
-                # Split on \n to extract complete lines; keep
-                # the (possibly partial) trailing fragment.
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    line_text = line.decode("utf-8", "replace").rstrip("\r")
-                    if not line_text:
-                        # blank line = end of an event
-                        current_event = None
-                        continue
-                    if line_text.startswith("event: "):
-                        current_event = line_text[len("event: "):].strip()
-                    elif line_text.startswith("data: "):
-                        if current_event is None:
-                            continue
-                        try:
-                            import json as _json
-                            payload = _json.loads(
-                                line_text[len("data: "):],
-                            )
-                        except Exception:
-                            continue
-                        ev = {"type": current_event, **payload}
-                        yield ev
-                        if current_event in ("result", "error"):
-                            terminal_seen = True
-                            return
+                    ev["receipt_verified"] = False
+            yield ev
 
     # ── Ring 4: Pricing ───────────────────────────────────────────
 
