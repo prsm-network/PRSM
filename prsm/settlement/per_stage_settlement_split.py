@@ -111,6 +111,30 @@ class NodeSignatureMaterial:
     # zero consensus impact); the worker-emission brick populates it.
     tee_attestation: Optional[Dict[str, Any]] = None
 
+    def to_dict(self) -> Dict[str, Any]:
+        """JSON-able form (sp1314) so the per-node signature material can be CARRIED on the
+        §7 InferenceReceipt to the settle path, where the splitter reconstructs + consumes
+        it. All fields are primitives; ``tee_attestation`` is the audit-only dict (or None)."""
+        return {
+            "pubkey_b64": self.pubkey_b64,
+            "signature": self.signature,
+            "stage_index": int(self.stage_index),
+            "output_hash": self.output_hash,
+            "executed_at_unix": int(self.executed_at_unix),
+            "tee_attestation": self.tee_attestation,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "NodeSignatureMaterial":
+        return cls(
+            pubkey_b64=str(d["pubkey_b64"]),
+            signature=str(d["signature"]),
+            stage_index=int(d["stage_index"]),
+            output_hash=str(d["output_hash"]),
+            executed_at_unix=int(d["executed_at_unix"]),
+            tee_attestation=d.get("tee_attestation"),
+        )
+
 
 @dataclass(frozen=True)
 class StageSettlementShare:

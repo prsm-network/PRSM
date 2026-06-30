@@ -194,6 +194,12 @@ class InferenceReceipt:
     # has workers produce the proofs; brick 3 threads them; brick 4 verifies the
     # signatures against the anchor + derives topology from the signed stages.
     stage_activation_chain: Optional[Any] = None
+    # sp1314 (big-model paid settlement, S2) — per-node settlement-signature material
+    # ({node_id: NodeSignatureMaterial}) CARRIED out-of-band so the multi-stage settle path
+    # (the brick-1 splitter) can build the per-node BatchedReceipts. Self-securing (each
+    # entry is that node's OWN Ed25519 sig over its leaf), so it is NOT in signing_payload →
+    # pre-1314 receipts are byte-identical-signed; default None = unchanged.
+    per_stage_settlement_signatures: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
@@ -236,6 +242,13 @@ class InferenceReceipt:
         # Sprint 1255 — omit when None for pre-1255 byte-equivalence.
         if self.settler_pubkey_b64 is not None:
             d["settler_pubkey_b64"] = self.settler_pubkey_b64
+        # sp1314 — omit when None for pre-1314 byte-equivalence. Serialize each node's
+        # NodeSignatureMaterial (accepts an object with .to_dict() or an already-plain dict).
+        if self.per_stage_settlement_signatures is not None:
+            d["per_stage_settlement_signatures"] = {
+                str(node_id): (mat.to_dict() if hasattr(mat, "to_dict") else mat)
+                for node_id, mat in self.per_stage_settlement_signatures.items()
+            }
         return d
 
     @classmethod
@@ -325,6 +338,18 @@ class InferenceReceipt:
             d["stage_activation_chain"] = StageActivationChain.from_dict(
                 d["stage_activation_chain"],
             )
+        # sp1314 — reconstruct per-node NodeSignatureMaterial when present (local import:
+        # avoids any settlement↔models cycle) so a round-tripped receipt yields the typed
+        # material the splitter consumes.
+        if isinstance(d.get("per_stage_settlement_signatures"), dict):
+            from prsm.settlement.per_stage_settlement_split import (
+                NodeSignatureMaterial,
+            )
+            d["per_stage_settlement_signatures"] = {
+                str(nid): (NodeSignatureMaterial.from_dict(v)
+                           if isinstance(v, dict) else v)
+                for nid, v in d["per_stage_settlement_signatures"].items()
+            }
         accepted = {f for f in cls.__dataclass_fields__}
         return cls(**{k: v for k, v in d.items() if k in accepted})
 

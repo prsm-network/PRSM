@@ -1190,5 +1190,12 @@ class ParallaxScheduledExecutor(InferenceExecutor):
             stage_activation_chain=getattr(
                 outcome, "stage_activation_chain", None,
             ),
+            # sp1314 (big-model paid settlement, S2) — carry the per-node settlement-signature
+            # material to the settle path so the multi-stage splitter can build per-node
+            # BatchedReceipts. None for single-node/streaming (byte-identical pre-1314 receipt;
+            # NOT in signing_payload, self-securing).
+            per_stage_settlement_signatures=getattr(
+                outcome, "per_stage_settlement_signatures", None,
+            ),
         )
         return sign_receipt(unsigned, self._identity)
