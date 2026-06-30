@@ -88,6 +88,24 @@ MSG_PEER_CONNECTED = "peer_connected"
 MSG_PEER_DISCONNECTED = "peer_disconnected"
 
 
+def _ws_max_size_bytes() -> int:
+    """sp1326 — the WebSocket per-message frame ceiling (bytes), env-tunable via
+    PRSM_WS_MAX_SIZE_MB (default 256MB). The receiver closes a connection with 1009
+    MESSAGE_TOO_BIG when an inbound frame exceeds this, which aborts a cross-host chain
+    dispatch mid-flight. Production-vocab models (e.g. Qwen2.5 vocab=152064) produce
+    final-stage logit payloads larger than the old hardcoded 16MB, so the default is
+    raised to 256MB; operators with very long sequences can raise it further."""
+    import os
+    raw = (os.environ.get("PRSM_WS_MAX_SIZE_MB", "") or "").strip()
+    mb = 256
+    if raw:
+        try:
+            mb = max(1, int(float(raw)))
+        except ValueError:
+            mb = 256
+    return mb * 1024 * 1024
+
+
 @dataclass
 class P2PMessage:
     """A signed message exchanged between peers."""
@@ -385,19 +403,20 @@ class WebSocketTransport:
     async def start(self) -> None:
         """Start the WebSocket server and background tasks."""
         self._running = True
-        # Sprint 627 — bump max_size from default 1MB to 16MB so
-        # chain-executor logit payloads (vocab × seq_len × float32 +
-        # base64 overhead) don't get silently dropped. gpt2 5-token
-        # response = ~1.3MB after base64; larger models / longer prompts
-        # need more headroom. 16MB ceiling lets us handle full Llama
-        # vocab (128k) with reasonable sequence lengths.
+        # Sprint 627 — bump max_size from default 1MB so chain-executor logit payloads
+        # (vocab × seq_len × float32 + base64 overhead) don't get silently dropped.
+        # sp1326 — the old 16MB ceiling was sized for "128k vocab"; a PRODUCTION model with
+        # a LARGER vocab overflows it and the receiver closes the link with 1009
+        # MESSAGE_TOO_BIG mid-dispatch (observed live: Qwen2.5-7B vocab=152064 → a final-stage
+        # logit payload >16MB → cross-host chain aborted with TRANSPORT_ERROR). Now env-tunable
+        # (PRSM_WS_MAX_SIZE_MB, default 256MB) so large-vocab / longer-sequence fleets work.
         self._server = await websockets.server.serve(
             self._handle_incoming,
             self.host,
             self.port,
             ping_interval=self.ws_ping_interval,
             ping_timeout=self.ws_ping_timeout,
-            max_size=16 * 1024 * 1024,
+            max_size=_ws_max_size_bytes(),
         )
         self._tasks.append(asyncio.create_task(self._nonce_cleanup_loop()))
         logger.info(f"P2P transport listening on ws://{self.host}:{self.port}")
@@ -525,13 +544,6 @@ class WebSocketTransport:
                 await websocket.close(1002, failure_reason)
                 return
 
-            # Thread-safe check and add for peer connection
-            async with self._peers_lock:
-                if peer_id in self.peers:
-                    self._record_handshake_outcome(success=False, reason="Already connected")
-                    await websocket.close(1002, "Already connected")
-                    return
-
             pub_key_b64 = msg.payload.get("public_key", "")
 
             peer = PeerConnection(
@@ -547,15 +559,28 @@ class WebSocketTransport:
                 outbound=False,
             )
             
-            # Thread-safe peer addition
+            # Thread-safe peer addition. sp1326 — REPLACE a stale connection rather than
+            # rejecting the reconnect with "Already connected". In a worker-initiated-only
+            # topology (asymmetric firewall: the peer's inbound is blocked, so this node can
+            # never dial it back), a dropped link can only be re-established by the peer
+            # re-dialing US. If a stale entry survives a drop (cleanup race), rejecting the
+            # reconnect deadlocks into a connect/reject flap and the peer is unreachable for
+            # chain dispatch. The handshake is already validated (pubkey via the anchor), so
+            # last-writer-wins is safe: evict + close the old connection, accept the new one.
+            old_peer = None
             async with self._peers_lock:
-                # Double-check after acquiring lock (race condition prevention)
-                if peer_id in self.peers:
-                    self._record_handshake_outcome(success=False, reason="Already connected")
-                    await websocket.close(1002, "Already connected")
-                    return
+                old_peer = self.peers.get(peer_id)
                 self.peers[peer_id] = peer
                 peer_count = len(self.peers)
+            if old_peer is not None and old_peer.websocket is not None:
+                logger.info(
+                    "Replacing existing connection for peer %s with a fresh reconnect "
+                    "(sp1326 last-writer-wins; prevents the asymmetric-firewall flap)",
+                    peer_id[:12])
+                try:
+                    await old_peer.websocket.close(1012, "Replaced by reconnect")
+                except Exception:  # noqa: BLE001 — best-effort close of the stale socket
+                    pass
 
             # Send handshake acknowledgment
             ack = P2PMessage(
@@ -585,15 +610,22 @@ class WebSocketTransport:
         except asyncio.TimeoutError:
             logger.debug("Incoming connection timed out during handshake")
             self._record_handshake_outcome(success=False, reason="Timeout")
-        except websockets.exceptions.ConnectionClosed:
-            pass
+        except websockets.exceptions.ConnectionClosed as _cc:
+            logger.warning(
+                "sp1326 inbound connection closed: code=%s reason=%r rcvd=%r sent=%r",
+                getattr(_cc, "code", "?"), getattr(_cc, "reason", "?"),
+                getattr(getattr(_cc, "rcvd", None), "code", None),
+                getattr(getattr(_cc, "sent", None), "code", None))
         except Exception as e:
             logger.error(f"Error handling incoming connection: {e}")
         finally:
             if peer:
-                # Thread-safe peer removal
+                # Thread-safe peer removal. sp1326 — only evict if the stored connection is
+                # STILL this exact object: a sp1326 last-writer-wins replace may have already
+                # installed a FRESH connection under the same peer_id, and this stale read-loop's
+                # cleanup must not wipe that live entry.
                 async with self._peers_lock:
-                    if peer.peer_id in self.peers:
+                    if self.peers.get(peer.peer_id) is peer:
                         del self.peers[peer.peer_id]
                         logger.info(f"Peer disconnected: {peer.peer_id[:8]}...")
                 # Dispatch outside lock to prevent deadlock
@@ -641,9 +673,9 @@ class WebSocketTransport:
                     return None
 
             adapter = self._transport_adapter
-            # Sprint 627 — match server's 16MB max_size so large
-            # chain-executor responses aren't dropped at the client.
-            _WS_MAX_SIZE = 16 * 1024 * 1024
+            # sp1326 — match the server's env-tunable max_size (was a hardcoded 16MB) so large
+            # chain-executor responses aren't dropped at the client with 1009 MESSAGE_TOO_BIG.
+            _WS_MAX_SIZE = _ws_max_size_bytes()
             if adapter.name == "direct":
                 # Fast path: let websockets manage the connect itself.
                 # Avoids the adapter round-trip for the common case.
@@ -910,12 +942,17 @@ class WebSocketTransport:
                 except Exception as e:
                     logger.error(f"Error processing message from {peer.peer_id[:8]}: {e}")
 
-        except websockets.exceptions.ConnectionClosed:
-            pass
+        except websockets.exceptions.ConnectionClosed as _cc:
+            logger.warning(
+                "sp1326 peer connection closed peer=%s: code=%s reason=%r rcvd=%r sent=%r",
+                peer.peer_id[:8], getattr(_cc, "code", "?"), getattr(_cc, "reason", "?"),
+                getattr(getattr(_cc, "rcvd", None), "code", None),
+                getattr(getattr(_cc, "sent", None), "code", None))
         finally:
-            # Thread-safe peer removal
+            # Thread-safe peer removal. sp1326 — identity check: don't wipe a fresh
+            # replacement connection installed under the same peer_id (see _handle_incoming).
             async with self._peers_lock:
-                if peer.peer_id in self.peers:
+                if self.peers.get(peer.peer_id) is peer:
                     del self.peers[peer.peer_id]
                     logger.info(f"Peer disconnected: {peer.peer_id[:8]}...")
             # sp936 — drop the peer's rate-limit bucket so the dict doesn't grow

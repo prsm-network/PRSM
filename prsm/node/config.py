@@ -215,6 +215,24 @@ class NodeConfig:
         if _api_host:
             self.api_host = _api_host
 
+        # sp1326 — operator override of the WebSocket keepalive ping cadence
+        # (PRSM_WS_PING_INTERVAL_S / PRSM_WS_PING_TIMEOUT_S). The 20s/10s defaults
+        # are tuned for low-latency same-network peers; a cross-cloud parallax fleet
+        # whose event loop blocks during a cold layer-slice load (seconds-to-minutes)
+        # gets its connection reaped by the websockets ping policy mid-load, which
+        # cascades the chain dispatch into TRANSPORT_ERROR. Operators on high-latency
+        # / cold-load deployments set these generous so the link survives the block.
+        for _env, _attr in (
+            ("PRSM_WS_PING_INTERVAL_S", "ws_ping_interval"),
+            ("PRSM_WS_PING_TIMEOUT_S", "ws_ping_timeout"),
+        ):
+            _raw = os.environ.get(_env, "").strip()
+            if _raw:
+                try:
+                    setattr(self, _attr, float(_raw))
+                except ValueError:
+                    pass  # keep the default on a malformed value
+
     @property
     def identity_path(self) -> Path:
         return Path(self.data_dir) / "identity.json"

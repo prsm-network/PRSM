@@ -700,17 +700,49 @@ def deliver_for_settled_receipt(
     if not multistage_settlement_enabled(environ):
         return []
     from prsm.settlement.per_stage_delivery_client import (
-        deliver_settled_multistage_tasks,
+        DeliveryResult,
+        deliver_per_stage_task,
+    )
+    from prsm.settlement.per_stage_receiver_store import ingest_routed_task
+    from prsm.settlement.per_stage_routing import (
+        build_per_stage_settlement_tasks,
+        payee_set_from_tasks,
     )
     if wallet_map is None:
         from prsm.node.compute_wallet_map import ComputeWalletMap
         wallet_map = ComputeWalletMap.from_env()
-    resolver = build_per_stage_endpoint_resolver(node, environ)
-    return deliver_settled_multistage_tasks(
+
+    tasks = build_per_stage_settlement_tasks(
         receipt=receipt, total_value_wei=total_value_wei,
-        requester_address=requester_address, endpoint_for_node=resolver,
-        per_stage_authorization=per_stage_authorization, wallet_map=wallet_map,
-        http_post=http_post, timeout=timeout)
+        requester_address=requester_address,
+        per_stage_authorization=per_stage_authorization, wallet_map=wallet_map)
+    if not tasks:
+        return []
+    payees = payee_set_from_tasks(tasks)
+    resolver = build_per_stage_endpoint_resolver(node, environ)
+    self_node_id = getattr(getattr(node, "identity", None), "node_id", None)
+    store = resolve_per_stage_receiver_store(node, environ)
+
+    results = []
+    for task in tasks:
+        # sp1327 — the orchestrator IS one of the stage nodes (the head). Settle ITS OWN share
+        # IN-PROCESS via the local receiver store, NOT a self-HTTP-POST to localhost:8000: that
+        # re-entrant call deadlocks/times out because the inference request handler that fires
+        # this hook is still occupying the request path. Only FOREIGN tasks go over HTTP.
+        if self_node_id is not None and task.node_id == self_node_id and store is not None:
+            res = ingest_routed_task(store, task, payees=payees, my_node_id=self_node_id)
+            results.append(DeliveryResult(
+                task.node_id, delivered=True, accepted=res.accepted,
+                reason="in-process:" + res.reason, local_escrow_id=res.local_escrow_id))
+            continue
+        url = resolver(task.node_id)
+        if not url:
+            results.append(DeliveryResult(
+                task.node_id, False, None, "no resolvable endpoint for node"))
+            continue
+        results.append(deliver_per_stage_task(
+            url, task, payees, http_post=http_post, timeout=timeout))
+    return results
 
 
 async def run_per_stage_commit_cycle(node: Any, environ=os.environ) -> dict:
