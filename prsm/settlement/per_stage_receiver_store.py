@@ -283,3 +283,96 @@ def parse_delivery_request(
         except (TypeError, ValueError) as exc:
             raise ValueError(f"malformed payee {item!r}: {exc}")
     return task, payees
+
+
+# ── the node-side commit driver (S3b-3a: stage → commit → discard) ────
+
+
+@dataclass(frozen=True)
+class StageCommitResult:
+    """Outcome of committing ONE staged task on this node's own settlement client.
+    ``committed`` is True iff the client landed an on-chain commit for the task's share-batch this
+    pass; ``reason`` carries the gate/commit detail. ``committed_batch`` is the client's record
+    (opaque here) when one landed. Money-safe either way — a non-commit leaves the share unsettled
+    (retained for retry), never an over/under/double pay."""
+
+    node_id: str
+    local_escrow_id: str
+    committed: bool
+    reason: str
+    committed_batch: Optional[Any] = None
+
+
+async def commit_staged_task(
+    staged: StagedSettlementTask,
+    *,
+    client: Any,
+    chain_id: int = DEFAULT_CHAIN_ID,
+    now_unix: Optional[float] = None,
+) -> StageCommitResult:
+    """Commit ONE node's staged share-batch on its OWN ``BatchSettlementClient``
+    (``msg.sender == node == provider`` in Design A).
+
+    RE-VERIFIES membership against the STORED FULL payee set (``staged.payees``) at commit time —
+    re-running the sp1316 gate (signer / set-hash / membership / cap / EXPIRY / request-binding),
+    so an auth that expired between stage + commit is caught. NOTE: this differs from the
+    bench-oriented ``per_stage_commit.commit_per_node_share_batches``, which reconstructs the
+    payee set from the shares it holds (the all-clients-in-one-process model). A node that holds
+    ONLY its own share must verify against the stored full set, else the set-hash check fails.
+
+    Then accumulates the task's node-signed ``BatchedReceipt`` into ``client`` and drives
+    ``commit_ready_batches``. FAIL-SOFT: a gate reject / client bind-mismatch / commit error
+    returns ``committed=False`` with the reason (NEVER raises, NEVER a partial/unauthorized
+    commit)."""
+    task = staged.task
+    lid = staged.local_escrow_id
+    verdict: PerStageAuthorizationVerdict = verify_routed_settlement_task(
+        task, payees=staged.payees, chain_id=chain_id, now_unix=now_unix)
+    if not verdict.authorized:
+        return StageCommitResult(task.node_id, lid, False, f"auth re-check failed: {verdict.reason}")
+    try:
+        await client.accumulate(task.batched_receipt)
+        records = await client.commit_ready_batches()
+    except Exception as exc:  # noqa: BLE001 — fail-soft: the share stays unsettled (retryable)
+        logger.warning(
+            "commit_staged_task: node %s commit error (%s: %s) — share %s NOT settled "
+            "(retained for retry; no double-settle)",
+            task.node_id, type(exc).__name__, exc, lid)
+        return StageCommitResult(task.node_id, lid, False, f"commit error: {type(exc).__name__}: {exc}")
+    if records:
+        return StageCommitResult(task.node_id, lid, True, "committed", committed_batch=records[0])
+    return StageCommitResult(
+        task.node_id, lid, False,
+        "no batch committed this pass (retained/quarantined by the client)")
+
+
+async def drain_and_commit_staged(
+    store: PerStageReceiverStore,
+    *,
+    client_for_node: Callable[[str], Any],
+    chain_id: int = DEFAULT_CHAIN_ID,
+    now_unix: Optional[float] = None,
+    discard_committed: bool = True,
+) -> List[StageCommitResult]:
+    """Drain the staged tasks (oldest-first) and commit each on its node's own client.
+
+    Each task is committed via ``commit_staged_task``; on a landed commit it is DISCARDED from the
+    store (``discard_committed=True``) so the next drain won't re-attempt it (the accumulator's
+    ``local_escrow_id`` dedup is the second guard). A task that did NOT commit STAYS staged
+    (retryable next drain). NEVER raises — a per-task failure is isolated in its result."""
+    results: List[StageCommitResult] = []
+    for staged in store.all_staged():
+        try:
+            client = client_for_node(staged.task.node_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("drain_and_commit_staged: no client for node %s (%s) — skipped",
+                           staged.task.node_id, exc)
+            results.append(StageCommitResult(
+                staged.task.node_id, staged.local_escrow_id, False, f"no client: {exc}"))
+            continue
+        res = await commit_staged_task(
+            staged, client=client, chain_id=chain_id, now_unix=now_unix)
+        if res.committed and discard_committed:
+            store.discard(res.local_escrow_id)
+        results.append(res)
+    return results
