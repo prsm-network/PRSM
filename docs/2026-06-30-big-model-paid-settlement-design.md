@@ -141,9 +141,112 @@ Each ships behind the default-off flag, fully tested, money-path-gated.
   node over the P2P substrate; each node verifies the auth gate (brick 3b), accumulates to its
   OWN client, and the poll loop commits + finalizes (msg.sender = node). Replace the
   `"skipped:multi-stage-deferred"` guard. Still default-off. Risk: **HIGH** (money path + new
-  transport — likely 2 sub-sprints: S3a route/receive, S3b per-node commit). Gates:
+  transport — 2 sub-sprints: S3a route/receive, S3b per-node commit). Gates:
   conservation, idempotency (`{job_id}::stage::{node}`), fail-closed auth, dry-run, + a
   testnet 2-node proof before mainnet.
+  - **S3a — split → routable tasks. ✅ DONE (sp1315, 0476c694).** Pure core (no transport, no
+    commit). `prsm/settlement/per_stage_routing.py`: `PerStageSettlementTask` (frozen: node_id,
+    share_wei, node-signed `BatchedReceipt`, per-stage auth; JSON round-trip reusing
+    `published_batch_store` helpers) + `build_per_stage_settlement_tasks()` reads the
+    sp1314-carried `receipt.per_stage_settlement_signatures`, runs the tested splitter, wraps
+    each conserving share into a routable task. Fail-closed `None` exactly where the splitter
+    falls back to single-payee (no sigs / <2 nodes / unmapped node). Integration-tested through
+    the REAL splitter + `ComputeWalletMap`. 5 TDD + 135 per-stage regression.
+  - **S3b — transport delivery + per-node verify + accumulate + commit (the money path).**
+    Route each task to its node over the P2P substrate, each node verifies the auth gate +
+    accumulates to its OWN client, poll loop commits + finalizes (msg.sender = node); replace
+    the `"skipped:multi-stage-deferred"` guard. HIGH risk → full safety gates + testnet 2-node
+    proof before mainnet. Sub-bricks:
+    - **S3b-1 — node-side RECEIVER gate. ✅ DONE (sp1316, 6fed0de2).** Pure verify (no transport,
+      no chain). Key shape: the requester signs over the WHOLE set's `payee_set_hash` but a node
+      holds only its own task → `payee_set_from_tasks` derives the full `(payee, share)` set (the
+      orchestrator has every task) to route alongside each node's task, and
+      `verify_routed_settlement_task` runs the tested sp1172 verifier fail-closed for the node's
+      OWN membership BEFORE any commit. Identical money-safety invariants pre-route + on-chain
+      (signer/set-hash/membership/cap/expiry/request-binding). Returns `authorized=False` (never
+      raises) on no-auth / malformed payload / bad sig shape / any invariant fail. 10 TDD through
+      the REAL splitter + REAL signed auth.
+    - **S3b-2 — receiver store + ingest (the receive half). ✅ DONE (sp1317, 798714a5).**
+      `prsm/settlement/per_stage_receiver_store.py`: `PerStageReceiverStore` (bounded, GC-able,
+      atomically-persisted; keyed by the per-node `local_escrow_id` `{job_id}::stage::{node_id}`
+      — the SAME idempotency key the splitter stamps + the accumulator dedups on, so a
+      re-delivery refreshes, never double-stages → never a double-commit; mirrors
+      `IssuedAuthorizationStore` discipline) + `ingest_routed_task` (gate-then-stage: rejects +
+      stages NOTHING on misroute / unauthorized membership / stage failure; never raises on a
+      logical reject). Finding: the per-stage auth's WIRE shape is all-hex-strings (signature +
+      every bytes32 hash) which JSON persistence depends on — the sp1316 gate tolerates raw
+      bytes (verifier normalizes) but the store needs the wire shape; a persist failure is
+      fail-soft-logged. Pure (no transport, no chain). 10 TDD through the REAL splitter + REAL
+      signed auth. **Substrate decision: deliver over the existing settlement HTTP surface on
+      `node/api.py` (matches sp1305 `/settlement/receipt/leaf` + the paid single-stage path
+      where the requester POSTs the auth), NOT the inference chain_rpc (settlement is a
+      post-inference concern — coupling it into the layer-slice server is the wrong fit).** The
+      thin HTTP delivery endpoint (`POST /settlement/per-stage-task`) + the orchestrator-side
+      client send is the next wiring brick (S3b-2b).
+    - **S3b-2b — HTTP delivery endpoint + gated receiver-store resolver (the receive side).
+      ✅ DONE (sp1318, 14988710).** `POST /settlement/per-stage-task` (`node/api.py`) → parse
+      `{task, payees}` (`parse_delivery_request`, 422 on malformed) → `ingest_routed_task` into
+      the node's store → `{accepted, reason, local_escrow_id}`. Gated by
+      `PRSM_MULTISTAGE_SETTLEMENT` (`client_wiring.multistage_settlement_enabled`; default-off →
+      503 + proven single-stage path byte-unchanged). `client_wiring.resolve_per_stage_receiver_store`
+      lazily builds + caches the node's `PerStageReceiverStore`
+      (`PRSM_MULTISTAGE_RECEIVER_STORE_FILE` or `~/.prsm/per_stage_receiver.json`); None when
+      gated off / build fails (never a silent accept). NO on-chain commit. 20 TDD (endpoint
+      end-to-end through the REAL splitter + REAL signed auth).
+    - **S3b-2c — orchestrator-side send (the send half). ✅ DONE (sp1319, 28fb25ec).**
+      `prsm/settlement/per_stage_delivery_client.py`: `deliver_per_stage_task(peer_url, task,
+      payees)` POSTs one task (FAIL-SOFT — never raises; transport error / non-200 / non-JSON →
+      `delivered=False`; on 200 surfaces `{accepted, reason, local_escrow_id}`; injectable
+      `http_post`, mirrors `receipt_challenge_client`) + `deliver_settled_multistage_tasks(...)`
+      builds tasks (S3a) → `[]` when not a settleable multi-stage receipt → derives the payee set
+      once → POSTs each via `endpoint_for_node(node_id)` (an unmapped node = recorded undelivered,
+      never a raise). FAIL-SOFT rationale: a miss leaves a stage unpaid on-chain (the v1
+      per-stage-independence weakness, the SAFE failure). 8 TDD incl. a loop-back transport
+      driving the REAL receiver (send→receive proven without a network). No chain effect.
+      Remaining glue: the post-settlement HOOK that supplies the real peer-registry
+      `endpoint_for_node` resolver — wired with S3b-3 (both fire post-settle).
+    - **S3b-3 — per-node accumulate + commit + finalize (the on-chain money path).** On an
+      authorized staged task, drive the node's own `BatchSettlementClient` (msg.sender = node);
+      replace the `"skipped:multi-stage-deferred"` guard. Dry-run before broadcast; testnet
+      2-node go/no-go before mainnet (mainnet commit stays user-gated).
+      - **S3b-3a — node-side commit DRIVER. ✅ DONE (sp1320, 48d760d8).** `commit_staged_task`
+        + `drain_and_commit_staged` on the receiver store (client duck-typed). RE-VERIFIES
+        membership against the STORED FULL payee set at commit time (re-runs the sp1316 gate →
+        catches an auth that EXPIRED between stage + commit, before accumulate), then accumulates
+        the node-signed `BatchedReceipt` + drives `commit_ready_batches`; discards on a landed
+        commit (idempotent — accumulator `local_escrow_id` dedup is the 2nd guard), retains on a
+        non-commit (retryable). FAIL-SOFT (gate reject / bind-mismatch / commit error →
+        `committed=False`, never raises). KEY divergence from the bench
+        `commit_per_node_share_batches`: a node holds ONLY its own share, so it must verify
+        against the stored full set (reconstructing from a lone share fails the set-hash check) —
+        that's why the store retains `staged.payees`. 6 TDD with a fake client (no chain) incl.
+        the expired-between-stage-and-commit money-safety reject. The actual broadcast stays the
+        client's concern (view-only = no broadcast).
+      - **S3b-3b — the live wiring (mostly DONE; one ingress brick + validation remain).**
+        - **Delivery wiring ✅ DONE (sp1321, fae7c224).** `client_wiring.build_per_stage_endpoint_resolver(node)`
+          (node_id→Optional[base_url]; static map `PRSM_MULTISTAGE_ENDPOINT_MAP` wins over the
+          transport-peer fallback; None-on-miss) + `deliver_for_settled_receipt(node, ...)` (gated
+          node entrypoint → fans out via S3b-2c). 9 TDD.
+        - **Node-side poll-loop commit cycle ✅ DONE (sp1322, b0193c6f).**
+          `client_wiring.run_per_stage_commit_cycle(node)` drains the receiver store + commits
+          each staged share on the node's own client; wired into the node settlement poll loop
+          (node.py) as an isolated never-raises step. Gated + fail-soft; INERT on a view-only
+          client (tasks accumulate until a funded key, mirroring the single-stage cycle). 5 TDD.
+        - **REMAINING — paid-multi-stage request INGRESS + the orchestrator post-settle hook +
+          guard replacement.** The paid multi-stage request must carry the per-stage auth
+          (`per_stage_payment_authorization`), the serve path must verify it at serve-time against
+          the planned topology payee set + stash it (like `_record_paid_requester` for
+          single-stage), and the post-settle hook (api.py ~8700) must retrieve it + fire
+          `deliver_for_settled_receipt`; then flip `client_wiring.py:273-281`'s
+          `"skipped:multi-stage-deferred"` when the gate is on. This is money-path INGRESS — best
+          built with the testnet validation available.
+        - **VALIDATION (gated, infra-dependent).** The full chain (quote → per-stage auth →
+          serve → split → deliver-over-HTTP → receive → stage → poll-drain → commit) needs a
+          **2-live-node testnet go/no-go before mainnet**. The existing `scripts/per_stage_sepolia_bench.py`
+          (sp1160) already proves per-node on-chain commit/finalize on Base Sepolia; the S3b
+          marginal additions (HTTP routing + receiver store + full-set verify) are off-chain +
+          unit-tested. The 2-live-node HTTP integration + the mainnet activation are user-gated
+          (irreversible — the autonomous loop pauses there).
 - **S4 — Per-node settler-key provisioning + funding runbook.** Operator guidance: each stage
   node needs a funded settler key bound to its provider address (reuse the sp1301 go-live
   preflight, extended per-node). Risk: LOW (ops/docs).
