@@ -257,7 +257,11 @@ Each ships behind the default-off flag, fully tested, money-path-gated.
           go/no-go before mainnet** (the only piece the in-process test can't cover is a real
           `BatchSettlementClient` broadcasting — already Sepolia-proven per-node by sp1160). The
           2-live-node deployment + the mainnet activation are user-gated (irreversible — the
-          autonomous loop pauses there).
+          autonomous loop pauses there). **The operator go/no-go procedure is written:
+          `docs/2026-06-30-big-model-paid-settlement-2node-testnet-runbook.md`** (topology + 3
+          funded EOAs, the wallet-map==settler-key invariant, per-node env, the full
+          quote→sign→infer→deliver→commit→finalize flow, read-only verification, GO/NO-GO
+          criteria, and mainnet activation as a separate user-gated ceremony).
 - **S4 — Per-node settler-key provisioning + funding runbook.** Operator guidance: each stage
   node needs a funded settler key bound to its provider address (reuse the sp1301 go-live
   preflight, extended per-node). Risk: LOW (ops/docs).
