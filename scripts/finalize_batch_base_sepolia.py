@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Finalize a per-stage settlement batch on Base Sepolia (sp1327 follow-up).
+"""Finalize a settlement batch on Base (network-aware; sp1327 follow-up).
 
-Standalone, repo-free apart from web3 + eth-account — run it AFTER the registry's
-24h challenge window elapses to settle a PENDING batch: ``finalizeBatch(batchId)``
-draws the requester's escrow → pays the batch's provider (the stage node's settler)
-its committed share.
+Standalone, repo-light (web3 + eth-account + prsm.config.networks) — run it AFTER the
+registry's challenge window elapses to settle a PENDING batch: ``finalizeBatch(batchId)``
+draws the requester's escrow → pays the batch's provider (the settler) its committed share.
+
+The registry/FTNS/chainId are resolved from ``PRSM_NETWORK`` (``testnet`` → Base Sepolia
+84532; ``mainnet`` → the F bundle on Base 8453), so the SAME script finalizes both the
+testnet per-stage GO batches AND the mainnet production canary. RPC from BASE_RPC_URL
+(mainnet) / BASE_SEPOLIA_RPC_URL (testnet), else a sensible default.
 
 The 2-node cross-cloud testnet GO (2026-06-30) left two PENDING batches:
   HEAD   ca30cbc632a0ebee337c4b18c5c6c5e6399505d2618e2ca8c24bb1d5ff57271c  → Settler-A 0xBbEB…
@@ -30,10 +34,21 @@ import os
 import sys
 import time
 
-REGISTRY = "0xF8BEEb4362222b50109b6034767322B31aA92449"  # Base Sepolia per-stage registry
-FTNS = "0x7F5f00FAA2421c4C585cc66c87420b1659c98e6a"
-ESCROW = "0xaa28b5818242608e04C1773c3e34bF7bFfb96248"
-CHAIN_ID = 84532
+# Network-aware: resolve the registry/FTNS/chainId from PRSM_NETWORK
+# (testnet → Base Sepolia 84532; mainnet → the F bundle on Base 8453). Falls back to
+# the Base Sepolia constants if prsm.config isn't importable.
+def _resolve_network():
+    try:
+        from prsm.config.networks import resolve_endpoints
+        e = resolve_endpoints()
+        return (str(e.settlement_registry), str(e.ftns_token), int(e.chain_id),
+                str(getattr(e, "rpc_url", "") or ""))
+    except Exception:
+        return ("0xF8BEEb4362222b50109b6034767322B31aA92449",
+                "0x7F5f00FAA2421c4C585cc66c87420b1659c98e6a", 84532, "https://sepolia.base.org")
+
+
+REGISTRY, FTNS, CHAIN_ID, _RPC_DEFAULT = _resolve_network()
 
 _ABI = [
     {"inputs": [{"name": "batchId", "type": "bytes32"}], "name": "finalizeBatch",
@@ -71,11 +86,13 @@ def main() -> int:
         return 2
 
     from web3 import Web3
-    rpc = os.environ.get("BASE_SEPOLIA_RPC_URL", "").strip() or "https://sepolia.base.org"
+    rpc = (os.environ.get("BASE_RPC_URL", "").strip()
+           or os.environ.get("BASE_SEPOLIA_RPC_URL", "").strip()
+           or _RPC_DEFAULT)
     w3 = Web3(Web3.HTTPProvider(rpc))
     if w3.eth.chain_id != CHAIN_ID:
-        print(f"ERROR: connected chainId {w3.eth.chain_id} != Base Sepolia {CHAIN_ID}; refusing.",
-              file=sys.stderr)
+        print(f"ERROR: connected chainId {w3.eth.chain_id} != the PRSM_NETWORK-resolved chainId "
+              f"{CHAIN_ID}; refusing (set PRSM_NETWORK + matching RPC).", file=sys.stderr)
         return 1
     reg = w3.eth.contract(address=Web3.to_checksum_address(REGISTRY), abi=_ABI)
     ftns = w3.eth.contract(address=Web3.to_checksum_address(FTNS), abi=_ERC20)
