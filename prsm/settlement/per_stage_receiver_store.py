@@ -252,3 +252,34 @@ def ingest_routed_task(
             "(no commit will follow)", type(exc).__name__, exc)
         return TaskIngestResult(False, f"stage failed: {type(exc).__name__}: {exc}")
     return TaskIngestResult(True, "authorized+staged", local_escrow_id=rec.local_escrow_id)
+
+
+def parse_delivery_request(
+    body: Any,
+) -> Tuple[PerStageSettlementTask, List[Tuple[str, int]]]:
+    """Parse a ``POST /settlement/per-stage-task`` body ``{"task": {...}, "payees": [[addr, share],
+    ...]}`` into a ``(PerStageSettlementTask, payees)`` pair for ``ingest_routed_task``.
+
+    Raises ``ValueError`` on ANY malformed shape (caller maps to HTTP 422) — a delivery the node
+    can't parse is rejected, never silently accepted."""
+    if not isinstance(body, dict):
+        raise ValueError("delivery body must be a JSON object")
+    task_raw = body.get("task")
+    payees_raw = body.get("payees")
+    if not isinstance(task_raw, dict):
+        raise ValueError("delivery body missing a 'task' object")
+    if not isinstance(payees_raw, list):
+        raise ValueError("delivery body missing a 'payees' list")
+    try:
+        task = PerStageSettlementTask.from_dict(task_raw)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"malformed task: {type(exc).__name__}: {exc}")
+    payees: List[Tuple[str, int]] = []
+    for item in payees_raw:
+        if not (isinstance(item, (list, tuple)) and len(item) == 2):
+            raise ValueError("each payee must be a [address, share_wei] pair")
+        try:
+            payees.append((str(item[0]), int(item[1])))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"malformed payee {item!r}: {exc}")
+    return task, payees

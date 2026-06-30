@@ -16992,6 +16992,51 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             "payees": [[addr, share] for addr, share in payees],
         }
 
+    @app.post("/settlement/per-stage-task", tags=["settlement"])
+    async def settlement_per_stage_task(request: Request) -> Dict[str, Any]:
+        """Sprint 1318 (S3b-2b) — node-side delivery endpoint for a routed per-stage settlement
+        task. The settling orchestrator POSTs each stage node its ``{"task": {...}, "payees":
+        [[addr, share_wei], ...]}`` (the per-node challenge-defensible BatchedReceipt + the
+        requester's per-stage authorization + the full payee set). The receiving node FAIL-CLOSED
+        verifies the requester authorized paying ITS OWN ``(payee, share)`` as a member of the
+        signed set (the sp1316 gate) then STAGES the task for its own client to commit later
+        (S3b-3) — it does NOT commit here.
+
+        Gated by ``PRSM_MULTISTAGE_SETTLEMENT`` (503 when off — a node that hasn't opted into
+        multi-stage settlement accepts no routed tasks). Returns ``{accepted, reason,
+        local_escrow_id}``; ``accepted=False`` on an unauthorized / misrouted / unparseable
+        delivery (nothing staged). 422 only for an unparseable body shape."""
+        from prsm.settlement.client_wiring import resolve_per_stage_receiver_store
+        from prsm.settlement.per_stage_receiver_store import (
+            ingest_routed_task,
+            parse_delivery_request,
+        )
+
+        store = resolve_per_stage_receiver_store(node)
+        if store is None:
+            raise HTTPException(
+                status_code=503,
+                detail="multi-stage settlement not enabled on this node "
+                       "(set PRSM_MULTISTAGE_SETTLEMENT=1 to accept routed per-stage tasks)",
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=422, detail="body must be valid JSON")
+        try:
+            task, payees = parse_delivery_request(body)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        result = ingest_routed_task(
+            store, task, payees=payees,
+            my_node_id=node.identity.node_id if node.identity else None,
+        )
+        return {
+            "accepted": result.accepted,
+            "reason": result.reason,
+            "local_escrow_id": result.local_escrow_id,
+        }
+
 
     # ── Staking Endpoints ─────────────────────────────────────────
 

@@ -579,6 +579,49 @@ def get_settlement_status(client: Optional[Any]) -> dict:
         return {"enabled": True, "status_error": f"{type(exc).__name__}: {exc}"}
 
 
+def multistage_settlement_enabled(environ=os.environ) -> bool:
+    """sp1318 (S3b-2b) — is the big-model multi-stage paid-settlement data plane ON?
+
+    DEFAULT-OFF: the proven single-stage settlement path is byte-for-byte unchanged unless
+    ``PRSM_MULTISTAGE_SETTLEMENT`` is explicitly truthy (1/true/yes/on). Until the on-chain
+    commit brick (S3b-3) lands + a testnet 2-node proof passes, this gates only the receive
+    plumbing (the routed-task delivery endpoint + receiver store)."""
+    return str(environ.get("PRSM_MULTISTAGE_SETTLEMENT", "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def resolve_per_stage_receiver_store(node: Any, environ=os.environ) -> Optional[Any]:
+    """sp1318 (S3b-2b) — the node's staged-task receiver store, lazily built + cached, gated.
+
+    Returns ``None`` when ``PRSM_MULTISTAGE_SETTLEMENT`` is off (the delivery endpoint then 503s
+    — a node that hasn't opted into multi-stage settlement accepts no routed tasks). When on,
+    builds a ``PerStageReceiverStore`` once and caches it on
+    ``node._settlement_per_stage_receiver_store`` (path from
+    ``PRSM_MULTISTAGE_RECEIVER_STORE_FILE`` or ``~/.prsm/per_stage_receiver.json``). Never raises
+    — a build failure logs + returns None (the endpoint then 503s, never a silent accept)."""
+    if not multistage_settlement_enabled(environ):
+        return None
+    existing = getattr(node, "_settlement_per_stage_receiver_store", None)
+    if existing is not None:
+        return existing
+    try:
+        from pathlib import Path
+
+        from prsm.settlement.per_stage_receiver_store import PerStageReceiverStore
+        path = (
+            str(environ.get("PRSM_MULTISTAGE_RECEIVER_STORE_FILE", "")).strip()
+            or str(Path.home() / ".prsm" / "per_stage_receiver.json")
+        )
+        store = PerStageReceiverStore(path)
+    except Exception as exc:  # noqa: BLE001 — never crash the delivery path on a store build error
+        logger.warning(
+            "resolve_per_stage_receiver_store: build failed (%s: %s); routed-task delivery "
+            "unavailable this run", type(exc).__name__, exc)
+        return None
+    node._settlement_per_stage_receiver_store = store
+    return store
+
+
 async def run_settlement_poll_cycle(client: Any) -> dict:
     """Sprint 1038 (brick 2) — drive ONE commit/finalize/reconcile cycle of the
     on-chain settlement client.
