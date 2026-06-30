@@ -7400,6 +7400,12 @@ def compute_infer_cli(
     "NOTHING. Exit 0 if all PASS, else 1.",
 )
 @click.option(
+    "--stream", "do_stream", is_flag=True, default=False,
+    help="Stream tokens as they generate (sp1310 pay_and_infer_stream) "
+    "instead of waiting for the full unary response. The payment "
+    "authorization + on-chain settlement are identical.",
+)
+@click.option(
     "--format", "output_format",
     type=click.Choice(["text", "json"]), default="text",
     help="Output format",
@@ -7409,7 +7415,7 @@ def compute_pay_infer_cli(
     max_spend_ftns: Optional[float], privacy_tier: str, content_tier: str,
     provider_address: Optional[str], network_name: str,
     api_url_override: Optional[str], verify_pubkey_b64: Optional[str],
-    dry_run: bool, output_format: str,
+    dry_run: bool, do_stream: bool, output_format: str,
 ) -> None:
     """Sprint 1192 — pay for one inference from the terminal (requester-payment).
 
@@ -7525,6 +7531,77 @@ def compute_pay_infer_cli(
             raise SystemExit(1)
         if output_format != "json":
             console.print("\n[green]preflight PASS[/green] — ready to pay.\n")
+        return
+
+    if do_stream:
+        # sp1310 — paid STREAMING: print tokens live, then the charge/verify footer.
+        # Same signed authorization + on-chain settlement as the unary path.
+        async def _go_stream():
+            client = PRSMClient(
+                base_url=url,
+                api_key=(os.environ.get("PRSM_NODE_API_KEY") or "").strip())
+            terminal = None
+            try:
+                async for ev in client.pay_and_infer_stream(
+                    prompt,
+                    requester_key=requester_key,
+                    provider_address=provider_address,
+                    model_id=model_id,
+                    max_tokens=max_tokens,
+                    budget_ftns=budget_ftns,
+                    max_spend_ftns=spend_ceiling,
+                    privacy_tier=privacy_tier,
+                    content_tier=content_tier,
+                    chain_id=chain_id,
+                    verify_pubkey_b64=verify_pubkey_b64,
+                ):
+                    if ev.get("type") == "token" and output_format != "json":
+                        import sys as _sys
+                        _sys.stdout.write(ev.get("text_delta", ""))
+                        _sys.stdout.flush()
+                    elif ev.get("type") in ("result", "error"):
+                        terminal = ev
+            finally:
+                await client.close()
+            return terminal
+
+        try:
+            terminal = _run_async(_go_stream())
+        except ValueError as exc:
+            console.print(f"❌ {exc}", style="red")
+            raise SystemExit(1)
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc)
+            if any(s in msg.lower()
+                   for s in ("connect", "refused", "unreachable", "timeout")):
+                console.print(f"❌ cannot reach daemon at {url}: {exc}", style="red")
+                raise SystemExit(2)
+            console.print(f"❌ pay-infer (stream) failed: {exc}", style="red")
+            raise SystemExit(1)
+
+        terminal = terminal or {
+            "type": "error", "detail": "stream ended with no terminal event"}
+        if terminal.get("type") == "error":
+            detail = terminal.get("detail") or terminal
+            if output_format == "json":
+                click.echo(_json.dumps({"ok": False, "detail": detail}))
+            else:
+                console.print(f"\n[red]Payment/stream error:[/red] {detail}")
+            raise SystemExit(1)
+        if output_format == "json":
+            click.echo(_json.dumps(terminal))
+            return
+        console.print()  # newline after the streamed tokens
+        charged = terminal.get("ftns_charged")
+        if charged is not None:
+            console.print(
+                f"[dim]charged: {charged} FTNS (settled from your escrow)[/dim]")
+        if "receipt_verified" in terminal:
+            ok = terminal["receipt_verified"]
+            console.print(
+                f"[dim]receipt_verified: "
+                f"{'[green]yes[/green]' if ok else '[red]no[/red]'}[/dim]")
+        console.print()
         return
 
     async def _go():
