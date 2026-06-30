@@ -253,8 +253,24 @@ Each ships behind the default-off flag, fully tested, money-path-gated.
           → POST each → 2 receiver nodes (real apps + stores) → gate → stage →
           `run_per_stage_commit_cycle` commits 1/1 + drains; plus the money-safety reject (auth
           signed over a different set → each node's gate fail-closes, nothing staged/committed).
-          This de-risks the live run. **REAL-EVM proof of the routed path ✅ DONE (sp1325,
-          0b46e91f):** `test_sp1325_per_stage_ROUTED_onchain_payout_e2e` (in the sp1159 local-EVM
+          This de-risks the live run. **★★★ 2-NODE CROSS-CLOUD TESTNET GO ACHIEVED (2026-06-30,
+          Base Sepolia chainId 84532): the full chain ran end-to-end across two DIFFERENT cloud
+          providers over the public internet** — cross-host 2-stage Qwen-7B inference (signed §7
+          chain, linked activation hashes) → multi-stage quote → escrow → per-stage auth → paid
+          serve+settle → post-settle delivery (head IN-PROCESS, worker over an SSH reverse tunnel
+          since its inbound was firewall-blocked) → both nodes gate-verify + stage → **each node
+          self-committed its own share on-chain (on-chain provider == own settler, msg.sender)**:
+          head batch `ca30cbc6…` (Settler-A 0xBbEB…, 0.14 FTNS), worker batch `f98566d9…`
+          (Settler-B 0x2010…, 0.14 FTNS), both PENDING + requester-bound; **conservation
+          0.14+0.14 == 0.28 FTNS (settled cost) verified on-chain.** Finalize pending the
+          challenge window. Three real bugs found+fixed live (sp1326/1327, commit ce265706): the
+          16MB WS frame cap (too small for Qwen's 152k vocab → MESSAGE_TOO_BIG killed every
+          cross-host dispatch — THE actual blocker, not the firewall), the head self-delivery
+          re-entrancy (self-HTTP-POST deadlock → ingest in-process), and transport reconnect
+          robustness (ping-timeout env + reconnect-replace for asymmetric-firewall fleets). Two
+          design findings: quote-vs-settled-value binding (exact-share auth needs budget==cost or
+          a binding/cap-based quote), and the 1.0 FTNS batch threshold being too high for small
+          per-stage shares. **REAL-EVM proof of the routed path ✅ DONE (sp1325, 0b46e91f):** `test_sp1325_per_stage_ROUTED_onchain_payout_e2e` (in the sp1159 local-EVM
           bench) runs the DISTRIBUTED self-commit chain — S3a split → per-node gate+stage
           (S3b-1/2) → `drain_and_commit_staged` on each node's OWN real `BatchSettlementClient`
           (S3b-3a) → finalize — against real deployed contracts on a local hardhat chain, and
