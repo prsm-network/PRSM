@@ -754,8 +754,58 @@ async def _resolve_paid_requester_or_402(
     local op). Clients must therefore sign a new authorization per attempt."""
     payment_authorization = body.get("payment_authorization")
     payment_delegation = body.get("payment_delegation")   # sp1094 — relayer path
-    if payment_authorization is None and payment_delegation is None:
+    per_stage_authorization = body.get("per_stage_payment_authorization")  # sp1324 — multi-stage
+    if (
+        payment_authorization is None
+        and payment_delegation is None
+        and per_stage_authorization is None
+    ):
         return None
+    # sp1324 (S3b ingress) — a paid MULTI-STAGE (big-model) request carries a per-stage
+    # PaymentAuthorization instead of the single-stage one. Authenticate the requester here
+    # (signer == payload.requester) + CARRY the auth; the FULL money gate (set-hash / membership /
+    # cap / expiry vs the ACTUAL served payee set) runs FAIL-CLOSED at each node's commit (sp1316),
+    # since the served payee set isn't known until the chain is routed. A single-stage auth (if
+    # also present) takes precedence (it pays one provider on-chain today); the per-stage path
+    # fires only when no single-stage auth is supplied.
+    if (
+        per_stage_authorization is not None
+        and payment_authorization is None
+        and payment_delegation is None
+    ):
+        from prsm.settlement.client_wiring import multistage_settlement_enabled
+        if not multistage_settlement_enabled():
+            # Gate off → the proven path is unchanged; a per-stage auth is simply ignored
+            # (the job runs self-pay, exactly as before this sprint).
+            return None
+        from prsm.settlement.per_stage_payment_authorization import (
+            InvalidSignatureFormat,
+            recover_per_stage_signer,
+        )
+        try:
+            _payload = per_stage_authorization["payload"]
+            _claimed = str(_payload["requester"])
+            _signer = recover_per_stage_signer(
+                _payload, per_stage_authorization["signature"])
+        except (KeyError, TypeError, ValueError, InvalidSignatureFormat) as exc:
+            raise HTTPException(
+                status_code=402,
+                detail=f"per-stage payment authorization malformed: {exc}")
+        if _signer.lower() != _claimed.lower():
+            raise HTTPException(
+                status_code=402,
+                detail="per-stage payment authorization signer does not match its "
+                       "requester — refusing to serve")
+        try:
+            _cap = int(_payload["total_max_spend_wei"])
+        except (KeyError, TypeError, ValueError):
+            _cap = None
+        return {
+            "requester": _signer,
+            "max_spend_wei": _cap,
+            "multi_stage": True,
+            "per_stage_authorization": per_stage_authorization,
+        }
     from decimal import Decimal as _D
     from prsm.settlement.payment_authorization import (
         canonical_request_hash, inference_request_fields,
@@ -8731,6 +8781,44 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                             logger.debug(
                                 "Sprint 1037 accumulate hook error: %s",
                                 _acc_exc,
+                            )
+                        # sp1324 (S3b ingress) — paid MULTI-STAGE settlement: when this job
+                        # carried a per-stage authorization (and the gate is on), ROUTE each
+                        # per-node task to its stage node so that node self-commits its share
+                        # (Design A). The single-stage accumulate above no-ops for a multi-stage
+                        # receipt ("skipped:multi-stage-deferred"); THIS is the multi-stage path.
+                        # FAIL-SOFT: a delivery miss leaves a stage unpaid (safe), never breaks
+                        # the response. The on-chain commit is each node's own poll-loop concern
+                        # (sp1322); requester escrow is drawn only at each node's finalize.
+                        try:
+                            if (_paid or {}).get("multi_stage") and (_paid or {}).get(
+                                "per_stage_authorization"
+                            ) is not None:
+                                from decimal import Decimal as _D_ms
+                                from prsm.settlement.client_wiring import (
+                                    deliver_for_settled_receipt,
+                                )
+                                _total_wei = int(
+                                    _D_ms(str(decision.release_to_operator))
+                                    * (_D_ms(10) ** 18)
+                                )
+                                _ms_results = deliver_for_settled_receipt(
+                                    node, receipt=receipt,
+                                    total_value_wei=_total_wei,
+                                    requester_address=_paid["requester"],
+                                    per_stage_authorization=_paid[
+                                        "per_stage_authorization"],
+                                )
+                                if _ms_results:
+                                    logger.info(
+                                        "sp1324 multi-stage settlement delivery "
+                                        "(job=%s): %d task(s), %d accepted",
+                                        job_id, len(_ms_results),
+                                        sum(1 for r in _ms_results if r.accepted),
+                                    )
+                        except Exception as _ms_exc:  # noqa: BLE001 — never break the response
+                            logger.debug(
+                                "sp1324 multi-stage delivery hook error: %s", _ms_exc,
                             )
                         if decision.should_slash:
                             logger.warning(

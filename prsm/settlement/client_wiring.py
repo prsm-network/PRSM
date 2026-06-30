@@ -272,10 +272,14 @@ async def accumulate_settled_inference_receipt(
             return "skipped:zero-release"
         # Cross-host multi-stage: the off-chain settle split `release_ftns`
         # across N stage nodes (sprint 1031). Booking the FULL amount to one
-        # provider on-chain would over-attribute (a conservation mismatch once
-        # the commit path goes live). Skip until per-stage on-chain accumulation
-        # (brick 2). Uses the SAME split helper the off-chain path uses, so the
-        # two ledgers stay consistent.
+        # provider on-chain HERE would over-attribute (a conservation mismatch).
+        # So this single-payee accumulate correctly SKIPS a multi-stage receipt.
+        # sp1324 (S3b): the multi-stage on-chain path is now wired SEPARATELY — the
+        # api.py post-settle hook fires `deliver_for_settled_receipt` (gated by
+        # PRSM_MULTISTAGE_SETTLEMENT), routing each per-node task to its stage node so
+        # that node self-commits its OWN share (Design A). This skip is the deliberate
+        # hand-off point, not an unhandled gap. Uses the SAME split helper the off-chain
+        # path uses, so the two ledgers stay consistent.
         from prsm.economy.credit_policy import split_release_across_stages
         if split_release_across_stages(receipt, rel) is not None:
             return "skipped:multi-stage-deferred"

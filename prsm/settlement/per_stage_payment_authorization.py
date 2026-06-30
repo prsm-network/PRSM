@@ -81,6 +81,7 @@ __all__ = [
     "PerStageAuthorizationVerdict",
     "compute_payee_set_hash",
     "encode_per_stage_typed_data_hash",
+    "recover_per_stage_signer",
     "sign_per_stage_authorization",
     "verify_per_stage_authorization",
 ]
@@ -271,6 +272,22 @@ class PerStageAuthorizationVerdict(NamedTuple):
 
     authorized: bool
     reason: str
+
+
+def recover_per_stage_signer(
+    payload: Dict[str, Any],
+    signature: Union[bytes, str],
+    *,
+    chain_id: int = DEFAULT_CHAIN_ID,
+) -> str:
+    """Recover the EIP-712 signer of a per-stage authorization WITHOUT the payee set.
+
+    For INGRESS authentication (sp1324): a paid multi-stage request can be attributed to its
+    requester by confirming the per-stage auth's signer == ``payload["requester"]`` before the
+    full money gate (set-hash / membership / cap) runs at the node-side commit (which needs the
+    served payee set). Raises ``InvalidSignatureFormat`` on a malformed signature shape;
+    ``ValueError`` on a malformed payload."""
+    return _recover_signer(payload, signature, chain_id)
 
 
 def _recover_signer(
