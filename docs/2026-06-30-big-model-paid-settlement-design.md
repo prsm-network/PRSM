@@ -272,10 +272,11 @@ Each ships behind the default-off flag, fully tested, money-path-gated.
           settled value is the DETERMINISTIC price `estimate_cost = cost_per_layer × num_layers ==
           receipt.cost_ftns`, so the quote now returns that price as `total_value_wei` (+
           `price_ftns`) with `budget_ftns` a CAP; the exact-share auth matches the settle for any
-          budget≥price (no cap-based crypto change). **(2) the 1.0 FTNS batch threshold too high
-          for small per-stage shares — STILL OPEN** (a 0.14 share never crossed it; the live GO
-          committed via a low-threshold client; the per-stage path should set a
-          per-stage-appropriate commit threshold / force-flush a single staged share).
+          budget≥price (no cap-based crypto change). **(2) the batch threshold too high for small per-stage shares ✅ FIXED (sp1329, c77d3f05)**
+          — the per-stage commit cycle now uses a DEDICATED client with `count_threshold=1`
+          (`resolve_per_stage_settlement_client`, distinct state file), so a single small share
+          (e.g. 0.14 FTNS) commits immediately; the builder gained `accumulator_config` +
+          `state_store` kwargs (default-None = unchanged single-stage behavior).
           **REAL-EVM proof of the routed path ✅ DONE (sp1325, 0b46e91f):** `test_sp1325_per_stage_ROUTED_onchain_payout_e2e` (in the sp1159 local-EVM
           bench) runs the DISTRIBUTED self-commit chain — S3a split → per-node gate+stage
           (S3b-1/2) → `drain_and_commit_staged` on each node's OWN real `BatchSettlementClient`
