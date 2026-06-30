@@ -148,12 +148,24 @@ def main() -> int:
     if rcpt.status != 1:
         print(f"  REVERTED (status 0) — tx {txh.hex()}", file=sys.stderr)
         return 1
-    time.sleep(2)
-    after_status = int(reg.functions.batches(bid).call()[7])
-    after_bal = ftns.functions.balanceOf(Web3.to_checksum_address(provider)).call()
-    print(f"  ✅ FINALIZED. batch status: {statuses.get(after_status, after_status)}")
-    print(f"  settler FTNS: {before/1e18} → {after_bal/1e18} (+{(after_bal-before)/1e18} FTNS)")
-    return 0
+    # Poll the post-tx state with retries — a single immediate read can hit an RPC node
+    # that hasn't yet applied the block, falsely showing PENDING / an unchanged balance.
+    after_status, after_bal = status, before
+    for _ in range(10):
+        time.sleep(3)
+        after_status = int(reg.functions.batches(bid).call()[7])
+        after_bal = ftns.functions.balanceOf(Web3.to_checksum_address(provider)).call()
+        if after_status == 2:
+            break
+    ok = after_status == 2
+    print(f"  {'✅ FINALIZED' if ok else '⚠️ tx mined but status still ' + statuses.get(after_status, str(after_status))}"
+          f" — batch status: {statuses.get(after_status, after_status)}")
+    delta = (after_bal - before) / 1e18
+    # Self-pay (provider==requester) settles within escrow and the provider's wallet rises by
+    # the share; a normal settlement also credits the provider. Either way report the delta.
+    print(f"  provider FTNS wallet: {before/1e18} → {after_bal/1e18} (+{delta} FTNS)")
+    print(f"  tx: {txh.hex()}")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
