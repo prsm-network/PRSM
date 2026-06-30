@@ -6383,7 +6383,7 @@ class PRSMNode:
         try:
             from prsm.settlement.settlement_audit_wiring import (
                 build_compute_integrity_watcher,
-                build_env_endpoint_resolver,
+                build_discovery_endpoint_resolver,
                 build_peer_compute_integrity_watcher,
             )
             watcher = build_compute_integrity_watcher(
@@ -6406,10 +6406,13 @@ class PRSMNode:
                 )
             # sp1308 — CROSS-PROVIDER audit: same watcher machinery, but the source pulls
             # FOREIGN producers' §7 receipts (verified_batch_store + the sp1305 serve
-            # endpoint, fetched via sp1306) through an INJECTED endpoint resolver. Inert
-            # unless an operator configures PRSM_PEER_RECEIPT_ENDPOINTS (a JSON
-            # provider->url map); automatic endpoint discovery is a follow-on.
-            resolver = build_env_endpoint_resolver(_os.environ)
+            # endpoint, fetched via sp1306) through an INJECTED endpoint resolver.
+            # sp1309 — the resolver is now AUTOMATIC: it matches each provider eth-address
+            # against the live peer set (a peer's hardware_profile.operator_address, sp690/
+            # sp788) to find its receipt-serve endpoint, with PRSM_PEER_RECEIPT_ENDPOINTS as
+            # a manual override pin. Inert only if there's neither discovery nor the env map.
+            resolver = build_discovery_endpoint_resolver(
+                getattr(self, "discovery", None), environ=_os.environ)
             peer_watcher = build_peer_compute_integrity_watcher(
                 verified_batch_store=getattr(
                     self, "_settlement_verified_batch_store", None),

@@ -649,3 +649,64 @@ def build_peer_compute_integrity_watcher(
                 )
 
     return ChallengeWatcher(source=_source, dry_run_client=dry_run_client)
+
+
+def build_discovery_endpoint_resolver(discovery: Any, *, environ: Any = None) -> Any:
+    """Sprint 1309 — AUTOMATIC producer-endpoint resolution for the cross-provider audit
+    (sp1308), removing the manual PRSM_PEER_RECEIPT_ENDPOINTS requirement.
+
+    Resolves a provider eth-address -> receipt-serve base URL by matching it against the LIVE
+    peer set: a peer that advertised its ``operator_address`` (sp690, delegation-verified
+    sp788) in its ``hardware_profile`` IS that producer, and its discovery ``address``
+    (host:port) is the receipt-serve endpoint (prefixed http:// if it carries no scheme).
+
+    Composition: an explicit ``PRSM_PEER_RECEIPT_ENDPOINTS`` entry (sp1308) OVERRIDES
+    discovery (an operator pin), then discovery fills the rest. Fail-soft: any error -> None
+    for that lookup (never crashes the audit loop).
+
+    Trust note: the audit is DRY-RUN + surface-only (never broadcasts), so a peer that lies
+    about its operator_address can at worst cause a reviewable false alert — never an on-chain
+    action — which keeps the trust bar on this self-advertised field low.
+
+    Returns a callable ``(provider_address) -> base_url | None``, or ``None`` when NEITHER a
+    discovery object NOR the env map is available (the peer audit then stays inert)."""
+    import os as _os
+    env = environ if environ is not None else _os.environ
+    env_resolver = build_env_endpoint_resolver(env)   # may be None
+    if discovery is None and env_resolver is None:
+        return None
+
+    def _normalize_url(addr: Any):
+        s = str(addr or "").strip()
+        if not s:
+            return None
+        return s if s.startswith(("http://", "https://")) else f"http://{s}"
+
+    def _resolve(provider_address: str):
+        if not provider_address:
+            return None
+        # 1) manual override pin wins (operator control / backward compat)
+        if env_resolver is not None:
+            url = env_resolver(provider_address)
+            if url:
+                return url
+        # 2) discovery: a peer whose hardware_profile.operator_address matches the provider
+        if discovery is None:
+            return None
+        try:
+            peers = discovery.get_known_peers()
+        except Exception:  # noqa: BLE001 — discovery hiccup: no resolution this cycle
+            return None
+        target = str(provider_address).lower()
+        for p in (peers or []):
+            hw = getattr(p, "hardware_profile", None)
+            if not isinstance(hw, dict):
+                continue
+            op = hw.get("operator_address")
+            if op and str(op).lower() == target:
+                url = _normalize_url(getattr(p, "address", None))
+                if url:
+                    return url
+        return None
+
+    return _resolve
