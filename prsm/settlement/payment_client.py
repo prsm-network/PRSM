@@ -114,3 +114,67 @@ def build_payment_delegation(
     }
     signature = sign_payment_delegation(payload, funder_key, chain_id=chain_id)
     return {"payload": payload, "signature": "0x" + signature.hex()}
+
+
+def build_per_stage_payment_authorization(
+    *,
+    requester_key: Union[str, bytes],
+    payees,
+    model_id: str,
+    prompt: str,
+    max_tokens: int,
+    privacy_tier: str,
+    content_tier: str,
+    expiry_unix: int,
+    total_max_spend_ftns: Union[str, float, Decimal, None] = None,
+    job_nonce: Optional[str] = None,
+    chain_id: int = DEFAULT_CHAIN_ID,
+) -> Dict[str, Any]:
+    """Sprint 1312 — build + sign a PerStagePaymentAuthorization for PAID cross-host
+    MULTI-STAGE (big-model sliced) inference.
+
+    The requester authorizes a SET of stage-node payees (each with a max share), NOT a single
+    provider — so the provider can settle EACH stage node from the requester's escrow. The
+    server's per-stage commit path (``per_stage_commit``, sp1172) verifies this exact auth via
+    the existing ``verify_per_stage_authorization`` before committing any node's share.
+
+    ``payees`` is the ``(eth_address, max_share_ftns)`` set for the planned topology (the
+    requester obtains it from the provider's quote / topology preview). The set is committed
+    via an ORDER-INDEPENDENT hash (``compute_payee_set_hash``); the provider re-derives the
+    set from the served topology and checks it matches before settling. Returns
+    ``{"payload": {...}, "signature": "0x.."}`` for the request body's
+    ``per_stage_payment_authorization`` field. ``total_max_spend_ftns`` defaults to the SUM of
+    the payee shares.
+
+    NOTE: this builder + the existing verifier are the AUTH surface; the on-chain multi-stage
+    SETTLEMENT that consumes it in the main inference path is a separate, deferred money-path
+    build (per-stage accumulation, per-node settler keys, worker per-stage signatures live)."""
+    from prsm.settlement.per_stage_payment_authorization import (
+        compute_payee_set_hash,
+        sign_per_stage_authorization,
+    )
+    requester = Account.from_key(requester_key).address
+    payees_wei = [
+        (addr, int(Decimal(str(share)) * (Decimal(10) ** 18))) for addr, share in payees
+    ]
+    payee_set_hash = compute_payee_set_hash(payees_wei)   # validates the set; raises on bad
+    total_wei = (
+        sum(s for _, s in payees_wei) if total_max_spend_ftns is None
+        else int(Decimal(str(total_max_spend_ftns)) * (Decimal(10) ** 18))
+    )
+    if job_nonce is None:
+        job_nonce = "0x" + secrets.token_bytes(32).hex()
+    request_hash = canonical_request_hash(inference_request_fields(
+        model_id=model_id, prompt=prompt, max_tokens=int(max_tokens),
+        privacy_tier=privacy_tier, content_tier=content_tier,
+    ))
+    payload = {
+        "requester": requester,
+        "payee_set_hash": "0x" + payee_set_hash.hex(),
+        "total_max_spend_wei": total_wei,
+        "job_nonce": job_nonce,
+        "expiry_unix": int(expiry_unix),
+        "request_hash": request_hash,
+    }
+    signature = sign_per_stage_authorization(payload, requester_key, chain_id=chain_id)
+    return {"payload": payload, "signature": "0x" + signature.hex()}
