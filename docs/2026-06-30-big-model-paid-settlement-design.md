@@ -295,8 +295,14 @@ Each ships behind the default-off flag, fully tested, money-path-gated.
 - **S4 — Per-node settler-key provisioning + funding runbook.** Operator guidance: each stage
   node needs a funded settler key bound to its provider address (reuse the sp1301 go-live
   preflight, extended per-node). Risk: LOW (ops/docs).
-- **S5 — SDK/CLI paid-multistage surface.** `PRSMClient.pay_and_infer_multistage` (quote →
-  build per-stage auth → send) + a CLI flag. Risk: LOW (client glue).
+- **S5 — SDK/CLI paid-multistage surface. ✅ DONE (sp1330, da6bce09).**
+  `PRSMClient.pay_and_infer_multistage(prompt, *, requester_key, model_id, ...)` — quote → sign
+  ONE per-stage auth over the quoted (price-based, sp1328) payees → POST the paid request;
+  raises clearly on not-multi-stage / not-settleable; attaches the quote under
+  `result["multistage_quote"]`; `verify_pubkey_b64` runs inline receipt verify. CLI
+  `prsm compute pay-infer-multistage` (key from env, `--network`→chain_id, `--quote-only`
+  preview, text/json). 4 SDK TDD + 77 SDK/CLI/paid regression. **The big-model paid path is now
+  callable end-to-end from the SDK + terminal — the full arc (S1→S5) is complete.**
 
 **Prereqs that gate S2/S3:** worker `per_stage_settlement_signatures` must be POPULATED in
 production runs (confirm the field is filled end-to-end, not just declared); the proven
