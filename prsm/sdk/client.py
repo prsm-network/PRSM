@@ -285,6 +285,84 @@ class PRSMClient:
                 result["receipt_verified"] = False
         return result
 
+    async def relayed_infer(
+        self,
+        prompt: str,
+        *,
+        relayer_key: str,
+        payment_delegation: Dict[str, Any],
+        provider_address: Optional[str] = None,
+        model_id: str = "gpt2",
+        max_tokens: int = 8,
+        budget_ftns: float = 1.0,
+        max_spend_ftns=None,
+        privacy_tier: str = "none",
+        content_tier: str = "A",
+        chain_id: int = 8453,
+        expiry_unix: Optional[int] = None,
+        verify_pubkey_b64: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Sprint 1311 — SPONSORED (relayer) inference for a WALLET-LESS end-user.
+
+        The relayer/gateway (holding ``relayer_key``) signs a per-request PaymentAuthorization
+        and attaches the FUNDER's pre-signed ``payment_delegation`` (from
+        ``build_payment_delegation``, issued out-of-band by the sponsor). The provider
+        verifies the two-signature chain and settles A→B from the FUNDER's escrow — so the
+        END-USER holds no wallet and signs nothing; the gateway sponsors the inference under
+        the funder's cap. Returns the server payload; a rejected chain surfaces as HTTP 402.
+        ``verify_pubkey_b64`` runs the inline receipt verification like ``pay_and_infer``."""
+        import time
+        from prsm.settlement.payment_client import build_payment_authorization
+
+        if provider_address is None:
+            info = await self._get("/info")
+            provider_address = (info or {}).get("operator_address")
+            if not provider_address:
+                raise ValueError(
+                    "operator published no payment address (operator_address absent from "
+                    "/info); supply provider_address explicitly"
+                )
+        if max_spend_ftns is None:
+            max_spend_ftns = budget_ftns
+        if expiry_unix is None:
+            expiry_unix = int(time.time()) + 300
+        _max_tokens = int(max_tokens or 0)
+        # The RELAYER signs the per-request auth (auth.requester == relayer); the funder's
+        # delegation (signed separately) authorizes this relayer to spend from its escrow.
+        auth = build_payment_authorization(
+            requester_key=relayer_key,
+            provider_address=provider_address,
+            model_id=model_id,
+            prompt=prompt,
+            max_tokens=_max_tokens,
+            privacy_tier=privacy_tier,
+            content_tier=content_tier,
+            max_spend_ftns=max_spend_ftns,
+            expiry_unix=int(expiry_unix),
+            chain_id=chain_id,
+        )
+        body = {
+            "prompt": prompt,
+            "model_id": model_id,
+            "budget_ftns": budget_ftns,
+            "privacy_tier": privacy_tier,
+            "content_tier": content_tier,
+            "max_tokens": _max_tokens,
+            "payment_authorization": auth,
+            "payment_delegation": payment_delegation,
+        }
+        result = await self._post("/compute/inference", body)
+        if verify_pubkey_b64:
+            try:
+                from prsm.compute.inference.models import InferenceReceipt
+                from prsm.compute.inference.receipt import verify_receipt
+                receipt = InferenceReceipt.from_dict(result.get("receipt") or {})
+                result["receipt_verified"] = bool(
+                    verify_receipt(receipt, public_key_b64=verify_pubkey_b64))
+            except Exception:
+                result["receipt_verified"] = False
+        return result
+
     # ── Sprint 821 — Content publish + fetch ────────────────────
 
     async def publish_content(
