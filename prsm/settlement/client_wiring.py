@@ -622,6 +622,93 @@ def resolve_per_stage_receiver_store(node: Any, environ=os.environ) -> Optional[
     return store
 
 
+def build_per_stage_endpoint_resolver(node: Any, environ=os.environ):
+    """sp1321 (S3b-3b) — a ``node_id -> Optional[base_url]`` resolver for delivering per-stage
+    settlement tasks to their stage nodes.
+
+    Reuses the existing endpoint-resolver backends (sp's aggregate_endpoint_resolver): an
+    operator-curated static map (``PRSM_MULTISTAGE_ENDPOINT_MAP``, JSON ``{node_id: base_url}``)
+    wins over the transport-peer fallback (host:port from the live WS connection; scheme/port
+    overridable via ``PRSM_MULTISTAGE_ENDPOINT_SCHEME``/``_PORT``). Returns a callable that yields
+    ``None`` on an unresolved node (so the FAIL-SOFT sender records it undelivered rather than
+    raising). When neither a static map nor a transport exists, every lookup is ``None``."""
+    import json
+
+    from prsm.compute.query_orchestrator.aggregate_endpoint_resolver import (
+        AggregateEndpointUnresolvedError,
+        ChainedEndpointResolver,
+        StaticMapEndpointResolver,
+        TransportPeerEndpointResolver,
+    )
+
+    resolvers = []
+    static_raw = str(environ.get("PRSM_MULTISTAGE_ENDPOINT_MAP", "")).strip()
+    if static_raw:
+        try:
+            resolvers.append(StaticMapEndpointResolver(json.loads(static_raw)))
+        except (ValueError, TypeError) as exc:
+            logger.warning(
+                "PRSM_MULTISTAGE_ENDPOINT_MAP malformed (%s) — ignoring static map", exc)
+    transport = getattr(node, "transport", None)
+    if transport is not None:
+        scheme = str(environ.get("PRSM_MULTISTAGE_ENDPOINT_SCHEME", "https")).strip() or "https"
+        port_raw = str(environ.get("PRSM_MULTISTAGE_ENDPOINT_PORT", "")).strip()
+        try:
+            resolvers.append(TransportPeerEndpointResolver(
+                transport, scheme=scheme,
+                aggregate_port=int(port_raw) if port_raw else None))
+        except ValueError as exc:
+            logger.warning("per-stage transport endpoint resolver build failed (%s)", exc)
+    if not resolvers:
+        return lambda node_id: None
+    chained = ChainedEndpointResolver(resolvers)
+
+    def _resolve(node_id: str) -> Optional[str]:
+        try:
+            return chained(node_id)
+        except AggregateEndpointUnresolvedError:
+            return None
+
+    return _resolve
+
+
+def deliver_for_settled_receipt(
+    node: Any,
+    *,
+    receipt: Any,
+    total_value_wei: int,
+    requester_address: str,
+    per_stage_authorization: Optional[dict] = None,
+    wallet_map: Any = None,
+    http_post=None,
+    environ=os.environ,
+    timeout: float = 10.0,
+) -> list:
+    """sp1321 (S3b-3b) — node-aware orchestrator entrypoint: split a settled multi-stage receipt
+    + DELIVER each per-node task to its stage node (the send half, S3b-2c) using this node's peer
+    registry to resolve endpoints.
+
+    GATED: returns ``[]`` when ``PRSM_MULTISTAGE_SETTLEMENT`` is off (the proven single-stage path
+    is untouched). Resolves the endpoint resolver from ``node`` + builds the wallet map from env
+    when not supplied, then fans out via ``deliver_settled_multistage_tasks`` (FAIL-SOFT — a miss
+    is a recorded undelivered result, never a raise; the on-chain commit is each node's own
+    concern via the poll-loop commit driver). Returns the per-node ``DeliveryResult`` list."""
+    if not multistage_settlement_enabled(environ):
+        return []
+    from prsm.settlement.per_stage_delivery_client import (
+        deliver_settled_multistage_tasks,
+    )
+    if wallet_map is None:
+        from prsm.node.compute_wallet_map import ComputeWalletMap
+        wallet_map = ComputeWalletMap.from_env()
+    resolver = build_per_stage_endpoint_resolver(node, environ)
+    return deliver_settled_multistage_tasks(
+        receipt=receipt, total_value_wei=total_value_wei,
+        requester_address=requester_address, endpoint_for_node=resolver,
+        per_stage_authorization=per_stage_authorization, wallet_map=wallet_map,
+        http_post=http_post, timeout=timeout)
+
+
 async def run_settlement_poll_cycle(client: Any) -> dict:
     """Sprint 1038 (brick 2) — drive ONE commit/finalize/reconcile cycle of the
     on-chain settlement client.
