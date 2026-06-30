@@ -16863,6 +16863,52 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         history = node._batch_settlement.get_history(limit=limit)
         return {"history": history, "count": len(history)}
 
+    @app.get("/settlement/receipt/leaf/{leaf_hash}")
+    async def settlement_receipt_by_leaf(leaf_hash: str) -> Dict[str, Any]:
+        """Sprint 1305 — §7 settlement-receipt data plane: serve a retained
+        InferenceReceipt by its committed-batch LEAF HASH so a remote challenger can
+        run the §7 compute-integrity verifier (``verify_inference_receipt_for_challenge``)
+        on a suspicious on-chain batch leaf.
+
+        Closes the data-plane gap (sp1141 retained §7 receipts locally, keyed by the
+        SAME leaf hash an observer reads off the committed batch, but exposed NO fetch
+        path — so a challenger had no channel to obtain the receipt). The served record
+        is VERIFICATION METADATA only: the settler + per-stage signatures, the
+        ``stage_activation_chain``, ``topology_assignment``, ``request_id``, and the
+        ``prompt_hash`` / ``output_hash`` — HASHES, not plaintext (the §7 receipt carries
+        no prompt/output text; ``streamed_output`` is a bool). So serving it enables
+        permissionless verification without leaking inference content.
+
+        Gated by the audit data plane: the store only exists when PRSM_SETTLEMENT_AUDIT
+        is enabled (503 otherwise). Read-only, ungated like the other ``/settlement/*``
+        read endpoints, so the challenge path stays permissionless.
+        """
+        store = getattr(node, "_settlement_inference_receipt_store", None)
+        if store is None:
+            raise HTTPException(
+                status_code=503,
+                detail="settlement receipt store not initialized — enable the "
+                       "audit data plane (PRSM_SETTLEMENT_AUDIT=1) to serve §7 "
+                       "receipts for compute-integrity challenges",
+            )
+        try:
+            leaf = bytes.fromhex(leaf_hash[2:] if leaf_hash.startswith("0x")
+                                 else leaf_hash)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="leaf_hash must be valid hex")
+        if len(leaf) != 32:
+            raise HTTPException(
+                status_code=422,
+                detail="leaf_hash must be 32 bytes (64 hex chars)",
+            )
+        rec = store.get(leaf)
+        if rec is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no retained §7 receipt for leaf {leaf.hex()}",
+            )
+        return rec.to_dict()
+
 
     # ── Staking Endpoints ─────────────────────────────────────────
 
