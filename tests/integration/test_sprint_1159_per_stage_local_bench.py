@@ -555,3 +555,185 @@ def test_sp1159_per_stage_onchain_payout_e2e(hardhat_node, deployed):
     assert asyncio.run(
         escrow.ftns_balance_of(node_eth[_probe_nid])
     ) - ftns_before[_probe_nid] == expected_share_by_node[_probe_nid]
+
+
+@requires_hardhat
+def test_sp1325_per_stage_ROUTED_onchain_payout_e2e(hardhat_node, deployed, tmp_path):
+    """Sprint 1325 (S3b on-chain proof) — the DISTRIBUTED self-commit path end-to-end on a REAL
+    EVM, the piece the in-process sp1323 e2e (fake client) couldn't cover and the 2-node testnet
+    run targets.
+
+    Unlike sp1159 (which commits via ``commit_per_node_share_batches``, the all-clients-in-one-
+    process bench orchestration), THIS exercises the S3b chain each node actually runs in
+    production: build routable tasks (S3a) → each node ingests its OWN task through the fail-closed
+    gate + receiver store (S3b-1/2, verifying against the STORED full payee set) →
+    ``drain_and_commit_staged`` commits on the node's OWN real ``BatchSettlementClient`` (S3b-3a) →
+    finalize. Asserts the SAME money-safety on the real chain: self-commit (provider == own
+    settler), conservation, exact per-node payout, escrow drained by the total.
+
+    2 nodes (mirroring the 2-node testnet runbook), using the deployed fixture's node0/node1.
+    """
+    import dataclasses
+
+    from web3 import Web3
+
+    from prsm.compute.shard_receipt import per_stage_leaf_job_id
+    from prsm.economy.web3.batch_settlement_contract_client import (
+        BATCH_SETTLEMENT_REGISTRY_ABI,
+        Web3SettlementContractClient,
+    )
+    from prsm.economy.web3.escrow_pool_client import EscrowPoolClient
+    from prsm.node.compute_wallet_map import ComputeWalletMap
+    from prsm.node.identity import generate_node_identity
+    from prsm.settlement.accumulator import AccumulatorConfig, ReceiptAccumulator
+    from prsm.settlement.client import BatchSettlementClient
+    from prsm.settlement.per_stage_commit import finalize_per_node_share_batches
+    from prsm.settlement.per_stage_payment_authorization import (
+        compute_payee_set_hash,
+        sign_per_stage_authorization,
+    )
+    from prsm.settlement.per_stage_receiver_store import (
+        PerStageReceiverStore,
+        drain_and_commit_staged,
+        ingest_routed_task,
+    )
+    from prsm.settlement.per_stage_routing import (
+        build_per_stage_settlement_tasks,
+        payee_set_from_tasks,
+    )
+
+    w3 = Web3(Web3.HTTPProvider(hardhat_node))
+
+    # ── 2 stage nodes, each its own Ed25519 identity + a deployed eth key ──────
+    identities = [generate_node_identity(display_name=f"sp1325-stage{i}") for i in range(2)]
+    node_ids = [idn.node_id for idn in identities]
+    node_eth = {node_ids[i]: deployed["nodes"][i] for i in range(2)}
+    node_keys = {node_ids[i]: deployed["nodeKeys"][i] for i in range(2)}
+    requester = deployed["requester"]
+    total_wei = 20 * _ONE_FTNS + 1  # non-divisible by 2 → exercises the remainder
+
+    # ── requester mints + deposits the TOTAL into escrow ───────────────────────
+    erc20_mint_abi = [{
+        "inputs": [{"name": "to", "type": "address"}, {"name": "amount", "type": "uint256"}],
+        "name": "mint", "outputs": [], "stateMutability": "nonpayable", "type": "function"}]
+    token_mint = w3.eth.contract(
+        address=Web3.to_checksum_address(deployed["token"]), abi=erc20_mint_abi)
+    deployer_acct = w3.eth.account.from_key(deployed["deployerKey"])
+    mint_tx = token_mint.functions.mint(
+        Web3.to_checksum_address(requester), total_wei).build_transaction({
+            "from": deployer_acct.address,
+            "nonce": w3.eth.get_transaction_count(deployer_acct.address, "pending"),
+            "gasPrice": w3.eth.gas_price, "chainId": w3.eth.chain_id})
+    signed = w3.eth.account.sign_transaction(mint_tx, deployer_acct.key)
+    raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
+    rcpt = w3.eth.wait_for_transaction_receipt(w3.eth.send_raw_transaction(raw), timeout=60)
+    assert rcpt.status == 1, "mint to requester reverted"
+
+    escrow = EscrowPoolClient(
+        rpc_url=hardhat_node, escrow_pool_address=deployed["pool"],
+        ftns_token_address=deployed["token"], private_key=deployed["requesterKey"])
+    asyncio.run(escrow.deposit(total_wei))
+    assert asyncio.run(escrow.balance_of(requester)) == total_wei
+
+    # ── build a settled multi-stage receipt carrying per-stage sigs (S2) ───────
+    ir0 = _make_multistage_receipt(node_ids)
+    output_hex = ir0.output_hash.hex()
+    executed = int(time.time())
+    job_id = per_stage_leaf_job_id(ir0.request_id)
+    node_sigs = {
+        node_ids[i]: _sig_material_for(
+            identities[i], job_id=job_id, stage_index=i,
+            output_hash_hex=output_hex, executed_at_unix=executed)
+        for i in range(2)}
+    ir = dataclasses.replace(ir0, per_stage_settlement_signatures=node_sigs)
+    wallet_map = ComputeWalletMap.from_mapping(
+        {nid: Web3.to_checksum_address(node_eth[nid]) for nid in node_ids})
+
+    # ── S3a: split the settled receipt into routable per-node tasks ────────────
+    bare = build_per_stage_settlement_tasks(
+        receipt=ir, total_value_wei=total_wei,
+        requester_address=Web3.to_checksum_address(requester), wallet_map=wallet_map)
+    assert bare is not None and len(bare) == 2
+    payees = payee_set_from_tasks(bare)
+    expected_share_by_node = {t.node_id: t.share_wei for t in bare}
+    assert sum(expected_share_by_node.values()) == total_wei
+
+    # requester signs the per-stage authorization over the actual split payee set
+    auth_payload = {
+        "requester": Web3.to_checksum_address(requester),
+        "payee_set_hash": "0x" + compute_payee_set_hash(payees).hex(),
+        "total_max_spend_wei": total_wei,
+        "job_nonce": "0x" + hashlib.sha256(b"sp1325-nonce").hexdigest(),
+        "expiry_unix": int(time.time()) + 86400,
+        "request_hash": "0x" + hashlib.sha256(b"sp1325-req").hexdigest()}
+    auth = {"payload": auth_payload,
+            "signature": "0x" + sign_per_stage_authorization(
+                auth_payload, deployed["requesterKey"]).hex()}
+    tasks = [dataclasses.replace(t, payment_authorization=auth) for t in bare]
+
+    # ── S3b-1/2: each node ingests its OWN task through the fail-closed gate ────
+    stores = {nid: PerStageReceiverStore(tmp_path / f"{nid[:8]}.json") for nid in node_ids}
+    for t in tasks:
+        res = ingest_routed_task(stores[t.node_id], t, payees=payees, my_node_id=t.node_id)
+        assert res.accepted, f"node {t.node_id} gate rejected its own routed task: {res.reason}"
+
+    # ── per-node REAL settlement clients (each bound to + keyed by its own addr) ─
+    cfg = AccumulatorConfig(count_threshold=1, time_threshold_seconds=3600, value_threshold_ftns=1)
+    clients = {}
+    for nid in node_ids:
+        clients[nid] = BatchSettlementClient(
+            accumulator=ReceiptAccumulator(cfg),
+            contract_client=Web3SettlementContractClient(
+                rpc_url=hardhat_node, contract_address=deployed["registry"],
+                private_key=node_keys[nid]),
+            provider_address=Web3.to_checksum_address(node_eth[nid]))
+
+    ftns_before = {nid: asyncio.run(escrow.ftns_balance_of(node_eth[nid])) for nid in node_ids}
+
+    # ── S3b-3a: each node DRAINS its store + commits its OWN share on the chain ─
+    committed = {}
+    for nid in node_ids:
+        results = asyncio.run(drain_and_commit_staged(
+            stores[nid], client_for_node=lambda _n, _c=clients[nid]: _c))
+        assert len(results) == 1 and results[0].committed, (
+            f"node {nid} failed to commit its staged share: "
+            f"{results[0].reason if results else 'no result'}")
+        committed[nid] = results[0].committed_batch
+        # the receiver store drained on a landed commit (idempotent)
+        assert stores[nid].all_staged() == [], f"node {nid} store not drained after commit"
+
+    # ── on-chain provider-of-record per batch == the committing node (msg.sender) ─
+    registry_read = w3.eth.contract(
+        address=Web3.to_checksum_address(deployed["registry"]),
+        abi=BATCH_SETTLEMENT_REGISTRY_ABI)
+    batch_ids = {}
+    for nid in node_ids:
+        cb = committed[nid]
+        batch_ids[nid] = cb.batch_id
+        b = registry_read.functions.batches(cb.batch_id).call()
+        assert b[0].lower() == node_eth[nid].lower(), (
+            f"on-chain provider for {nid} must be its OWN committer {node_eth[nid]}, got {b[0]}")
+        assert b[1].lower() == requester.lower(), "batch requester must be the funder"
+        assert int(b[4]) == expected_share_by_node[nid], "committed value != conserving share"
+        assert int(b[7]) == 1, "batch must be PENDING before finalize"
+
+    # ── finalize past the challenge window → escrow settles each node its share ─
+    w3.provider.make_request("evm_increaseTime", [3601])
+    w3.provider.make_request("evm_mine", [])
+    finalized = asyncio.run(finalize_per_node_share_batches(
+        committed=committed, client_for_node=lambda nid: clients[nid]))
+    assert set(finalized.keys()) == set(node_ids), "every node must finalize its own batch"
+
+    # ── MONEY-SAFETY on the REAL chain (the distributed path matches sp1159) ────
+    total_paid = 0
+    for nid in node_ids:
+        delta = asyncio.run(escrow.ftns_balance_of(node_eth[nid])) - ftns_before[nid]
+        assert delta == expected_share_by_node[nid], (
+            f"node {nid} paid {delta} on-chain but its conserving share is "
+            f"{expected_share_by_node[nid]}")
+        total_paid += delta
+    assert total_paid == total_wei, "sum of on-chain payouts != total (FTNS created/lost)"
+    assert asyncio.run(escrow.balance_of(requester)) == 0, "requester escrow must drain by the total"
+    for nid in node_ids:
+        assert int(registry_read.functions.batches(batch_ids[nid]).call()[7]) == 2, (
+            f"{nid}'s batch must read FINALIZED")
