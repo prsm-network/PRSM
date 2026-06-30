@@ -118,10 +118,15 @@ stages if some nodes don't settle).
 
 Each ships behind the default-off flag, fully tested, money-path-gated.
 
-- **S1 — Requester quote / topology preview.** A read-only endpoint that returns the planned
-  payee set `{node_eth: share}` for a multi-stage request, so the requester can sign the
-  per-stage auth (sp1312) for the EXACT set the provider will serve. (Without this the
-  requester can't form a valid `payee_set_hash`.) Risk: LOW (read-only).
+- **S1 — Requester quote / topology preview. ✅ DONE (sp1313, 500dc34a).** Risk was MED
+  (not LOW): a correct quote must come from the SERVE path or it can't match (the verifier is
+  fail-closed). Implemented `ParallaxScheduledExecutor.plan_topology` (runs `_pre_execute_gates`
+  = filter→allocate→route WITHOUT executing) + `POST /compute/inference/quote-multistage` →
+  `build_per_stage_payee_set` → `{multi_stage, settleable, payees, payee_set_hash,
+  total_value_wei}`. DRIFT-SAFE: one shared `topology_from_chain_stages` helper builds the
+  stage→node positions for BOTH serve + quote (behavior-preserving refactor of
+  TopologyAwareChainExecutor). Round-trip TESTED: quoted `payee_set_hash` == what
+  `build_per_stage_payment_authorization` signs. 7 TDD + 302 regression.
 - **S2 — Orchestrator split + route.** On a settled multi-stage receipt, run the splitter →
   N node-signed `BatchedReceipt`s, and route each (+ the per-stage auth) to its node over the
   P2P substrate (extend the settlement gossip/announce, `settlement_gossip.py`). Risk: MED
