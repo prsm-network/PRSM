@@ -486,3 +486,63 @@ async def announce_committed_batches(
         if ok:
             n += 1
     return n
+
+
+def build_compute_integrity_watcher(
+    *,
+    published_batch_store: Any,
+    inference_receipt_store: Any,
+    dry_run_client: Any,
+) -> Any:
+    """Sprint 1307 — assemble an active ChallengeWatcher for COMPUTE-INTEGRITY fraud (the
+    §7 counterpart to the on-chain settlement-fraud audit engine).
+
+    The watcher's pluggable source correlates the node's two opt-in audit stores: for each
+    committed batch in the ``PublishedBatchStore`` (Brick A — the full ORDERED receipt set
+    behind the on-chain merkle root) and each leaf index, it recomputes that leaf's hash
+    (``hash_leaf(batched_receipt_to_leaf(br))`` — IDENTICAL to the key the
+    ``InferenceReceiptStore`` retained the §7 receipt under, sp1141) and, when a §7 receipt
+    is retained for that leaf, yields a ``WatchUnit`` binding the §7 receipt (for the
+    verifier) to the ordered batch receipts + target index (for the assembler).
+
+    The watcher then runs ``verify_inference_receipt_for_challenge`` on each unit and, for
+    any on-chain-actionable finding, DRY-RUNS (read-only) the challenge — it NEVER
+    broadcasts/signs/slashes (that stays user-gated). Self-auditing the node's OWN committed
+    batches is an integrity tripwire: it fires if this node ever produced a §7 receipt that
+    fails verification (a producer bug, key mismatch, or local-state tampering) BEFORE that
+    becomes a slashable on-chain liability.
+
+    Returns a ``ChallengeWatcher``, or ``None`` when any dependency is absent (audit off) —
+    so the caller can launch the loop only when the data plane is wired.
+    """
+    if (published_batch_store is None or inference_receipt_store is None
+            or dry_run_client is None):
+        return None
+
+    from prsm.settlement.challenge_watcher import ChallengeWatcher, WatchUnit
+    from prsm.settlement.merkle import batched_receipt_to_leaf, hash_leaf
+
+    async def _source():
+        for pb in published_batch_store.all_batches():
+            receipts = list(getattr(pb, "receipts", []) or [])
+            batch_id = getattr(pb, "batch_id", None)
+            if batch_id is None:
+                continue
+            for idx, br in enumerate(receipts):
+                try:
+                    leaf = hash_leaf(batched_receipt_to_leaf(br))
+                except Exception:  # noqa: BLE001 — a malformed receipt skips that leaf
+                    continue
+                rec = inference_receipt_store.get(leaf)
+                if rec is None:
+                    continue  # no §7 receipt retained for this leaf — nothing to verify
+                yield WatchUnit(
+                    batch_id=batch_id,
+                    inference_receipt=rec.inference_receipt,
+                    settler_public_key_b64=rec.settler_public_key_b64,
+                    batch_receipts=receipts,
+                    target_index=idx,
+                    stage_public_keys=rec.stage_public_keys,
+                )
+
+    return ChallengeWatcher(source=_source, dry_run_client=dry_run_client)
