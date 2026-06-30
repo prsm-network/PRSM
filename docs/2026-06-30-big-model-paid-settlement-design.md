@@ -240,13 +240,17 @@ Each ships behind the default-off flag, fully tested, money-path-gated.
           `deliver_for_settled_receipt`; then flip `client_wiring.py:273-281`'s
           `"skipped:multi-stage-deferred"` when the gate is on. This is money-path INGRESS — best
           built with the testnet validation available.
-        - **VALIDATION (gated, infra-dependent).** The full chain (quote → per-stage auth →
-          serve → split → deliver-over-HTTP → receive → stage → poll-drain → commit) needs a
-          **2-live-node testnet go/no-go before mainnet**. The existing `scripts/per_stage_sepolia_bench.py`
-          (sp1160) already proves per-node on-chain commit/finalize on Base Sepolia; the S3b
-          marginal additions (HTTP routing + receiver store + full-set verify) are off-chain +
-          unit-tested. The 2-live-node HTTP integration + the mainnet activation are user-gated
-          (irreversible — the autonomous loop pauses there).
+        - **VALIDATION.** **In-process end-to-end ✅ DONE (sp1323, 8a7185e1):**
+          `tests/integration/test_sprint_1323_per_stage_e2e.py` wires the WHOLE chain over REAL
+          HTTP (FastAPI TestClient) in one process — orchestrator split → `deliver_for_settled_receipt`
+          → POST each → 2 receiver nodes (real apps + stores) → gate → stage →
+          `run_per_stage_commit_cycle` commits 1/1 + drains; plus the money-safety reject (auth
+          signed over a different set → each node's gate fail-closes, nothing staged/committed).
+          This de-risks the live run. **Still gated, infra-dependent:** a **2-live-node testnet
+          go/no-go before mainnet** (the only piece the in-process test can't cover is a real
+          `BatchSettlementClient` broadcasting — already Sepolia-proven per-node by sp1160). The
+          2-live-node deployment + the mainnet activation are user-gated (irreversible — the
+          autonomous loop pauses there).
 - **S4 — Per-node settler-key provisioning + funding runbook.** Operator guidance: each stage
   node needs a funded settler key bound to its provider address (reuse the sp1301 go-live
   preflight, extended per-node). Risk: LOW (ops/docs).
