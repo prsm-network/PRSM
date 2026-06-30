@@ -127,15 +127,23 @@ Each ships behind the default-off flag, fully tested, money-path-gated.
   stage→node positions for BOTH serve + quote (behavior-preserving refactor of
   TopologyAwareChainExecutor). Round-trip TESTED: quoted `payee_set_hash` == what
   `build_per_stage_payment_authorization` signs. 7 TDD + 302 regression.
-- **S2 — Orchestrator split + route.** On a settled multi-stage receipt, run the splitter →
-  N node-signed `BatchedReceipt`s, and route each (+ the per-stage auth) to its node over the
-  P2P substrate (extend the settlement gossip/announce, `settlement_gossip.py`). Risk: MED
-  (new routing; no on-chain effect yet — nodes just receive).
-- **S3 — Per-node accumulate + commit (unwire the skip).** On each stage node, consume a
-  routed per-node receipt: verify the auth gate, accumulate to the node's own client, let the
-  poll loop commit + finalize (msg.sender = node). Replace the `"skipped:multi-stage-deferred"`
-  guard with this routed path (still default-off). Risk: **HIGH** (money path; this is the
-  core). Gates: conservation test, idempotency test, fail-closed auth test, dry-run.
+- **S2 — Carry per-node settlement signatures on the receipt. ✅ DONE (sp1314, b8a64ef3).**
+  REFINED from "split + route": code review showed the *foundational* gap is that the per-node
+  signature material (which the RPC executor assembles, chain_rpc/client.py:838) was DROPPED
+  at receipt-build, so the settle path never saw it. S2 threads
+  `per_stage_settlement_signatures` onto `InferenceReceipt` (carried out-of-band, NOT in
+  signing_payload → pre-1314 receipts byte-identical-signed; self-securing). 7 TDD + 1283
+  regression. The split+route+commit are now consolidated into **S3** (routing to a
+  non-consuming receiver would be inert, so route+receive+commit ship together).
+- **S3 — Split + route + per-node accumulate + commit (consolidated; the money path).** On a
+  settled multi-stage receipt: run the splitter (brick 1) on the now-carried per-node
+  signatures (S2) → N node-signed `BatchedReceipt`s; ROUTE each (+ the per-stage auth) to its
+  node over the P2P substrate; each node verifies the auth gate (brick 3b), accumulates to its
+  OWN client, and the poll loop commits + finalizes (msg.sender = node). Replace the
+  `"skipped:multi-stage-deferred"` guard. Still default-off. Risk: **HIGH** (money path + new
+  transport — likely 2 sub-sprints: S3a route/receive, S3b per-node commit). Gates:
+  conservation, idempotency (`{job_id}::stage::{node}`), fail-closed auth, dry-run, + a
+  testnet 2-node proof before mainnet.
 - **S4 — Per-node settler-key provisioning + funding runbook.** Operator guidance: each stage
   node needs a funded settler key bound to its provider address (reuse the sp1301 go-live
   preflight, extended per-node). Risk: LOW (ops/docs).
