@@ -175,20 +175,61 @@ TOOLS = [
     Tool(
         name="prsm_list_datasets",
         description=(
-            "Browse available datasets on the PRSM network with pricing information. "
-            "Filter by keyword or maximum price."
+            "Browse/search datasets on the PRSM network with pricing + creator provenance. "
+            "Keyword search by default; set semantic=true to find CONCEPTUALLY related "
+            "datasets (embedding similarity), not just keyword matches. Use prsm_get_dataset "
+            "to actually retrieve one."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "search": {
                     "type": "string",
-                    "description": "Keyword to search dataset titles and descriptions",
+                    "description": "Keyword (or, with semantic=true, a natural-language topic)",
                     "default": "",
                 },
                 "max_price": {
                     "type": "number",
                     "description": "Maximum base access fee in FTNS",
+                },
+                "semantic": {
+                    "type": "boolean",
+                    "description": "Semantic (embedding-similarity) search instead of keyword",
+                    "default": False,
+                },
+            },
+        },
+    ),
+    Tool(
+        name="prsm_get_dataset",
+        description=(
+            "Retrieve a dataset from the PRSM network and VERIFY it. Give a `query` to find + "
+            "fetch the best match, or a specific `cid`. Returns a text preview plus an integrity "
+            "check (the bytes hash to their content_hash) and the creator's on-chain provenance "
+            "attribution — so you can trust the content is intact and know who created it. This "
+            "is the one-call find -> fetch -> verify path (the flagship data-consumer action)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural-language description of the dataset to find + fetch",
+                },
+                "cid": {
+                    "type": "string",
+                    "description": "Exact content id to fetch (from prsm_list_datasets); "
+                                   "overrides query",
+                },
+                "semantic": {
+                    "type": "boolean",
+                    "description": "Use semantic search to resolve `query` (default keyword)",
+                    "default": False,
+                },
+                "max_preview_chars": {
+                    "type": "integer",
+                    "description": "Max characters of text content to preview (default 8000)",
+                    "default": 8000,
                 },
             },
         },
@@ -4088,12 +4129,23 @@ async def handle_prsm_list_datasets(arguments: Dict[str, Any]) -> str:
     string. Filters by max_price if the dataset's per-shard royalty rate is
     available in the index record. Returns up to 20 results by default.
     """
+    import urllib.parse as _url
     search = (arguments.get("search") or "").strip()
     max_price = arguments.get("max_price")
     limit = int(arguments.get("limit") or 20)
+    semantic = bool(arguments.get("semantic"))
+    _q = _url.quote(search)
 
     try:
-        result = await _call_node_api("GET", f"/content/search?q={search}&limit={limit}")
+        # sp1345 — semantic (embedding-similarity) browsing when requested; keyword otherwise.
+        if semantic:
+            result = await _call_node_api(
+                "GET", f"/content/search/semantic?q={_q}&top_k={limit}")
+            if result.get("semantic_available") is False:
+                return ("Semantic search is unavailable on this node (no embedding function "
+                        "wired). Retry without semantic=true for keyword search.")
+        else:
+            result = await _call_node_api("GET", f"/content/search?q={_q}&limit={limit}")
     except Exception:
         # Fallback: surface the index stats so the user knows the node is reachable
         try:
@@ -4134,6 +4186,86 @@ async def handle_prsm_list_datasets(arguments: Dict[str, Any]) -> str:
             f"  • {r.get('cid', '?')[:16]}…  {r.get('filename', '(unnamed)')}"
             f"  {size_mb:.2f} MB  by {r.get('creator_id', '?')[:12]}{royalty_str}"
         )
+    return "\n".join(lines)
+
+
+async def handle_prsm_get_dataset(arguments: Dict[str, Any]) -> str:
+    """Handle prsm_get_dataset — the one-call find -> fetch -> verify data-consumer action.
+
+    Resolves a `cid` (given, or the top `query` match via keyword/semantic search), retrieves
+    it, INTEGRITY-checks the bytes (sha256 == content_hash), surfaces creator + on-chain
+    provenance attribution, and returns a text preview the model can reason over. Mirrors the
+    SDK ``find_and_fetch`` but composed over the node HTTP API (the MCP server's transport).
+    """
+    import base64
+    import hashlib
+    import urllib.parse as _url
+
+    query = (arguments.get("query") or "").strip()
+    cid = (arguments.get("cid") or "").strip()
+    semantic = bool(arguments.get("semantic"))
+    max_preview = int(arguments.get("max_preview_chars") or 8000)
+    if not cid and not query:
+        return "Provide `query` (to find a dataset) or `cid` (to fetch a specific one)."
+
+    matched: Dict[str, Any] = {}
+    if not cid:
+        _q = _url.quote(query)
+        path = (f"/content/search/semantic?q={_q}&top_k=1" if semantic
+                else f"/content/search?q={_q}&limit=1")
+        try:
+            sr = await _call_node_api("GET", path)
+        except Exception as e:  # noqa: BLE001
+            return f"Search failed: {e}. Is the node running? (prsm node start)"
+        if semantic and sr.get("semantic_available") is False:
+            return ("Semantic search unavailable on this node (no embedding function). Retry "
+                    "with semantic=false.")
+        rows = sr.get("results") or []
+        if not rows:
+            return (f"No dataset found matching '{query}'. Browse with prsm_list_datasets "
+                    f"(try semantic=true for a broader concept match).")
+        matched = rows[0]
+        cid = matched.get("cid") or ""
+
+    try:
+        r = await _call_node_api("GET", f"/content/retrieve/{cid}?verify_hash=true")
+    except Exception as e:  # noqa: BLE001
+        return f"Retrieve failed for {cid}: {e}"
+    if (r or {}).get("status") != "success":
+        return (f"Content {cid} is not retrievable (status={r.get('status')}, "
+                f"providers tried={r.get('providers_tried', 0)}).")
+
+    raw = b""
+    integrity = "unknown"
+    content_hash = r.get("content_hash")
+    try:
+        raw = base64.b64decode(r.get("data") or "")
+        if content_hash:
+            integrity = ("VERIFIED" if hashlib.sha256(raw).hexdigest() == content_hash
+                         else "FAILED")
+    except Exception:  # noqa: BLE001
+        integrity = "unknown"
+
+    lines = [
+        f"Dataset retrieved: {cid}",
+        f"  filename: {r.get('filename') or matched.get('filename') or '?'}",
+        f"  size_bytes: {r.get('size_bytes', len(raw))}",
+        f"  integrity: {integrity}  (sha256 == content_hash)",
+    ]
+    creator = r.get("creator_eth_address") or matched.get("creator_eth_address")
+    prov = r.get("provenance_hash") or matched.get("provenance_hash")
+    if creator:
+        lines.append(f"  creator: {creator}  (verifiable provenance)")
+    if prov:
+        lines.append(f"  provenance_hash: {prov}")
+    try:
+        text = raw.decode("utf-8")
+        preview = text[:max_preview]
+        lines.append(f"\n--- content preview ({len(preview)}/{len(text)} chars) ---\n{preview}")
+        if len(text) > len(preview):
+            lines.append("… (truncated)")
+    except UnicodeDecodeError:
+        lines.append(f"\n[binary content, {len(raw)} bytes — not previewable as text]")
     return "\n".join(lines)
 
 
@@ -13781,6 +13913,7 @@ TOOL_HANDLERS = {
     "prsm_analyze": handle_prsm_analyze,
     "prsm_quote": handle_prsm_quote,
     "prsm_list_datasets": handle_prsm_list_datasets,
+    "prsm_get_dataset": handle_prsm_get_dataset,
     "prsm_node_status": handle_prsm_node_status,
     "prsm_section7_readiness": handle_prsm_section7_readiness,
     "prsm_hardware_benchmark": handle_prsm_hardware_benchmark,
