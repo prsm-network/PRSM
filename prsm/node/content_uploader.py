@@ -511,6 +511,10 @@ class UploadedContent:
     # RoyaltyDistributor.distribute_royalty() call. None when not
     # supplied (v1 backwards-compat).
     creator_eth_address: Optional[str] = None  # 0x-prefixed 40-hex
+    # sp1343 — the sp1340 descriptive metadata (title/description/tags). Retained so the
+    # periodic re-advertise (readvertise_all) republishes topic-searchable ads, not just
+    # filename ones. Default {} keeps every other UploadedContent construction backward-safe.
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class ContentUploader:
@@ -1505,6 +1509,7 @@ class ContentUploader:
             provenance_hash=provenance_hash_hex,
             provenance_tx_hash=provenance_tx_hash,
             creator_eth_address=creator_eth_address,
+            metadata=metadata or {},  # sp1343 — retain for topic-searchable re-advertise
         )
         # sp919 — first-creator-wins on the royalty-routing address: a
         # concurrent/later identical-content upload (same cid) must NOT clobber
@@ -1896,6 +1901,50 @@ class ContentUploader:
             parent_cids,
             creator_eth_address=creator_eth_address,
         )
+
+    def _build_content_advertise_payload(self, u: "UploadedContent") -> Dict[str, Any]:
+        """sp1343 — the GOSSIP_CONTENT_ADVERTISE payload for a locally-hosted item, rebuilt
+        from its retained UploadedContent (mirrors the fields the upload path publishes). Used
+        by the periodic re-advertise so peers' ContentIndex can upsert/refresh the record."""
+        return {
+            "cid": u.content_id,
+            "filename": u.filename,
+            "size_bytes": u.size_bytes,
+            "content_hash": u.content_hash,
+            "creator_id": u.creator_id,
+            "provider_id": self.identity.node_id,
+            "created_at": u.created_at,
+            "metadata": u.metadata or {},
+            "royalty_rate": u.royalty_rate,
+            "parent_cids": u.parent_cids,
+            "embedding_id": u.embedding_id,
+            "provenance_hash": u.provenance_hash,
+            "creator_eth_address": u.creator_eth_address,
+        }
+
+    async def readvertise_all(self) -> int:
+        """sp1343 — re-publish GOSSIP_CONTENT_ADVERTISE for every locally-hosted content so it
+        stays fresh in the network gossip log (24h retention) and reaches LATE-JOINING nodes
+        that missed the original advertisement.
+
+        A late-joiner catches up via the digest exchange (GOSSIP_DIGEST_REQUEST/RESPONSE) — but
+        only within the gossip-log retention window; without a re-advertise cadence, content
+        goes dark after 24h and new nodes can never discover it. This closes that gap: any node
+        online for one re-advertise interval learns about all currently-hosted content. Returns
+        the count re-advertised. Fail-soft per item (one bad record never aborts the sweep)."""
+        n = 0
+        for u in list(self.uploaded_content.values()):
+            try:
+                await self.gossip.publish(
+                    GOSSIP_CONTENT_ADVERTISE, self._build_content_advertise_payload(u))
+                n += 1
+            except Exception as exc:  # noqa: BLE001 — one bad record never aborts the sweep
+                logger.debug(
+                    "sp1343 re-advertise failed for %s: %s",
+                    str(getattr(u, "content_id", "?"))[:12], exc)
+        if n:
+            logger.info("sp1343 re-advertised %d local content item(s) to the network", n)
+        return n
 
     async def record_access(self, cid: str, accessor_id: str) -> None:
         """Record that content was accessed, distributing royalties.

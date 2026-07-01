@@ -2402,6 +2402,7 @@ class PRSMNode:
         self._operator_address = resolve_operator_address()
         # Tasks created on start() — None until then.
         self._compensation_scheduler_task = None
+        self._content_readvertise_task = None  # sp1343 — late-joiner catalog re-advertise
         self._settlement_poll_task = None  # sp1038 brick 2
         self._settlement_audit_task = None  # sp1140 brick E.2 (opt-in audit loop)
         self._compute_integrity_watcher = None  # sp1307 — §7 ChallengeWatcher (opt-in)
@@ -5250,6 +5251,27 @@ class PRSMNode:
             self.content_index.start()
         if self.content_uploader:
             self.content_uploader.start()
+            # sp1343 — periodic content RE-ADVERTISE so LATE-JOINING nodes can discover
+            # already-hosted content. Gossip catch-up (digest) only spans the ~24h log
+            # retention; without a re-advertise cadence, content goes dark after 24h and new
+            # nodes can never learn it exists. Interval kept well under the retention window;
+            # opt out with PRSM_CONTENT_READVERTISE_INTERVAL_S=0. Fail-soft.
+            import os as _os
+            try:
+                _readv_interval = float(
+                    _os.environ.get("PRSM_CONTENT_READVERTISE_INTERVAL_S", "3600"))
+            except (TypeError, ValueError):
+                _readv_interval = 3600.0
+            if _readv_interval > 0:
+                async def _periodic_content_readvertise():
+                    while self._started:
+                        await asyncio.sleep(_readv_interval)
+                        try:
+                            await self.content_uploader.readvertise_all()
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("content re-advertise failed: %s", exc)
+                self._content_readvertise_task = asyncio.create_task(
+                    _periodic_content_readvertise())
         if self.content_provider:
             self.content_provider.start()
         # Wire content_economy into content_provider for payment processing (Phase 4)
@@ -6704,6 +6726,12 @@ class PRSMNode:
             self._capability_announce_task.cancel()
             await _drain_task_bounded(
                 self._capability_announce_task, _STOP_TIMEOUT, "capability_announce_task",
+            )
+
+        if getattr(self, '_content_readvertise_task', None):  # sp1343
+            self._content_readvertise_task.cancel()
+            await _drain_task_bounded(
+                self._content_readvertise_task, _STOP_TIMEOUT, "content_readvertise_task",
             )
 
         if self.discovery:
