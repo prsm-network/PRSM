@@ -554,6 +554,74 @@ class PRSMClient:
         ) as resp:
             return await resp.json()
 
+    async def find_and_fetch(
+        self,
+        query: str,
+        *,
+        min_tier: Optional[str] = None,
+        exclude_new: bool = False,
+        timeout: float = 30.0,
+    ) -> Dict[str, Any]:
+        """Sprint 1341 — one-call find → fetch → verify: the flagship data-consumer path.
+
+        Topic-searches the network (sp1339/1340), fetches the TOP hit, and INDEPENDENTLY
+        re-verifies the retrieved bytes client-side (sha256 == the record's content_hash — a
+        defense-in-depth check that doesn't trust the server's own verify), returning the
+        content plus its verifiable creator/provenance in one shot.
+
+        Raises ``FileNotFoundError`` when the search finds nothing or the top hit isn't
+        retrievable. The returned dict carries:
+          data (base64) · content_hash · integrity_verified (bool) · creator_eth_address ·
+          provenance_hash · filename · size_bytes · creator_tier · matched (the search row).
+
+        NOTE on trust: ``integrity_verified`` proves the bytes match their claimed
+        content_hash. It is NOT full AUTHENTICITY — that the ``provenance_hash`` is the
+        on-chain-registered creator is a separate check the caller runs against the
+        ProvenanceRegistry using the returned ``provenance_hash``.
+        """
+        import base64
+        import hashlib
+
+        search = await self.search_content(
+            query, limit=1, min_tier=min_tier, exclude_new=exclude_new)
+        results = (search or {}).get("results") or []
+        if not results:
+            raise FileNotFoundError(f"no content found for query {query!r}")
+        top = results[0]
+        cid = top.get("cid")
+
+        fetched = await self.fetch_content(cid, timeout=timeout, verify_hash=True)
+        if (fetched or {}).get("status") != "success":
+            raise FileNotFoundError(
+                f"top match {cid!r} not retrievable "
+                f"(status={(fetched or {}).get('status')!r})")
+
+        content_hash = fetched.get("content_hash")
+        data_b64 = fetched.get("data") or ""
+        integrity_verified = False
+        try:
+            if content_hash and data_b64:
+                computed = hashlib.sha256(base64.b64decode(data_b64)).hexdigest()
+                integrity_verified = computed == content_hash
+        except Exception:
+            integrity_verified = False
+
+        return {
+            "cid": cid,
+            "data": data_b64,
+            "content_hash": content_hash,
+            "integrity_verified": integrity_verified,
+            # provenance/attribution — prefer the retrieve values (authoritative), fall back
+            # to the search row (both surface them since sp1338/1339).
+            "creator_eth_address": (
+                fetched.get("creator_eth_address") or top.get("creator_eth_address")),
+            "provenance_hash": fetched.get("provenance_hash") or top.get("provenance_hash"),
+            "filename": fetched.get("filename") or top.get("filename"),
+            "size_bytes": fetched.get("size_bytes"),
+            "creator_tier": top.get("creator_tier"),
+            "matched": top,
+        }
+
     # ── Sprint 820 — Streaming verifiable inference ─────────────
 
     async def _stream_events(self, body: Dict[str, Any]):

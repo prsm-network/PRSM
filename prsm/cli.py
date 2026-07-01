@@ -12517,6 +12517,99 @@ def content_fetch_cli(
         )
 
 
+@content.command("get")
+@click.argument("query")
+@click.option(
+    "--output", "output_path", default=None,
+    type=click.Path(dir_okay=False),
+    help="Write the retrieved bytes to PATH (base64-decoded).",
+)
+@click.option(
+    "--min-tier", "min_tier",
+    type=click.Choice(["low", "medium", "high"]), default=None,
+    help="Only consider creators at or above this tier.",
+)
+@click.option(
+    "--api-url", "api_url_override", default=None, help="Override daemon URL",
+)
+@click.option(
+    "--format", "output_format",
+    type=click.Choice(["text", "json"]), default="text",
+    help="Output format",
+)
+def content_get_cli(
+    query: str, output_path: Optional[str], min_tier: Optional[str],
+    api_url_override: Optional[str], output_format: str,
+) -> None:
+    """Sprint 1341 — one-call find → fetch → verify: search a topic, fetch the top hit,
+    verify its integrity client-side, and show who created it.
+
+    Wraps the SDK ``find_and_fetch``: topic-search (sp1339/1340) → retrieve the top match →
+    re-hash the bytes (sha256 == content_hash) → surface creator/provenance. The flagship
+    data-consumer command. Exit 0 found+verified, 1 nothing found / integrity FAIL, 2 daemon
+    unreachable.
+    """
+    import base64 as _b64
+    import json as _json
+    from prsm.sdk.client import PRSMClient
+    url = _api_url_from_creds(api_url_override)
+
+    async def _go():
+        client = PRSMClient(base_url=url,
+                            api_key=(os.environ.get("PRSM_NODE_API_KEY") or "").strip())
+        try:
+            return await client.find_and_fetch(query, min_tier=min_tier)
+        finally:
+            await client.close()
+
+    try:
+        res = _run_async(_go())
+    except FileNotFoundError as exc:
+        if output_format == "json":
+            click.echo(_json.dumps({"ok": False, "error": str(exc)}))
+        else:
+            console.print(f"[yellow]No result:[/yellow] {exc}")
+        raise SystemExit(1)
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        if any(s in msg.lower() for s in ("connect", "refused", "unreachable", "timeout")):
+            console.print(f"[red]Daemon unreachable at {url}[/red] — {exc}")
+            raise SystemExit(2)
+        console.print(f"[red]content get failed:[/red] {exc}")
+        raise SystemExit(1)
+
+    if output_path:
+        try:
+            from pathlib import Path as _Path
+            _Path(output_path).write_bytes(_b64.b64decode((res.get("data") or "").encode()))
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]Write failed:[/red] {exc}")
+            raise SystemExit(1)
+
+    if output_format == "json":
+        # drop the (large) base64 payload from the json summary unless it was not written
+        summary = {k: v for k, v in res.items() if k != "data" or not output_path}
+        click.echo(_json.dumps(summary, indent=2, default=str))
+        raise SystemExit(0 if res.get("integrity_verified") else 1)
+
+    ok = res.get("integrity_verified")
+    console.print(
+        f"[green]Found[/green] [cyan]{res.get('cid')}[/cyan]  "
+        f"[bold]{res.get('filename') or '?'}[/bold]  "
+        f"[dim](tier={res.get('creator_tier', '?')})[/dim]")
+    console.print(
+        f"  integrity: {'[green]VERIFIED[/green]' if ok else '[red]FAILED[/red]'}  "
+        f"[dim](sha256 == content_hash)[/dim]")
+    if res.get("creator_eth_address"):
+        console.print(f"  creator: [dim]{res['creator_eth_address']}[/dim]")
+    if res.get("provenance_hash"):
+        console.print(f"  provenance_hash: [dim]{res['provenance_hash']}[/dim]")
+    console.print(f"  size_bytes: [dim]{res.get('size_bytes', '?')}[/dim]")
+    if output_path:
+        console.print(f"  wrote → [bold]{output_path}[/bold]")
+    raise SystemExit(0 if ok else 1)
+
+
 @content.command("mine")
 @click.option("--api-port", default=8000, type=int)
 @click.option(
