@@ -4066,6 +4066,12 @@ async def handle_prsm_analyze(
         if emit_progress:
             await emit_progress("Aggregating swarm results...", 3.0, 4.0)
 
+        # sp1347 — surface a 4xx (e.g. 402 insufficient funds) instead of rendering an empty
+        # "PRSM Analysis Result" with response="" (the /compute/forge money path can 402).
+        _e = _api_error(result)
+        if _e:
+            return f"PRSM analysis rejected: {_e}" + _funding_hint(_e)
+
         response = result.get("response", "")
         route = result.get("route", "unknown")
         job_id = result.get("job_id", "")
@@ -4669,6 +4675,11 @@ async def handle_prsm_upload_dataset(arguments: Dict[str, Any]) -> str:
             "base_access_fee": base_fee,
             "per_shard_fee": per_shard,
         })
+        # sp1347 — a 4xx (413 too big, 503 no publisher, 422) returns a dict, not an exception;
+        # without this guard the success message rendered with default fields = FAKE SUCCESS.
+        _e = _api_error(result)
+        if _e:
+            return f"Dataset upload failed: {_e}"
         return (
             f"Dataset Published\n"
             f"  ID: {dataset_id}\n"
@@ -4911,6 +4922,23 @@ async def handle_prsm_training_status(arguments: Dict[str, Any]) -> str:
             "  Once enough traces are collected (100+), the NWTN model can be fine-tuned\n"
             "  for better task decomposition and WASM agent generation."
         )
+
+
+def _api_error(result: Any) -> Optional[str]:
+    """sp1347 — extract a node API error message from a response dict, or None if it's not an
+    error. ``_call_node_api`` returns ``resp.json()`` REGARDLESS of HTTP status, so a 4xx
+    (FastAPI HTTPException → ``{"detail": ...}``, or a handler's ``{"error": ...}`` /
+    ``{"success": False}``) lands as a plain dict. Handlers that skip this and read success-path
+    keys silently render fake-success/blank output on an error (the bug class sp1346 fixed in
+    prsm_inference). Prefer explicit error/detail; an explicit ``success == False`` is an error."""
+    if not isinstance(result, dict):
+        return "unexpected non-dict response from the node"
+    err = result.get("error") or result.get("detail")
+    if err:
+        return str(err)
+    if result.get("success") is False:
+        return str(result.get("message") or "request failed")
+    return None
 
 
 def _funding_hint(err_text: Any) -> str:
