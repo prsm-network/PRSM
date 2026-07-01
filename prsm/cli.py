@@ -12049,6 +12049,9 @@ def content_search_cli(
             f"  • [cyan]{cid}[/cyan]  [bold]{fname}[/bold]  "
             f"[dim](tier={tier})[/dim]"
         )
+        # sp1339 — verifiable creator attribution at discovery time (when advertised).
+        if r.get("creator_eth_address"):
+            console.print(f"      creator: [dim]{r['creator_eth_address']}[/dim]")
 
 
 @content.command("publish-shard")

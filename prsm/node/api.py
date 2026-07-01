@@ -10354,6 +10354,16 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 "size_bytes": r.size_bytes,
                 "content_hash": r.content_hash,
                 "creator_id": r.creator_id,
+                # sp1339 — surface verifiable creator attribution + provenance on each search
+                # HIT (parity with the sp1338 /content/retrieve surface), so a consumer can see
+                # who created a dataset + its provenance commitment at DISCOVERY time — without
+                # fetching every candidate first. Both come from the gossip advertisement the
+                # index recorded; str-or-None (never a non-str from a malformed advertise).
+                "creator_eth_address": (
+                    r.creator_eth_address
+                    if isinstance(r.creator_eth_address, str) else None),
+                "provenance_hash": (
+                    r.provenance_hash if isinstance(r.provenance_hash, str) else None),
                 "creator_tier": tier,
                 "providers": list(r.providers),
                 "created_at": r.created_at,
