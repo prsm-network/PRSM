@@ -3751,6 +3751,32 @@ TOOLS = [
 
 # ── Tool Handlers ────────────────────────────────────────────────────────
 
+class NodeAPIError(Exception):
+    """sp1348 — a node HTTP error (4xx/5xx) raised by _call_node_api so it can't be swallowed
+    as data. ``_call_node_api`` used to return ``resp.json()`` regardless of status, so a 4xx
+    (FastAPI HTTPException → {"detail": ...}) reached handlers as a plain dict; any handler that
+    read success-path keys then rendered fake-success / blank (sp1346/1347 fixed a few by hand).
+    Raising at the source fixes the WHOLE class at once — every handler's 4xx now surfaces via
+    its own ``except`` or the call_tool dispatch. ``__str__`` folds in the sp1346 funding hint so
+    an insufficient-funds error self-guides toward prsm_faucet wherever it's surfaced."""
+
+    def __init__(self, status: int, message: str) -> None:
+        self.status = status
+        self.message = str(message)
+        super().__init__(self.message)
+
+    def __str__(self) -> str:
+        return f"HTTP {self.status}: {self.message}" + _funding_hint(self.message)
+
+
+def _raise_for_status(status: Any, body: Any) -> None:
+    """sp1348 — raise NodeAPIError when ``status`` is an HTTP error (>= 400), carrying the
+    parsed reason (error/detail/success-message via _api_error, else the raw text/status)."""
+    if isinstance(status, int) and status >= 400:
+        msg = _api_error(body) if isinstance(body, dict) else (str(body)[:300] if body else None)
+        raise NodeAPIError(status, msg or f"HTTP {status}")
+
+
 async def _get_node_api_url() -> str:
     """Get the PRSM node API URL."""
     return os.environ.get("PRSM_NODE_URL", "http://localhost:8000")
@@ -3773,6 +3799,17 @@ async def _call_node_api(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
+    async def _read(resp):
+        # sp1348 — read the body then RAISE on an HTTP error status so a 4xx/5xx can't be
+        # silently returned as data (the fake-success bug class). 2xx returns unchanged.
+        if raw_text:
+            txt = await resp.text()
+            _raise_for_status(resp.status, txt)
+            return txt
+        body = await resp.json()
+        _raise_for_status(resp.status, body)
+        return body
+
     async with aiohttp.ClientSession() as session:
         if method == "GET":
             async with session.get(
@@ -3780,9 +3817,7 @@ async def _call_node_api(
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
-                if raw_text:
-                    return await resp.text()
-                return await resp.json()
+                return await _read(resp)
         elif method == "DELETE":
             # Sprint 221 — added DELETE for agent allowance revoke.
             async with session.delete(
@@ -3790,9 +3825,7 @@ async def _call_node_api(
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
-                if raw_text:
-                    return await resp.text()
-                return await resp.json()
+                return await _read(resp)
         elif method == "PUT":
             # Sprint 232 — added PUT for node-resources update.
             async with session.put(
@@ -3801,9 +3834,7 @@ async def _call_node_api(
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
-                if raw_text:
-                    return await resp.text()
-                return await resp.json()
+                return await _read(resp)
         else:
             async with session.post(
                 f"{url}{path}",
@@ -3811,9 +3842,7 @@ async def _call_node_api(
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
-                if raw_text:
-                    return await resp.text()
-                return await resp.json()
+                return await _read(resp)
 
 
 # ──────────────────────────────────────────────────────────────────────
