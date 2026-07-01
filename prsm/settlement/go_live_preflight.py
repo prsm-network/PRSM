@@ -318,13 +318,121 @@ def run_settlement_go_live_preflight(
     return report
 
 
+def run_multistage_go_live_preflight(
+    *,
+    env: Optional[dict] = None,
+    reader: Optional[Any] = None,
+    provider_address: Optional[str] = None,
+    node: Optional[Any] = None,
+) -> SettlementGoLiveReport:
+    """Sprint 1337 (S4) — go-live preflight for BIG-MODEL MULTI-STAGE (Design A) on-chain
+    settlement. Read-only/offline go/no-go, extending the single-stage
+    ``run_settlement_go_live_preflight`` per-node.
+
+    In Design A each stage node self-commits its OWN share with its OWN funded settler key, so
+    the single-stage preflight (this node's settler key controls its provider_address + funded +
+    registry active + write-capable client) IS the per-node gate. On top of it this adds the
+    multi-stage config the per-stage delivery/split/commit path needs. Runnable standalone
+    (``python -m prsm.settlement.go_live_preflight multistage``) using env only; pass a live
+    ``node`` for the fuller per-stage client / receiver-store checks."""
+    import os
+    environ = env if env is not None else os.environ
+
+    # Per-node base gate (settler key / funding / registry / write-capable client).
+    report = run_settlement_go_live_preflight(
+        env=environ, reader=reader, provider_address=provider_address)
+
+    from prsm.settlement.client_wiring import multistage_settlement_enabled
+
+    # ── the multi-stage gate ────────────────────────────────────────────────
+    if multistage_settlement_enabled(environ):
+        report.add("multistage_settlement", "PASS",
+                   "PRSM_MULTISTAGE_SETTLEMENT enabled (per-stage delivery + self-commit active)")
+    else:
+        report.add("multistage_settlement", "FAIL",
+                   "PRSM_MULTISTAGE_SETTLEMENT is off — the per-stage delivery hook returns [] "
+                   "and no stage node self-commits; big-model paid settlement is inert.")
+
+    # ── node_id → payee wallet map (the splitter fail-closes without it) ─────
+    n = 0
+    try:
+        from prsm.node.compute_wallet_map import ComputeWalletMap
+        n = len(getattr(ComputeWalletMap.from_env(environ), "_map", {}) or {})
+    except Exception as exc:  # noqa: BLE001 — never crash the report
+        logger.warning("multistage preflight: wallet map load raised: %s", exc)
+    if n > 0:
+        report.add("compute_wallet_map", "PASS",
+                   f"PRSM_COMPUTE_WALLET_MAP_FILE resolves {n} node_id→payee entries")
+    else:
+        report.add("compute_wallet_map", "FAIL",
+                   "no compute wallet map (PRSM_COMPUTE_WALLET_MAP_FILE empty/missing) — the "
+                   "per-stage splitter fail-closes when a stage node_id has no payee address, so "
+                   "the payee set can't be built and multi-stage settlement cannot commit.")
+
+    # ── per-stage accumulate state (distinct from the single-stage client) ──
+    ms_state = (environ.get("PRSM_MULTISTAGE_SETTLEMENT_STATE_FILE", "") or "").strip()
+    report.add("per_stage_state_file", "INFO",
+               (f"per-stage accumulate state at {ms_state} (count_threshold=1 client)"
+                if ms_state else
+                "PRSM_MULTISTAGE_SETTLEMENT_STATE_FILE unset — a DISTINCT default path is used "
+                "(sp1329) so the per-stage client can't collide with the single-stage one."))
+
+    # ── foreign-node task delivery endpoints ────────────────────────────────
+    if (environ.get("PRSM_MULTISTAGE_ENDPOINT_MAP", "") or "").strip():
+        report.add("endpoint_resolution", "INFO",
+                   "PRSM_MULTISTAGE_ENDPOINT_MAP pins static stage-node endpoints (overrides "
+                   "runtime discovery).")
+    else:
+        report.add("endpoint_resolution", "WARN",
+                   "no static PRSM_MULTISTAGE_ENDPOINT_MAP — foreign per-node tasks rely on "
+                   "runtime peer discovery (sp1309, provider-address match). Works live but is "
+                   "unverifiable offline; confirm the stage peers are discoverable.")
+
+    # ── prereq reminder: worker per-stage settlement signatures ─────────────
+    report.add("worker_per_stage_sigs", "INFO",
+               "worker per-stage settlement signatures are emitted at the sign sites (sp1158) "
+               "when the settlement context is present — re-exercise the proven big-model runs "
+               "with PRSM_MULTISTAGE_SETTLEMENT on to confirm they populate the receipt.")
+
+    # ── richer per-stage wiring checks when a live node is supplied ─────────
+    if node is not None:
+        try:
+            from prsm.settlement.client_wiring import (
+                resolve_per_stage_receiver_store,
+                resolve_per_stage_settlement_client,
+            )
+            ps_client = resolve_per_stage_settlement_client(node, environ)
+            ps_write = bool(ps_client is not None and getattr(
+                getattr(ps_client, "_contract", None), "address", None))
+            report.add("per_stage_client", "PASS" if ps_write else "FAIL",
+                       "per-stage settlement client builds WRITE-CAPABLE (count_threshold=1)"
+                       if ps_write else
+                       "per-stage settlement client did NOT build write-capable — check the "
+                       "settler key / gate.")
+            rx = resolve_per_stage_receiver_store(node, environ)
+            report.add("per_stage_receiver_store", "PASS" if rx is not None else "WARN",
+                       "per-stage receiver store wired (in-process ingest of this node's own task)"
+                       if rx is not None else
+                       "no per-stage receiver store — this node's OWN stage task falls back to a "
+                       "self-HTTP POST instead of in-process ingest (sp1327).")
+        except Exception as exc:  # noqa: BLE001
+            report.add("per_stage_client", "WARN",
+                       f"per-stage wiring check raised: {exc}")
+
+    return report
+
+
 def _main() -> int:
     import json
-    report = run_settlement_go_live_preflight()
+    import sys
+    multistage = any(a in ("multistage", "--multistage") for a in sys.argv[1:])
+    report = (run_multistage_go_live_preflight() if multistage
+              else run_settlement_go_live_preflight())
+    label = "MULTI-STAGE " if multistage else ""
     print(json.dumps(report.to_dict(), indent=2))
     for f in report.findings:
         print(f"  [{f.status:4}] {f.check}: {f.detail}")
-    print(f"\n{'✅ GO' if report.go else '❌ NO-GO'} "
+    print(f"\n{label}{'✅ GO' if report.go else '❌ NO-GO'} "
           f"({sum(1 for f in report.findings if f.status == 'FAIL')} FAIL)")
     return 0 if report.go else 1
 
