@@ -10515,6 +10515,15 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         size_bytes: Optional[int] = Field(default=None, description="Size of retrieved content")
         content_hash: Optional[str] = Field(default=None, description="SHA-256 hash of content")
         filename: Optional[str] = Field(default=None, description="Original filename if available")
+        # sp1338 — surface verifiable-provenance + creator attribution to the CONSUMER (the
+        # server already resolves these for the §14 reputation record; they were dropped at
+        # the response boundary). Lets a data consumer see WHO created the dataset it fetched
+        # and its provenance commitment — the "verifiable provenance and creator attribution"
+        # the Vision positions PRSM on (§5.4). None for content that predates creator threading.
+        creator_eth_address: Optional[str] = Field(
+            default=None, description="Creator's on-chain address (provenance/attribution)")
+        provenance_hash: Optional[str] = Field(
+            default=None, description="On-chain provenance commitment hash for this content")
         providers_tried: int = Field(default=0, description="Number of providers attempted")
         error: Optional[str] = Field(default=None, description="Error message if status is 'error'")
 
@@ -10743,6 +10752,14 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 size_bytes=len(content_bytes),
                 content_hash=content_hash,
                 filename=filename,
+                # sp1338 — attach the provenance/attribution already resolved above so the
+                # consumer can verify who created this content + its provenance commitment.
+                # Coerce to str-or-None at this serialization boundary: a record whose field
+                # is absent/non-str must degrade to None, never 500 the retrieve.
+                creator_eth_address=(
+                    creator_eth_address if isinstance(creator_eth_address, str) else None),
+                provenance_hash=(
+                    provenance_hash if isinstance(provenance_hash, str) else None),
             )
             
         except asyncio.TimeoutError:

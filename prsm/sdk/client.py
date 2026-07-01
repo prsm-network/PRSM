@@ -530,6 +530,13 @@ class PRSMClient:
         Threads ``timeout`` + ``verify_hash`` as query params;
         the server-side timeout cap (PRSM_MAX_RETRIEVE_TIMEOUT_SEC,
         default 300) applies.
+
+        sp1338 — on ``status == "success"`` the payload also carries
+        ``content_hash`` (integrity), plus ``creator_eth_address`` and
+        ``provenance_hash`` (verifiable provenance + creator attribution),
+        so a consumer can confirm WHO created the fetched dataset and its
+        on-chain provenance commitment. Both are ``None`` for content that
+        predates creator threading.
         """
         await self._ensure_session()
         import aiohttp as _aiohttp

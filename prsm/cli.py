@@ -12475,6 +12475,15 @@ def content_fetch_cli(
     console.print(
         f"  content_hash: [dim]{data.get('content_hash', '?')}[/dim]"
     )
+    # sp1338 — verifiable provenance + creator attribution (None for pre-provenance content).
+    if data.get("creator_eth_address"):
+        console.print(
+            f"  creator: [bold]{data['creator_eth_address']}[/bold]"
+        )
+    if data.get("provenance_hash"):
+        console.print(
+            f"  provenance_hash: [dim]{data['provenance_hash']}[/dim]"
+        )
     console.print(
         f"  providers_tried: "
         f"[dim]{data.get('providers_tried', 0)}[/dim]"
