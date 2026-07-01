@@ -3674,6 +3674,9 @@ TOOLS = [
             "Phase 7 content-tier gating) and returns the inference output along with a "
             "signed receipt that the caller can independently verify against the settling "
             "node's published Ed25519 public key.\n\n"
+            "COSTS FTNS: needs a budget_ftns balance. If it fails with insufficient funds, "
+            "get testnet FTNS with prsm_faucet, verify with prsm_local_balance, then retry. "
+            "Estimate the cost first with prsm_inference_quote.\n\n"
             "TWO LAYERS OF PRIVACY (per PRSM_Vision.md §7):\n"
             "- content_tier — encryption status of data being queried:\n"
             "    A = public content (default; no encryption)\n"
@@ -4910,6 +4913,21 @@ async def handle_prsm_training_status(arguments: Dict[str, Any]) -> str:
         )
 
 
+def _funding_hint(err_text: Any) -> str:
+    """sp1346 — when an inference error looks like insufficient FTNS, return an actionable
+    next-step that points the model at the funding tools; otherwise ''. Makes the
+    faucet -> inference flow self-guiding through MCP: without this, a model that hits
+    "insufficient FTNS balance to lock escrow" gets a dead-end error and has no idea it can
+    prsm_faucet its way to funded (the compute-flagship analog of sp1345's data actionables)."""
+    t = str(err_text or "").lower()
+    if ("insufficient" in t or "402" in t or "not enough" in t
+            or ("escrow" in t and "balance" in t) or "no ftns" in t):
+        return ("\n\nOut of FTNS? Get testnet FTNS with prsm_faucet, confirm it landed with "
+                "prsm_local_balance, then retry. Estimate the cost first with "
+                "prsm_inference_quote.")
+    return ""
+
+
 async def handle_prsm_inference(
     arguments: Dict[str, Any],
     *,
@@ -4984,7 +5002,7 @@ async def handle_prsm_inference(
         except InferenceError as e:
             # Server-side rejection (budget, model, tier, etc.) —
             # surface the structured error directly.
-            return f"Inference rejected: {e.message}"
+            return f"Inference rejected: {e.message}" + _funding_hint(e.message)
         except Exception as e:  # noqa: BLE001
             return (
                 f"PRSM streaming inference failed: {e}.\n"
@@ -5019,12 +5037,16 @@ async def handle_prsm_inference(
     # Surface API-level errors with helpful context (only reachable
     # on the unary path — the streaming path raises InferenceError
     # for these cases, handled above).
-    if isinstance(result, dict) and result.get("error"):
-        return f"Inference rejected: {result['error']}"
+    # sp1346 — a FastAPI HTTPException (e.g. 402 insufficient funds) lands as {"detail": ...},
+    # NOT {"error": ...}; _call_node_api returns the body regardless of status. Pre-fix this
+    # surfaced "Inference failed: None" (losing the real reason + skipping the funding hint).
+    if isinstance(result, dict) and (result.get("error") or result.get("detail")):
+        _err = result.get("error") or result.get("detail")
+        return f"Inference rejected: {_err}" + _funding_hint(_err)
     if not isinstance(result, dict) or not result.get("success"):
-        return (
-            f"Inference failed: {result.get('error') if isinstance(result, dict) else 'unknown error'}"
-        )
+        _err = (result.get("error") or result.get("detail") or "unknown error"
+                if isinstance(result, dict) else "unknown error")
+        return f"Inference failed: {_err}" + _funding_hint(_err)
 
     # Format successful response with cost reconciliation footer
     # (Phase 3.x.1 Task 7 — uses shared _format_cost_footer helper).
