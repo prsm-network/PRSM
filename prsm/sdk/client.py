@@ -717,6 +717,90 @@ class PRSMClient:
                     ev["receipt_verified"] = False
             yield ev
 
+    async def pay_and_infer_multistage_stream(
+        self,
+        prompt: str,
+        *,
+        requester_key: str,
+        model_id: str,
+        max_tokens: int = 8,
+        budget_ftns: float = 1.0,
+        privacy_tier: str = "none",
+        content_tier: str = "A",
+        chain_id: int = 8453,
+        expiry_unix: Optional[int] = None,
+        verify_pubkey_b64: Optional[str] = None,
+    ):
+        """Sprint 1332 (S5) — paid big-model MULTI-STAGE STREAMING inference: the streaming twin
+        of ``pay_and_infer_multistage``.
+
+        Quotes the stage→node payee set + the deterministic price, signs ONE per-stage
+        PaymentAuthorization over it, and streams ``/compute/inference/stream`` with it; each
+        stage node self-settles its share (the streaming settle path fires the per-stage delivery,
+        sp1332). Yields the same token/result/error events as ``infer_stream``; the terminal
+        ``result`` event gains ``multistage_quote`` (price + payees) and, when ``verify_pubkey_b64``
+        is set, ``receipt_verified``.
+
+        NOTE: sliced big models CANNOT stream — the server disables the streaming runner under
+        ``PRSM_PARALLAX_SLICE_LOAD`` (a sliced node can't run ``model.generate``). This serves
+        multi-stage models that DON'T slice; for a sliced big model use the unary
+        ``pay_and_infer_multistage``. Raises ``ValueError`` on not-multi-stage / not-settleable."""
+        import time
+        from decimal import Decimal
+
+        from prsm.settlement.payment_client import (
+            build_per_stage_payment_authorization,
+        )
+
+        _max_tokens = int(max_tokens or 0)
+        quote = await self._post("/compute/inference/quote-multistage", {
+            "model_id": model_id, "prompt": prompt,
+            "max_tokens": _max_tokens, "budget_ftns": budget_ftns,
+        })
+        if not quote.get("multi_stage"):
+            raise ValueError(
+                "request does not route multi-stage (single node) — use pay_and_infer_stream: "
+                + str(quote.get("reason", "")))
+        if not quote.get("settleable"):
+            raise ValueError(
+                "multi-stage request not settleable: " + str(quote.get("reason", "")))
+
+        if expiry_unix is None:
+            expiry_unix = int(time.time()) + 300
+        payees_ftns = [
+            (addr, Decimal(str(share)) / (Decimal(10) ** 18))
+            for addr, share in quote.get("payees", [])
+        ]
+        auth = build_per_stage_payment_authorization(
+            requester_key=requester_key, payees=payees_ftns,
+            model_id=model_id, prompt=prompt, max_tokens=_max_tokens,
+            privacy_tier=privacy_tier, content_tier=content_tier,
+            expiry_unix=int(expiry_unix), chain_id=chain_id,
+        )
+        body = {
+            "prompt": prompt, "model_id": model_id, "budget_ftns": budget_ftns,
+            "privacy_tier": privacy_tier, "content_tier": content_tier,
+            "max_tokens": _max_tokens, "per_stage_payment_authorization": auth,
+        }
+        async for ev in self._stream_events(body):
+            if ev.get("type") == "result":
+                ev["multistage_quote"] = {
+                    "price_ftns": quote.get("price_ftns"),
+                    "stage_count": quote.get("stage_count"),
+                    "payees": quote.get("payees"),
+                    "payee_set_hash": quote.get("payee_set_hash"),
+                }
+                if verify_pubkey_b64:
+                    try:
+                        from prsm.compute.inference.models import InferenceReceipt
+                        from prsm.compute.inference.receipt import verify_receipt
+                        receipt = InferenceReceipt.from_dict(ev.get("receipt") or {})
+                        ev["receipt_verified"] = bool(
+                            verify_receipt(receipt, public_key_b64=verify_pubkey_b64))
+                    except Exception:
+                        ev["receipt_verified"] = False
+            yield ev
+
     # ── Ring 4: Pricing ───────────────────────────────────────────
 
     async def quote(

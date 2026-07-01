@@ -366,6 +366,36 @@ async def _settle_streaming_escrow(
                 logger.debug(
                     "Sprint 1037 accumulate hook error: %s", _acc_exc,
                 )
+            # sp1332 — streaming multi-stage settlement delivery (parity with the unary sp1324
+            # hook). When this STREAMED job carried a per-stage authorization + the gate is on,
+            # route each per-node task to its stage node so that node self-commits its share
+            # (Design A). NOTE: sliced big models can't stream (the streaming runner is disabled
+            # under PRSM_PARALLAX_SLICE_LOAD — a sliced node can't run model.generate), so this
+            # fires only for multi-stage models that DON'T use slice-load; the flagship sliced
+            # big-model path settles through the unary /compute/inference hook. FAIL-SOFT — a
+            # delivery miss leaves a stage unpaid (safe), never breaks the stream.
+            try:
+                if (_paid or {}).get("multi_stage") and (_paid or {}).get(
+                    "per_stage_authorization"
+                ) is not None and result.receipt is not None:
+                    from decimal import Decimal as _D_ms
+                    from prsm.settlement.client_wiring import (
+                        deliver_for_settled_receipt,
+                    )
+                    _total_wei = int(
+                        _D_ms(str(decision.release_to_operator)) * (_D_ms(10) ** 18))
+                    _ms_results = deliver_for_settled_receipt(
+                        node, receipt=result.receipt, total_value_wei=_total_wei,
+                        requester_address=_paid["requester"],
+                        per_stage_authorization=_paid["per_stage_authorization"])
+                    if _ms_results:
+                        logger.info(
+                            "sp1332 streaming multi-stage settlement delivery (job=%s): "
+                            "%d task(s), %d accepted", job_id, len(_ms_results),
+                            sum(1 for r in _ms_results if r.accepted))
+            except Exception as _ms_exc:  # noqa: BLE001 — never break the stream settle
+                logger.debug(
+                    "sp1332 streaming multi-stage delivery hook error: %s", _ms_exc)
             if decision.should_slash:
                 logger.warning(
                     "Sprint 784 — slash signal for job_id=%s: "

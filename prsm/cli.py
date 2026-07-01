@@ -7686,12 +7686,15 @@ def compute_pay_infer_cli(
               help="Base64 operator public key — verify the returned receipt inline.")
 @click.option("--quote-only", "quote_only", is_flag=True, default=False,
               help="Preview the multi-stage quote (price + payees) and STOP — sign + POST nothing.")
+@click.option("--stream", "do_stream", is_flag=True, default=False,
+              help="Stream tokens live (pay_and_infer_multistage_stream). Only for multi-stage "
+                   "models that DON'T slice-load — sliced big models can't stream (use unary).")
 @click.option("--format", "output_format", type=click.Choice(["text", "json"]), default="text")
 def compute_pay_infer_multistage_cli(
     prompt: str, model_id: str, max_tokens: int, budget_ftns: float,
     privacy_tier: str, content_tier: str, network_name: str,
     api_url_override: Optional[str], verify_pubkey_b64: Optional[str],
-    quote_only: bool, output_format: str,
+    quote_only: bool, do_stream: bool, output_format: str,
 ) -> None:
     """Sprint 1330 (S5) — pay for a big-model MULTI-STAGE (cross-host sliced) inference.
 
@@ -7747,6 +7750,54 @@ def compute_pay_infer_multistage_cli(
     if not requester_key:
         console.print("❌ no signing key — set PRIVATE_KEY (or FTNS_WALLET_PRIVATE_KEY).", style="red")
         raise SystemExit(1)
+
+    if do_stream:
+        async def _go_stream():
+            client = PRSMClient(base_url=url, api_key=(os.environ.get("PRSM_NODE_API_KEY") or "").strip())
+            terminal = None
+            try:
+                async for ev in client.pay_and_infer_multistage_stream(
+                    prompt, requester_key=requester_key, model_id=model_id,
+                    max_tokens=max_tokens, budget_ftns=budget_ftns,
+                    privacy_tier=privacy_tier, content_tier=content_tier,
+                    chain_id=chain_id, verify_pubkey_b64=verify_pubkey_b64):
+                    if ev.get("type") == "token" and output_format != "json":
+                        import sys as _sys
+                        _sys.stdout.write(ev.get("text_delta", "")); _sys.stdout.flush()
+                    elif ev.get("type") in ("result", "error"):
+                        terminal = ev
+            finally:
+                await client.close()
+            return terminal
+        try:
+            terminal = _run_async(_go_stream())
+        except ValueError as exc:
+            console.print(f"❌ {exc}", style="red")
+            raise SystemExit(1)
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc)
+            if any(s in msg.lower() for s in ("connect", "refused", "unreachable", "timeout")):
+                console.print(f"❌ cannot reach daemon at {url}: {exc}", style="red")
+                raise SystemExit(2)
+            console.print(f"❌ pay-infer-multistage (stream) failed: {exc}", style="red")
+            raise SystemExit(1)
+        terminal = terminal or {}
+        if output_format == "json":
+            click.echo(_json.dumps(terminal))
+            raise SystemExit(0 if terminal.get("type") == "result" else 1)
+        if terminal.get("type") == "error":
+            console.print(f"\n[red]stream error:[/red] {terminal.get('detail', terminal)}")
+            raise SystemExit(1)
+        mq = terminal.get("multistage_quote") or {}
+        if mq.get("price_ftns") is not None:
+            console.print(f"\n[dim]settled {mq['price_ftns']} FTNS across {mq.get('stage_count')} "
+                          f"stage node(s) from your escrow[/dim]")
+        if "receipt_verified" in terminal:
+            ok = terminal["receipt_verified"]
+            console.print(f"[dim]receipt_verified: "
+                          f"{'[green]yes[/green]' if ok else '[red]no[/red]'}[/dim]")
+        console.print()
+        return
 
     async def _go():
         client = PRSMClient(base_url=url, api_key=(os.environ.get("PRSM_NODE_API_KEY") or "").strip())
