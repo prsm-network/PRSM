@@ -73,6 +73,7 @@ class _FakeContentUploader:
     async def upload_text(
         self, *, text, filename, replicas,
         royalty_rate, parent_cids, creator_eth_address,
+        metadata=None,  # sp1340 — real signature carries topic-search metadata
     ):
         self.last_text = text
         self.last_filename = filename

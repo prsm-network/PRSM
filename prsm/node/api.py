@@ -135,6 +135,21 @@ class ContentUploadRequest(BaseModel):
         max_length=10_000,
         description="CIDs of source material this content derives from",
     )
+    # sp1340 — descriptive metadata for TOPIC search. A filename alone is a poor search key
+    # (a dataset named "data.bin" is unfindable by topic); title/description/tags flow into the
+    # content record's metadata dict + the GOSSIP_CONTENT_ADVERTISE payload, and
+    # ContentIndex._index_keywords tokenizes them — so a peer can find this content by topic,
+    # network-wide (sp1339). All optional (v1 uploads unaffected). Capped for gossip-payload +
+    # DoS safety.
+    title: Optional[str] = Field(
+        default=None, max_length=256,
+        description="Short human title — indexed for keyword/topic search.")
+    description: Optional[str] = Field(
+        default=None, max_length=4096,
+        description="Longer description / abstract — indexed for keyword/topic search.")
+    tags: Optional[List[Annotated[str, StringConstraints(max_length=64)]]] = Field(
+        default=None, max_length=32,
+        description="Topic tags — each indexed for keyword/topic search.")
     # Sprint 243 — capture creator's on-chain ETH address for the
     # eventual RoyaltyDistributor.distribute_royalty() destination.
     # Optional (default None) for backwards-compat with v1 uploads.
@@ -9775,10 +9790,22 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 )
             encrypted = True
 
+        # sp1340 — assemble the searchable metadata dict from the descriptive fields. It flows
+        # to the content record + the GOSSIP_CONTENT_ADVERTISE payload, where every peer's
+        # ContentIndex._index_keywords tokenizes the string + list-of-string values → topic
+        # search finds this content network-wide even when the filename is opaque.
+        _search_meta: Dict[str, Any] = {}
+        if req.title:
+            _search_meta["title"] = req.title
+        if req.description:
+            _search_meta["description"] = req.description
+        if req.tags:
+            _search_meta["tags"] = req.tags
         try:
             result = await node.content_uploader.upload_text(
                 text=upload_text,
                 filename=upload_filename,
+                metadata=_search_meta or None,
                 replicas=req.replicas,
                 royalty_rate=req.royalty_rate,
                 parent_cids=req.parent_cids if req.parent_cids else None,

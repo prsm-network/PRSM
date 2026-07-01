@@ -12229,6 +12229,18 @@ def content_publish_shard_cli(
     "Repeatable for multiple parents.",
 )
 @click.option(
+    "--title", "title", default=None,
+    help="Short human title — indexed for topic search so peers can find this by keyword.",
+)
+@click.option(
+    "--description", "description", default=None,
+    help="Longer description / abstract — indexed for topic search.",
+)
+@click.option(
+    "--tag", "tags", default=(), multiple=True,
+    help="Topic tag (repeatable) — each indexed for topic search.",
+)
+@click.option(
     "--api-url", "api_url_override", default=None,
     help="Override daemon URL",
 )
@@ -12240,7 +12252,8 @@ def content_publish_shard_cli(
 def content_publish_cli(
     file_path: str, filename_override: Optional[str],
     replicas: int, royalty_rate: Optional[float],
-    parent_cids: tuple, api_url_override: Optional[str],
+    parent_cids: tuple, title: Optional[str], description: Optional[str],
+    tags: tuple, api_url_override: Optional[str],
     output_format: str,
 ) -> None:
     """Sprint 806 — upload a text file to the P2P content store.
@@ -12296,6 +12309,13 @@ def content_publish_cli(
     }
     if royalty_rate is not None:
         body["royalty_rate"] = royalty_rate
+    # sp1340 — descriptive metadata for topic search (indexed network-wide).
+    if title:
+        body["title"] = title
+    if description:
+        body["description"] = description
+    if tags:
+        body["tags"] = list(tags)
 
     url = _api_url_from_creds(api_url_override)
     endpoint = f"{url}/content/upload"

@@ -620,6 +620,10 @@ class ContentIndex:
         for v in record.metadata.values():
             if isinstance(v, str):
                 text_parts.append(v)
+            # sp1340 — also index list/tuple-of-string metadata values (e.g. `tags`) so a
+            # creator's topic tags are keyword-searchable, not just string fields.
+            elif isinstance(v, (list, tuple)):
+                text_parts.extend(x for x in v if isinstance(x, str))
 
         cid = record.cid
         for word in self._tokenize(" ".join(text_parts)):

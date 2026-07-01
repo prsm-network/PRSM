@@ -58,9 +58,11 @@ class _FakeContentUploader:
     async def upload_text(
         self, *, text, filename, replicas,
         royalty_rate, parent_cids, creator_eth_address,
+        metadata=None,  # sp1340 — descriptive topic-search metadata (real signature has it)
     ):
         self.last_text = text
         self.last_filename = filename
+        self.last_metadata = metadata
         return _FakeUploadResult(
             cid="Qm" + "a" * 44,
             filename=filename,
