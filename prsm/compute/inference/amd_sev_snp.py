@@ -63,11 +63,17 @@ def _err(msg: str, structural: bool = False) -> AttestationVerificationResult:
 
 
 def _load_chain(cert_pem: bytes) -> List[x509.Certificate]:
+    # sp1336 — load via the lenient loader: AMD VCEK/ARK certs can carry a non-positive
+    # serial that a future `cryptography` release will REFUSE to parse (today it only
+    # warns). The lenient loader keeps cryptography's parsing for everything except the
+    # serial-rejection, so verification survives that upgrade. Byte-identical trust
+    # decision — see prsm.compute.inference.x509_lenient.
+    from prsm.compute.inference.x509_lenient import load_pem_x509_certificate_lenient
     certs: List[x509.Certificate] = []
     marker = b"-----BEGIN CERTIFICATE-----"
     for part in cert_pem.split(marker)[1:]:
         try:
-            certs.append(x509.load_pem_x509_certificate(marker + part))
+            certs.append(load_pem_x509_certificate_lenient(marker + part))
         except Exception:  # noqa: BLE001 - skip unparseable block
             continue
     return certs

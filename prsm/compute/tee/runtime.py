@@ -7,6 +7,7 @@ SoftwareTEERuntime wraps the Ring 1 WASM sandbox as a fallback.
 """
 
 import abc
+import base64
 import logging
 from typing import Any
 
@@ -299,24 +300,34 @@ class SevSnpTEERuntime(_HardwareTEERuntime):
         with urllib.request.urlopen(url, timeout=30) as r:  # noqa: S310 - fixed AMD KDS host
             return r.read()
 
+    @staticmethod
+    def _der_to_pem(der: bytes) -> bytes:
+        """DER → PEM by base64 wrapping — NO x509 parse. sp1336: AMD VCEK/ARK certs can
+        carry a non-positive serial that a future ``cryptography`` release will refuse to
+        parse; a transcode needs no parsing and is byte-for-byte what a parse+re-emit
+        would produce."""
+        import textwrap
+        body = "\n".join(textwrap.wrap(base64.b64encode(der).decode("ascii"), 64))
+        return (f"-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----\n").encode("ascii")
+
     @classmethod
     def _fetch_vcek_pem(cls, product: str, chip_id: bytes, tcb: dict) -> bytes:
-        """KDS serves the VCEK as DER; convert to PEM for the envelope."""
-        from cryptography import x509
-        from cryptography.hazmat.primitives import serialization
-        der = cls._http_get(cls._vcek_url(product, chip_id, tcb))
-        return x509.load_der_x509_certificate(der).public_bytes(serialization.Encoding.PEM)
+        """KDS serves the VCEK as DER; wrap to PEM for the envelope (sp1336: no parse)."""
+        return cls._der_to_pem(cls._http_get(cls._vcek_url(product, chip_id, tcb)))
 
     @classmethod
     def _fetch_ask_pem(cls, product: str) -> bytes:
         """KDS cert_chain returns ASK then ARK (PEM); the envelope carries the ASK (the
-        VCEK's issuer) — the ARK is the verifier's CONFIGURED trust root, not bundled."""
-        from cryptography import x509
-        from cryptography.hazmat.primitives import serialization
-        certs = x509.load_pem_x509_certificates(cls._http_get(cls._chain_url(product)))
-        if not certs:
+        VCEK's issuer) — the ARK is the verifier's CONFIGURED trust root, not bundled.
+        sp1336: slice the first PEM block by markers instead of x509-parsing (AMD certs
+        can carry a non-positive serial a future ``cryptography`` won't parse)."""
+        pem = cls._http_get(cls._chain_url(product))
+        marker = b"-----BEGIN CERTIFICATE-----"
+        end = b"-----END CERTIFICATE-----"
+        blocks = pem.split(marker)
+        if len(blocks) < 2 or end not in blocks[1]:
             raise TEEHardwareUnavailableError("KDS cert_chain returned no certificates")
-        return certs[0].public_bytes(serialization.Encoding.PEM)  # ASK
+        return marker + blocks[1].split(end)[0] + end + b"\n"  # ASK
 
     @staticmethod
     def _assemble_envelope(report: bytes, vcek_pem: bytes, ask_pem: bytes) -> bytes:
