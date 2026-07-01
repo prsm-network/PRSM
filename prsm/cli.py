@@ -12530,6 +12530,11 @@ def content_fetch_cli(
     help="Only consider creators at or above this tier.",
 )
 @click.option(
+    "--verify-provenance", "verify_provenance", is_flag=True, default=False,
+    help="Also verify ON-CHAIN (trustlessly) that the provenance_hash resolves to the claimed "
+         "creator. Needs an RPC URL + PRSM_PROVENANCE_REGISTRY_ADDRESS (or network default).",
+)
+@click.option(
     "--api-url", "api_url_override", default=None, help="Override daemon URL",
 )
 @click.option(
@@ -12539,15 +12544,16 @@ def content_fetch_cli(
 )
 def content_get_cli(
     query: str, output_path: Optional[str], min_tier: Optional[str],
-    api_url_override: Optional[str], output_format: str,
+    verify_provenance: bool, api_url_override: Optional[str], output_format: str,
 ) -> None:
-    """Sprint 1341 — one-call find → fetch → verify: search a topic, fetch the top hit,
+    """Sprint 1341/1342 — one-call find → fetch → verify: search a topic, fetch the top hit,
     verify its integrity client-side, and show who created it.
 
     Wraps the SDK ``find_and_fetch``: topic-search (sp1339/1340) → retrieve the top match →
-    re-hash the bytes (sha256 == content_hash) → surface creator/provenance. The flagship
-    data-consumer command. Exit 0 found+verified, 1 nothing found / integrity FAIL, 2 daemon
-    unreachable.
+    re-hash the bytes (sha256 == content_hash) → surface creator/provenance. With
+    ``--verify-provenance`` (sp1342) it ALSO confirms on-chain (trustlessly) that the
+    provenance_hash resolves to the claimed creator. The flagship data-consumer command. Exit 0
+    found + all requested checks pass, 1 nothing found / a check FAILED, 2 daemon unreachable.
     """
     import base64 as _b64
     import json as _json
@@ -12558,7 +12564,8 @@ def content_get_cli(
         client = PRSMClient(base_url=url,
                             api_key=(os.environ.get("PRSM_NODE_API_KEY") or "").strip())
         try:
-            return await client.find_and_fetch(query, min_tier=min_tier)
+            return await client.find_and_fetch(
+                query, min_tier=min_tier, verify_provenance=verify_provenance)
         finally:
             await client.close()
 
@@ -12586,28 +12593,40 @@ def content_get_cli(
             console.print(f"[red]Write failed:[/red] {exc}")
             raise SystemExit(1)
 
+    integrity_ok = bool(res.get("integrity_verified"))
+    all_ok = integrity_ok and (
+        not verify_provenance or bool(res.get("authenticity_verified")))
+
     if output_format == "json":
         # drop the (large) base64 payload from the json summary unless it was not written
         summary = {k: v for k, v in res.items() if k != "data" or not output_path}
         click.echo(_json.dumps(summary, indent=2, default=str))
-        raise SystemExit(0 if res.get("integrity_verified") else 1)
+        raise SystemExit(0 if all_ok else 1)
 
-    ok = res.get("integrity_verified")
     console.print(
         f"[green]Found[/green] [cyan]{res.get('cid')}[/cyan]  "
         f"[bold]{res.get('filename') or '?'}[/bold]  "
         f"[dim](tier={res.get('creator_tier', '?')})[/dim]")
     console.print(
-        f"  integrity: {'[green]VERIFIED[/green]' if ok else '[red]FAILED[/red]'}  "
+        f"  integrity: {'[green]VERIFIED[/green]' if integrity_ok else '[red]FAILED[/red]'}  "
         f"[dim](sha256 == content_hash)[/dim]")
+    if verify_provenance:
+        auth_ok = bool(res.get("authenticity_verified"))
+        detail = res.get("authenticity_detail") or ""
+        console.print(
+            f"  authenticity: {'[green]VERIFIED[/green]' if auth_ok else '[red]FAILED[/red]'}  "
+            f"[dim](on-chain creator {'==' if auth_ok else '!='} claimed)[/dim]"
+            + (f"  [dim]{detail}[/dim]" if not auth_ok and detail else ""))
+        if res.get("registered_creator"):
+            console.print(f"  registered_creator: [dim]{res['registered_creator']}[/dim]")
     if res.get("creator_eth_address"):
-        console.print(f"  creator: [dim]{res['creator_eth_address']}[/dim]")
+        console.print(f"  claimed creator: [dim]{res['creator_eth_address']}[/dim]")
     if res.get("provenance_hash"):
         console.print(f"  provenance_hash: [dim]{res['provenance_hash']}[/dim]")
     console.print(f"  size_bytes: [dim]{res.get('size_bytes', '?')}[/dim]")
     if output_path:
         console.print(f"  wrote → [bold]{output_path}[/bold]")
-    raise SystemExit(0 if ok else 1)
+    raise SystemExit(0 if all_ok else 1)
 
 
 @content.command("mine")

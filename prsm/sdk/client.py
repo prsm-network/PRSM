@@ -561,8 +561,10 @@ class PRSMClient:
         min_tier: Optional[str] = None,
         exclude_new: bool = False,
         timeout: float = 30.0,
+        verify_provenance: bool = False,
+        provenance_verifier: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """Sprint 1341 — one-call find → fetch → verify: the flagship data-consumer path.
+        """Sprint 1341/1342 — one-call find → fetch → verify: the flagship data-consumer path.
 
         Topic-searches the network (sp1339/1340), fetches the TOP hit, and INDEPENDENTLY
         re-verifies the retrieved bytes client-side (sha256 == the record's content_hash — a
@@ -574,10 +576,17 @@ class PRSMClient:
           data (base64) · content_hash · integrity_verified (bool) · creator_eth_address ·
           provenance_hash · filename · size_bytes · creator_tier · matched (the search row).
 
-        NOTE on trust: ``integrity_verified`` proves the bytes match their claimed
-        content_hash. It is NOT full AUTHENTICITY — that the ``provenance_hash`` is the
-        on-chain-registered creator is a separate check the caller runs against the
-        ProvenanceRegistry using the returned ``provenance_hash``.
+        Two independent trust checks:
+          * ``integrity_verified`` (always) — the bytes match their claimed content_hash.
+          * ``authenticity_verified`` (only when ``verify_provenance=True``, sp1342) — the
+            content's ``provenance_hash`` resolves ON-CHAIN (ProvenanceRegistry) to a creator
+            that MATCHES the claimed ``creator_eth_address``. This is the trustless check that
+            the provider isn't lying about who made the data: the client reads the chain
+            itself, it does not ask the (untrusted) serving node. Also returns
+            ``registered_creator`` (the on-chain creator, or None). ``provenance_verifier`` is
+            an injectable ``provenance_hash -> Optional[creator_address]`` callable (sync or
+            async); when omitted, a read-only ProvenanceRegistry client is built from
+            env/network config (None → authenticity_verified stays False with a reason).
         """
         import base64
         import hashlib
@@ -606,7 +615,7 @@ class PRSMClient:
         except Exception:
             integrity_verified = False
 
-        return {
+        result: Dict[str, Any] = {
             "cid": cid,
             "data": data_b64,
             "content_hash": content_hash,
@@ -621,6 +630,77 @@ class PRSMClient:
             "creator_tier": top.get("creator_tier"),
             "matched": top,
         }
+
+        # sp1342 — full ON-CHAIN AUTHENTICITY (opt-in). Resolve the provenance_hash against the
+        # ProvenanceRegistry and confirm the claimed creator IS the on-chain-registered creator.
+        # Trustless: the client reads the chain itself, never asking the untrusted serving node.
+        if verify_provenance:
+            import asyncio
+            ph = result["provenance_hash"]
+            claimed = result["creator_eth_address"]
+            registered = None
+            reason = None
+            verifier = provenance_verifier
+            if verifier is None:
+                verifier = self._default_provenance_verifier()
+            if not ph:
+                reason = "content carries no provenance_hash (unregistered)"
+            elif verifier is None:
+                reason = ("no on-chain verifier — set PRSM_PROVENANCE_REGISTRY_ADDRESS + an RPC "
+                          "URL, or pass provenance_verifier")
+            else:
+                try:
+                    if asyncio.iscoroutinefunction(verifier):
+                        registered = await verifier(ph)
+                    else:
+                        registered = await asyncio.to_thread(verifier, ph)
+                except Exception as exc:  # noqa: BLE001 — a lookup failure is NOT authenticity
+                    reason = f"provenance lookup failed: {type(exc).__name__}: {exc}"
+            authentic = bool(
+                registered and claimed
+                and str(registered).lower() == str(claimed).lower())
+            if not authentic and reason is None:
+                if not registered:
+                    reason = "provenance_hash is not registered on-chain"
+                else:
+                    reason = (f"on-chain creator {registered} does NOT match the claimed "
+                              f"creator {claimed}")
+            result["registered_creator"] = registered
+            result["authenticity_verified"] = authentic
+            result["authenticity_detail"] = "verified" if authentic else reason
+
+        return result
+
+    def _default_provenance_verifier(self):
+        """sp1342 — a read-only ``provenance_hash -> Optional[creator_address]`` verifier backed
+        by the on-chain ProvenanceRegistry, built from env/network config (no key needed). Returns
+        None when web3/registry/RPC aren't configured (→ authenticity stays unverified, honestly)."""
+        try:
+            import os
+
+            from prsm.config.networks import resolve_endpoints
+            from prsm.economy.web3.provenance_registry import ProvenanceRegistryClient
+
+            ep = resolve_endpoints()
+            registry = (os.environ.get("PRSM_PROVENANCE_REGISTRY_ADDRESS", "").strip()
+                        or getattr(ep, "provenance_registry", None))
+            rpc = (os.environ.get("PRSM_BASE_RPC_URL", "").strip()
+                   or os.environ.get("BASE_RPC_URL", "").strip()
+                   or getattr(ep, "rpc_url", None))
+            if not registry or not rpc:
+                return None
+            client = ProvenanceRegistryClient(rpc_url=rpc, contract_address=registry)
+
+            def _verify(ph):
+                ch = bytes.fromhex(str(ph).removeprefix("0x"))
+                if len(ch) != 32:
+                    return None
+                rec = client.get_content(ch)
+                return getattr(rec, "creator", None) if rec else None
+
+            return _verify
+        except Exception:  # noqa: BLE001 — unconfigured/unavailable → no verifier (honest None)
+            return None
 
     # ── Sprint 820 — Streaming verifiable inference ─────────────
 
