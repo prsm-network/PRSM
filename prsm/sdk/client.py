@@ -514,6 +514,35 @@ class PRSMClient:
         ) as resp:
             return await resp.json()
 
+    async def search_content_semantic(
+        self,
+        query: str,
+        *,
+        top_k: int = 10,
+        min_similarity: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Sprint 1344 — GET /content/search/semantic: find content CONCEPTUALLY related to
+        ``query`` (embedding-similarity), not just keyword matches. The complement to
+        ``search_content`` for topic/concept discovery.
+
+        Returns ``{query, results, count, semantic_available}``. Each result row carries
+        ``cid``, ``similarity`` (cosine), ``filename``, ``creator_eth_address``,
+        ``provenance_hash``, ``metadata``. ``semantic_available`` is False when the serving
+        node has no embedding function wired — then ``search_content`` (keyword) is the path.
+        """
+        await self._ensure_session()
+        import aiohttp as _aiohttp
+
+        params: Dict[str, Any] = {
+            "q": query, "top_k": top_k, "min_similarity": min_similarity}
+        async with self._session.get(
+            f"{self.base_url}/content/search/semantic",
+            headers=self._headers(),
+            timeout=_aiohttp.ClientTimeout(total=20.0),
+            params=params,
+        ) as resp:
+            return await resp.json()
+
     async def fetch_content(
         self,
         cid: str,

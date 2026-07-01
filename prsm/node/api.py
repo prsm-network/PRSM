@@ -10405,6 +10405,31 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             "count": len(rendered),
         }
 
+    @app.get("/content/search/semantic")
+    async def search_content_semantic(
+        q: str = "", top_k: int = 10, min_similarity: float = 0.0,
+    ) -> Dict[str, Any]:
+        """sp1344 — SEMANTIC content search: find content conceptually related to `q`, not just
+        keyword matches. Embeds the query + runs the top-k cosine scan over the semantic index,
+        returning hits ordered by descending similarity, each with filename/creator/provenance.
+
+        ``semantic_available`` is False when this node has no embedding function wired (or numpy
+        is absent) — the keyword ``/content/search`` is the always-available path.
+        """
+        if not (1 <= top_k <= 100):
+            raise HTTPException(status_code=422, detail=f"top_k must be in [1, 100], got {top_k}")
+        if len(q) > 1024:
+            raise HTTPException(status_code=413, detail=f"q size {len(q)} exceeds 1024 chars.")
+        uploader = getattr(node, "content_uploader", None)
+        if uploader is None or not hasattr(uploader, "semantic_search"):
+            return {"query": q, "results": [], "count": 0, "semantic_available": False}
+        rows = await uploader.semantic_search(
+            q, top_k=top_k, min_similarity=min_similarity)
+        # semantic_available reflects whether the embedding path is wired on this node
+        available = bool(getattr(uploader, "_embedding_fn", None) is not None)
+        return {"query": q, "results": rows, "count": len(rows),
+                "semantic_available": available}
+
     @app.get("/content/index/stats")
     async def content_index_stats() -> Dict[str, Any]:
         """Get content index statistics."""

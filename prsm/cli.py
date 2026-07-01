@@ -11963,6 +11963,11 @@ def content():
     help="Hide cold-start (TIER_NEW) creators.",
 )
 @click.option(
+    "--semantic", "semantic", is_flag=True, default=False,
+    help="SEMANTIC (embedding-similarity) search — find CONCEPTUALLY related content, not just "
+         "keyword matches. Needs the serving node to have an embedding function wired.",
+)
+@click.option(
     "--api-url", "api_url_override", default=None,
     help="Override daemon URL",
 )
@@ -11973,14 +11978,15 @@ def content():
 )
 def content_search_cli(
     query: str, limit: int, min_tier: Optional[str],
-    exclude_new: bool, api_url_override: Optional[str],
+    exclude_new: bool, semantic: bool, api_url_override: Optional[str],
     output_format: str,
 ) -> None:
-    """Sprint 808 — keyword search across the content index.
+    """Sprint 808/1344 — search the content index.
 
-    Wraps GET /content/search. Returns a list of content rows
-    matching QUERY. Use --min-tier to filter to creators with
-    a minimum reputation; --exclude-new to hide cold-start.
+    Wraps GET /content/search (keyword). With --semantic (sp1344) it uses
+    GET /content/search/semantic (embedding-similarity — conceptually related content).
+    Use --min-tier to filter to creators with a minimum reputation; --exclude-new to hide
+    cold-start (keyword mode only).
 
     Exit codes:
       0 — searched (zero hits is OK, not an error)
@@ -11990,12 +11996,16 @@ def content_search_cli(
     import json as _json
     import httpx as _httpx
     url = _api_url_from_creds(api_url_override)
-    endpoint = f"{url}/content/search"
-    params: Dict[str, Any] = {"q": query, "limit": limit}
-    if min_tier:
-        params["min_tier"] = min_tier
-    if exclude_new:
-        params["exclude_new"] = True
+    if semantic:
+        endpoint = f"{url}/content/search/semantic"
+        params: Dict[str, Any] = {"q": query, "top_k": limit}
+    else:
+        endpoint = f"{url}/content/search"
+        params = {"q": query, "limit": limit}
+        if min_tier:
+            params["min_tier"] = min_tier
+        if exclude_new:
+            params["exclude_new"] = True
     try:
         resp = _httpx.get(endpoint, params=params, timeout=15.0)
     except Exception as exc:
@@ -12030,25 +12040,30 @@ def content_search_cli(
 
     results = data.get("results", [])
     count = data.get("count", len(results))
-    if not results:
+    # sp1344 — flag when semantic search was requested but the node has no embedding path.
+    if semantic and data.get("semantic_available") is False:
         console.print(
-            f"[dim]No matches[/dim] for [bold]{query}[/bold]. "
-            "Try a broader query or drop --min-tier / "
-            "--exclude-new."
-        )
+            "[yellow]Semantic search unavailable on this node[/yellow] (no embedding function "
+            "wired). Falling back to keyword search would need to drop --semantic.")
+    if not results:
+        hint = ("Try a broader query." if semantic
+                else "Try a broader query or drop --min-tier / --exclude-new.")
+        console.print(f"[dim]No matches[/dim] for [bold]{query}[/bold]. {hint}")
         return
     console.print(
         f"[bold]{count} result(s)[/bold] for "
         f"[bold]{query}[/bold]:"
     )
     for r in results:
-        tier = r.get("creator_tier", "?")
         fname = r.get("filename", "?")
         cid = r.get("cid", "?")
+        # sp1344 — semantic rows rank by similarity; keyword rows by tier.
+        if semantic:
+            tag = f"[dim](similarity={r.get('similarity', '?')})[/dim]"
+        else:
+            tag = f"[dim](tier={r.get('creator_tier', '?')})[/dim]"
         console.print(
-            f"  • [cyan]{cid}[/cyan]  [bold]{fname}[/bold]  "
-            f"[dim](tier={tier})[/dim]"
-        )
+            f"  • [cyan]{cid}[/cyan]  [bold]{fname}[/bold]  {tag}")
         # sp1339 — verifiable creator attribution at discovery time (when advertised).
         if r.get("creator_eth_address"):
             console.print(f"      creator: [dim]{r['creator_eth_address']}[/dim]")

@@ -1946,6 +1946,56 @@ class ContentUploader:
             logger.info("sp1343 re-advertised %d local content item(s) to the network", n)
         return n
 
+    async def semantic_search(
+        self, query_text: str, *, top_k: int = 10, min_similarity: float = 0.0,
+    ) -> List[Dict[str, Any]]:
+        """sp1344 — semantic (embedding-similarity) content search: find content CONCEPTUALLY
+        related to ``query_text``, not just keyword matches.
+
+        Embeds the query and runs the tested top-k cosine scan (``_SemanticIndex.find_top_k``)
+        over the semantic index (this node's uploads + DHT-pulled peer embeddings), decorating
+        each hit with its ContentIndex record (filename / creator / provenance / metadata). Rows
+        are ordered by descending cosine similarity.
+
+        Returns ``[]`` when semantic search is UNAVAILABLE — no embedding function wired, or
+        numpy absent, or the query can't be embedded. Keyword ``/content/search`` (sp1339/1340)
+        stays the always-available path; this is the conceptual-relatedness complement.
+        """
+        if self._embedding_fn is None or not _HAS_NUMPY:
+            return []
+        try:
+            q_emb = await self._embedding_fn(query_text)
+        except Exception as exc:  # noqa: BLE001 — an embed failure is "no results", not a crash
+            logger.debug("sp1344 semantic query embedding failed: %s", exc)
+            return []
+        if q_emb is None:
+            return []
+
+        rows: List[Dict[str, Any]] = []
+        for cid, sim, creator_id in self._semantic_index.find_top_k(q_emb, int(top_k)):
+            if float(sim) < float(min_similarity):
+                continue
+            rec = None
+            if self.content_index is not None:
+                try:
+                    rec = self.content_index.lookup(cid)
+                except Exception:  # noqa: BLE001
+                    rec = None
+            if rec is None:
+                rec = self.uploaded_content.get(cid)
+            _creator = getattr(rec, "creator_eth_address", None)
+            _prov = getattr(rec, "provenance_hash", None)
+            rows.append({
+                "cid": cid,
+                "similarity": round(float(sim), 6),
+                "filename": getattr(rec, "filename", None),
+                "creator_id": creator_id,
+                "creator_eth_address": _creator if isinstance(_creator, str) else None,
+                "provenance_hash": _prov if isinstance(_prov, str) else None,
+                "metadata": getattr(rec, "metadata", None) or {},
+            })
+        return rows
+
     async def record_access(self, cid: str, accessor_id: str) -> None:
         """Record that content was accessed, distributing royalties.
 
