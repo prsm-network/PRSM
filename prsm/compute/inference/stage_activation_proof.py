@@ -50,6 +50,12 @@ class StageActivationProof:
     input_activation_hash: str   # sha256 hex of the input activation to this stage
     output_activation_hash: str  # sha256 hex of the output activation of this stage
     stage_signature_b64: str = ""  # Ed25519 sig (by stage_node_id) over signing_bytes()
+    # sp1334 (TEE Tier-B) — sha256 hex of the stage's TEE attestation bytes. When non-empty
+    # it is folded into signing_bytes(), so the stage signature (and thus the receipt) binds
+    # the exact attestation this node emitted — a node can no longer swap its tee_attestation
+    # without invalidating its own signature. Empty = unbound (pre-1334 behavior); see the
+    # omit-when-default handling in signing_bytes()/to_dict().
+    tee_attestation_hash: str = ""
 
     def signing_bytes(self, request_id: str) -> bytes:
         """Canonical bytes the WORKER signs. Binds the stage to the specific request +
@@ -65,16 +71,28 @@ class StageActivationProof:
             str(self.input_activation_hash),
             str(self.output_activation_hash),
         ]
+        # sp1334 — OMIT-WHEN-DEFAULT: an empty tee_attestation_hash appends nothing, so an
+        # unbound proof yields byte-identical signing bytes to pre-1334 (existing signatures
+        # keep verifying, incl. retained §7 receipts). A non-empty hash is appended as a
+        # LABELED line (can't collide with the fixed positional fields above), binding the
+        # attestation into the signature.
+        if self.tee_attestation_hash:
+            parts.append("tee_attestation_hash=" + str(self.tee_attestation_hash))
         return "\n".join(parts).encode("utf-8")
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "stage_index": int(self.stage_index),
             "stage_node_id": str(self.stage_node_id),
             "input_activation_hash": str(self.input_activation_hash),
             "output_activation_hash": str(self.output_activation_hash),
             "stage_signature_b64": str(self.stage_signature_b64),
         }
+        # sp1334 — omit-when-empty so an unbound proof serializes (→ StageActivationChain
+        # .stable_hash → the receipt signing payload) byte-identically to pre-1334.
+        if self.tee_attestation_hash:
+            d["tee_attestation_hash"] = str(self.tee_attestation_hash)
+        return d
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "StageActivationProof":
@@ -84,6 +102,7 @@ class StageActivationProof:
             input_activation_hash=str(d["input_activation_hash"]),
             output_activation_hash=str(d["output_activation_hash"]),
             stage_signature_b64=str(d.get("stage_signature_b64", "")),
+            tee_attestation_hash=str(d.get("tee_attestation_hash", "")),
         )
 
 
@@ -181,6 +200,38 @@ def activation_hash(blob: bytes) -> str:
     """The canonical sha256-hex of an activation blob, used on both the worker (when it
     signs its proof) and the verifier. Centralized so the two never diverge."""
     return hashlib.sha256(bytes(blob)).hexdigest()
+
+
+def stage_proof_bind_attestation_enabled(environ: Any = None) -> bool:
+    """sp1334 (TEE Tier-B) — whether to bind the stage's TEE attestation into the
+    StageActivationProof signature (PRSM_STAGE_PROOF_BIND_ATTESTATION).
+
+    DEFAULT OFF: proofs are unbound → signing_bytes()/to_dict() are byte-identical to
+    pre-1334 (zero rollout risk). Turn ON FLEET-WIDE together: the WORKER that signs and
+    the HEAD that reassembles the proof for verification must agree, since the head
+    recomputes the same sha256(attestation) the worker signed over. A split fleet (some
+    on, some off) would fail per-stage verification for the mixed inferences.
+    """
+    import os
+    env = environ if environ is not None else os.environ
+    return str(env.get("PRSM_STAGE_PROOF_BIND_ATTESTATION", "") or "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def tee_attestation_hash_for(
+    attestation: Any, *, environ: Any = None,
+) -> str:
+    """sp1334 — the value to put in StageActivationProof.tee_attestation_hash for a stage
+    whose emitted TEE attestation is ``attestation`` (bytes). Returns ``sha256_hex`` when
+    the binding is enabled AND the attestation is non-empty, else "" (unbound). Both the
+    worker (sign) and the head (reassemble-to-verify) call this on the SAME attestation
+    bytes, so they compute the identical hash deterministically."""
+    if not attestation:
+        return ""
+    if not stage_proof_bind_attestation_enabled(environ):
+        return ""
+    return activation_hash(bytes(attestation))
 
 
 # ── Verification (sp1108, brick 2) ────────────────────────────────────────────────

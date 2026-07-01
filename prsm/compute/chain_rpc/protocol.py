@@ -1809,14 +1809,21 @@ class RunLayerSliceResponse:
             from prsm.compute.inference.stage_activation_proof import (
                 StageActivationProof,
                 activation_hash,
+                tee_attestation_hash_for,
             )
             _in_hash = activation_hash(stage_input_blob)
             _out_hash = activation_hash(activation_blob)
+            # sp1334 (TEE Tier-B) — bind this stage's TEE attestation into the proof
+            # signature when PRSM_STAGE_PROOF_BIND_ATTESTATION is on (else "" → unbound,
+            # byte-identical to pre-1334). Ties the signature to the exact attestation this
+            # node emitted, so it can't be swapped post-hoc.
+            _att_hash = tee_attestation_hash_for(tee_attestation)
             _proof = StageActivationProof(
                 stage_index=int(chain_stage_index),
                 stage_node_id=identity.node_id,
                 input_activation_hash=_in_hash,
                 output_activation_hash=_out_hash,
+                tee_attestation_hash=_att_hash,
             )
             _proof_sig = identity.sign(_proof.signing_bytes(request_id))
         # sp1156 brick 2 — ALSO emit the challenge-defensible settlement leaf

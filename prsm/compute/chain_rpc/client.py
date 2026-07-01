@@ -252,6 +252,7 @@ def _build_stage_activation_chain(request_id: str, outcomes: List["StageOutcome"
     from prsm.compute.inference.stage_activation_proof import (
         StageActivationChain,
         StageActivationProof,
+        tee_attestation_hash_for,
     )
 
     if not outcomes:
@@ -270,6 +271,11 @@ def _build_stage_activation_chain(request_id: str, outcomes: List["StageOutcome"
             input_activation_hash=o.stage_input_activation_hash,
             output_activation_hash=o.stage_output_activation_hash,
             stage_signature_b64=o.stage_activation_proof_b64,
+            # sp1334 (TEE Tier-B) — recompute the SAME sha256(attestation) the worker signed
+            # over (deterministic, from the carried tee_attestation) so the reassembled proof's
+            # signing_bytes match and verify_stage_proof passes. "" when the binding is off
+            # (fleet-wide flag) → byte-identical to pre-1334.
+            tee_attestation_hash=tee_attestation_hash_for(o.tee_attestation),
         ))
     return StageActivationChain(request_id=request_id, proofs=proofs)
 
