@@ -1652,10 +1652,15 @@ def build_layer_stage_server_executor(
         FilesystemModelRegistry,
     )
     from prsm.compute.chain_rpc.server import LayerStageServer
-    from prsm.compute.tee.runtime import SoftwareTEERuntime
+    from prsm.compute.tee.runtime import build_tee_runtime
 
     registry = FilesystemModelRegistry(root=root, anchor=anchor)
-    tee_runtime = SoftwareTEERuntime()
+    # sp1333 (Tier-B producer) — was a hardcoded SoftwareTEERuntime() (dev-only attestation).
+    # The selector picks the SEV-SNP/SGX hardware runtime when PRSM_TEE_RUNTIME_KIND requests it
+    # (node-bound, fail-closed if the device is absent), so a real TEE node stamps each §7
+    # receipt with a REAL quote → the on-chain attestation commitment (roadmap F). Default
+    # (unset) is SoftwareTEERuntime — byte-for-byte unchanged for the common operator.
+    tee_runtime = build_tee_runtime(node_id=node.identity.node_id)
 
     # Sprint 618 (Phase 2F-5i) — env-tunable KVCacheManager for
     # INCREMENTAL decode_mode. Opt-in via

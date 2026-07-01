@@ -348,3 +348,69 @@ class SgxTEERuntime(_HardwareTEERuntime):
             "+ hardware — hardware-validation-pending (sprint E). The verifier "
             "side (IntelDCAPBackend) is already complete + tested."
         )
+
+
+def build_tee_runtime(node_id: str = "", environ=None) -> "TEERuntime":
+    """Sprint 1333 (TEE Tier-B producer) — select the TEE runtime the stage server attests with,
+    per ``PRSM_TEE_RUNTIME_KIND``.
+
+    The stage server (``LayerStageServer``) already calls ``tee_runtime.get_attestation_bytes()``
+    and stamps each §7 receipt's ``tee_attestation`` + ``tee_type`` from it, which flows into the
+    on-chain attestation commitment (roadmap F). Until now that runtime was hardcoded to
+    ``SoftwareTEERuntime`` (a DEV-ONLY blob), so a node on real SEV-SNP hardware could never emit a
+    real quote. This is the missing selection:
+
+      - ``""`` / ``"software"`` (DEFAULT): ``SoftwareTEERuntime`` — the dev-only attestation
+        (Tier A). Byte-for-byte the prior behavior.
+      - ``"auto"``: the first hardware runtime whose device is present (SEV-SNP, then SGX), else
+        software. Logs which was selected — a silent downgrade to software IS possible here, so
+        operators who require hardware attestation should pin the explicit kind, not ``auto``.
+      - ``"sev-snp"`` / ``"sgx"``: that hardware runtime, node-bound (REPORT_DATA[:32] ==
+        sha256(node_id), sp1083). FAIL-CLOSED — if the device is absent it RAISES
+        ``TEEHardwareUnavailableError`` rather than fall back to software: an operator who
+        explicitly asked for hardware attestation must never be silently handed the dev-only blob
+        (that would emit receipts CLAIMING hardware without it — a Tier-B integrity violation).
+    """
+    import os
+    env = environ if environ is not None else os.environ
+    kind = str(env.get("PRSM_TEE_RUNTIME_KIND", "") or "").strip().lower()
+
+    if kind in ("", "software"):
+        return SoftwareTEERuntime()
+
+    if kind == "auto":
+        for cls in (SevSnpTEERuntime, SgxTEERuntime):
+            rt = cls(node_id=node_id)
+            if rt.available:
+                logger.info(
+                    "build_tee_runtime: auto-selected hardware TEE runtime %s "
+                    "(node-bound attestation).", rt.name)
+                return rt
+        logger.info(
+            "build_tee_runtime: PRSM_TEE_RUNTIME_KIND=auto but no TEE device present; "
+            "using SoftwareTEERuntime (dev-only attestation).")
+        return SoftwareTEERuntime()
+
+    _KINDS = {
+        "sev-snp": SevSnpTEERuntime, "sevsnp": SevSnpTEERuntime, "sev": SevSnpTEERuntime,
+        "sgx": SgxTEERuntime,
+    }
+    cls = _KINDS.get(kind)
+    if cls is None:
+        logger.warning(
+            "build_tee_runtime: unknown PRSM_TEE_RUNTIME_KIND=%r; using SoftwareTEERuntime "
+            "(dev-only). Valid: software | auto | sev-snp | sgx.", kind)
+        return SoftwareTEERuntime()
+
+    rt = cls(node_id=node_id)
+    if not rt.available:
+        raise TEEHardwareUnavailableError(
+            f"PRSM_TEE_RUNTIME_KIND={kind!r} explicitly requested hardware TEE attestation, but "
+            f"the {rt.name} device is not present on this host. Refusing to fall back to the "
+            f"dev-only software runtime — that would emit §7 receipts CLAIMING hardware "
+            f"attestation without it. Provision the TEE device, or set "
+            f"PRSM_TEE_RUNTIME_KIND=auto (opportunistic) / software (dev-only).")
+    logger.info(
+        "build_tee_runtime: selected hardware TEE runtime %s (node-bound attestation) — "
+        "receipts will carry real quotes (Tier B).", rt.name)
+    return rt
