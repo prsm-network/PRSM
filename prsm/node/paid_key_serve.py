@@ -18,6 +18,35 @@ from __future__ import annotations
 from typing import Any, Callable
 
 
+class PaidKeyStore:
+    """sp1360 (F1 redesign, R4) — the publisher's retained wrapped-key store for the payment-gated
+    serve endpoint. Maps content_hash → ``{"wrapped_key": bytes, "fee_wei": int}``. In-memory: the
+    wrapped key is never broadcast and never written to disk here (it exists only to be served, per
+    request, to a paid + authenticated fetcher). ``put`` is called by the publish path; ``get`` by
+    ``serve_paid_key``."""
+
+    def __init__(self) -> None:
+        self._d: dict = {}
+
+    def put(self, content_hash: bytes, wrapped_key: bytes, fee_wei: int) -> None:
+        self._d[bytes(content_hash)] = {
+            "wrapped_key": bytes(wrapped_key), "fee_wei": int(fee_wei)}
+
+    def get(self, content_hash: bytes):
+        return self._d.get(bytes(content_hash))
+
+    def __len__(self) -> int:
+        return len(self._d)
+
+
+def build_paid_key_verify_payment(verifier_client: Any) -> Callable[[str, bytes, int], bool]:
+    """sp1360 — adapt a ContentAccessVerifierClient into the ``verify_payment(payer, content_hash,
+    fee_wei) -> bool`` callable ``serve_paid_key`` gates on (reads verifyPayment on-chain)."""
+    def _vp(payer: str, content_hash: bytes, fee_wei: int) -> bool:
+        return bool(verifier_client.verify_payment(payer, content_hash, fee_wei))
+    return _vp
+
+
 class PaidKeyServeError(Exception):
     """A paid-key serve was refused. ``status`` maps to the HTTP code the route returns
     (404 no such key, 401 bad signature, 402 unpaid, 503 can't verify on-chain)."""

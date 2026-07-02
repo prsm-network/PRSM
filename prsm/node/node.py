@@ -4509,6 +4509,37 @@ class PRSMNode:
             self._settlement_published_batch_store = _published_batch_store
             self._settlement_inference_receipt_store = _inference_receipt_store
             self._settlement_verified_batch_store = _verified_batch_store
+
+            # sp1360 (F1 redesign, R4) — Tier B/C paid-key serve data plane (default OFF). When
+            # PRSM_PAID_KEY_SERVE is enabled, hold a retained-key store the publish path populates
+            # and, if PRSM_CONTENT_ACCESS_VERIFIER is set, a read-only verify_payment callable the
+            # GET /content/paid-key endpoint gates on. Fail-soft: any wiring error leaves the serve
+            # disabled (the endpoint returns 503) rather than breaking node startup.
+            self._paid_key_store = None
+            self._paid_key_verify_payment = None
+            if (os.environ.get("PRSM_PAID_KEY_SERVE") or "").strip().lower() in (
+                    "1", "true", "yes", "on"):
+                try:
+                    from prsm.node.paid_key_serve import (
+                        PaidKeyStore,
+                        build_paid_key_verify_payment,
+                    )
+                    self._paid_key_store = PaidKeyStore()
+                    _cav = (os.environ.get("PRSM_CONTENT_ACCESS_VERIFIER") or "").strip()
+                    if _cav:
+                        from prsm.config.networks import resolve_endpoints
+                        from prsm.economy.web3.content_access_verifier import (
+                            ContentAccessVerifierClient,
+                        )
+                        _ep = resolve_endpoints(None)
+                        _vc = ContentAccessVerifierClient(
+                            _ep.rpc_url_default, _cav, _ep.ftns_token)  # read-only (no signer)
+                        self._paid_key_verify_payment = build_paid_key_verify_payment(_vc)
+                except Exception as _exc:  # noqa: BLE001
+                    logger.warning("paid-key serve wiring failed (disabled): %s", _exc)
+                    self._paid_key_store = None
+                    self._paid_key_verify_payment = None
+
             self._onchain_settlement_client = (
                 build_onchain_settlement_client_or_none(
                     provider_address=self._operator_address,
