@@ -34,6 +34,11 @@
     "provenance_registry_v2_chain_id": 8453,
     "provenance_registry_v2_basescan": "https://basescan.org/address/0xe0cedDA354f99526c7fbb9b9651e12aDB2180dbf#code",
     "_provenance_registry_v2_authorization": "PRSM-CR-2026-05-06-2",
-    "_provenance_registry_v2_invariants_verified_at_deploy": "MAX_ROYALTY_RATE_BPS=9800 AND verifyEmbeddingCommitment(zero,zero)==false (anti-zero-forgery guard)"
+    "_provenance_registry_v2_invariants_verified_at_deploy": "MAX_ROYALTY_RATE_BPS=9800 AND verifyEmbeddingCommitment(zero,zero)==false (anti-zero-forgery guard)",
+    "content_access_verifier": "0xF32A9049EeB1Fa3eE9f76A085a6b8662d5c9aE59",
+    "content_access_verifier_deployed_at": "2026-07-02T00:00:00Z",
+    "content_access_verifier_registry": "0xe0cedDA354f99526c7fbb9b9651e12aDB2180dbf",
+    "content_access_verifier_basescan": "https://basescan.org/address/0xF32A9049EeB1Fa3eE9f76A085a6b8662d5c9aE59#code",
+    "_content_access_verifier_note": "Tier B/C paid-decrypt verifier (sp1364), deployed + verified on Base mainnet. Wired to FTNS 0x5276...16e5 + ProvenanceRegistry V2 0xe0ce...0dbf (the registry the mainnet RoyaltyDistributor uses). Not Ownable / no funds at deploy. Post-deploy invariants confirmed read-only (ftns/registry match, verifyPayment(random)==false, empty pool)."
   }
 }
