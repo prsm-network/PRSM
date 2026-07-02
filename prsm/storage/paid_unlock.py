@@ -33,6 +33,36 @@ class PaidUnlockError(Exception):
     Fail-loud so a consumer never mistakes garbage for the real dataset."""
 
 
+def serialize_encrypted_content(payload: Any) -> bytes:
+    """sp1352 — serialize a ``prsm.storage.encryption.EncryptedPayload`` (the freely-served Tier
+    B/C ciphertext) to JSON bytes for transport/retrieval. The publisher serves these bytes; the
+    consumer parses them back with ``deserialize_encrypted_content`` before reconstruct."""
+    import base64
+    return json.dumps({
+        "v": 1,
+        "ciphertext_b64": base64.b64encode(bytes(payload.ciphertext)).decode("ascii"),
+        "iv_b64": base64.b64encode(bytes(payload.iv)).decode("ascii"),
+        "auth_tag_b64": base64.b64encode(bytes(payload.auth_tag)).decode("ascii"),
+        "key_id": str(payload.key_id),
+    }).encode("utf-8")
+
+
+def deserialize_encrypted_content(data: bytes) -> Any:
+    """sp1352 — parse the served Tier B/C ciphertext bytes back into a storage
+    ``EncryptedPayload`` (for ``reconstruct_paid_content``). Raises PaidUnlockError on garbage."""
+    import base64
+    from prsm.storage.encryption import EncryptedPayload
+    try:
+        d = json.loads(data)
+        return EncryptedPayload(
+            ciphertext=base64.b64decode(d["ciphertext_b64"]),
+            iv=base64.b64decode(d["iv_b64"]),
+            auth_tag=base64.b64decode(d["auth_tag_b64"]),
+            key_id=str(d["key_id"]))
+    except Exception as exc:  # noqa: BLE001
+        raise PaidUnlockError(f"malformed encrypted content envelope: {exc}") from exc
+
+
 def wrap_content_key_for_deposit(content_key: Any, recipients: List[Any]) -> bytes:
     """PUBLISHER side — wrap the content-encryption key to the buyer(s) as the on-chain
     ``encrypted_key`` for ``KeyDistributionClient.deposit_key``. The wrapped key is released

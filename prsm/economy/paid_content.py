@@ -20,7 +20,74 @@ This is what brick 4's SDK/CLI/MCP surface wraps.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, List, Optional
+
+
+def publish_paid_content(
+    *,
+    plaintext: bytes,
+    recipients: List[Any],
+    royalty_verifier_address: str,
+    release_fee_ftns_wei: int,
+    key_client: Any,
+    publish_ciphertext: Callable[[bytes, bytes], Any],
+    content_hash: Optional[bytes] = None,
+) -> Dict[str, Any]:
+    """Sprint 1352 (arc brick 4, PUBLISHER side) — make a dataset Tier B/C paid-access.
+
+    1. Encrypt the content with a fresh AES-256-GCM key (the ciphertext is served FREELY — a
+       node holding it sees only random bytes).
+    2. Wrap the content key to the designated buyer(s)' X25519 pubkeys
+       (``wrap_content_key_for_deposit``) → the on-chain ``encrypted_key``.
+    3. Deposit it on-chain (``KeyDistribution.deposit_key``), naming the royalty VERIFIER + the
+       release fee — a consumer who pays that fee to the verifier gets the key released.
+    4. Publish the ciphertext to the content layer (freely fetchable by content_hash).
+
+    Deposit BEFORE publish (don't serve orphan ciphertext if the deposit reverts). Returns
+    ``{content_hash, deposit_tx, deposit_status, release_fee_ftns_wei, ciphertext, num_recipients}``.
+
+    Args:
+      recipients: the buyers' ``EnterpriseRecipient`` (X25519 pubkeys — the DECRYPT identity).
+      royalty_verifier_address: the ``IRoyaltyPaymentVerifier`` the release gates on (the
+        publisher's choice; the consumer pays a fee this verifier confirms).
+      key_client: a ``KeyDistributionClient`` (deposit_key).
+      publish_ciphertext: ``(content_hash, ciphertext_bytes) -> ref`` — stores the freely-served
+        ciphertext under content_hash (the existing content layer).
+      content_hash: override the deposit key; default is sha256(ciphertext) (deterministic, ties
+        the deposit to the exact served bytes; a fresh random IV makes each publish distinct).
+    """
+    import hashlib
+
+    from prsm.storage.encryption import encrypt, generate_key
+    from prsm.storage.paid_unlock import (
+        serialize_encrypted_content,
+        wrap_content_key_for_deposit,
+    )
+
+    if not recipients:
+        raise ValueError("at least one recipient (buyer X25519 pubkey) is required")
+    if int(release_fee_ftns_wei) <= 0:
+        raise ValueError("release_fee_ftns_wei must be > 0")
+
+    content_key = generate_key()
+    ciphertext_bytes = serialize_encrypted_content(encrypt(plaintext, content_key))
+    ch = content_hash if content_hash is not None else hashlib.sha256(ciphertext_bytes).digest()
+    if len(ch) != 32:
+        raise ValueError(f"content_hash must be 32 bytes, got {len(ch)}")
+
+    wrapped = wrap_content_key_for_deposit(content_key, list(recipients))
+    tx, status = key_client.deposit_key(
+        ch, wrapped, royalty_verifier_address, int(release_fee_ftns_wei))
+    publish_ciphertext(ch, ciphertext_bytes)   # serve the freely-fetchable ciphertext
+
+    return {
+        "content_hash": ch,
+        "deposit_tx": tx,
+        "deposit_status": status,
+        "release_fee_ftns_wei": int(release_fee_ftns_wei),
+        "ciphertext": ciphertext_bytes,
+        "num_recipients": len(recipients),
+    }
 
 
 def pay_and_unlock(
