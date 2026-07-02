@@ -26,6 +26,42 @@ class KeyNotReleasedError(Exception):
     attempt to decrypt without the real key."""
 
 
+class KeyCommitmentMismatchError(Exception):
+    """sp1357 (F1 redesign) — the wrapped key fetched from the payment-gated endpoint does NOT
+    match the on-chain commitment: the server served the WRONG key (malicious or corrupted).
+    Fail-loud — never decrypt with an unverified key."""
+
+
+def fetch_and_verify_wrapped_key(fetch_fn: Any, content_hash: bytes, commitment: bytes) -> bytes:
+    """sp1357 (F1 redesign, R1) — the consumer's key acquisition under the binding-gate design.
+
+    Replaces reading the world-readable KeyReleased event (the F1 critical): fetch the wrapped key
+    OFF-chain via ``fetch_fn(content_hash) -> bytes`` (the payment-gated endpoint client, which
+    proves payment to the server) and VERIFY it against the on-chain ``commitment`` before returning
+    it. So neither an unpaid party (the endpoint gates on verifyPayment) nor a lying publisher
+    (the commitment check) can hand the consumer a usable-but-wrong key.
+
+    Raises KeyNotReleasedError if the fetch yields nothing; KeyCommitmentMismatchError if the served
+    bytes don't match the commitment. Pure/offline — ``fetch_fn`` and the commitment are injected.
+    """
+    from prsm.storage.paid_unlock import verify_key_commitment
+
+    if len(bytes(commitment)) != 32:
+        raise KeyCommitmentMismatchError(
+            f"on-chain commitment must be 32 bytes, got {len(bytes(commitment))}")
+    wrapped = fetch_fn(content_hash)
+    if not wrapped:
+        raise KeyNotReleasedError(
+            f"payment-gated key endpoint returned no key for content "
+            f"{bytes(content_hash).hex()[:12]}… (unpaid, not served, or endpoint down)")
+    wrapped = bytes(wrapped)
+    if not verify_key_commitment(wrapped, commitment):
+        raise KeyCommitmentMismatchError(
+            f"served wrapped key does not match the on-chain commitment for content "
+            f"{bytes(content_hash).hex()[:12]}… — the server served the WRONG key; refusing to use it")
+    return wrapped
+
+
 def _matching_key(events: Any, content_hash: bytes, recipient: str) -> Optional[bytes]:
     ch = bytes(content_hash)
     rl = str(recipient).lower()

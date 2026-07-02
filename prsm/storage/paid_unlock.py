@@ -33,6 +33,25 @@ class PaidUnlockError(Exception):
     Fail-loud so a consumer never mistakes garbage for the real dataset."""
 
 
+def key_commitment(wrapped_key: bytes) -> bytes:
+    """sp1357 (F1 redesign, R1) — the on-chain COMMITMENT to a wrapped content key: sha256(wrapped).
+
+    ONLY this 32-byte commitment is deposited on-chain — never the wrapped key itself, which would
+    be world-readable in contract storage (the B5 F1 critical). The consumer fetches the wrapped key
+    OFF-chain from a payment-gated endpoint and verifies it against this commitment (via
+    ``verify_key_commitment``) before trusting it, so a lying publisher cannot serve a wrong key.
+    sha256 (not Ethereum keccak) is fine: the contract stores the commitment as opaque bytes and
+    never hashes it — only the Python publisher and consumer compute it, and both use sha256."""
+    import hashlib
+    return hashlib.sha256(bytes(wrapped_key)).digest()
+
+
+def verify_key_commitment(wrapped_key: bytes, commitment: bytes) -> bool:
+    """sp1357 — constant-time check that ``wrapped_key`` matches the on-chain ``commitment``."""
+    import hmac
+    return hmac.compare_digest(key_commitment(wrapped_key), bytes(commitment))
+
+
 def serialize_encrypted_content(payload: Any) -> bytes:
     """sp1352 — serialize a ``prsm.storage.encryption.EncryptedPayload`` (the freely-served Tier
     B/C ciphertext) to JSON bytes for transport/retrieval. The publisher serves these bytes; the
