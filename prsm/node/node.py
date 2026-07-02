@@ -4524,7 +4524,9 @@ class PRSMNode:
                         PaidKeyStore,
                         build_paid_key_verify_payment,
                     )
-                    self._paid_key_store = PaidKeyStore()
+                    # sp1362 (R5 HIGH): durable store so paid buyers aren't stranded on restart.
+                    self._paid_key_store = PaidKeyStore(
+                        os.environ.get("PRSM_PAID_KEY_STORE_FILE", "").strip() or None)
                     _cav = (os.environ.get("PRSM_CONTENT_ACCESS_VERIFIER") or "").strip()
                     if _cav:
                         from prsm.config.networks import resolve_endpoints
@@ -4532,8 +4534,12 @@ class PRSMNode:
                             ContentAccessVerifierClient,
                         )
                         _ep = resolve_endpoints(None)
+                        # sp1362 (R5 low): pin the chain on the serve-side gate too — the gate
+                        # decides whether to release the retained key, so a hostile/mis-chained RPC
+                        # reporting a bogus verifyPayment==true would leak it.
                         _vc = ContentAccessVerifierClient(
-                            _ep.rpc_url_default, _cav, _ep.ftns_token)  # read-only (no signer)
+                            _ep.rpc_url, _cav, _ep.ftns_token,  # read-only (no signer)
+                            expected_chain_id=_ep.chain_id)
                         self._paid_key_verify_payment = build_paid_key_verify_payment(_vc)
                 except Exception as _exc:  # noqa: BLE001
                     logger.warning("paid-key serve wiring failed (disabled): %s", _exc)

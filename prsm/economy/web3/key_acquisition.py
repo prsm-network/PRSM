@@ -35,11 +35,16 @@ class KeyCommitmentMismatchError(Exception):
 def fetch_and_verify_wrapped_key(fetch_fn: Any, content_hash: bytes, commitment: bytes) -> bytes:
     """sp1357 (F1 redesign, R1) — the consumer's key acquisition under the binding-gate design.
 
-    Replaces reading the world-readable KeyReleased event (the F1 critical): fetch the wrapped key
-    OFF-chain via ``fetch_fn(content_hash) -> bytes`` (the payment-gated endpoint client, which
-    proves payment to the server) and VERIFY it against the on-chain ``commitment`` before returning
-    it. So neither an unpaid party (the endpoint gates on verifyPayment) nor a lying publisher
-    (the commitment check) can hand the consumer a usable-but-wrong key.
+    Fetch the wrapped key OFF-chain via ``fetch_fn(content_hash) -> bytes`` (the payment-gated
+    endpoint client, which proves payment to the server) and VERIFY it against ``commitment`` before
+    returning it.
+
+    TRUST NOTE (R5 sp1362): the commitment binds the served key ONLY as strongly as the commitment's
+    source. When ``commitment`` is read from the authoritative on-chain deposit, this defends against
+    a malicious/compromised SERVING NODE or a network MITM substituting a wrong key. It does NOT
+    defend against a malicious PUBLISHER, who controls both the deposit and the served key (and whom
+    the buyer already trusts for the dataset itself). Callers MUST source ``commitment`` from an
+    authoritative channel (on-chain), not from the same untrusted path that serves the key.
 
     Raises KeyNotReleasedError if the fetch yields nothing; KeyCommitmentMismatchError if the served
     bytes don't match the commitment. Pure/offline — ``fetch_fn`` and the commitment are injected.

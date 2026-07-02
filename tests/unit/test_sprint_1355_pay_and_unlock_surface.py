@@ -47,8 +47,10 @@ def _fixture(plaintext=b"paywalled dataset via the SDK"):
 
 
 async def _unlock(content_hash, content, buyer_priv, commitment, vc, fetch, *, fee_wei=_FEE):
+    from prsm.economy.web3.key_distribution import KeyDeposit
     kc = MagicMock()
-    kc.get_deposit.return_value = None                              # best-effort fee check skips
+    kc.get_deposit.return_value = KeyDeposit(                       # fee matches → check passes
+        publisher="0xpub", royalty="0xroy", release_fee_ftns_wei=_FEE, active=True)
     client = PRSMClient()
     try:
         return await client.pay_and_unlock_content(

@@ -43,13 +43,15 @@ def test_mismatched_fee_raises_before_paying():
         assert_fee_matches_deposit(c, _CH, _FEE + 1)
 
 
-def test_best_effort_skips_when_unreadable():
-    # no deposit / no client / raising client → skip (the endpoint gate is the hard check)
-    assert_fee_matches_deposit(None, _CH, _FEE)
-    assert_fee_matches_deposit(_client(None), _CH, _FEE)
+def test_fail_closed_when_client_present_but_unconfirmable():
+    # sp1362 (R5 low): only a MISSING client skips; a real client that can't confirm FAILS CLOSED
+    assert_fee_matches_deposit(None, _CH, _FEE)                     # no client → skip (opt-out)
+    with pytest.raises(FeeMismatchError, match="nothing to unlock"):
+        assert_fee_matches_deposit(_client(None), _CH, _FEE)       # deposit None → fail-closed
     raising = MagicMock()
     raising.get_deposit.side_effect = RuntimeError("rpc down")
-    assert_fee_matches_deposit(raising, _CH, _FEE)      # no raise
+    with pytest.raises(FeeMismatchError, match="could not confirm"):
+        assert_fee_matches_deposit(raising, _CH, _FEE)             # RPC error → fail-closed
 
 
 # ── publish order: deposit LAST (F5) ──────────────────────────────────────────

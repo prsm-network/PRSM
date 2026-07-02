@@ -15,22 +15,65 @@ useless; the gate exists to stop the DESIGNATED buyer from fetching without payi
 """
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 
 class PaidKeyStore:
-    """sp1360 (F1 redesign, R4) — the publisher's retained wrapped-key store for the payment-gated
-    serve endpoint. Maps content_hash → ``{"wrapped_key": bytes, "fee_wei": int}``. In-memory: the
-    wrapped key is never broadcast and never written to disk here (it exists only to be served, per
-    request, to a paid + authenticated fetcher). ``put`` is called by the publish path; ``get`` by
-    ``serve_paid_key``."""
+    """sp1360/1362 (F1 redesign) — the publisher's retained wrapped-key store for the payment-gated
+    serve endpoint. Maps content_hash → ``{"wrapped_key": bytes, "fee_wei": int}``.
 
-    def __init__(self) -> None:
+    DURABLE (sp1362, R5 HIGH): the on-chain payment gate persists forever, so the key MUST outlive a
+    node restart — otherwise a buyer who pays after a restart gets 404 and loses funds with no
+    refund. When constructed with a ``path``, every ``put`` is flushed to a JSON file and the store
+    rehydrates from it on startup. The wrapped key is already ciphertext (sealed to the buyer's
+    X25519 pubkey), so file persistence adds negligible exposure; still, treat the file as
+    operator-protected. Without a ``path`` it stays in-memory (tests / ephemeral use)."""
+
+    def __init__(self, path: "Optional[str]" = None) -> None:
         self._d: dict = {}
+        self._path = (path or "").strip() or None
+        if self._path:
+            self._load()
+
+    def _load(self) -> None:
+        import base64
+        import json
+        import os
+        if not (self._path and os.path.exists(self._path)):
+            return
+        try:
+            with open(self._path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            for ch_hex, entry in (raw or {}).items():
+                self._d[bytes.fromhex(ch_hex)] = {
+                    "wrapped_key": base64.b64decode(entry["wrapped_key_b64"]),
+                    "fee_wei": int(entry["fee_wei"]),
+                }
+        except Exception:  # noqa: BLE001 — a corrupt file must not crash startup (serve returns 404)
+            pass
+
+    def _flush(self) -> None:
+        import base64
+        import json
+        import os
+        if not self._path:
+            return
+        out = {
+            ch.hex(): {
+                "wrapped_key_b64": base64.b64encode(e["wrapped_key"]).decode("ascii"),
+                "fee_wei": int(e["fee_wei"]),
+            }
+            for ch, e in self._d.items()
+        }
+        tmp = self._path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(out, fh)
+        os.replace(tmp, self._path)   # atomic
 
     def put(self, content_hash: bytes, wrapped_key: bytes, fee_wei: int) -> None:
         self._d[bytes(content_hash)] = {
             "wrapped_key": bytes(wrapped_key), "fee_wei": int(fee_wei)}
+        self._flush()
 
     def get(self, content_hash: bytes):
         return self._d.get(bytes(content_hash))

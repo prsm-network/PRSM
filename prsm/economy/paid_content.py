@@ -111,23 +111,29 @@ class FeeMismatchError(Exception):
 
 
 def assert_fee_matches_deposit(key_client: Any, content_hash: bytes, fee_wei: int) -> None:
-    """sp1361 — refuse to pay a fee that doesn't match the on-chain deposit. BEST-EFFORT: if the
-    deposit can't be read (no client / RPC issue / not deposited), skip — the endpoint's
-    verifyPayment gate is the hard check; this just catches the common wrong-fee footgun early.
-    Raises FeeMismatchError on a definite mismatch."""
+    """sp1361/1362 — refuse to pay a fee that doesn't match the on-chain deposit. FAIL-CLOSED
+    (R5 low): the ContentAccessVerifier pulls FTNS for ANY fee, but the key-serve gate checks the
+    AUTHORITATIVE deposit fee — so a wrong/unconfirmable fee is pulled with no unlock and no refund.
+    Therefore, when a key_client IS provided, an unreadable deposit (RPC error) or a missing deposit
+    now RAISES rather than silently paying. Only skips when NO client was provided (caller opted
+    out — offline/tests)."""
     if key_client is None or not hasattr(key_client, "get_deposit"):
         return
+    ch12 = bytes(content_hash).hex()[:12]
     try:
         deposit = key_client.get_deposit(content_hash)
-    except Exception:  # noqa: BLE001 — an unreadable deposit must not block a legitimate payment
-        return
-    if deposit is None:
-        return
-    on_chain = int(getattr(deposit, "release_fee_ftns_wei", -1))
-    if on_chain >= 0 and on_chain != int(fee_wei):
+    except Exception as exc:  # noqa: BLE001 — can't confirm ⇒ don't pay (fail-closed)
         raise FeeMismatchError(
-            f"fee {fee_wei} != on-chain deposit fee {on_chain} for content "
-            f"{bytes(content_hash).hex()[:12]}… — refusing to pay a fee that won't unlock")
+            f"could not confirm the on-chain deposit fee for content {ch12}… ({exc}) — refusing "
+            f"to pay a fee that may not unlock") from exc
+    if deposit is None:
+        raise FeeMismatchError(
+            f"no on-chain deposit for content {ch12}… — nothing to unlock; refusing to pay")
+    on_chain = int(getattr(deposit, "release_fee_ftns_wei", -1))
+    if on_chain != int(fee_wei):
+        raise FeeMismatchError(
+            f"fee {fee_wei} != on-chain deposit fee {on_chain} for content {ch12}… — refusing to "
+            f"pay a fee that won't unlock")
 
 
 def build_content_access_settle_fee(
