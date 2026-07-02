@@ -76,24 +76,12 @@ def test_sdk_accepts_hex_content_hash():
     assert out == plaintext
 
 
-def test_sdk_validates_content_hash_fee_and_commitment():
+def test_sdk_validates_content_hash_and_fee():
     _o, content, buyer_priv, commitment, vc, fetch, _ = _fixture()
     with pytest.raises(ValueError, match="32 bytes"):
         asyncio.run(_unlock("dead", content, buyer_priv, commitment, vc, fetch))
     with pytest.raises(ValueError, match="positive"):
         asyncio.run(_unlock(_CH, content, buyer_priv, commitment, vc, fetch, fee_wei=0))
-
-    async def _no_commit():
-        client = PRSMClient()
-        try:
-            return await client.pay_and_unlock_content(
-                _CH, requester_key="0x" + "01" * 32, x25519_privkey_b64=buyer_priv,
-                fee_wei=_FEE, verifier_address="0x" + "ab" * 20, commitment=None,
-                _verifier_client=vc, _content=content, _fetch_wrapped_key=fetch)
-        finally:
-            await client.close()
-    with pytest.raises(ValueError, match="commitment"):
-        asyncio.run(_no_commit())
 
 
 def test_sdk_wrong_served_key_fails_commitment():
@@ -104,6 +92,65 @@ def test_sdk_wrong_served_key_fails_commitment():
     bad_fetch = lambda ch: (b"a substituted key" if paid["ok"] else None)
     with pytest.raises(KeyCommitmentMismatchError, match="WRONG key"):
         asyncio.run(_unlock(_CH, content, buyer_priv, commitment, vc, bad_fetch))
+
+
+def test_sdk_reads_authoritative_commitment_when_not_supplied():
+    # sp1363 (R5 MEDIUM): commitment=None → the SDK reads it from the gated KeyReleased event
+    # (acquire_released_key) AFTER paying, not from the untrusted serve path.
+    from eth_account import Account
+    from prsm.economy.web3.key_distribution import KeyDeposit, KeyNotFoundError
+    from prsm.storage.encryption import encrypt, generate_key
+    from prsm.storage.paid_unlock import key_commitment, wrap_content_key_for_deposit
+
+    content_key = generate_key()
+    plaintext = b"authoritative-commitment path"
+    content = encrypt(plaintext, content_key)
+    buyer_priv, buyer_pub = generate_recipient_keypair()
+    wrapped = wrap_content_key_for_deposit(
+        content_key, [EnterpriseRecipient(identifier="b", x25519_pubkey_b64=buyer_pub)])
+    commitment = key_commitment(wrapped)
+    payer = Account.from_key("0x" + "01" * 32).address
+
+    state = {"paid": False}
+    vc = MagicMock()
+    vc.address = payer
+    vc.verify_payment.return_value = False
+    vc.pay_for_access.side_effect = lambda *a: state.__setitem__("paid", True)
+
+    class _Ev:
+        content_hash, recipient, encrypted_key = _CH, payer, commitment
+
+    class _KD:                                          # release emits the COMMITMENT in the event
+        def __init__(self):
+            self._rel = []
+
+        def get_deposit(self, ch):
+            return KeyDeposit(publisher="0xp", royalty="0xr", release_fee_ftns_wei=_FEE, active=True)
+
+        def latest_block(self):
+            return 100
+
+        def get_key_released_events(self, fb, tb, *, argument_filters=None):
+            return list(self._rel)
+
+        def release(self, ch, recipient):
+            if not state["paid"]:
+                raise KeyNotFoundError("unpaid")
+            self._rel.append(_Ev())
+            return ("0xr", None)
+
+    async def _go():
+        client = PRSMClient()
+        try:
+            return await client.pay_and_unlock_content(
+                _CH, requester_key="0x" + "01" * 32, x25519_privkey_b64=buyer_priv,
+                fee_wei=_FEE, verifier_address="0x" + "ab" * 20, commitment=None,
+                _verifier_client=vc, _content=content, _key_client=_KD(),
+                _fetch_wrapped_key=lambda ch: (wrapped if state["paid"] else None))
+        finally:
+            await client.close()
+
+    assert asyncio.run(_go()) == plaintext
 
 
 # ── CLI: keys must come from the environment, never argv ──────────────────────

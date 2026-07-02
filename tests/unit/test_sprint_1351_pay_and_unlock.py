@@ -63,6 +63,27 @@ def test_already_paid_no_settle():
     assert out == plaintext
 
 
+def test_authoritative_commitment_read_after_payment():
+    # sp1363 (R5 MEDIUM): when no commitment is supplied, it's read via fetch_commitment AFTER
+    # settle (the on-chain release is gated on payment) — never trusted from the serve path.
+    content, wrapped, commitment, buyer_priv, plaintext = _fixture()
+    order = []
+    out = pay_and_unlock(
+        content_hash=_CH, recipient_privkey_b64=buyer_priv,
+        fetch_wrapped_key=lambda ch: wrapped, retrieve_content=lambda ch: content,
+        fetch_commitment=lambda: (order.append("read-commitment"), commitment)[1],
+        settle_fee=lambda: order.append("pay"))
+    assert out == plaintext
+    assert order == ["pay", "read-commitment"]         # commitment read AFTER payment
+
+
+def test_missing_both_commitment_and_fetch_raises():
+    content, wrapped, _commitment, buyer_priv, _ = _fixture()
+    with pytest.raises(PaidUnlockError, match="commitment or fetch_commitment"):
+        pay_and_unlock(content_hash=_CH, recipient_privkey_b64=buyer_priv,
+                       fetch_wrapped_key=lambda ch: wrapped, retrieve_content=lambda ch: content)
+
+
 # ── fail-loud at each stage ───────────────────────────────────────────────────
 
 def test_unpaid_fetch_returns_nothing_surfaces_key_not_released():

@@ -816,10 +816,8 @@ class PRSMClient:
         commit = commitment
         if commit is not None and not isinstance(commit, (bytes, bytearray)):
             commit = bytes.fromhex(commit[2:] if str(commit).startswith("0x") else commit)
-        if commit is None:
-            raise ValueError(
-                "commitment (the on-chain sha256 commitment to the wrapped key) is required — "
-                "obtain it from the publisher manifest or the deposit")
+        # sp1363 (R5 MEDIUM): if the caller doesn't supply an authoritative commitment, we read it
+        # from the on-chain KeyReleased event below (never trust a publisher/MITM-supplied value).
 
         # Resolve chain config (RPC / FTNS / KeyDistribution) unless injected.
         if _verifier_client is None or _key_client is None:
@@ -838,13 +836,27 @@ class PRSMClient:
                 rpc, verifier_address, ftns, private_key=requester_key,
                 expected_chain_id=chain_id)
 
-        # sp1361 (review F3/F4/F12): confirm the fee matches the on-chain deposit BEFORE paying, so
-        # a mismatched fee can't be pulled with no way to unlock. Best-effort (read-only client).
+        # The KeyDistribution client — SIGNING (sp1363: it also drives the gated release() that
+        # surfaces the authoritative on-chain commitment) — unless injected.
         key_client = _key_client
         if key_client is None:
             from prsm.economy.web3.key_distribution import KeyDistributionClient
-            key_client = KeyDistributionClient(rpc, keydist)  # read-only, no signer
+            key_client = KeyDistributionClient(rpc, keydist, private_key=requester_key)
+        # sp1361 (review F3/F4/F12): confirm the fee matches the on-chain deposit BEFORE paying.
         assert_fee_matches_deposit(key_client, ch, int(fee_wei))
+
+        # sp1363 (R5 MEDIUM): when no authoritative commitment was supplied, read it from the
+        # gated KeyReleased event (acquire_released_key) AFTER payment — never from the untrusted
+        # publisher/serve path.
+        fetch_commitment = None
+        if commit is None:
+            from eth_account import Account as _Account
+
+            from prsm.economy.web3.key_acquisition import acquire_released_key
+            _payer = _Account.from_key(requester_key).address
+
+            def fetch_commitment(_kc=key_client, _c=ch, _p=_payer):
+                return bytes(acquire_released_key(_kc, _c, _p))
 
         # The freely-served ciphertext (fetched async, then decrypted in the worker thread).
         content = _content
@@ -870,8 +882,8 @@ class PRSMClient:
         return await asyncio.to_thread(
             pay_and_unlock,
             content_hash=ch, recipient_privkey_b64=x25519_privkey_b64, commitment=commit,
-            fetch_wrapped_key=fetch_wrapped_key, retrieve_content=lambda _c: content,
-            settle_fee=settle_fee)
+            fetch_commitment=fetch_commitment, fetch_wrapped_key=fetch_wrapped_key,
+            retrieve_content=lambda _c: content, settle_fee=settle_fee)
 
     # ── Sprint 820 — Streaming verifiable inference ─────────────
 

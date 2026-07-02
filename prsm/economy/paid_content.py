@@ -171,9 +171,10 @@ def pay_and_unlock(
     *,
     content_hash: bytes,
     recipient_privkey_b64: str,
-    commitment: bytes,
     fetch_wrapped_key: Callable[[bytes], Any],
     retrieve_content: Callable[[bytes], Any],
+    commitment: Optional[bytes] = None,
+    fetch_commitment: Optional[Callable[[], Any]] = None,
     settle_fee: Optional[Callable[[], Any]] = None,
 ) -> bytes:
     """Consumer pay -> unlock for a Tier B/C paid-access dataset. Returns the plaintext.
@@ -187,12 +188,16 @@ def pay_and_unlock(
       content_hash: the 32-byte content id (the deposit key / retrieval id).
       recipient_privkey_b64: the buyer's X25519 private key — the DECRYPT identity (the content
                  key was sealed to its pubkey at deposit).
-      commitment: the on-chain 32-byte commitment to the wrapped key (sha256(wrapped)); the served
-                 key is checked against it (defeats a lying publisher).
       fetch_wrapped_key: ``content_hash -> wrapped_key bytes`` — fetches the wrapped key from the
                  payment-gated serve endpoint (the caller bakes in the authenticated request).
       retrieve_content: maps ``content_hash`` to the served ciphertext
                  (``prsm.storage.encryption.EncryptedPayload``).
+      commitment: the 32-byte commitment to verify the served key against. Provide it ONLY from an
+                 authoritative source; otherwise pass ``fetch_commitment``.
+      fetch_commitment: sp1363 (R5 MEDIUM) — a zero-arg callable that reads the commitment from the
+                 AUTHORITATIVE on-chain source (the gated KeyReleased event), called AFTER settle so
+                 the release passes verifyPayment. Used when ``commitment`` is not supplied, so the
+                 consumer doesn't trust a publisher-/MITM-supplied value.
       settle_fee: optional zero-arg callable that pays the release fee (so verifyPayment becomes
                  true). Pass ``None`` when the fee is already settled.
 
@@ -206,8 +211,16 @@ def pay_and_unlock(
     if settle_fee is not None:
         settle_fee()
 
-    # 2. Fetch the wrapped key off-chain + verify it against the on-chain commitment (B2 redesign).
-    wrapped_key = fetch_and_verify_wrapped_key(fetch_wrapped_key, content_hash, commitment)
+    # 2. Resolve the commitment from an AUTHORITATIVE source (on-chain) if not supplied directly.
+    resolved_commitment = commitment
+    if resolved_commitment is None:
+        if fetch_commitment is None:
+            raise PaidUnlockError("commitment or fetch_commitment is required")
+        resolved_commitment = fetch_commitment()
+
+    # 3. Fetch the wrapped key off-chain + verify it against the commitment (B2 redesign).
+    wrapped_key = fetch_and_verify_wrapped_key(
+        fetch_wrapped_key, content_hash, resolved_commitment)
 
     # 3. Retrieve the freely-served ciphertext.
     content = retrieve_content(content_hash)
