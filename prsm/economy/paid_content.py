@@ -90,6 +90,28 @@ def publish_paid_content(
     }
 
 
+def build_content_access_settle_fee(
+    verifier_client: Any,
+    content_hash: bytes,
+    fee_wei: int,
+) -> Callable[[], Any]:
+    """Sprint 1354 (brick 4, CONSUMER side) — turn a ContentAccessVerifierClient into the
+    ``settle_fee`` callable ``pay_and_unlock`` expects.
+
+    The returned zero-arg callable calls ``verifier_client.pay_for_access(content_hash, fee_wei)``
+    (approve FTNS + payForAccess), which records the payment so ``KeyDistribution.release`` — driven
+    by ``acquire_released_key`` inside ``pay_and_unlock`` — passes its verifyPayment gate. This is
+    the real, live ``settle_fee`` (vs. the injectable/mock used while the verifier was undecided).
+
+    Usage:
+        settle = build_content_access_settle_fee(verifier_client, content_hash, fee_wei)
+        plaintext = pay_and_unlock(..., settle_fee=settle)
+    """
+    def _settle() -> Any:
+        return verifier_client.pay_for_access(content_hash, fee_wei)
+    return _settle
+
+
 def pay_and_unlock(
     *,
     content_hash: bytes,
