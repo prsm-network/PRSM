@@ -40,6 +40,17 @@ describe("ContentAccessVerifier — Tier B/C paid-access gate", function () {
     expect(await ftns.balanceOf(await verifier.getAddress())).to.equal(FEE);
   });
 
+  it("is idempotent — a repeat payment for the same tuple does NOT double-charge (sp1356 F8/F11)", async function () {
+    await verifier.connect(consumer).payForAccess(CH, FEE);
+    const afterFirst = await ftns.balanceOf(consumer.address);
+    // second identical call: no revert, no second pull, creator not credited twice
+    await verifier.connect(consumer).payForAccess(CH, FEE);
+    expect(await ftns.balanceOf(consumer.address)).to.equal(afterFirst);   // no double-charge
+    expect(await verifier.claimable(creator.address)).to.equal(FEE);       // credited once
+    expect(await verifier.totalClaimable()).to.equal(FEE);
+    expect(await verifier.verifyPayment(consumer.address, CH, FEE)).to.equal(true);
+  });
+
   it("verifyPayment is true ONLY for the exact (payer, content, fee) tuple", async function () {
     await verifier.connect(consumer).payForAccess(CH, FEE);
     expect(await verifier.verifyPayment(consumer.address, CH, FEE)).to.equal(true);

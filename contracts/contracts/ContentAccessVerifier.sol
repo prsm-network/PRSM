@@ -92,6 +92,11 @@ contract ContentAccessVerifier is ReentrancyGuard {
     ///         released to ``msg.sender``) and credits the fee to the content's registered creator.
     function payForAccess(bytes32 contentHash, uint256 feeWei) external nonReentrant {
         if (feeWei == 0) revert ZeroFee();
+        // sp1356 (review F8/F11): idempotent — a repeat payment for the same
+        // (payer, content, fee) is a NO-OP, never a second charge. release is permissionless and
+        // verifyPayment is persistent, so once paid the key is releasable forever; charging again
+        // buys nothing. A consumer retry (RPC lag, unsaved plaintext) must not double-spend.
+        if (paid[_key(msg.sender, contentHash, feeWei)]) return;
         (address creator, ) = registry.getCreatorAndRate(contentHash);
         if (creator == address(0)) revert ContentNotRegistered(contentHash);
 

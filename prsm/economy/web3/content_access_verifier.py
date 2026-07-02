@@ -87,11 +87,21 @@ class ContentAccessVerifierClient:
         verifier_address: str,
         ftns_token_address: str,
         private_key: Optional[str] = None,
+        expected_chain_id: Optional[int] = None,
     ) -> None:
         if not HAS_WEB3:
             raise RuntimeError("web3 package required")
 
         self.web3 = Web3(Web3.HTTPProvider(rpc_url))
+        # sp1356 (review F7): pin the chain the signer commits to. A hostile/misconfigured RPC can
+        # report (or drift to) a different chainId; without this, approve/payForAccess would be
+        # signed against whatever the RPC claims. Assert the intended network up front, fail loud.
+        if expected_chain_id is not None:
+            actual = int(self.web3.eth.chain_id)
+            if actual != int(expected_chain_id):
+                raise RuntimeError(
+                    f"RPC chainId {actual} != expected {expected_chain_id} — refusing to sign "
+                    f"against an unintended chain")
         self.verifier_address = Web3.to_checksum_address(verifier_address)
         self.ftns_address = Web3.to_checksum_address(ftns_token_address)
 

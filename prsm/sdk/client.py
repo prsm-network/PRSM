@@ -785,12 +785,16 @@ class PRSMClient:
             rpc = rpc_url or ep.rpc_url_default
             ftns = ftns_token_address or ep.ftns_token
             keydist = key_distribution_address or ep.key_distribution
+            chain_id = ep.chain_id
 
         verifier_client = _verifier_client
         if verifier_client is None:
             from prsm.economy.web3.content_access_verifier import ContentAccessVerifierClient
+            # sp1356 (review F7): pin the intended chain so the payment isn't signed against a
+            # chain a hostile/misconfigured RPC reports.
             verifier_client = ContentAccessVerifierClient(
-                rpc, verifier_address, ftns, private_key=requester_key)
+                rpc, verifier_address, ftns, private_key=requester_key,
+                expected_chain_id=chain_id)
 
         key_client = _key_client
         if key_client is None:

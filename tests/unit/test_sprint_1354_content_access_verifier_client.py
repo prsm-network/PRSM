@@ -107,7 +107,7 @@ class _FakeWeb3:
         return object()
 
 
-def _client(state, *, with_key=True):
+def _client(state, *, with_key=True, expected_chain_id=None):
     _ACTIVE["state"] = state
     with patch("prsm.economy.web3.content_access_verifier.Web3", _FakeWeb3), \
          patch("prsm.economy.web3.content_access_verifier.Account") as acct:
@@ -115,7 +115,18 @@ def _client(state, *, with_key=True):
         return ContentAccessVerifierClient(
             rpc_url="http://t", verifier_address="0x" + "ab" * 20,
             ftns_token_address="0x" + "cd" * 20,
-            private_key=("0x" + "01" * 32) if with_key else None)
+            private_key=("0x" + "01" * 32) if with_key else None,
+            expected_chain_id=expected_chain_id)
+
+
+def test_client_chain_id_mismatch_raises():
+    # sp1356 (review F7): the fake RPC reports chainId 84532; pinning a different one fails loud.
+    with pytest.raises(RuntimeError, match="chainId"):
+        _client(_State(), expected_chain_id=999)
+
+
+def test_client_chain_id_match_ok():
+    assert _client(_State(), expected_chain_id=84532) is not None
 
 
 def _names(state):
@@ -165,9 +176,21 @@ def test_claim_calls_claim():
 
 def test_settle_fee_builder_calls_pay_for_access():
     fake = MagicMock()
+    fake.verify_payment.return_value = False               # not yet paid → must pay
     settle = build_content_access_settle_fee(fake, _CH, _FEE)
     settle()
     fake.pay_for_access.assert_called_once_with(_CH, _FEE)
+
+
+def test_settle_fee_skips_when_already_paid(monkeypatch):
+    # sp1356 (review F8/F11): verify-before-pay — a retry after payment is a no-op (no double-charge)
+    fake = MagicMock()
+    fake.address = _PAYER
+    fake.verify_payment.return_value = True                # already settled
+    settle = build_content_access_settle_fee(fake, _CH, _FEE)
+    assert settle() is None
+    fake.pay_for_access.assert_not_called()
+    fake.verify_payment.assert_called_once_with(_PAYER, _CH, _FEE)
 
 
 def test_settle_fee_wired_into_pay_and_unlock_end_to_end():
@@ -212,6 +235,7 @@ def test_settle_fee_wired_into_pay_and_unlock_end_to_end():
     kd = _KD()
 
     verifier_client = MagicMock()
+    verifier_client.verify_payment.return_value = False    # not yet paid → settle pays
     verifier_client.pay_for_access.side_effect = lambda *a: (order.append("pay"),
                                                              setattr(kd, "_paid", True))
     settle = build_content_access_settle_fee(verifier_client, _CH, _FEE)

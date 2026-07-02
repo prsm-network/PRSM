@@ -108,6 +108,15 @@ def build_content_access_settle_fee(
         plaintext = pay_and_unlock(..., settle_fee=settle)
     """
     def _settle() -> Any:
+        # sp1356 (review F8/F11): verify-before-pay — if this payer already settled this
+        # (content, fee), skip payment (no double-charge on a retry). Best-effort read; the
+        # contract-side short-circuit in payForAccess is the hard guarantee.
+        try:
+            payer = getattr(verifier_client, "address", None)
+            if payer and verifier_client.verify_payment(payer, content_hash, fee_wei):
+                return None
+        except Exception:  # noqa: BLE001 — a failed read must not block a legitimate payment
+            pass
         return verifier_client.pay_for_access(content_hash, fee_wei)
     return _settle
 
