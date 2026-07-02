@@ -83,8 +83,32 @@ def main() -> int:
     print(f"      getCreatorAndRate → creator={creator} rate={rate}bps ✓")
 
     before = int(cav.token.functions.balanceOf(addr).call())
-    print(f"\n[2/5] payForAccess (approve if needed + pay {FEE} wei)…  wallet FTNS={before}")
-    cav.pay_for_access(ch, FEE)
+    va = cav.verifier_address
+    print(f"\n[2/5] payForAccess…  wallet FTNS={before}")
+    # Pre-approve + poll to network visibility, so pay_for_access's payForAccess gas-estimate
+    # doesn't simulate transferFrom against a replica that hasn't seen the approve (ERC20
+    # InsufficientAllowance from a lagging replica, not a real shortfall).
+    if int(cav.token.functions.allowance(addr, va).call()) < FEE:
+        print("      approving FTNS to the CAV…")
+        atx = cav.token.functions.approve(va, FEE).build_transaction(cav._tx_overrides())
+        cav._sign_and_send(atx)
+        poll(lambda: int(cav.token.functions.allowance(addr, va).call()),
+             lambda a: a >= FEE, "allowance")
+        print("      allowance visible ✓")
+    # payForAccess — retry through residual replica lag (the approve is confirmed on-chain).
+    last = None
+    for attempt in range(6):
+        try:
+            cav.pay_for_access(ch, FEE)
+            last = None
+            break
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            print(f"      payForAccess attempt {attempt + 1} hit replica lag, retrying in 5s…")
+            time.sleep(5)
+    if last is not None:
+        raise last
+    print("      payForAccess sent ✓")
 
     print("[3/5] verifyPayment(payer, contentHash, fee)…")
     poll(lambda: cav.verify_payment(addr, ch, FEE), lambda v: v is True, "verifyPayment")
