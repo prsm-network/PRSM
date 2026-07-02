@@ -12644,6 +12644,108 @@ def content_get_cli(
     raise SystemExit(0 if all_ok else 1)
 
 
+@content.command("unlock")
+@click.argument("content_hash")
+@click.option(
+    "--fee", "fee_ftns", type=float, required=True,
+    help="Release fee to pay, in FTNS (must match the deposit's fee exactly).",
+)
+@click.option(
+    "--verifier-address", "verifier_address",
+    default=lambda: (os.environ.get("PRSM_CONTENT_ACCESS_VERIFIER") or "").strip(),
+    help="Deployed ContentAccessVerifier address (or PRSM_CONTENT_ACCESS_VERIFIER).",
+)
+@click.option(
+    "--output", "output_path", default=None, type=click.Path(dir_okay=False),
+    help="Write the decrypted plaintext to PATH.",
+)
+@click.option(
+    "--cid", default=None, help="Retrieval id for the ciphertext (default: 0x<content_hash>).",
+)
+@click.option("--network", default=None, help="Network (else PRSM_NETWORK).")
+@click.option("--rpc-url", "rpc_url", default=None, help="Override RPC URL.")
+@click.option("--api-url", "api_url_override", default=None, help="Override daemon URL")
+@click.option(
+    "--format", "output_format", type=click.Choice(["text", "json"]), default="text",
+)
+def content_unlock_cli(
+    content_hash: str, fee_ftns: float, verifier_address: str, output_path: Optional[str],
+    cid: Optional[str], network: Optional[str], rpc_url: Optional[str],
+    api_url_override: Optional[str], output_format: str,
+) -> None:
+    """Sprint 1355 — buy + decrypt a Tier B/C paid dataset: pay the release fee, get the key
+    released on-chain, fetch the ciphertext, and decrypt it. Prints/writes the plaintext.
+
+    Keys come from the ENVIRONMENT (never argv/shell history): PRSM_REQUESTER_KEY (your ETH key —
+    signs the payment + release; its address is who the key releases to) and PRSM_X25519_PRIVKEY
+    (your decrypt key). Exit 0 success, 1 unpaid / wrong-key / not-retrievable, 2 daemon
+    unreachable.
+    """
+    import base64 as _b64  # noqa: F401 — parity with sibling commands
+    import json as _json
+    from prsm.sdk.client import PRSMClient
+
+    requester_key = (os.environ.get("PRSM_REQUESTER_KEY") or "").strip()
+    x25519_privkey = (os.environ.get("PRSM_X25519_PRIVKEY") or "").strip()
+    if not requester_key or not x25519_privkey:
+        console.print(
+            "[red]Missing keys[/red] — set PRSM_REQUESTER_KEY (ETH) and PRSM_X25519_PRIVKEY "
+            "(decrypt) in your environment (never on the command line).")
+        raise SystemExit(1)
+    if not verifier_address:
+        console.print(
+            "[red]Missing --verifier-address[/red] (or PRSM_CONTENT_ACCESS_VERIFIER).")
+        raise SystemExit(1)
+
+    fee_wei = int(round(fee_ftns * (10 ** 18)))
+    url = _api_url_from_creds(api_url_override)
+
+    async def _go():
+        client = PRSMClient(base_url=url,
+                            api_key=(os.environ.get("PRSM_NODE_API_KEY") or "").strip())
+        try:
+            return await client.pay_and_unlock_content(
+                content_hash, requester_key=requester_key, x25519_privkey_b64=x25519_privkey,
+                fee_wei=fee_wei, verifier_address=verifier_address, cid=cid,
+                network=network, rpc_url=rpc_url)
+        finally:
+            await client.close()
+
+    try:
+        plaintext = _run_async(_go())
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        if any(s in msg.lower() for s in ("connect", "refused", "unreachable", "timeout")):
+            console.print(f"[red]Daemon unreachable at {url}[/red] — {exc}")
+            raise SystemExit(2)
+        console.print(f"[red]unlock failed:[/red] {exc}")
+        raise SystemExit(1)
+
+    if output_path:
+        from pathlib import Path as _Path
+        _Path(output_path).write_bytes(plaintext)
+
+    if output_format == "json":
+        try:
+            preview = plaintext[:200].decode("utf-8")
+        except Exception:  # noqa: BLE001
+            preview = None
+        click.echo(_json.dumps(
+            {"ok": True, "size_bytes": len(plaintext), "output": output_path,
+             "preview": preview}, default=str))
+        raise SystemExit(0)
+
+    console.print(f"[green]Unlocked[/green] {len(plaintext)} bytes")
+    if output_path:
+        console.print(f"  wrote → [bold]{output_path}[/bold]")
+    else:
+        try:
+            console.print(f"  preview: [dim]{plaintext[:200].decode('utf-8')}[/dim]")
+        except Exception:  # noqa: BLE001
+            console.print("  [dim](binary content — use --output to write it)[/dim]")
+    raise SystemExit(0)
+
+
 @content.command("mine")
 @click.option("--api-port", default=8000, type=int)
 @click.option(

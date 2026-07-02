@@ -731,6 +731,93 @@ class PRSMClient:
         except Exception:  # noqa: BLE001 — unconfigured/unavailable → no verifier (honest None)
             return None
 
+    # ── Sprint 1355 — Tier B/C paid content: buy + decrypt ──────
+
+    async def pay_and_unlock_content(
+        self,
+        content_hash,
+        *,
+        requester_key: str,
+        x25519_privkey_b64: str,
+        fee_wei: int,
+        verifier_address: str,
+        cid: Optional[str] = None,
+        network: Optional[str] = None,
+        rpc_url: Optional[str] = None,
+        ftns_token_address: Optional[str] = None,
+        key_distribution_address: Optional[str] = None,
+        _verifier_client: Any = None,
+        _key_client: Any = None,
+        _content: Any = None,
+    ) -> bytes:
+        """Sprint 1355 — buy + decrypt a Tier B/C paid dataset. Returns the plaintext bytes.
+
+        Pays the release fee to the ContentAccessVerifier, triggers the KeyDistribution key
+        release (now that verifyPayment passes), fetches the freely-served ciphertext, and
+        decrypts it with your X25519 key. FAIL-LOUD: an unpaid fee, a wrong key, or tampered
+        bytes raises (KeyNotReleasedError / PaidUnlockError) — never returns garbage.
+
+        ``content_hash``: the 32-byte KeyDistribution content id (hex str or bytes).
+        ``requester_key``: your ETH private key — signs payForAccess + release, and its address
+          is the on-chain recipient the key releases to. ``x25519_privkey_b64``: your DECRYPT key
+          (the content key was sealed to its pubkey at deposit). ``verifier_address``: the
+          deployed ContentAccessVerifier (not yet in network config — pass explicitly).
+        The web3 clients / ciphertext are injectable (``_verifier_client`` / ``_key_client`` /
+          ``_content``) for tests; keys are never stored on the client.
+        """
+        import asyncio
+        import base64
+
+        from prsm.economy.paid_content import build_content_access_settle_fee, pay_and_unlock
+        from prsm.storage.paid_unlock import deserialize_encrypted_content
+
+        ch = content_hash if isinstance(content_hash, (bytes, bytearray)) else bytes.fromhex(
+            content_hash[2:] if str(content_hash).startswith("0x") else content_hash)
+        if len(ch) != 32:
+            raise ValueError("content_hash must be 32 bytes")
+        if int(fee_wei) <= 0:
+            raise ValueError("fee_wei must be positive")
+
+        # Resolve chain config (RPC / FTNS / KeyDistribution) unless overridden or injected.
+        if _verifier_client is None or _key_client is None:
+            from prsm.config.networks import resolve_endpoints
+            ep = resolve_endpoints(network)
+            rpc = rpc_url or ep.rpc_url_default
+            ftns = ftns_token_address or ep.ftns_token
+            keydist = key_distribution_address or ep.key_distribution
+
+        verifier_client = _verifier_client
+        if verifier_client is None:
+            from prsm.economy.web3.content_access_verifier import ContentAccessVerifierClient
+            verifier_client = ContentAccessVerifierClient(
+                rpc, verifier_address, ftns, private_key=requester_key)
+
+        key_client = _key_client
+        if key_client is None:
+            from prsm.economy.web3.key_distribution import KeyDistributionClient
+            key_client = KeyDistributionClient(
+                rpc, keydist, private_key=requester_key)
+
+        # The freely-served ciphertext (fetched async, then decrypted in the worker thread).
+        content = _content
+        if content is None:
+            row = await self.fetch_content(cid or ("0x" + ch.hex()))
+            data_b64 = (row or {}).get("data")
+            if not data_b64:
+                from prsm.storage.paid_unlock import PaidUnlockError
+                raise PaidUnlockError(
+                    f"ciphertext for content {ch.hex()[:12]}… is not retrievable")
+            content = deserialize_encrypted_content(base64.b64decode(data_b64))
+
+        recipient = verifier_client.address
+        settle_fee = build_content_access_settle_fee(verifier_client, ch, int(fee_wei))
+
+        # pay_and_unlock is synchronous (blocking web3) — run it off the event loop.
+        return await asyncio.to_thread(
+            pay_and_unlock,
+            content_hash=ch, recipient=recipient, recipient_privkey_b64=x25519_privkey_b64,
+            key_client=key_client, retrieve_content=lambda _c: content, settle_fee=settle_fee)
+
     # ── Sprint 820 — Streaming verifiable inference ─────────────
 
     async def _stream_events(self, body: Dict[str, Any]):
