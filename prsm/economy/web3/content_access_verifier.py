@@ -59,6 +59,12 @@ CONTENT_ACCESS_VERIFIER_ABI = [
         "inputs": [{"name": "", "type": "address"}],
         "outputs": [{"name": "", "type": "uint256"}],
     },
+    {
+        # sp1365 — the ProvenanceRegistry this CAV credits (getCreatorAndRate). The AUTHORITATIVE
+        # source for the anti-squat check (the deployed CAV may be wired to a specific registry).
+        "type": "function", "name": "registry", "stateMutability": "view",
+        "inputs": [], "outputs": [{"name": "", "type": "address"}],
+    },
 ]
 
 _ERC20_ABI = [
@@ -146,6 +152,11 @@ class ContentAccessVerifierClient:
             raise RuntimeError("private_key required")
         return int(self.token.functions.allowance(
             self._account.address, self.verifier_address).call())
+
+    def registry_address(self) -> str:
+        """sp1365 — the ProvenanceRegistry this CAV credits fees through (getCreatorAndRate). The
+        authoritative registry for the anti-squat check (creator == key depositor)."""
+        return str(self.verifier.functions.registry().call())
 
     # ── Writes ─────────────────────────────────────────────────
 

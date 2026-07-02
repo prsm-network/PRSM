@@ -801,6 +801,7 @@ class PRSMClient:
 
         from prsm.economy.paid_content import (
             assert_fee_matches_deposit,
+            assert_publisher_controls_payee,
             build_content_access_settle_fee,
             pay_and_unlock,
         )
@@ -844,6 +845,21 @@ class PRSMClient:
             key_client = KeyDistributionClient(rpc, keydist, private_key=requester_key)
         # sp1361 (review F3/F4/F12): confirm the fee matches the on-chain deposit BEFORE paying.
         assert_fee_matches_deposit(key_client, ch, int(fee_wei))
+
+        # sp1365 (review F9/F2): refuse to pay if the fee payee (the CAV's registry creator) is not
+        # the key depositor (KeyDistribution publisher) — the signature of squatting. Best-effort:
+        # if the registry can't be read, skip (the fee check is the hard gate); a real mismatch
+        # raises SquatMismatchError and aborts before any payment.
+        _creator_reader = None
+        try:
+            from prsm.economy.web3.provenance_registry_v2 import ProvenanceRegistryV2Client
+            _reg = ProvenanceRegistryV2Client(
+                rpc_url=rpc, contract_address=verifier_client.registry_address())
+            _creator_reader = (
+                lambda c, _r=_reg: _r.contract.functions.getCreatorAndRate(c).call()[0])
+        except Exception:  # noqa: BLE001 — unreadable registry ⇒ skip (not a mismatch)
+            _creator_reader = None
+        assert_publisher_controls_payee(key_client, _creator_reader, ch)
 
         # sp1363 (R5 MEDIUM): when no authoritative commitment was supplied, read it from the
         # gated KeyReleased event (acquire_released_key) AFTER payment — never from the untrusted

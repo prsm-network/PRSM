@@ -79,6 +79,9 @@ def publish_paid_content(
     if len(ch) != 32:
         raise ValueError(f"content_hash must be 32 bytes, got {len(ch)}")
 
+    # sp1365 (review F2): don't publish into a content_hash another party already deposited.
+    assert_content_hash_unclaimed(key_client, ch, getattr(key_client, "address", None))
+
     wrapped = wrap_content_key_for_deposit(content_key, list(recipients))
     commitment = key_commitment(wrapped)       # sp1359: ONLY the commitment goes on-chain
 
@@ -102,6 +105,64 @@ def publish_paid_content(
         "ciphertext": ciphertext_bytes,
         "num_recipients": len(recipients),
     }
+
+
+class SquatMismatchError(Exception):
+    """sp1365 (review F9/F2) — the party that would EARN the access fee (the ProvenanceRegistry
+    creator the CAV credits) is not the party that CONTROLS the content (the KeyDistribution
+    publisher who deposited the key). Since contentHash is a public, squattable identifier and
+    neither deployed contract binds authority to the publisher, this mismatch is the signature of
+    squatting (F9 fee-redirect / F2 deposit squat). Fail-loud: never fund a squatter, never publish
+    into a squatted slot."""
+
+
+def assert_publisher_controls_payee(
+    key_client: Any, get_creator: Any, content_hash: bytes,
+) -> None:
+    """sp1365 — CONSUMER anti-squat guard. Verify the fee payee == the key depositor before paying.
+
+    ``get_creator(content_hash) -> address`` reads the CAV's registry (getCreatorAndRate.creator —
+    whom payForAccess credits). ``key_client.get_deposit(content_hash).publisher`` is who deposited
+    the key (controls the content). If they diverge, a squatter registered the creator OR squatted
+    the deposit without controlling both under one identity → refuse to pay. Best-effort skip only
+    when the reads aren't available (no client)."""
+    if key_client is None or get_creator is None or not hasattr(key_client, "get_deposit"):
+        return
+    ch12 = bytes(content_hash).hex()[:12]
+    try:
+        dep = key_client.get_deposit(content_hash)
+        creator = get_creator(content_hash)
+    except Exception:  # noqa: BLE001 — an unreadable check must not block a legitimate unlock
+        return
+    if dep is None:
+        return  # assert_fee_matches_deposit already fails-closed on a missing deposit
+    if not creator or str(creator).lower() in ("0x" + "0" * 40, ""):
+        raise SquatMismatchError(
+            f"content {ch12}… has no registered creator — the fee payee is unknown; refusing to pay")
+    if str(creator).lower() != str(dep.publisher).lower():
+        raise SquatMismatchError(
+            f"fee payee (registry creator {creator}) != key depositor (publisher {dep.publisher}) "
+            f"for content {ch12}… — possible squatting; refusing to pay a fee that wouldn't reach "
+            f"the content owner")
+
+
+def assert_content_hash_unclaimed(
+    key_client: Any, content_hash: bytes, publisher: str,
+) -> None:
+    """sp1365 — PUBLISHER anti-squat guard. Before depositing, ensure this content_hash isn't
+    already deposited by ANOTHER party (a front-run/squat). If it is, fail so the publisher
+    re-publishes for a fresh content_hash (a new random IV yields a new sha256(ciphertext))."""
+    if key_client is None or not hasattr(key_client, "get_deposit") or not publisher:
+        return
+    try:
+        dep = key_client.get_deposit(content_hash)
+    except Exception:  # noqa: BLE001
+        return
+    if dep is not None and str(dep.publisher).lower() != str(publisher).lower():
+        raise SquatMismatchError(
+            f"content_hash {bytes(content_hash).hex()[:12]}… is already deposited by "
+            f"{dep.publisher} (not you) — squatted or a stale re-run; re-publish to get a fresh "
+            f"content_hash (a new IV changes sha256(ciphertext))")
 
 
 class FeeMismatchError(Exception):

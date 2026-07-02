@@ -61,6 +61,7 @@ def test_publish_deposits_last():
     order = []
     kd = MagicMock()
     kd.deposit_key.side_effect = lambda *a: (order.append("deposit"), ("0xdep", None))[1]
+    kd.get_deposit.return_value = None            # fresh content_hash — not squatted (sp1365 guard)
     _, pub = generate_recipient_keypair()
     retained, served = {}, {}
     publish_paid_content(

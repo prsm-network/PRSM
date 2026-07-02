@@ -112,6 +112,7 @@ def test_publish_to_endpoint_to_decrypt(monkeypatch):
     store = PaidKeyStore()
     kd = MagicMock()
     kd.deposit_key.return_value = ("0xdep", None)
+    kd.get_deposit.return_value = None            # fresh content_hash — not squatted (sp1365 guard)
     buyer_priv, buyer_pub = generate_recipient_keypair()
 
     res = publish_paid_content(
