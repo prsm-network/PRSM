@@ -11,6 +11,35 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _fetch_paid_key_sync(base_url: str, content_hash: bytes, requester_key: str):
+    """Sprint 1359 (F1 redesign) — SYNC fetch of the wrapped key from the payment-gated serve
+    endpoint (run inside pay_and_unlock's worker thread AFTER the fee is settled). Signs the
+    paid-key challenge with the payer's ETH key so the server can gate on verifyPayment. Returns
+    the wrapped-key bytes, or None if the server refuses (fetch_and_verify_wrapped_key then raises
+    KeyNotReleasedError)."""
+    import base64
+
+    import httpx
+    from eth_account import Account
+    from eth_account.messages import encode_defunct
+
+    from prsm.node.paid_key_serve import paid_key_challenge
+
+    ch = bytes(content_hash)
+    nonce = ch.hex()[:16]
+    sig = Account.from_key(requester_key).sign_message(
+        encode_defunct(text=paid_key_challenge(ch, nonce))).signature.hex()
+    try:
+        with httpx.Client(timeout=30.0) as c:
+            resp = c.get(f"{base_url}/content/paid-key/0x{ch.hex()}",
+                         params={"nonce": nonce, "signature": sig})
+    except Exception:  # noqa: BLE001 — endpoint down / network → treat as no key (fail-loud upstream)
+        return None
+    if resp.status_code != 200:
+        return None
+    return base64.b64decode(resp.json()["wrapped_key_b64"])
+
+
 class PRSMClient:
     """Client for interacting with a PRSM node's API.
 
@@ -741,29 +770,30 @@ class PRSMClient:
         x25519_privkey_b64: str,
         fee_wei: int,
         verifier_address: str,
+        commitment=None,
         cid: Optional[str] = None,
         network: Optional[str] = None,
         rpc_url: Optional[str] = None,
         ftns_token_address: Optional[str] = None,
         key_distribution_address: Optional[str] = None,
         _verifier_client: Any = None,
-        _key_client: Any = None,
         _content: Any = None,
+        _fetch_wrapped_key: Any = None,
     ) -> bytes:
-        """Sprint 1355 — buy + decrypt a Tier B/C paid dataset. Returns the plaintext bytes.
+        """Sprint 1355 (+1359 F1 redesign) — buy + decrypt a Tier B/C paid dataset.
 
-        Pays the release fee to the ContentAccessVerifier, triggers the KeyDistribution key
-        release (now that verifyPayment passes), fetches the freely-served ciphertext, and
-        decrypts it with your X25519 key. FAIL-LOUD: an unpaid fee, a wrong key, or tampered
-        bytes raises (KeyNotReleasedError / PaidUnlockError) — never returns garbage.
+        Pays the release fee to the ContentAccessVerifier, then FETCHES the wrapped key from the
+        publisher's payment-gated endpoint (GET /content/paid-key/…, signing the challenge with
+        your ETH key) and VERIFIES it against the on-chain ``commitment`` before decrypting with
+        your X25519 key. The wrapped key never lives in world-readable on-chain storage (the B5 F1
+        fix). FAIL-LOUD: unpaid / wrong served key / tampered bytes raise.
 
-        ``content_hash``: the 32-byte KeyDistribution content id (hex str or bytes).
-        ``requester_key``: your ETH private key — signs payForAccess + release, and its address
-          is the on-chain recipient the key releases to. ``x25519_privkey_b64``: your DECRYPT key
-          (the content key was sealed to its pubkey at deposit). ``verifier_address``: the
-          deployed ContentAccessVerifier (not yet in network config — pass explicitly).
-        The web3 clients / ciphertext are injectable (``_verifier_client`` / ``_key_client`` /
-          ``_content``) for tests; keys are never stored on the client.
+        ``commitment``: the 32-byte sha256 commitment to the wrapped key (hex or bytes) — obtain it
+          from the publisher-signed manifest or the on-chain deposit; the served key is checked
+          against it. ``requester_key``: your ETH key (signs payForAccess + the key-fetch challenge).
+          ``x25519_privkey_b64``: your DECRYPT key. ``verifier_address``: the deployed
+          ContentAccessVerifier. Injectables (``_verifier_client`` / ``_content`` /
+          ``_fetch_wrapped_key``) are for tests; keys are never stored on the client.
         """
         import asyncio
         import base64
@@ -778,29 +808,29 @@ class PRSMClient:
         if int(fee_wei) <= 0:
             raise ValueError("fee_wei must be positive")
 
-        # Resolve chain config (RPC / FTNS / KeyDistribution) unless overridden or injected.
-        if _verifier_client is None or _key_client is None:
+        commit = commitment
+        if commit is not None and not isinstance(commit, (bytes, bytearray)):
+            commit = bytes.fromhex(commit[2:] if str(commit).startswith("0x") else commit)
+        if commit is None:
+            raise ValueError(
+                "commitment (the on-chain sha256 commitment to the wrapped key) is required — "
+                "obtain it from the publisher manifest or the deposit")
+
+        # Resolve chain config (RPC / FTNS) unless injected.
+        if _verifier_client is None:
             from prsm.config.networks import resolve_endpoints
             ep = resolve_endpoints(network)
             rpc = rpc_url or ep.rpc_url_default
             ftns = ftns_token_address or ep.ftns_token
-            keydist = key_distribution_address or ep.key_distribution
             chain_id = ep.chain_id
 
         verifier_client = _verifier_client
         if verifier_client is None:
             from prsm.economy.web3.content_access_verifier import ContentAccessVerifierClient
-            # sp1356 (review F7): pin the intended chain so the payment isn't signed against a
-            # chain a hostile/misconfigured RPC reports.
+            # sp1356 (review F7): pin the intended chain.
             verifier_client = ContentAccessVerifierClient(
                 rpc, verifier_address, ftns, private_key=requester_key,
                 expected_chain_id=chain_id)
-
-        key_client = _key_client
-        if key_client is None:
-            from prsm.economy.web3.key_distribution import KeyDistributionClient
-            key_client = KeyDistributionClient(
-                rpc, keydist, private_key=requester_key)
 
         # The freely-served ciphertext (fetched async, then decrypted in the worker thread).
         content = _content
@@ -813,14 +843,21 @@ class PRSMClient:
                     f"ciphertext for content {ch.hex()[:12]}… is not retrievable")
             content = deserialize_encrypted_content(base64.b64decode(data_b64))
 
-        recipient = verifier_client.address
+        # The wrapped-key fetch is a SYNC blocking call run inside the worker thread AFTER settle_fee
+        # (the endpoint gates on payment), so the pay→fetch ordering holds.
+        base_url = self.base_url
+        fetch_wrapped_key = _fetch_wrapped_key
+        if fetch_wrapped_key is None:
+            def fetch_wrapped_key(_c, _u=base_url, _k=requester_key):
+                return _fetch_paid_key_sync(_u, _c, _k)
+
         settle_fee = build_content_access_settle_fee(verifier_client, ch, int(fee_wei))
 
-        # pay_and_unlock is synchronous (blocking web3) — run it off the event loop.
         return await asyncio.to_thread(
             pay_and_unlock,
-            content_hash=ch, recipient=recipient, recipient_privkey_b64=x25519_privkey_b64,
-            key_client=key_client, retrieve_content=lambda _c: content, settle_fee=settle_fee)
+            content_hash=ch, recipient_privkey_b64=x25519_privkey_b64, commitment=commit,
+            fetch_wrapped_key=fetch_wrapped_key, retrieve_content=lambda _c: content,
+            settle_fee=settle_fee)
 
     # ── Sprint 820 — Streaming verifiable inference ─────────────
 

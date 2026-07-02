@@ -12651,6 +12651,11 @@ def content_get_cli(
     help="Release fee to pay, in FTNS (must match the deposit's fee exactly).",
 )
 @click.option(
+    "--commitment", "commitment", required=True,
+    help="The on-chain sha256 commitment to the wrapped key (hex) — from the publisher manifest; "
+         "the fetched key is verified against it.",
+)
+@click.option(
     "--verifier-address", "verifier_address",
     default=lambda: (os.environ.get("PRSM_CONTENT_ACCESS_VERIFIER") or "").strip(),
     help="Deployed ContentAccessVerifier address (or PRSM_CONTENT_ACCESS_VERIFIER).",
@@ -12669,8 +12674,8 @@ def content_get_cli(
     "--format", "output_format", type=click.Choice(["text", "json"]), default="text",
 )
 def content_unlock_cli(
-    content_hash: str, fee_ftns: float, verifier_address: str, output_path: Optional[str],
-    cid: Optional[str], network: Optional[str], rpc_url: Optional[str],
+    content_hash: str, fee_ftns: float, commitment: str, verifier_address: str,
+    output_path: Optional[str], cid: Optional[str], network: Optional[str], rpc_url: Optional[str],
     api_url_override: Optional[str], output_format: str,
 ) -> None:
     """Sprint 1355 — buy + decrypt a Tier B/C paid dataset: pay the release fee, get the key
@@ -12706,8 +12711,8 @@ def content_unlock_cli(
         try:
             return await client.pay_and_unlock_content(
                 content_hash, requester_key=requester_key, x25519_privkey_b64=x25519_privkey,
-                fee_wei=fee_wei, verifier_address=verifier_address, cid=cid,
-                network=network, rpc_url=rpc_url)
+                fee_wei=fee_wei, verifier_address=verifier_address, commitment=commitment,
+                cid=cid, network=network, rpc_url=rpc_url)
         finally:
             await client.close()
 

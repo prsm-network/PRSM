@@ -194,58 +194,40 @@ def test_settle_fee_skips_when_already_paid(monkeypatch):
 
 
 def test_settle_fee_wired_into_pay_and_unlock_end_to_end():
-    from prsm.economy.web3.key_distribution import KeyNotFoundError
+    # sp1359 (F1 redesign): the settle_fee pays, THEN the payment-gated serve endpoint hands over
+    # the wrapped key (simulated by a fetch that only serves once paid), verified vs the commitment.
     from prsm.enterprise.recipient_encryption import (
         EnterpriseRecipient, generate_recipient_keypair,
     )
     from prsm.storage.encryption import encrypt, generate_key
-    from prsm.storage.paid_unlock import wrap_content_key_for_deposit
+    from prsm.storage.paid_unlock import key_commitment, wrap_content_key_for_deposit
 
-    # publisher-side artifacts
     content_key = generate_key()
     content = encrypt(b"paywalled rows", content_key)
     buyer_priv, buyer_pub = generate_recipient_keypair()
     wrapped = wrap_content_key_for_deposit(
         content_key, [EnterpriseRecipient(identifier="b", x25519_pubkey_b64=buyer_pub)])
+    commitment = key_commitment(wrapped)
 
-    # a KeyDistribution that only releases AFTER the fee is paid (mirrors the real gate)
     order = []
+    paid = {"ok": False}
 
-    class _Ev:
-        def __init__(s, ch, r, k):
-            s.content_hash, s.recipient, s.encrypted_key = ch, r, k
-
-    class _KD:
-        def __init__(s):
-            s._released, s._paid = [], False
-
-        def latest_block(s):
-            return 100
-
-        def get_key_released_events(s, fb, tb, *, argument_filters=None):
-            return list(s._released)
-
-        def release(s, ch, recipient):
-            order.append("release")
-            if not s._paid:
-                raise KeyNotFoundError("PaymentNotVerified")   # release gated on payment
-            s._released.append(_Ev(bytes(ch), recipient, wrapped))
-            return ("0xr", None)
-
-    kd = _KD()
+    def _fetch(ch):                                        # the gated serve endpoint
+        order.append("fetch")
+        return wrapped if paid["ok"] else None            # 402-equivalent until paid
 
     verifier_client = MagicMock()
     verifier_client.verify_payment.return_value = False    # not yet paid → settle pays
     verifier_client.pay_for_access.side_effect = lambda *a: (order.append("pay"),
-                                                             setattr(kd, "_paid", True))
+                                                             paid.__setitem__("ok", True))
     settle = build_content_access_settle_fee(verifier_client, _CH, _FEE)
 
     out = pay_and_unlock(
-        content_hash=_CH, recipient=_PAYER, recipient_privkey_b64=buyer_priv, key_client=kd,
-        retrieve_content=lambda c: content, settle_fee=settle)
+        content_hash=_CH, recipient_privkey_b64=buyer_priv, commitment=commitment,
+        fetch_wrapped_key=_fetch, retrieve_content=lambda c: content, settle_fee=settle)
 
     assert out == b"paywalled rows"
-    assert order == ["pay", "release"]                  # paid, THEN the gated release succeeded
+    assert order == ["pay", "fetch"]                    # paid, THEN the gated fetch succeeded
     verifier_client.pay_for_access.assert_called_once_with(_CH, _FEE)
 
 

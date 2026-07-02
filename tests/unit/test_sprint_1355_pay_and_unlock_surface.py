@@ -1,64 +1,27 @@
-"""Sprint 1355 — Tier B/C paid-decrypt arc, brick 4 SURFACE: SDK + CLI buy-and-decrypt.
+"""Sprint 1355 (+1359 F1 redesign) — brick 4 SURFACE: SDK + CLI buy-and-decrypt.
 
-PRSMClient.pay_and_unlock_content (pay the release fee → key release → fetch ciphertext → decrypt)
-and the `prsm content unlock` CLI over it. SDK tested end-to-end with injected web3 clients +
-ciphertext; CLI tested for the keys-from-env guard (keys must never come from argv).
+PRSMClient.pay_and_unlock_content (pay → FETCH the wrapped key from the payment-gated endpoint →
+verify vs the on-chain commitment → decrypt) and the `prsm content unlock` CLI over it. SDK tested
+end-to-end with an injected fetch (gated on payment); CLI tested for the keys-from-env guard.
 """
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import MagicMock
 
 import pytest
 
-from prsm.economy.web3.key_distribution import KeyNotFoundError
 from prsm.enterprise.recipient_encryption import (
     EnterpriseRecipient,
     generate_recipient_keypair,
 )
 from prsm.sdk.client import PRSMClient
 from prsm.storage.encryption import encrypt, generate_key
-from prsm.storage.paid_unlock import wrap_content_key_for_deposit
+from prsm.storage.paid_unlock import key_commitment, wrap_content_key_for_deposit
 
 _CH = bytes.fromhex("cd" * 32)
 _FEE = 10 ** 18
 _BUYER_ETH = "0x" + "33" * 20
-
-
-class _Ev:
-    def __init__(self, ch, r, k):
-        self.content_hash, self.recipient, self.encrypted_key = ch, r, k
-
-
-class _KD:
-    """KeyDistribution whose release is gated on payment (mirrors the real verifyPayment gate)."""
-
-    def __init__(self, wrapped, order):
-        self._wrapped, self._order = wrapped, order
-        self._paid = False
-        self._released = []
-
-    def latest_block(self):
-        return 100
-
-    def get_key_released_events(self, fb, tb, *, argument_filters=None):
-        return list(self._released)
-
-    def release(self, ch, recipient):
-        self._order.append("release")
-        if not self._paid:
-            raise KeyNotFoundError("PaymentNotVerified")
-        self._released.append(_Ev(bytes(ch), recipient, self._wrapped))
-        return ("0xr", None)
-
-
-class _Verifier:
-    def __init__(self, kd, order):
-        self.address = _BUYER_ETH
-        self._kd, self._order = kd, order
-
-    def pay_for_access(self, ch, fee):
-        self._order.append("pay")
-        self._kd._paid = True
 
 
 def _fixture(plaintext=b"paywalled dataset via the SDK"):
@@ -68,64 +31,81 @@ def _fixture(plaintext=b"paywalled dataset via the SDK"):
     buyer_priv, buyer_pub = generate_recipient_keypair()
     wrapped = wrap_content_key_for_deposit(
         content_key, [EnterpriseRecipient(identifier="b", x25519_pubkey_b64=buyer_pub)])
-    kd = _KD(wrapped, order)
-    vc = _Verifier(kd, order)
-    return order, content, buyer_priv, kd, vc, plaintext
+    commitment = key_commitment(wrapped)
+
+    paid = {"ok": False}
+    vc = MagicMock()
+    vc.address = _BUYER_ETH
+    vc.verify_payment.return_value = False                          # not paid → settle pays
+    vc.pay_for_access.side_effect = lambda *a: (order.append("pay"), paid.__setitem__("ok", True))
+
+    def fetch(ch):                                                 # the gated serve endpoint
+        order.append("fetch")
+        return wrapped if paid["ok"] else None
+
+    return order, content, buyer_priv, commitment, vc, fetch, plaintext
 
 
-async def _unlock(content_hash, content, buyer_priv, kd, vc):
+async def _unlock(content_hash, content, buyer_priv, commitment, vc, fetch, *, fee_wei=_FEE):
     client = PRSMClient()
     try:
         return await client.pay_and_unlock_content(
             content_hash, requester_key="0x" + "01" * 32, x25519_privkey_b64=buyer_priv,
-            fee_wei=_FEE, verifier_address="0x" + "ab" * 20,
-            _verifier_client=vc, _key_client=kd, _content=content)
+            fee_wei=fee_wei, verifier_address="0x" + "ab" * 20, commitment=commitment,
+            _verifier_client=vc, _content=content, _fetch_wrapped_key=fetch)
     finally:
         await client.close()
 
 
 # ── SDK ───────────────────────────────────────────────────────────────────────
 
-def test_sdk_pay_and_unlock_full_flow():
-    order, content, buyer_priv, kd, vc, plaintext = _fixture()
-    out = asyncio.run(_unlock(_CH, content, buyer_priv, kd, vc))
+def test_sdk_pay_then_fetch_then_decrypt():
+    order, content, buyer_priv, commitment, vc, fetch, plaintext = _fixture()
+    out = asyncio.run(_unlock(_CH, content, buyer_priv, commitment, vc, fetch))
     assert out == plaintext
-    assert order == ["pay", "release"]                 # paid, THEN the gated release succeeded
+    assert order == ["pay", "fetch"]                    # paid, THEN the gated fetch succeeded
 
 
 def test_sdk_accepts_hex_content_hash():
-    order, content, buyer_priv, kd, vc, plaintext = _fixture()
-    out = asyncio.run(_unlock("0x" + _CH.hex(), content, buyer_priv, kd, vc))
+    order, content, buyer_priv, commitment, vc, fetch, plaintext = _fixture()
+    out = asyncio.run(_unlock("0x" + _CH.hex(), content, buyer_priv, commitment, vc, fetch))
     assert out == plaintext
 
 
-def test_sdk_validates_content_hash_and_fee():
-    _o, content, buyer_priv, kd, vc, _ = _fixture()
+def test_sdk_validates_content_hash_fee_and_commitment():
+    _o, content, buyer_priv, commitment, vc, fetch, _ = _fixture()
     with pytest.raises(ValueError, match="32 bytes"):
-        asyncio.run(_unlock("dead", content, buyer_priv, kd, vc))
+        asyncio.run(_unlock("dead", content, buyer_priv, commitment, vc, fetch))
+    with pytest.raises(ValueError, match="positive"):
+        asyncio.run(_unlock(_CH, content, buyer_priv, commitment, vc, fetch, fee_wei=0))
 
-    async def _zero_fee():
+    async def _no_commit():
         client = PRSMClient()
         try:
             return await client.pay_and_unlock_content(
                 _CH, requester_key="0x" + "01" * 32, x25519_privkey_b64=buyer_priv,
-                fee_wei=0, verifier_address="0x" + "ab" * 20,
-                _verifier_client=vc, _key_client=kd, _content=content)
+                fee_wei=_FEE, verifier_address="0x" + "ab" * 20, commitment=None,
+                _verifier_client=vc, _content=content, _fetch_wrapped_key=fetch)
         finally:
             await client.close()
-    with pytest.raises(ValueError, match="positive"):
-        asyncio.run(_zero_fee())
+    with pytest.raises(ValueError, match="commitment"):
+        asyncio.run(_no_commit())
 
 
-def test_sdk_wrong_x25519_key_raises():
-    from prsm.storage.paid_unlock import PaidUnlockError
-    order, content, _buyer_priv, kd, vc, _ = _fixture()
-    other_priv, _ = generate_recipient_keypair()
-    with pytest.raises(PaidUnlockError, match="unwrap"):
-        asyncio.run(_unlock(_CH, content, other_priv, kd, vc))
+def test_sdk_wrong_served_key_fails_commitment():
+    from prsm.economy.web3.key_acquisition import KeyCommitmentMismatchError
+    order, content, buyer_priv, commitment, vc, _fetch, _ = _fixture()
+    paid = {"ok": False}
+    vc.pay_for_access.side_effect = lambda *a: paid.__setitem__("ok", True)
+    bad_fetch = lambda ch: (b"a substituted key" if paid["ok"] else None)
+    with pytest.raises(KeyCommitmentMismatchError, match="WRONG key"):
+        asyncio.run(_unlock(_CH, content, buyer_priv, commitment, vc, bad_fetch))
 
 
 # ── CLI: keys must come from the environment, never argv ──────────────────────
+
+_COMMIT = "0x" + "ee" * 32
+
 
 def test_cli_unlock_requires_env_keys(monkeypatch):
     from click.testing import CliRunner
@@ -133,7 +113,7 @@ def test_cli_unlock_requires_env_keys(monkeypatch):
     monkeypatch.delenv("PRSM_REQUESTER_KEY", raising=False)
     monkeypatch.delenv("PRSM_X25519_PRIVKEY", raising=False)
     r = CliRunner().invoke(main, [
-        "content", "unlock", "0x" + _CH.hex(), "--fee", "1",
+        "content", "unlock", "0x" + _CH.hex(), "--fee", "1", "--commitment", _COMMIT,
         "--verifier-address", "0x" + "ab" * 20])
     assert r.exit_code == 1
     assert "Missing keys" in r.output
@@ -145,9 +125,10 @@ def test_cli_unlock_requires_verifier(monkeypatch):
     monkeypatch.setenv("PRSM_REQUESTER_KEY", "0x" + "01" * 32)
     monkeypatch.setenv("PRSM_X25519_PRIVKEY", "somekey")
     monkeypatch.delenv("PRSM_CONTENT_ACCESS_VERIFIER", raising=False)
-    r = CliRunner().invoke(main, ["content", "unlock", "0x" + _CH.hex(), "--fee", "1"])
+    r = CliRunner().invoke(main, [
+        "content", "unlock", "0x" + _CH.hex(), "--fee", "1", "--commitment", _COMMIT])
     assert r.exit_code == 1
-    assert "verifier-address" in r.output.lower() or "verifier" in r.output.lower()
+    assert "verifier" in r.output.lower()
 
 
 if __name__ == "__main__":
