@@ -58,34 +58,46 @@ def main() -> int:
     print(f"content_hash:  0x{ch.hex()}")
     print(f"fee:           {FEE} wei ({Decimal(FEE) / (Decimal(10) ** 18)} FTNS)")
 
+    import time
+
+    def poll(read, ok, what, timeout=40, interval=2):
+        """Public Base RPCs load-balance reads across replicas that lag the write side a few
+        seconds. Poll a read-after-write until it reflects the confirmed tx (or time out)."""
+        deadline = time.time() + timeout
+        val = read()
+        while not ok(val) and time.time() < deadline:
+            time.sleep(interval)
+            val = read()
+        if not ok(val):
+            raise AssertionError(f"{what}: read never caught up (last={val!r}) after {timeout}s")
+        return val
+
     print("\n[1/5] register content in the registry (creator = payer)…")
     # 9800 bps = the registry's MAX creator rate (10000 - 200 network fee). The CAV credits the
     # FULL fee to the creator regardless — it only uses the creator from getCreatorAndRate, not
     # the rate — so this value is cosmetic for the smoke; it just has to be a valid registry rate.
     reg.register_content_v2(ch, 9800, "smoke://cav")
-    creator, rate = reg.contract.functions.getCreatorAndRate(ch).call()
-    print(f"      getCreatorAndRate → creator={creator} rate={rate}bps")
-    assert creator.lower() == addr.lower(), f"creator {creator} != payer {addr}"
+    creator, rate = poll(
+        lambda: reg.contract.functions.getCreatorAndRate(ch).call(),
+        lambda cr: cr[0].lower() == addr.lower(), "getCreatorAndRate")
+    print(f"      getCreatorAndRate → creator={creator} rate={rate}bps ✓")
 
     before = int(cav.token.functions.balanceOf(addr).call())
     print(f"\n[2/5] payForAccess (approve if needed + pay {FEE} wei)…  wallet FTNS={before}")
     cav.pay_for_access(ch, FEE)
 
     print("[3/5] verifyPayment(payer, contentHash, fee)…")
-    ok = cav.verify_payment(addr, ch, FEE)
-    print(f"      verifyPayment → {ok}")
-    assert ok is True, "verifyPayment returned false after paying"
+    poll(lambda: cav.verify_payment(addr, ch, FEE), lambda v: v is True, "verifyPayment")
+    print(f"      verifyPayment → True ✓")
 
     print("[4/5] creator credited (claimable == fee)…")
-    claimable = cav.claimable(addr)
-    print(f"      claimable(creator) → {claimable}")
-    assert claimable == FEE, f"claimable {claimable} != fee {FEE}"
+    poll(lambda: cav.claimable(addr), lambda c: c == FEE, "claimable==fee")
+    print(f"      claimable(creator) → {FEE} ✓")
 
     print("[5/5] claim()…")
     cav.claim()
-    after_claimable = cav.claimable(addr)
-    assert after_claimable == 0, f"claimable {after_claimable} != 0 after claim"
-    print(f"      claimable(creator) after claim → {after_claimable}")
+    poll(lambda: cav.claimable(addr), lambda c: c == 0, "claimable==0 after claim")
+    print(f"      claimable(creator) after claim → 0 ✓")
 
     print("\n✅ LIVE SMOKE PASSED — register → payForAccess → verifyPayment==true → creator "
           "credited → claim, all on-chain against the deployed ContentAccessVerifier.")
