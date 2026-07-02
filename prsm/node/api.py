@@ -17106,6 +17106,53 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             )
         return rec.to_dict()
 
+    @app.get("/content/paid-key/{content_hash}")
+    async def content_paid_key(
+        content_hash: str, nonce: str, signature: str,
+    ) -> Dict[str, Any]:
+        """Sprint 1358 (F1 redesign, R2) — payment-gated wrapped-key serve.
+
+        The F1 fix keeps the wrapped content key OFF-chain (only its commitment is on-chain). This
+        endpoint serves the retained wrapped key ONLY to a fetcher who signs the paid-key challenge
+        with the paying ETH key AND has an on-chain ``verifyPayment == true``. The consumer then
+        checks the served key against the on-chain commitment (R1) before decrypting. Disabled
+        unless ``PRSM_PAID_KEY_SERVE`` is set; 503 until the publish path (R3) populates the store.
+        """
+        import base64
+        import os
+
+        from prsm.node.paid_key_serve import PaidKeyServeError, serve_paid_key
+
+        if (os.environ.get("PRSM_PAID_KEY_SERVE") or "").strip().lower() not in (
+                "1", "true", "yes", "on"):
+            raise HTTPException(
+                status_code=503,
+                detail="paid-key serve disabled — set PRSM_PAID_KEY_SERVE=1 to serve Tier B/C keys")
+        store = getattr(node, "_paid_key_store", None)
+        verify_payment = getattr(node, "_paid_key_verify_payment", None)
+        if store is None or verify_payment is None:
+            raise HTTPException(
+                status_code=503,
+                detail="paid-key store / on-chain payment verification not initialized "
+                       "(needs PRSM_CONTENT_ACCESS_VERIFIER + a published paid dataset)")
+        try:
+            ch = bytes.fromhex(content_hash[2:] if content_hash.startswith("0x")
+                               else content_hash)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="content_hash must be valid hex")
+        if len(ch) != 32:
+            raise HTTPException(status_code=422, detail="content_hash must be 32 bytes")
+
+        try:
+            wrapped = serve_paid_key(
+                ch, nonce, signature, key_store=store, verify_payment=verify_payment)
+        except PaidKeyServeError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.message)
+        return {
+            "content_hash": "0x" + ch.hex(),
+            "wrapped_key_b64": base64.b64encode(wrapped).decode("ascii"),
+        }
+
     @app.post("/compute/inference/quote-multistage")
     async def compute_inference_quote_multistage(request: Request) -> Dict[str, Any]:
         """Sprint 1313 (S1) — paid multi-stage QUOTE. Previews the planned stage→node topology
