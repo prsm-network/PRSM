@@ -81,11 +81,16 @@ def publish_paid_content(
 
     wrapped = wrap_content_key_for_deposit(content_key, list(recipients))
     commitment = key_commitment(wrapped)       # sp1359: ONLY the commitment goes on-chain
-    tx, status = key_client.deposit_key(
-        ch, commitment, royalty_verifier_address, int(release_fee_ftns_wei))
+
+    # sp1361 (review F5): retain the key + serve the ciphertext BEFORE the on-chain deposit, so a
+    # LIVE gate always implies the content is deliverable. If the deposit reverts, the retained key
+    # + served ciphertext are harmless (no gate exists → no one can pay). The dangerous order is the
+    # reverse (gate live but content undeliverable → paid buyers stranded).
     if retain_wrapped_key is not None:
         retain_wrapped_key(ch, wrapped, int(release_fee_ftns_wei))   # for the gated serve endpoint
     publish_ciphertext(ch, ciphertext_bytes)   # serve the freely-fetchable ciphertext
+    tx, status = key_client.deposit_key(
+        ch, commitment, royalty_verifier_address, int(release_fee_ftns_wei))
 
     return {
         "content_hash": ch,
@@ -97,6 +102,32 @@ def publish_paid_content(
         "ciphertext": ciphertext_bytes,
         "num_recipients": len(recipients),
     }
+
+
+class FeeMismatchError(Exception):
+    """sp1361 (review F3/F4/F12) — the fee about to be paid does not match the on-chain deposit
+    fee. Paying it would pull + credit FTNS that can never satisfy the gate (no unlock, no refund).
+    Fail-loud BEFORE paying."""
+
+
+def assert_fee_matches_deposit(key_client: Any, content_hash: bytes, fee_wei: int) -> None:
+    """sp1361 — refuse to pay a fee that doesn't match the on-chain deposit. BEST-EFFORT: if the
+    deposit can't be read (no client / RPC issue / not deposited), skip — the endpoint's
+    verifyPayment gate is the hard check; this just catches the common wrong-fee footgun early.
+    Raises FeeMismatchError on a definite mismatch."""
+    if key_client is None or not hasattr(key_client, "get_deposit"):
+        return
+    try:
+        deposit = key_client.get_deposit(content_hash)
+    except Exception:  # noqa: BLE001 — an unreadable deposit must not block a legitimate payment
+        return
+    if deposit is None:
+        return
+    on_chain = int(getattr(deposit, "release_fee_ftns_wei", -1))
+    if on_chain >= 0 and on_chain != int(fee_wei):
+        raise FeeMismatchError(
+            f"fee {fee_wei} != on-chain deposit fee {on_chain} for content "
+            f"{bytes(content_hash).hex()[:12]}… — refusing to pay a fee that won't unlock")
 
 
 def build_content_access_settle_fee(

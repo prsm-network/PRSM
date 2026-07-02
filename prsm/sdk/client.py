@@ -779,6 +779,7 @@ class PRSMClient:
         _verifier_client: Any = None,
         _content: Any = None,
         _fetch_wrapped_key: Any = None,
+        _key_client: Any = None,
     ) -> bytes:
         """Sprint 1355 (+1359 F1 redesign) — buy + decrypt a Tier B/C paid dataset.
 
@@ -798,7 +799,11 @@ class PRSMClient:
         import asyncio
         import base64
 
-        from prsm.economy.paid_content import build_content_access_settle_fee, pay_and_unlock
+        from prsm.economy.paid_content import (
+            assert_fee_matches_deposit,
+            build_content_access_settle_fee,
+            pay_and_unlock,
+        )
         from prsm.storage.paid_unlock import deserialize_encrypted_content
 
         ch = content_hash if isinstance(content_hash, (bytes, bytearray)) else bytes.fromhex(
@@ -816,12 +821,13 @@ class PRSMClient:
                 "commitment (the on-chain sha256 commitment to the wrapped key) is required — "
                 "obtain it from the publisher manifest or the deposit")
 
-        # Resolve chain config (RPC / FTNS) unless injected.
-        if _verifier_client is None:
+        # Resolve chain config (RPC / FTNS / KeyDistribution) unless injected.
+        if _verifier_client is None or _key_client is None:
             from prsm.config.networks import resolve_endpoints
             ep = resolve_endpoints(network)
-            rpc = rpc_url or ep.rpc_url_default
+            rpc = rpc_url or ep.rpc_url
             ftns = ftns_token_address or ep.ftns_token
+            keydist = key_distribution_address or ep.key_distribution
             chain_id = ep.chain_id
 
         verifier_client = _verifier_client
@@ -831,6 +837,14 @@ class PRSMClient:
             verifier_client = ContentAccessVerifierClient(
                 rpc, verifier_address, ftns, private_key=requester_key,
                 expected_chain_id=chain_id)
+
+        # sp1361 (review F3/F4/F12): confirm the fee matches the on-chain deposit BEFORE paying, so
+        # a mismatched fee can't be pulled with no way to unlock. Best-effort (read-only client).
+        key_client = _key_client
+        if key_client is None:
+            from prsm.economy.web3.key_distribution import KeyDistributionClient
+            key_client = KeyDistributionClient(rpc, keydist)  # read-only, no signer
+        assert_fee_matches_deposit(key_client, ch, int(fee_wei))
 
         # The freely-served ciphertext (fetched async, then decrypted in the worker thread).
         content = _content

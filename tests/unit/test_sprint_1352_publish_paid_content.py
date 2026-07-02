@@ -75,7 +75,7 @@ def test_publish_deposits_commitment_not_the_key():
     _, pub = generate_recipient_keypair()
     res = _publish(b"proprietary NADA rows", pub, kd, served=served, retained=retained, order=order)
 
-    assert order == ["deposit", "publish"]                         # deposit BEFORE serving
+    assert order == ["publish", "deposit"]                         # sp1361 F5: deposit LAST
     ch, deposited, verifier, fee = kd.deposit_calls[0]
     # the DEPOSITED bytes are the 32-byte commitment, NOT the wrapped key
     assert deposited == res["commitment"] == key_commitment(res["wrapped_key"])

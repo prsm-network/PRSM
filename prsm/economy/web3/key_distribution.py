@@ -45,6 +45,15 @@ logger = logging.getLogger(__name__)
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 
+@dataclass
+class KeyDeposit:
+    """sp1361 — the on-chain KeyDistribution deposit record (minus the omitted encryptedKey)."""
+    publisher: str
+    royalty: str
+    release_fee_ftns_wei: int
+    active: bool
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Typed errors
 # ──────────────────────────────────────────────────────────────────────
@@ -215,6 +224,20 @@ KEY_DISTRIBUTION_ABI = [
             {"name": "publisher", "type": "address", "indexed": True},
         ],
     },
+    {
+        # sp1361 — the auto-getter for `mapping(bytes32 => KeyRecord) public records`. The dynamic
+        # `bytes encryptedKey` member is OMITTED by Solidity, so the getter returns the value-type
+        # members only: (publisher, royalty, releaseFeeFtnsWei, active). Lets a consumer read the
+        # AUTHORITATIVE release fee before paying (review F3/F4/F12).
+        "type": "function", "name": "records", "stateMutability": "view",
+        "inputs": [{"name": "", "type": "bytes32"}],
+        "outputs": [
+            {"name": "publisher", "type": "address"},
+            {"name": "royalty", "type": "address"},
+            {"name": "releaseFeeFtnsWei", "type": "uint256"},
+            {"name": "active", "type": "bool"},
+        ],
+    },
 ]
 
 
@@ -335,6 +358,22 @@ class KeyDistributionClient:
                 Web3.to_checksum_address(recipient),
             ).build_transaction(self._tx_overrides())
             return self._sign_and_send(tx)
+
+    # ── Reads ──────────────────────────────────────────────────
+
+    def get_deposit(self, content_hash: bytes) -> "Optional[KeyDeposit]":
+        """sp1361 — read the on-chain deposit record: (publisher, royalty verifier, release fee,
+        active). Returns None if no deposit exists (zero publisher). The encryptedKey/commitment is
+        a dynamic member omitted from the auto-getter — read it from the KeyReleased event or the
+        publisher manifest, not here. Lets a consumer confirm the AUTHORITATIVE fee before paying."""
+        self._validate_content_hash(content_hash)
+        publisher, royalty, fee, active = (
+            self.contract.functions.records(content_hash).call())
+        if str(publisher).lower() == ZERO_ADDRESS:
+            return None
+        return KeyDeposit(
+            publisher=str(publisher), royalty=str(royalty),
+            release_fee_ftns_wei=int(fee), active=bool(active))
 
     # ── Event stream ──────────────────────────────────────────
 

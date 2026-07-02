@@ -47,12 +47,14 @@ def _fixture(plaintext=b"paywalled dataset via the SDK"):
 
 
 async def _unlock(content_hash, content, buyer_priv, commitment, vc, fetch, *, fee_wei=_FEE):
+    kc = MagicMock()
+    kc.get_deposit.return_value = None                              # best-effort fee check skips
     client = PRSMClient()
     try:
         return await client.pay_and_unlock_content(
             content_hash, requester_key="0x" + "01" * 32, x25519_privkey_b64=buyer_priv,
             fee_wei=fee_wei, verifier_address="0x" + "ab" * 20, commitment=commitment,
-            _verifier_client=vc, _content=content, _fetch_wrapped_key=fetch)
+            _verifier_client=vc, _content=content, _fetch_wrapped_key=fetch, _key_client=kc)
     finally:
         await client.close()
 
