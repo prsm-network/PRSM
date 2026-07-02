@@ -52,6 +52,9 @@ class NetworkConfig:
     # Phase 7-storage
     storage_slashing: Optional[str] = None
     key_distribution: Optional[str] = None
+    # sp1364 — Tier B/C paid-decrypt ContentAccessVerifier (the IRoyaltyPaymentVerifier gating
+    # the payment-gated key serve). None until deployed per network.
+    content_access_verifier: Optional[str] = None
 
     # Phase 3.x.3 publisher key anchor
     publisher_key_anchor: Optional[str] = None
@@ -170,6 +173,10 @@ TESTNET = NetworkConfig(
     compensation_distributor="0xFd730f8E513eD184F255cb1a62791e711B2e81b9",
     storage_slashing="0x2ba1B361d2AD49f15F1131762fA3512d7824EB06",
     key_distribution="0xdB41A471AAC86285cD855bEdC27D7FC810dc3318",
+    # sp1364 — Tier B/C paid-decrypt verifier (deployed 2026-07-02, verified on Basescan). Wired to
+    # a fresh ProvenanceRegistryV2 0xCBe377Ae09fdD5F63875Aa5313C65A3C8C073731 (NOT the pre-existing
+    # 0xe75F...), so a paid-content publisher registers in 0xCBe377... for the fee-payee lookup.
+    content_access_verifier="0x99264Bca75d63DB9b8B5C7C1e2ECBf78d133905a",
     publisher_key_anchor=None,  # not yet deployed on Base Sepolia; Phase 3.x.3 Sepolia deploy was on Ethereum Sepolia
     creator_stake_registry=None,  # sp976 CreatorStakeRegistry — record the Base Sepolia rehearsal address here if a testnet gate is wanted (the rehearsal script is self-contained and does not require this).
     notes=(
@@ -267,6 +274,7 @@ class ResolvedEndpoints:
     compensation_distributor: Optional[str]
     storage_slashing: Optional[str]
     key_distribution: Optional[str]
+    content_access_verifier: Optional[str]
 
 
 def _resolve_network_name(network: Optional[str] = None) -> str:
@@ -375,5 +383,8 @@ def resolve_endpoints(network: Optional[str] = None) -> ResolvedEndpoints:
         ),
         key_distribution=_override(
             "PRSM_KEY_DISTRIBUTION_ADDRESS", cfg.key_distribution
+        ),
+        content_access_verifier=_override(
+            "PRSM_CONTENT_ACCESS_VERIFIER", cfg.content_access_verifier
         ),
     )
