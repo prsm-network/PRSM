@@ -17,7 +17,8 @@
  *   FTNS_ADDRESS      — the FTNS token address (explicit, no default: wrong token = stuck fees).
  *   REGISTRY_ADDRESS  — the ProvenanceRegistry address (explicit: wrong registry = wrong payee).
  * Optional env:
- *   AUTO_VERIFY=1     — verify on Basescan after deploy (needs BASESCAN_API_KEY / ETHERSCAN_API_KEY).
+ *   AUTO_VERIFY=1     — verify on Basescan after deploy (needs ETHERSCAN_API_KEY — Etherscan's V2
+ *                       unified API covers Base + Base Sepolia with one etherscan.io key).
  *
  * Canonical Base mainnet values (chain 8453), for reference — still pass them explicitly:
  *   FTNS_ADDRESS=0x5276a3756C85f2E9e46f6D34386167a209aa16e5
@@ -32,14 +33,14 @@
  *   # (deploy-provenance-registry-v2.js --network base-sepolia):
  *   PRIVATE_KEY=0x... BASE_SEPOLIA_RPC_URL=https://... \
  *   FTNS_ADDRESS=0x7F5f00FAA2421c4C585cc66c87420b1659c98e6a REGISTRY_ADDRESS=0x<sepolia-registry> \
- *   AUTO_VERIFY=1 BASESCAN_API_KEY=... \
+ *   AUTO_VERIFY=1 ETHERSCAN_API_KEY=... \
  *     npx hardhat run scripts/deploy-content-access-verifier.js --network base-sepolia
  *
  *   # Base mainnet:
  *   PRIVATE_KEY=0x... BASE_RPC_URL=https://... \
  *   FTNS_ADDRESS=0x5276a3756C85f2E9e46f6D34386167a209aa16e5 \
  *   REGISTRY_ADDRESS=0xe0cedDA354f99526c7fbb9b9651e12aDB2180dbf \
- *   AUTO_VERIFY=1 BASESCAN_API_KEY=... \
+ *   AUTO_VERIFY=1 ETHERSCAN_API_KEY=... \
  *     npx hardhat run scripts/deploy-content-access-verifier.js --network base
  *
  * After deploy: put the address in prsm/deployments/contract_addresses.json under

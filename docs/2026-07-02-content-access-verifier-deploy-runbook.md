@@ -32,7 +32,7 @@ PRIVATE_KEY=0x… BASE_SEPOLIA_RPC_URL=https://… \
 # 1b. deploy ContentAccessVerifier against it:
 PRIVATE_KEY=0x… BASE_SEPOLIA_RPC_URL=https://… \
 FTNS_ADDRESS=0x7F5f00FAA2421c4C585cc66c87420b1659c98e6a REGISTRY_ADDRESS=$SEPOLIA_REGISTRY \
-AUTO_VERIFY=1 BASESCAN_API_KEY=… \
+AUTO_VERIFY=1 ETHERSCAN_API_KEY=… \
   npx hardhat run scripts/deploy-content-access-verifier.js --network base-sepolia
 
 # 1c. live smoke (publisher + consumer, small dataset): a publisher registers content in the Sepolia
@@ -47,7 +47,7 @@ AUTO_VERIFY=1 BASESCAN_API_KEY=… \
 PRIVATE_KEY=0x… BASE_RPC_URL=https://… \
 FTNS_ADDRESS=0x5276a3756C85f2E9e46f6D34386167a209aa16e5 \
 REGISTRY_ADDRESS=0xe0cedDA354f99526c7fbb9b9651e12aDB2180dbf \
-AUTO_VERIFY=1 BASESCAN_API_KEY=… \
+AUTO_VERIFY=1 ETHERSCAN_API_KEY=… \
   npx hardhat run scripts/deploy-content-access-verifier.js --network base
 ```
 
