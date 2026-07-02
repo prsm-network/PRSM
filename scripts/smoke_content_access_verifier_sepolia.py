@@ -58,8 +58,11 @@ def main() -> int:
     print(f"content_hash:  0x{ch.hex()}")
     print(f"fee:           {FEE} wei ({Decimal(FEE) / (Decimal(10) ** 18)} FTNS)")
 
-    print("\n[1/5] register content in the registry (creator = payer, 100% rate)…")
-    reg.register_content_v2(ch, 10000, "smoke://cav")
+    print("\n[1/5] register content in the registry (creator = payer)…")
+    # 9800 bps = the registry's MAX creator rate (10000 - 200 network fee). The CAV credits the
+    # FULL fee to the creator regardless — it only uses the creator from getCreatorAndRate, not
+    # the rate — so this value is cosmetic for the smoke; it just has to be a valid registry rate.
+    reg.register_content_v2(ch, 9800, "smoke://cav")
     creator, rate = reg.contract.functions.getCreatorAndRate(ch).call()
     print(f"      getCreatorAndRate → creator={creator} rate={rate}bps")
     assert creator.lower() == addr.lower(), f"creator {creator} != payer {addr}"
