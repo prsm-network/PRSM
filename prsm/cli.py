@@ -12751,6 +12751,72 @@ def content_unlock_cli(
     raise SystemExit(0)
 
 
+@content.command("publish-paid")
+@click.argument("file_path", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "--buyer-pubkey", "buyer_pubkeys", multiple=True, required=True,
+    help="A buyer's X25519 public key (base64). Repeatable for multiple buyers.",
+)
+@click.option("--fee", "fee_ftns", type=float, required=True, help="Release fee in FTNS.")
+@click.option("--filename", default=None, help="Served filename (default: the file's name).")
+@click.option("--api-url", "api_url_override", default=None, help="Override daemon URL")
+@click.option(
+    "--format", "output_format", type=click.Choice(["text", "json"]), default="text",
+)
+def content_publish_paid_cli(
+    file_path: str, buyer_pubkeys, fee_ftns: float, filename: Optional[str],
+    api_url_override: Optional[str], output_format: str,
+) -> None:
+    """Sprint 1367 — publish a Tier B/C PAID dataset from your operator node: encrypt + wrap the
+    content to the buyer(s), serve the ciphertext, deposit the sha256 commitment on-chain (naming
+    the ContentAccessVerifier), and retain the key for the payment-gated serve. Your node must run
+    with PRSM_PAID_KEY_SERVE=1 + PRSM_PAID_PUBLISHER_KEY (the deposit is signed node-side).
+
+    Buyers then unlock with `prsm content unlock <content_hash> --fee <F> --commitment <C>`.
+    Exit 0 published, 1 failed, 2 daemon unreachable.
+    """
+    import base64 as _b64
+    import json as _json
+    from pathlib import Path as _Path
+
+    import httpx
+
+    data = _Path(file_path).read_bytes()
+    url = _api_url_from_creds(api_url_override)
+    body = {
+        "plaintext_b64": _b64.b64encode(data).decode(),
+        "buyer_x25519_pubkeys": list(buyer_pubkeys),
+        "fee_wei": int(round(fee_ftns * (10 ** 18))),
+        "filename": filename or _Path(file_path).name,
+    }
+    key = (os.environ.get("PRSM_NODE_API_KEY") or "").strip()
+    headers = {"Authorization": f"Bearer {key}"} if key else None
+    try:
+        with httpx.Client(timeout=120.0) as c:
+            resp = c.post(f"{url}/content/paid/publish", json=body, headers=headers)
+    except httpx.RequestError as exc:
+        console.print(f"[red]Daemon unreachable at {url}[/red] — {exc}")
+        raise SystemExit(2)
+    if resp.status_code != 200:
+        console.print(f"[red]publish-paid failed ({resp.status_code}):[/red] {resp.text[:300]}")
+        raise SystemExit(1)
+
+    out = resp.json()
+    if output_format == "json":
+        click.echo(_json.dumps(out, indent=2))
+        raise SystemExit(0)
+    console.print("[green]Published paid dataset[/green]")
+    console.print(f"  content_hash: [cyan]{out['content_hash']}[/cyan]")
+    console.print(f"  commitment:   [dim]{out['commitment']}[/dim]")
+    console.print(f"  verifier:     [dim]{out['verifier']}[/dim]")
+    console.print(f"  deposit_tx:   [dim]{out.get('deposit_tx')}[/dim]")
+    console.print(f"  fee: {fee_ftns} FTNS   recipients: {out['num_recipients']}")
+    console.print(
+        f"\n  Buyers unlock with: [bold]prsm content unlock {out['content_hash']} "
+        f"--fee {fee_ftns} --commitment {out['commitment']}[/bold]")
+    raise SystemExit(0)
+
+
 @content.command("mine")
 @click.option("--api-port", default=8000, type=int)
 @click.option(
