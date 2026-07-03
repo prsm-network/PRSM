@@ -4517,6 +4517,7 @@ class PRSMNode:
             # disabled (the endpoint returns 503) rather than breaking node startup.
             self._paid_key_store = None
             self._paid_key_verify_payment = None
+            self._paid_publish_key_client = None      # sp1367 — publisher deposit client
             if (os.environ.get("PRSM_PAID_KEY_SERVE") or "").strip().lower() in (
                     "1", "true", "yes", "on"):
                 try:
@@ -4541,10 +4542,18 @@ class PRSMNode:
                             _ep.rpc_url, _cav, _ep.ftns_token,  # read-only (no signer)
                             expected_chain_id=_ep.chain_id)
                         self._paid_key_verify_payment = build_paid_key_verify_payment(_vc)
+                    # sp1367 — publisher key client, so this operator node can PUBLISH paid content
+                    # (deposit the commitment). Optional: only when PRSM_PAID_PUBLISHER_KEY is set.
+                    _pubkey = (os.environ.get("PRSM_PAID_PUBLISHER_KEY") or "").strip()
+                    if _pubkey and _ep.key_distribution:
+                        from prsm.economy.web3.key_distribution import KeyDistributionClient
+                        self._paid_publish_key_client = KeyDistributionClient(
+                            _ep.rpc_url, _ep.key_distribution, private_key=_pubkey)
                 except Exception as _exc:  # noqa: BLE001
                     logger.warning("paid-key serve wiring failed (disabled): %s", _exc)
                     self._paid_key_store = None
                     self._paid_key_verify_payment = None
+                    self._paid_publish_key_client = None
 
             self._onchain_settlement_client = (
                 build_onchain_settlement_client_or_none(

@@ -107,6 +107,51 @@ def publish_paid_content(
     }
 
 
+def build_paid_content(plaintext: bytes, recipients: List[Any]) -> Dict[str, Any]:
+    """sp1367 — the pure crypto step of paid publish (no chain, no serve): encrypt with a fresh
+    AES-256-GCM key + wrap that key to the buyer(s)' X25519 pubkeys. Returns
+    ``{ciphertext, wrapped_key, commitment}`` (commitment = sha256(wrapped_key)).
+
+    Split out from publish_paid_content so an ASYNC caller (the node route) can upload the
+    ciphertext to the content layer FIRST — getting the authoritative content_hash =
+    sha256(ciphertext), which is also where the upload registers the creator on-chain — and THEN
+    deposit the commitment under that same hash (via ``deposit_commitment_and_retain``)."""
+    from prsm.storage.encryption import encrypt, generate_key
+    from prsm.storage.paid_unlock import (
+        key_commitment,
+        serialize_encrypted_content,
+        wrap_content_key_for_deposit,
+    )
+    if not recipients:
+        raise ValueError("at least one recipient (buyer X25519 pubkey) is required")
+    content_key = generate_key()
+    ciphertext = serialize_encrypted_content(encrypt(plaintext, content_key))
+    wrapped = wrap_content_key_for_deposit(content_key, list(recipients))
+    return {"ciphertext": ciphertext, "wrapped_key": wrapped, "commitment": key_commitment(wrapped)}
+
+
+def deposit_commitment_and_retain(
+    *,
+    key_client: Any,
+    paid_key_store: Any,
+    content_hash: bytes,
+    commitment: bytes,
+    wrapped_key: bytes,
+    fee_wei: int,
+    verifier_address: str,
+) -> Any:
+    """sp1367 — the on-chain + retain step of paid publish, given the content_hash the content
+    layer assigned (sha256(ciphertext)). Anti-squat guard (F2) → deposit the commitment naming the
+    CAV → retain the wrapped key in the node's store. Returns (tx_hash, status)."""
+    if int(fee_wei) <= 0:
+        raise ValueError("fee_wei must be > 0")
+    assert_content_hash_unclaimed(key_client, content_hash, getattr(key_client, "address", None))
+    tx, status = key_client.deposit_key(
+        content_hash, commitment, verifier_address, int(fee_wei))
+    paid_key_store.put(content_hash, wrapped_key, int(fee_wei))
+    return tx, status
+
+
 class SquatMismatchError(Exception):
     """sp1365 (review F9/F2) — the party that would EARN the access fee (the ProvenanceRegistry
     creator the CAV credits) is not the party that CONTROLS the content (the KeyDistribution

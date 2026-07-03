@@ -17153,6 +17153,95 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             "wrapped_key_b64": base64.b64encode(wrapped).decode("ascii"),
         }
 
+    @app.post("/content/paid/publish")
+    async def content_paid_publish(request: Request) -> Dict[str, Any]:
+        """Sprint 1367 (Tier B/C paid-decrypt PUBLISHER surface) — publish a paid dataset from this
+        operator node. Body JSON: ``plaintext_b64``, ``buyer_x25519_pubkeys`` (list), ``fee_wei``,
+        optional ``filename``.
+
+        Encrypts + wraps the content to the buyer(s), UPLOADS the ciphertext via the normal content
+        layer (which serves it AND registers the creator on-chain = the publisher, so the CAV's
+        getCreatorAndRate resolves + the anti-squat invariant holds), then DEPOSITS the sha256
+        commitment on-chain naming the ContentAccessVerifier and RETAINS the wrapped key for the
+        payment-gated serve endpoint. Never puts the wrapped key on-chain (F1).
+
+        Operator-only: needs PRSM_PAID_KEY_SERVE, a publisher key (node._paid_publish_key_client,
+        wired from PRSM_PAID_PUBLISHER_KEY), and the CAV resolved from network config.
+        """
+        import asyncio
+        import base64
+        import os
+
+        from prsm.economy.paid_content import (
+            build_paid_content,
+            deposit_commitment_and_retain,
+        )
+        from prsm.enterprise.recipient_encryption import EnterpriseRecipient
+
+        if (os.environ.get("PRSM_PAID_KEY_SERVE") or "").strip().lower() not in (
+                "1", "true", "yes", "on"):
+            raise HTTPException(status_code=503, detail="paid-content publish disabled "
+                                "(set PRSM_PAID_KEY_SERVE=1)")
+        store = getattr(node, "_paid_key_store", None)
+        key_client = getattr(node, "_paid_publish_key_client", None)
+        uploader = getattr(node, "content_uploader", None)
+        if store is None or key_client is None or uploader is None:
+            raise HTTPException(
+                status_code=503,
+                detail="paid publish not initialized — needs PRSM_PAID_KEY_SERVE, a publisher key "
+                       "(PRSM_PAID_PUBLISHER_KEY), and a content uploader")
+
+        from prsm.config.networks import resolve_endpoints
+        cav = resolve_endpoints(None).content_access_verifier
+        if not cav:
+            raise HTTPException(status_code=503, detail="no ContentAccessVerifier for this network "
+                                "(set PRSM_CONTENT_ACCESS_VERIFIER)")
+
+        body = await request.json()
+        pubkeys = body.get("buyer_x25519_pubkeys") or []
+        if not isinstance(pubkeys, list) or not pubkeys:
+            raise HTTPException(status_code=422, detail="buyer_x25519_pubkeys must be a non-empty list")
+        try:
+            fee_wei = int(body["fee_wei"])
+            plaintext = base64.b64decode(body["plaintext_b64"])
+        except (KeyError, ValueError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail=f"bad request: {exc}")
+
+        recipients = [EnterpriseRecipient(identifier=f"buyer-{i}", x25519_pubkey_b64=str(k))
+                      for i, k in enumerate(pubkeys)]
+        try:
+            crypto = build_paid_content(plaintext, recipients)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
+        # Upload the ciphertext → the content layer serves it + registers creator == publisher.
+        uploaded = await uploader.upload(
+            crypto["ciphertext"], body.get("filename", "paid-dataset.bin"),
+            {"paid": True}, creator_eth_address=getattr(key_client, "address", None))
+        if uploaded is None or not getattr(uploaded, "content_hash", None):
+            raise HTTPException(status_code=502, detail="content upload failed")
+        cid = str(uploaded.content_hash)
+        ch = bytes.fromhex(cid[2:] if cid.startswith("0x") else cid)
+
+        try:
+            tx, _status = await asyncio.to_thread(
+                deposit_commitment_and_retain,
+                key_client=key_client, paid_key_store=store, content_hash=ch,
+                commitment=crypto["commitment"], wrapped_key=crypto["wrapped_key"],
+                fee_wei=fee_wei, verifier_address=cav)
+        except Exception as exc:  # noqa: BLE001 — surface deposit/squat failures to the operator
+            raise HTTPException(status_code=409, detail=f"deposit/retain failed: {exc}")
+
+        return {
+            "content_hash": "0x" + ch.hex(),
+            "cid": cid,
+            "commitment": "0x" + crypto["commitment"].hex(),
+            "verifier": cav,
+            "deposit_tx": tx,
+            "fee_wei": fee_wei,
+            "num_recipients": len(recipients),
+        }
+
     @app.post("/compute/inference/quote-multistage")
     async def compute_inference_quote_multistage(request: Request) -> Dict[str, Any]:
         """Sprint 1313 (S1) — paid multi-stage QUOTE. Previews the planned stage→node topology
