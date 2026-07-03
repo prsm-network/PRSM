@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 
 _KNOWN_TRUST_STACK_KINDS = ("mock", "production")
-_KNOWN_GPU_POOL_KINDS = ("static-empty", "dht-backed")
+_KNOWN_GPU_POOL_KINDS = ("static-empty", "dht-backed", "static-file")
 
 # Sprint 559 — catalog schema versioning. v1 shape:
 #   {
@@ -1443,6 +1443,14 @@ def build_parallax_executor_or_none(node: Any) -> Optional[Any]:
             build_dht_backed_pool_provider,
         )
         pool_provider = build_dht_backed_pool_provider(node)
+    elif pool_kind == "static-file":
+        # Sprint 1371 — operator-pinned pool from PRSM_PARALLAX_GPU_POOL_FILE. Lets a controlled
+        # multi-node deployment force a real cross-node split without libp2p hardware_profile
+        # propagation (which the default WebSocket transport lacks — the mainnet-canary blocker).
+        from prsm.node.static_file_pool_provider import (
+            build_static_file_pool_provider,
+        )
+        pool_provider = build_static_file_pool_provider(node)
     else:  # defensive
         return None
 

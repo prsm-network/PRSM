@@ -154,3 +154,32 @@ can't fit one; (c) use GPU nodes with real limited VRAM (how the earlier multi-h
 splits naturally). This is a parallax-scheduler task, orthogonal to the (already-proven) settlement
 loop. The 2-node **testnet** full loop (commit + finalize + conservation) already passed, so the
 settlement design is validated; this is purely the mainnet compute-topology plumbing.
+
+### RESOLUTION — static-file pool provider (sp1371)
+
+Implemented a `static-file` GPU pool provider (`prsm/node/static_file_pool_provider.py`,
+`PRSM_PARALLAX_GPU_POOL_KIND=static-file`) that pins the parallax pool from a JSON file instead of
+relying on libp2p hardware_profile propagation. This fixes BOTH blockers at once: both nodes are
+listed (membership), same `region` (one allocation group), and `memory_gb` tuned so the model can't
+fit one node (forced split). Unit-proven end to end: the pinned pool drives `allocate_across_regions`
+to a real **2-stage** pipeline (`[(0,6),(6,12)]` for a 12-layer model — contiguous, no gap/overlap),
+not two replicas and not InsufficientCapacity. 9 TDD.
+
+**Operator recipe for the next canary attempt** — on BOTH nodes, in the start env:
+```bash
+export PRSM_PARALLAX_GPU_POOL_KIND=static-file
+export PRSM_PARALLAX_GPU_POOL_FILE=$HOME/parallax_pool.json
+```
+`parallax_pool.json` (identical on both, fill the two node_ids):
+```json
+{"gpus": [
+  {"node_id": "<A_node_id>", "region": "canary", "layer_capacity": 6, "memory_gb": 0.5, "stake_amount": 1000000000000000000},
+  {"node_id": "<B_node_id>", "region": "canary", "layer_capacity": 6, "memory_gb": 0.5, "stake_amount": 1000000000000000000}
+]}
+```
+Key tuning: **`memory_gb` must be below the model's single-node footprint** so it can't fit one node
+(gpt2 → 0.5; scale up for bigger models). Same `region` on both (they must share an allocation
+group). Positive `stake_amount` if `PRSM_PARALLAX_STAKE_ELIGIBILITY=enforced`. Confirm with
+`GET /admin/parallax/pool/snapshot` (expect `gpu_count: 2`) and a `quote-multistage` returning
+`multi_stage: true, stage_count: 2` before running the canary. The settlement side is already
+proven GO — this was the only gap.
