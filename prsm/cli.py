@@ -12817,6 +12817,33 @@ def content_publish_paid_cli(
     raise SystemExit(0)
 
 
+@content.command("buyer-keygen")
+@click.option(
+    "--format", "output_format", type=click.Choice(["text", "json"]), default="text",
+)
+def content_buyer_keygen_cli(output_format: str) -> None:
+    """Sprint 1368 — generate an X25519 keypair for BUYING Tier B/C paid content.
+
+    Give the PUBLIC key to a publisher (they wrap the content key to it when they run
+    `content publish-paid --buyer-pubkey <PUBLIC>`). Keep the PRIVATE key secret and set it as
+    PRSM_X25519_PRIVKEY when you run `content unlock`. This runs locally — no node needed.
+    """
+    import json as _json
+
+    from prsm.enterprise.recipient_encryption import generate_recipient_keypair
+
+    priv_b64, pub_b64 = generate_recipient_keypair()
+    if output_format == "json":
+        click.echo(_json.dumps({"x25519_pubkey_b64": pub_b64, "x25519_privkey_b64": priv_b64}))
+        return
+    console.print("[green]X25519 keypair for Tier B/C paid content[/green]")
+    console.print(f"  PUBLIC  (share with the publisher): [cyan]{pub_b64}[/cyan]")
+    console.print(f"  PRIVATE (keep secret → PRSM_X25519_PRIVKEY): [red]{priv_b64}[/red]")
+    console.print(
+        "\n  [dim]Never share the private key. The publisher wraps the content key to your PUBLIC "
+        "key;\n  only the PRIVATE key can decrypt what you buy.[/dim]")
+
+
 @content.command("mine")
 @click.option("--api-port", default=8000, type=int)
 @click.option(
