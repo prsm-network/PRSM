@@ -126,3 +126,31 @@ you simply stop originating new per-stage commits. No migration, no contract cha
   the quote / delivery / commit logs live.
 - **Operator (you):** provision hosts + keys + escrow; set env (keys stay in your shell); sign the
   mainnet commit + finalize broadcasts. The autonomous loop pauses at every irreversible signature.
+
+---
+
+## Appendix — COMPUTE-LAYER PREREQUISITE (found 2026-07-03 during the live canary)
+
+The settlement stack activated cleanly on mainnet (both nodes preflight ✅ GO, funded, peered,
+wallet map resolving). The canary was blocked NOT by settlement but by the parallax **compute**
+layer failing to produce a 2-stage split on the two nodes. Root cause, diagnosed via
+`GET /admin/parallax/pool/snapshot`:
+
+1. **Pool membership.** `gpu_count: 1` — the head's parallax pool contained only itself. A
+   `/peers/connect` transport link does NOT put the peer in the head's GPU pool; the pool is
+   `dht-backed` and reads peer `hardware_profile`s, which only propagate over **libp2p discovery**
+   (`libp2p_discovery.py:452`). The default WebSocket transport doesn't propagate them, and the only
+   pool kinds are `dht-backed` / `static-empty` (no static-file pool to list nodes explicitly).
+2. **Advertised capacity.** The head advertised a synthetic default profile
+   (`layer_capacity: 16, memory_gb: 80, device: cuda, region: local-region`). gpt2's 12 layers fit
+   one node → no reason to split. `PRSM_PARALLAX_LAYER_CAPACITY_OVERRIDE` / `MEMORY_GB_OVERRIDE` /
+   `PRSM_PARALLAX_REGION` did NOT change the advertised profile (confirmed ignored by the tiler).
+
+**To run the live 2-stage canary, the compute layer must first be made to shard across the two
+nodes**, independent of settlement. Options for a future attempt: (a) run the nodes on **libp2p**
+transport so hardware_profiles propagate → the peer enters the pool; (b) supply a custom
+`PRSM_HARDWARE_PROFILE_FILE` with a low `layer_capacity` (< model layers) on each node so the model
+can't fit one; (c) use GPU nodes with real limited VRAM (how the earlier multi-host proofs got their
+splits naturally). This is a parallax-scheduler task, orthogonal to the (already-proven) settlement
+loop. The 2-node **testnet** full loop (commit + finalize + conservation) already passed, so the
+settlement design is validated; this is purely the mainnet compute-topology plumbing.
