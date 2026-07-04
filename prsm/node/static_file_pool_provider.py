@@ -66,7 +66,39 @@ def _gpu_from_entry(entry: dict) -> ParallaxGPU:
         gpu_name=str(entry.get("gpu_name", "") or ""),
         device=str(entry.get("device", "cuda") or "cuda"),
         num_gpus=int(entry.get("num_gpus", 1)),
+        # sp1372 — optional per-entry inter-node RTT map (node_id → ms). Missing links get
+        # the full-mesh default below so the DP router can route (absent RTT → inf → no chain).
+        rtt_to_nodes=(
+            {str(k): float(v) for k, v in entry["rtt_to_nodes"].items()}
+            if isinstance(entry.get("rtt_to_nodes"), dict) else None),
     )
+
+
+def _patch_full_mesh_rtt(gpus: List[ParallaxGPU]) -> List[ParallaxGPU]:
+    """Sprint 1372 — mirror the dht provider (dht_backed_pool_provider): the Phase-2 DP router
+    computes inter-stage cost from ``node.rtt_to(other)``, which returns ``inf`` when
+    ``rtt_to_nodes`` is absent — so a chain across statically-pinned nodes is rejected as
+    infeasible (``path=[] latency=inf``) and only single-node requests route. Patch a full-mesh
+    default RTT (``PRSM_PARALLAX_DEFAULT_RTT_MS``, else 100 ms) for any missing link so a
+    multi-node static pool is ROUTABLE, not just allocatable. Per-entry ``rtt_to_nodes`` wins."""
+    if len(gpus) <= 1:
+        return gpus
+    default_rtt = 100.0
+    raw = (os.environ.get("PRSM_PARALLAX_DEFAULT_RTT_MS", "") or "").strip()
+    if raw:
+        try:
+            default_rtt = float(raw)
+        except ValueError:
+            pass
+    from dataclasses import replace as _dc_replace
+    patched: List[ParallaxGPU] = []
+    for g in gpus:
+        rtt_map = dict(g.rtt_to_nodes) if g.rtt_to_nodes else {}
+        for other in gpus:
+            if other.node_id != g.node_id and other.node_id not in rtt_map:
+                rtt_map[other.node_id] = default_rtt
+        patched.append(_dc_replace(g, rtt_to_nodes=rtt_map))
+    return patched
 
 
 def _load_entries(path: str) -> List[dict]:
@@ -107,5 +139,5 @@ def build_static_file_pool_provider(node: Any = None) -> Callable[[], List[Paral
                 logger.warning(
                     "static-file pool: skipping malformed entry %s: %s",
                     entry.get("node_id", "<no node_id>"), exc)
-        return gpus
+        return _patch_full_mesh_rtt(gpus)
     return _provider

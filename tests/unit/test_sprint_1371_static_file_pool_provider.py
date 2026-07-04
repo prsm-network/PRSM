@@ -123,6 +123,42 @@ def test_provider_pool_yields_a_real_2stage_split(tmp_path, monkeypatch):
         assert end_prev == start_next                       # no gap, no overlap → conservation
 
 
+def test_full_mesh_rtt_makes_pool_routable(tmp_path, monkeypatch):
+    # sp1372: absent rtt_to_nodes → the Phase-2 DP router rejects the chain (node.rtt_to → inf →
+    # path=[] latency=inf → only single-node requests route). The provider patches a full-mesh
+    # default RTT so a multi-node static pool is ROUTABLE, not just allocatable. Diagnosed live on
+    # the Lambda GPU canary 2026-07-04 (a real 14B split failed at the router, not the allocator).
+    monkeypatch.setenv("PRSM_PARALLAX_DEFAULT_RTT_MS", "100")
+    path = _write(tmp_path, {"gpus": [
+        {"node_id": _A, "region": "canary", "layer_capacity": 6, "memory_gb": 16.0},
+        {"node_id": _B, "region": "canary", "layer_capacity": 6, "memory_gb": 16.0},
+    ]})
+    monkeypatch.setenv("PRSM_PARALLAX_GPU_POOL_FILE", path)
+    gpus = {g.node_id: g for g in build_static_file_pool_provider()()}
+    assert gpus[_A].rtt_to_nodes == {_B: 100.0}          # A → B mesh link
+    assert gpus[_B].rtt_to_nodes == {_A: 100.0}          # B → A mesh link
+
+
+def test_single_node_gets_no_rtt_mesh(tmp_path, monkeypatch):
+    path = _write(tmp_path, [{"node_id": _A, "region": "r", "layer_capacity": 6, "memory_gb": 8.0}])
+    monkeypatch.setenv("PRSM_PARALLAX_GPU_POOL_FILE", path)
+    (g,) = build_static_file_pool_provider()()
+    assert not g.rtt_to_nodes                            # no peers → nothing to mesh
+
+
+def test_per_entry_rtt_overrides_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("PRSM_PARALLAX_DEFAULT_RTT_MS", "100")
+    path = _write(tmp_path, {"gpus": [
+        {"node_id": _A, "region": "r", "layer_capacity": 6, "memory_gb": 8.0,
+         "rtt_to_nodes": {_B: 5.0}},
+        {"node_id": _B, "region": "r", "layer_capacity": 6, "memory_gb": 8.0},
+    ]})
+    monkeypatch.setenv("PRSM_PARALLAX_GPU_POOL_FILE", path)
+    gpus = {g.node_id: g for g in build_static_file_pool_provider()()}
+    assert gpus[_A].rtt_to_nodes[_B] == 5.0              # explicit per-entry value preserved
+    assert gpus[_B].rtt_to_nodes[_A] == 100.0           # default fills the unspecified reverse link
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
