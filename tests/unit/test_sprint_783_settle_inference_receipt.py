@@ -228,3 +228,43 @@ def test_over_funded_escrow_amount_propagated():
     assert d.release_to_operator == Decimal("1.0")
     assert d.refund_to_payer == Decimal("1.0")
     esc.release_escrow_split.assert_awaited_once()
+
+
+# ---- sp1374: multi-stage defers the on-chain broadcast --------------------
+
+def _make_multistage_receipt(operator_id):
+    """A cross-host receipt whose signed topology names 2 distinct stage nodes
+    (head=operator + a worker) — so split_release_across_stages fans out."""
+    from prsm.compute.inference.topology_rotation import TopologyAssignment
+    topo = TopologyAssignment(
+        positions={(0, 0): operator_id, (1, 0): "worker2"},
+        stage_count=2, slots_per_stage=1)
+    return _make_receipt(
+        settler_node_id=operator_id, topology_assignment=topo,
+        cost_ftns=Decimal("1.0"))
+
+
+def test_sp1374_multistage_on_defers_onchain_broadcast(monkeypatch):
+    # PRSM_MULTISTAGE_SETTLEMENT on: the per-stage escrow commit (sp1324/1322)
+    # settles the stage shares on-chain via the registry, so the off-chain split
+    # here must NOT broadcast — else the stage nodes are DOUBLE-PAID.
+    from prsm.economy.credit_policy import settle_inference_receipt
+    monkeypatch.setenv("PRSM_MULTISTAGE_SETTLEMENT", "1")
+    esc = _make_escrow_mock(amount=1.0)
+    r = _make_multistage_receipt("op1")
+    asyncio.run(settle_inference_receipt(
+        payment_escrow=esc, receipt=r, operator_id="op1", job_id="j1"))
+    esc.release_escrow_split.assert_awaited_once()
+    assert esc.release_escrow_split.call_args.kwargs.get("broadcast") is False
+
+
+def test_sp1374_multistage_off_still_broadcasts(monkeypatch):
+    # multistage OFF: the off-chain broadcast IS the on-chain settlement — unchanged.
+    from prsm.economy.credit_policy import settle_inference_receipt
+    monkeypatch.delenv("PRSM_MULTISTAGE_SETTLEMENT", raising=False)
+    esc = _make_escrow_mock(amount=1.0)
+    r = _make_multistage_receipt("op1")
+    asyncio.run(settle_inference_receipt(
+        payment_escrow=esc, receipt=r, operator_id="op1", job_id="j1"))
+    esc.release_escrow_split.assert_awaited_once()
+    assert esc.release_escrow_split.call_args.kwargs.get("broadcast", True) is True

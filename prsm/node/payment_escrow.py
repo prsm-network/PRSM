@@ -348,13 +348,20 @@ class PaymentEscrow:
         job_id: str,
         splits: List[tuple],
         consensus_reached: bool = True,
+        broadcast: bool = True,
     ) -> Optional[List[Transaction]]:
         """Release an escrow to multiple recipients — sp907 lock wrapper.
         Serialized per job_id so concurrent split-releases (or a split
-        racing a release/refund) cannot double-pay recipients."""
+        racing a release/refund) cannot double-pay recipients.
+
+        sp1374 — ``broadcast=False`` performs the local-ledger release WITHOUT
+        the on-chain BatchSettlement broadcast. Used by the multi-stage settle
+        path (credit_policy) when PRSM_MULTISTAGE_SETTLEMENT is on: the per-stage
+        escrow commit (sp1324/1322) settles those shares on-chain via the
+        registry, so a second on-chain broadcast here would DOUBLE-PAY."""
         async with self._job_lock(job_id):
             return await self._release_escrow_split_locked(
-                job_id, splits, consensus_reached,
+                job_id, splits, consensus_reached, broadcast=broadcast,
             )
 
     async def _release_escrow_split_locked(
@@ -362,6 +369,7 @@ class PaymentEscrow:
         job_id: str,
         splits: List[tuple],
         consensus_reached: bool = True,
+        broadcast: bool = True,
     ) -> Optional[List[Transaction]]:
         """Release an escrow to multiple recipients atomically.
 
@@ -591,8 +599,10 @@ class PaymentEscrow:
                     f"already released): {exc}"
                 )
 
-        # Broadcast on-chain after local ledger commit.
-        if self.broadcast_tx:
+        # Broadcast on-chain after local ledger commit. sp1374 — skipped when
+        # broadcast=False (multi-stage: the per-stage escrow commit settles these
+        # shares on-chain via the registry; a second broadcast here double-pays).
+        if broadcast and self.broadcast_tx:
             for tx in txs:
                 try:
                     await self.broadcast_tx(tx)

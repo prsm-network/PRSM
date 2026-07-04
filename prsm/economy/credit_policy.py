@@ -303,7 +303,18 @@ async def settle_inference_receipt(
             )
         except Exception:
             pass
-        await payment_escrow.release_escrow_split(job_id, float_splits)
+        # sp1374 — when the multi-stage per-stage escrow commit is active
+        # (PRSM_MULTISTAGE_SETTLEMENT on), it settles these stage shares on-chain
+        # via the BatchSettlementRegistry (sp1324 delivery → sp1322 per-node
+        # self-commit). So do the local-ledger split here but DO NOT broadcast
+        # on-chain — a second broadcast (legacy BatchSettlement direct transfer)
+        # would DOUBLE-PAY the stage nodes. When multistage is off, this off-chain
+        # broadcast IS the on-chain settlement (unchanged).
+        import os as _os
+        _multistage = (_os.environ.get("PRSM_MULTISTAGE_SETTLEMENT", "") or "").strip().lower() in (
+            "1", "true", "yes")
+        await payment_escrow.release_escrow_split(
+            job_id, float_splits, broadcast=not _multistage)
     elif release > 0 and refund > 0:
         # Partial (single payee): split-API handles remainder refund.
         await payment_escrow.release_escrow_split(
