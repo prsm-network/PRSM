@@ -692,6 +692,33 @@ def build_reduced_config_slice_model(
                 f"for {model_id!r}: {type(exc).__name__}: {exc}"
             ) from exc
 
+    # sp1373 — some architectures ALSO carry PER-LAYER rotary embeddings
+    # (e.g. Qwen2.5: ``model.layers.N.self_attn.rotary_emb.inv_freq``), whose
+    # inv_freq is likewise a computed buffer (not a checkpoint weight) left on
+    # meta after the meta-build. sp1227 rebuilt only the model-level rotary, so
+    # the per-layer inv_freq buffers survived → the meta-tensor guard below
+    # rejected the slice → full-load fallback → OOM for a 14B on one 24GB GPU.
+    # Materialize every remaining meta inv_freq: prefer the just-rebuilt
+    # model-level rotary's real inv_freq (identical for uniform RoPE), else
+    # recompute it from the config (default RoPE init).
+    _meta_rotary = [
+        _m for _m in model.modules()
+        if getattr(getattr(_m, "inv_freq", None), "is_meta", False)
+    ]
+    if _meta_rotary:
+        import torch as _torch
+        _model_rotary = getattr(_inner, "rotary_emb", None) if _inner is not None else None
+        _ref = getattr(_model_rotary, "inv_freq", None) if _model_rotary is not None else None
+        if _ref is None or bool(getattr(_ref, "is_meta", False)):
+            _hd = getattr(cfg, "head_dim", None) or (
+                int(cfg.hidden_size) // int(cfg.num_attention_heads))
+            _base = float(getattr(cfg, "rope_theta", 10000.0))
+            _ref = 1.0 / (
+                _base ** (_torch.arange(0, _hd, 2, dtype=_torch.float32) / _hd))
+        for _m in _meta_rotary:
+            _m.register_buffer(
+                "inv_freq", _ref.clone().detach().to(device), persistent=False)
+
     # C3 — fail-loud AFTER tie_weights: no OWNED key may be missing; nothing
     # unexpected (an off-by-one relative remap surfaces here as an unexpected
     # key). This is the silent-corruption guard for strict=False.
