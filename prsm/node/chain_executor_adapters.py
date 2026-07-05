@@ -1620,6 +1620,52 @@ class IdentityLayerSliceRunner:
         )
 
 
+def ensure_hf_model_registered(
+    *, registry_root: Any, model_id: str, num_layers: int, identity: Any,
+) -> bool:
+    """Sprint 1377 — idempotently register an HF model as a single-shard sentinel in the local
+    FilesystemModelRegistry (the signed manifest ``build_layer_stage_server_executor`` requires;
+    the HF runner loads the actual weights from the HF cache at runtime, so no weight copy). This
+    is the same registration ``scripts/stage_hf_model.py`` does — folded into node-start so an
+    operator doesn't have to run it by hand (the manual step the 2026-07-04 mainnet GPU canary hit).
+
+    Idempotent: a pre-existing manifest (registered by us or another publisher) → returns True
+    without clobbering. Returns False + logs a warning on any failure; NEVER raises."""
+    import logging as _lg
+    try:
+        from pathlib import Path
+
+        from prsm.compute.model_registry.registry import (
+            FilesystemModelRegistry,
+            ModelAlreadyRegisteredError,
+            ModelShard,
+            ShardedModel,
+        )
+        registry = FilesystemModelRegistry(root=Path(str(registry_root)))
+        shard = ModelShard(
+            shard_id=f"{model_id.replace('/', '_')}-shard-0", model_id=model_id,
+            shard_index=0, total_shards=1, tensor_data=b"\x00" * 32, tensor_shape=(32,),
+            layer_range=(0, int(num_layers)), size_bytes=32)
+        model = ShardedModel(
+            model_id=model_id, model_name=f"HF runner sentinel for {model_id}",
+            total_shards=1, shards=[shard])
+        try:
+            registry.register(model, identity=identity)
+            _lg.getLogger(__name__).info(
+                "sp1377 auto-stage: registered %s in model registry %s (layers 0-%s) — "
+                "layer-stage server can now build; no manual stage_hf_model.py run needed.",
+                model_id, registry_root, num_layers)
+        except ModelAlreadyRegisteredError:
+            pass  # idempotent — manifest already present
+        return True
+    except Exception as exc:  # noqa: BLE001 — fail-soft; operator can run stage_hf_model.py manually
+        _lg.getLogger(__name__).warning(
+            "sp1377 auto-stage: could not register %s in registry %s (%s: %s) — "
+            "run scripts/stage_hf_model.py manually.",
+            model_id, registry_root, type(exc).__name__, exc)
+        return False
+
+
 def build_layer_stage_server_executor(
     *,
     node: Any,

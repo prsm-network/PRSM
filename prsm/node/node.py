@@ -2937,6 +2937,26 @@ class PRSMNode:
             )
             built = build_parallax_executor_or_none(self)
             self.inference_executor = built
+            # sp1377 — auto-stage the configured HF model into the local model registry so the
+            # layer-stage server can build (else the worker stage-executor is a stub → chain fails).
+            # Uses the num_layers from the catalog (auto-derived by sp1376). Fail-soft; only when the
+            # operator opted into a registry root + an HF model. Removes the manual stage_hf_model.py.
+            if built is not None:
+                _reg_root = (os.environ.get("PRSM_MODEL_REGISTRY_ROOT", "") or "").strip()
+                _hf_mid = (os.environ.get("PRSM_PARALLAX_HF_MODEL_ID", "") or "").strip()
+                if _reg_root and _hf_mid and getattr(self, "identity", None) is not None:
+                    try:
+                        _mi = (getattr(built, "_catalog", {}) or {}).get(_hf_mid)
+                        _nl = getattr(_mi, "num_layers", None)
+                        if _nl:
+                            from prsm.node.chain_executor_adapters import (
+                                ensure_hf_model_registered,
+                            )
+                            ensure_hf_model_registered(
+                                registry_root=_reg_root, model_id=_hf_mid,
+                                num_layers=_nl, identity=self.identity)
+                    except Exception as _stg_exc:  # noqa: BLE001 — never block startup
+                        logger.debug("sp1377 auto-stage skipped: %s", _stg_exc)
             if built is not None:
                 logger.info(
                     "Inference executor: ParallaxScheduledExecutor "
