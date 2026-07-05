@@ -1256,6 +1256,52 @@ def ensure_hf_model_staged(identity, env=None) -> str:
         return f"error:{type(exc).__name__}: {exc}"
 
 
+def augment_catalog_with_configured_hf_model(
+    catalog: dict,
+    model_info_cls: Any,
+    environ: Any = None,
+    config_loader: Any = None,
+    entry_deriver: Any = None,
+) -> None:
+    """Sprint 1376 — auto-catalog the operator's configured HF model.
+
+    Serving any HF model beyond the bundled catalog otherwise requires hand-running
+    ``scripts/gen_parallax_catalog.py`` + editing ``PRSM_PARALLAX_MODEL_CATALOG_FILE`` — the manual
+    step the 2026-07-04 mainnet GPU canary hit (Qwen-14B had to be added by hand). If
+    ``PRSM_PARALLAX_HF_MODEL_ID`` is set and absent from ``catalog``, derive its ModelInfo from the
+    model's HF ``config.json`` (a few-KB fetch, NOT the weights) via the SAME helper the generator
+    uses, and add it in place. FAIL-SOFT: any error (transformers absent / offline / bad id) logs a
+    warning and leaves ``catalog`` unchanged — the operator can still pre-populate the file.
+
+    ``config_loader`` / ``entry_deriver`` are injectable for tests (default to
+    ``transformers.AutoConfig.from_pretrained`` + ``catalog_entry_for_config``)."""
+    import os as _os
+    env = environ if environ is not None else _os.environ
+    hf_mid = (env.get("PRSM_PARALLAX_HF_MODEL_ID", "") or "").strip()
+    if not hf_mid or hf_mid in catalog:
+        return
+    try:
+        if config_loader is None:
+            from transformers import AutoConfig
+            config_loader = AutoConfig.from_pretrained
+        if entry_deriver is None:
+            from prsm.compute.inference.local_inference import (
+                catalog_entry_for_config,
+            )
+            entry_deriver = catalog_entry_for_config
+        entry = entry_deriver(config_loader(hf_mid), hf_mid)
+        catalog[hf_mid] = model_info_cls(**entry)
+        logger.info(
+            "sp1376 auto-catalog: derived ModelInfo for %s from its HF config "
+            "(num_layers=%s) — no manual catalog edit needed.",
+            hf_mid, (entry or {}).get("num_layers"))
+    except Exception as exc:  # noqa: BLE001 — fail-soft; operator can pre-populate the catalog file
+        logger.warning(
+            "sp1376 auto-catalog: could not derive ModelInfo for "
+            "PRSM_PARALLAX_HF_MODEL_ID=%r (%s: %s) — add it to the catalog manually "
+            "(scripts/gen_parallax_catalog.py).", hf_mid, type(exc).__name__, exc)
+
+
 def build_parallax_executor_or_none(node: Any) -> Optional[Any]:
     """Construct a ParallaxScheduledExecutor if every required
     operator-supplied component is present + valid.
@@ -1405,6 +1451,10 @@ def build_parallax_executor_or_none(node: Any) -> Optional[Any]:
             "construction: %s", catalog_path, exc,
         )
         return None
+
+    # sp1376 — auto-add the operator's configured HF model (PRSM_PARALLAX_HF_MODEL_ID) if the
+    # catalog file doesn't already name it, so serving a real HF model needs no manual catalog edit.
+    augment_catalog_with_configured_hf_model(catalog, ModelInfo)
 
     if not catalog:
         logger.warning(
