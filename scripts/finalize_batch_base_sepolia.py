@@ -26,7 +26,8 @@ Env:
 
 Read-only preview (no key, no tx): pass --check to print isFinalizable + secondsUntilFinalizable.
 
-Mainnet guard: refuses any chainId != 84532 (Base Sepolia).
+Chain guard: refuses any connected chainId != the PRSM_NETWORK-resolved chainId
+(testnet → 84532 Base Sepolia; mainnet → 8453 Base) — set PRSM_NETWORK + the matching RPC.
 """
 from __future__ import annotations
 
