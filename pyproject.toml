@@ -87,7 +87,11 @@ dependencies = [
     # Dashboard
     "streamlit>=1.28.0",
 
-    "numpy>=1.24.0",
+    # sp1375 — cap <2.0: numpy 2.x's C-ABI break silently kills torch's numpy bridge
+    # ("_ARRAY_API not found" / "Numpy is not available") on any box whose torch was built
+    # against numpy 1.x (e.g. GPU images with a preinstalled torch). numpy 1.x is fully
+    # compatible with torch 2.x + transformers 4.x; caught live on the 2026-07-04 GPU canary.
+    "numpy>=1.24.0,<2.0",
 
     # Async file I/O (required by IPFS client)
     "aiofiles>=23.0.0",
@@ -207,7 +211,10 @@ dev = [
 ml = [
     # Machine Learning
     "torch>=2.0.0",
-    "transformers>=4.35.0",
+    # sp1375 — cap <5.0: transformers 5.x changed the model-class registration/import so the
+    # slice-load runner fails "Could not import module 'Qwen2ForCausalLM'" on a real model.
+    # 4.x supports Qwen2.5/Llama/Mistral etc.; caught live on the 2026-07-04 GPU canary.
+    "transformers>=4.35.0,<5.0",
     "sentence-transformers>=2.2.0",
     "chromadb>=0.4.0",
     # sp1209 — instruct-model chat templates (apply_chat_template, sp1204/sp1208) render
