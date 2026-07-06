@@ -13444,6 +13444,55 @@ def wallet_info(network_name: str, address):
     console.print()
 
 
+@wallet.command("balance")
+@click.option("--address", "address", default=None,
+              help="Address to check (default: derive from PRIVATE_KEY / FTNS_WALLET_PRIVATE_KEY)")
+@click.option("--network", "network_name", default="mainnet", help="Network (mainnet/testnet)")
+@click.option("--api-url", "api_url_override", default=None, help="PRSM daemon API URL")
+@click.option("--format", "output_format", type=click.Choice(["text", "json"]), default="text")
+def wallet_balance(address, network_name, api_url_override, output_format) -> None:
+    """Sprint 1392 — show your ON-CHAIN FTNS + ETH-gas balance for a wallet address.
+
+    Complements `prsm ftns balance` (which shows the OFF-CHAIN local ledger). This reads the live
+    on-chain balances the faucet/deposit affect. Read-only, no signing. The address defaults to the
+    one derived from PRIVATE_KEY / FTNS_WALLET_PRIVATE_KEY; or pass --address 0x....
+    """
+    import json as _json
+
+    import httpx
+    dest = address or _wallet_load_signer(network_name).get("address")
+    if not dest:
+        console.print(
+            "❌ no address — pass --address 0x... or set PRIVATE_KEY (the address derives from it).",
+            style="red")
+        raise SystemExit(1)
+    url = _api_url_from_creds(api_url_override)
+    try:
+        r = httpx.get(f"{url}/wallet/balance/by-address/{dest}",
+                      headers=_node_api_key_headers(), timeout=20.0)
+    except httpx.ConnectError:
+        console.print(f"[red]Cannot connect to node API at {url}[/red]")
+        console.print("  [dim]Start your daemon first: prsm node start[/dim]")
+        raise SystemExit(2)
+    if r.status_code != 200:
+        detail = (r.json().get("detail", r.text)
+                  if r.headers.get("content-type", "").startswith("application/json") else r.text)
+        console.print(f"[red]Balance read failed (HTTP {r.status_code}):[/red] {str(detail)[:200]}")
+        raise SystemExit(1)
+    data = r.json()
+    if output_format == "json":
+        console.print(_json.dumps(data, indent=2))
+        return
+    console.print(f"\n[bold]On-chain wallet balance[/bold]  ([dim]{dest}[/dim])")
+    table = Table(show_header=False)
+    table.add_column("Asset", style="cyan")
+    table.add_column("Balance", style="green")
+    table.add_row("FTNS", f"{data.get('ftns', 0)}")
+    table.add_row("ETH (gas)", f"{data.get('native_eth', 0)}")
+    console.print(table)
+    console.print("  [dim]Off-chain ledger balance: prsm ftns balance[/dim]")
+
+
 @wallet.command("gas-status")
 @click.option("--api-url", default=None, help="PRSM daemon API URL")
 def wallet_gas_status(api_url: str) -> None:
