@@ -540,6 +540,49 @@ class StakeManagerClient:
             start = end + 1
         return out
 
+    def funding_preflight(
+        self,
+        *,
+        ftns_token_address: str,
+        amount_wei: int,
+        provider: Optional[str] = None,
+    ) -> dict:
+        """Sprint 1385 — READ-ONLY pre-bond check (never sends a tx): does the operator hold enough
+        FTNS to bond ``amount_wei``, enough ETH for gas, and is an FTNS approve to the StakeBond
+        contract still needed? Also reports the current stake. ``provider`` defaults to this client's
+        key address. Drives the ``prsm node stake-bond --dry-run`` go/no-go so an operator catches an
+        underfunded / missing-approval bond BEFORE broadcasting.
+        """
+        addr = Web3.to_checksum_address(provider or self.address)
+        erc20 = self.web3.eth.contract(
+            address=Web3.to_checksum_address(ftns_token_address),
+            abi=[
+                {"name": "balanceOf", "type": "function", "stateMutability": "view",
+                 "inputs": [{"name": "a", "type": "address"}],
+                 "outputs": [{"name": "", "type": "uint256"}]},
+                {"name": "allowance", "type": "function", "stateMutability": "view",
+                 "inputs": [{"name": "o", "type": "address"}, {"name": "s", "type": "address"}],
+                 "outputs": [{"name": "", "type": "uint256"}]},
+            ])
+        amount = int(amount_wei)
+        ftns_balance = int(erc20.functions.balanceOf(addr).call())
+        allowance = int(erc20.functions.allowance(addr, self.contract_address).call())
+        eth_balance = int(self.web3.eth.get_balance(addr))
+        rec = self.stake_of(addr)
+        return {
+            "operator": addr,
+            "amount_wei": amount,
+            "ftns_balance_wei": ftns_balance,
+            "sufficient_ftns": ftns_balance >= amount,
+            "eth_balance_wei": eth_balance,
+            "has_gas": eth_balance > 0,
+            "allowance_wei": allowance,
+            "needs_approve": allowance < amount,
+            "current_stake_wei": rec.amount_wei,
+            "current_stake_status": str(rec.status),
+            "go": ftns_balance >= amount and eth_balance > 0,
+        }
+
     # ── Internals ──────────────────────────────────────────────
 
     def _tx_overrides(self) -> dict:

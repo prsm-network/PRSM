@@ -330,6 +330,7 @@ live run with `python -m prsm.settlement.go_live_preflight`.
 command (approve + bond), then flip the node to enforced production trust:
 ```bash
 export FTNS_WALLET_PRIVATE_KEY=0x...                 # in your shell, NEVER on the CLI
+prsm node stake-bond 1 --dry-run                     # read-only preflight: FTNS balance / gas / allowance + go/no-go
 prsm node stake-bond 1 --tier-slash-rate-bps 100     # any bond >0 clears eligibility; >=1 FTNS = full confidence
 prsm node stake-info                                  # confirm the on-chain stake
 export PRSM_PARALLAX_TRUST_STACK_KIND=production

@@ -84,6 +84,7 @@ peer; production trust drops nodes without on-chain stake (the `StakeWeightedTru
 filter). On **each** node, post stake (key in `FTNS_WALLET_PRIVATE_KEY`, never argv) — one command
 approves FTNS + bonds:
 ```bash
+prsm node stake-bond 1 --dry-run                   # read-only: FTNS balance / gas / allowance + go/no-go (exit 1 if NO-GO)
 prsm node stake-bond 1 --tier-slash-rate-bps 100   # any bond >0 clears eligibility; >=1 FTNS = full confidence
 prsm node stake-info                                # confirm the on-chain stake landed
 ```

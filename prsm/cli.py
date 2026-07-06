@@ -5323,11 +5323,16 @@ def _resolve_stake_client(require_ftns: bool = False):
     "tier + higher slash exposure. Default 0.",
 )
 @click.option(
+    "--dry-run", "dry_run", is_flag=True, default=False,
+    help="Read-only funding preflight (FTNS balance / gas / allowance + go/no-go); no approve, "
+    "no bond. Exit 1 on NO-GO.",
+)
+@click.option(
     "--format", "output_format",
     type=click.Choice(["text", "json"]), default="text", help="Output format",
 )
 def node_stake_bond_cli(
-    amount_ftns: float, tier_slash_rate_bps: int, output_format: str,
+    amount_ftns: float, tier_slash_rate_bps: int, dry_run: bool, output_format: str,
 ) -> None:
     """Sprint 1379 — post FTNS stake to the StakeBond contract so this node passes the PRODUCTION
     trust stake-eligibility filter (PRSM_PARALLAX_STAKE_ELIGIBILITY=enforced). ONE command: approve
@@ -5342,6 +5347,30 @@ def node_stake_bond_cli(
         raise click.ClickException(f"amount_ftns must be positive (got {amount_ftns})")
     client, addrs = _resolve_stake_client(require_ftns=True)
     amount_wei = int(round(amount_ftns * 1e18))
+    if dry_run:
+        pf = client.funding_preflight(ftns_token_address=addrs["ftns"], amount_wei=amount_wei)
+        if output_format == "json":
+            click.echo(_json.dumps(pf, indent=2))
+        else:
+            verdict = "GO" if pf["go"] else "NO-GO"
+            click.echo(
+                f"stake-bond preflight [{verdict}] — operator {pf['operator']}, "
+                f"bond {amount_ftns} FTNS (tier {tier_slash_rate_bps} bps)")
+            click.echo(
+                f"  FTNS balance: {pf['ftns_balance_wei'] / 1e18} (need {amount_ftns}) — "
+                f"{'OK' if pf['sufficient_ftns'] else 'INSUFFICIENT'}")
+            click.echo(
+                f"  ETH for gas:  {pf['eth_balance_wei'] / 1e18} — "
+                f"{'OK' if pf['has_gas'] else 'NONE (fund the wallet with Base ETH)'}")
+            click.echo(
+                f"  allowance:    {pf['allowance_wei'] / 1e18} — "
+                f"{'approve will run' if pf['needs_approve'] else 'sufficient'}")
+            click.echo(
+                f"  current stake: {pf['current_stake_wei'] / 1e18} FTNS "
+                f"({pf['current_stake_status']})")
+        if not pf["go"]:
+            raise SystemExit(1)
+        return
     tx_hash, status = client.approve_and_bond(
         ftns_token_address=addrs["ftns"], amount_wei=amount_wei,
         tier_slash_rate_bps=tier_slash_rate_bps)
