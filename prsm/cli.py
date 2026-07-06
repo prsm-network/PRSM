@@ -5421,6 +5421,71 @@ def node_stake_withdraw_cli(output_format: str) -> None:
         click.echo(f"  operator {client.address} on-chain stake: {rec.amount_wei / 1e18} FTNS")
 
 
+@node.command("slash-status")
+@click.argument("address", required=False)
+@click.option(
+    "--from-block", "from_block", type=int, default=None,
+    help="Scan Slashed events from this block (default: last PRSM_STAKE_SCAN_LOOKBACK_BLOCKS ~300k).",
+)
+@click.option(
+    "--format", "output_format",
+    type=click.Choice(["text", "json"]), default="text", help="Output format",
+)
+def node_slash_status_cli(
+    address: Optional[str], from_block: Optional[int], output_format: str,
+) -> None:
+    """Sprint 1381 — read-only slash/challenge visibility for a node's stake: current stake state +
+    every StakeBond Slashed event against the operator (block, challenger, reason, amount slashed).
+    NO key needed — pass an ADDRESS or set PRSM_OPERATOR_ADDRESS. StakeBond + RPC resolve from
+    PRSM_NETWORK. Note: ReceiptChallenged (per-batch) isn't provider-indexed; this surfaces the
+    provider-indexed Slashed penalties (the economic outcome of a lost challenge).
+    """
+    import json as _json
+    import os as _os
+
+    op = (address or _os.environ.get("PRSM_OPERATOR_ADDRESS") or "").strip()
+    if not op:
+        raise click.ClickException(
+            "no operator address — pass it as an argument or set PRSM_OPERATOR_ADDRESS.")
+    from prsm.config.networks import resolve_endpoints
+    e = resolve_endpoints()
+    stake_bond = (
+        _os.environ.get("PRSM_STAKE_BOND_ADDRESS") or getattr(e, "stake_bond", "") or "").strip()
+    rpc = (_os.environ.get("PRSM_BASE_RPC_URL") or getattr(e, "rpc_url", "") or "").strip()
+    if not stake_bond or not rpc:
+        raise click.ClickException(
+            "could not resolve StakeBond/RPC (set PRSM_NETWORK + PRSM_STAKE_BOND_ADDRESS).")
+    from prsm.economy.web3.stake_manager import StakeManagerClient
+    client = StakeManagerClient(rpc_url=rpc, contract_address=stake_bond, private_key=None)
+    rec = client.stake_of(op)
+    events = client.get_slash_events(op, from_block=from_block)
+    total = sum(ev.slash_amount_wei for ev in events)
+    result = {
+        "operator": op, "stake_status": str(rec.status), "stake_ftns": rec.amount_wei / 1e18,
+        "tier_slash_rate_bps": rec.tier_slash_rate_bps, "slash_event_count": len(events),
+        "total_slashed_ftns": total / 1e18,
+        "slash_events": [
+            {"block": ev.block_number, "tx": ev.tx_hash, "challenger": ev.challenger,
+             "reason_id": ev.reason_id, "slashed_ftns": ev.slash_amount_wei / 1e18}
+            for ev in events
+        ],
+    }
+    if output_format == "json":
+        click.echo(_json.dumps(result, indent=2))
+    else:
+        click.echo(
+            f"operator {op}: stake {rec.amount_wei / 1e18} FTNS ({rec.status}), "
+            f"tier {rec.tier_slash_rate_bps} bps")
+        if not events:
+            click.echo("  no slash events in the scanned window — stake is clean.")
+        else:
+            click.echo(f"  {len(events)} slash event(s), total slashed {total / 1e18} FTNS:")
+            for ev in events:
+                click.echo(
+                    f"    block {ev.block_number}: -{ev.slash_amount_wei / 1e18} FTNS "
+                    f"by {ev.challenger} (reason {ev.reason_id[:12]}) tx {ev.tx_hash[:14]}")
+
+
 @node.command("stake-info")
 @click.option(
     "--format", "output_format",

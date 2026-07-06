@@ -21,10 +21,14 @@ the hardhat CLI, not from production Python code.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
+
+# sp1381 — Base public-RPC eth_getLogs window cap (mirrors settlement client's _SCAN_MAX_WINDOW).
+_SCAN_MAX_WINDOW = 9_000
 
 try:
     from web3 import Web3
@@ -276,6 +280,20 @@ class StakeRecord:
         return self.status == StakeStatus.UNBONDING
 
 
+@dataclass(frozen=True)
+class SlashEvent:
+    """Sprint 1381 — a decoded ``Slashed(provider, challenger, reasonId, slashAmount,
+    challengerBounty, foundationShare)`` StakeBond log, for operator slash/challenge visibility."""
+    block_number: int
+    tx_hash: str
+    provider: str
+    challenger: str
+    reason_id: str            # 0x-hex of the indexed reasonId
+    slash_amount_wei: int
+    challenger_bounty_wei: int
+    foundation_share_wei: int
+
+
 class StakeManagerClient:
     """Sync Web3 client for StakeBond.
 
@@ -475,6 +493,52 @@ class StakeManagerClient:
 
     def unbond_delay_seconds(self) -> int:
         return int(self.contract.functions.unbondDelaySeconds().call())
+
+    def get_slash_events(
+        self,
+        provider: str,
+        *,
+        from_block: Optional[int] = None,
+        to_block: Optional[int] = None,
+        lookback_blocks: Optional[int] = None,
+    ) -> List[SlashEvent]:
+        """Sprint 1381 — decode ``Slashed`` events for ``provider`` (an indexed topic, so the RPC
+        filters server-side), so an operator can see WHETHER / WHEN / WHY / HOW MUCH their stake was
+        slashed and WHO challenged. Read-only (no key). Chunked into ``_SCAN_MAX_WINDOW`` windows to
+        respect Base's public-RPC eth_getLogs cap; the default lookback is
+        ``PRSM_STAKE_SCAN_LOOKBACK_BLOCKS`` (300k ≈ a week on Base), overridable per call.
+        """
+        provider_cs = Web3.to_checksum_address(provider)
+        head = int(self.web3.eth.block_number) if to_block is None else int(to_block)
+        if from_block is None:
+            lb = lookback_blocks if lookback_blocks is not None else int(
+                os.environ.get("PRSM_STAKE_SCAN_LOOKBACK_BLOCKS", "") or 300_000)
+            from_block = max(0, head - lb)
+        out: List[SlashEvent] = []
+        event = self.contract.events.Slashed()
+        start = int(from_block)
+        while start <= head:
+            end = min(start + _SCAN_MAX_WINDOW - 1, head)
+            flt = event.create_filter(
+                from_block=start, to_block=end,
+                argument_filters={"provider": provider_cs})
+            for e in flt.get_all_entries():
+                a = e["args"]
+                txh = e["transactionHash"]
+                rid = a["reasonId"]
+                out.append(SlashEvent(
+                    block_number=int(e["blockNumber"]),
+                    tx_hash=txh.hex() if hasattr(txh, "hex") else str(txh),
+                    provider=provider_cs,
+                    challenger=a["challenger"],
+                    reason_id="0x" + (bytes(rid).hex() if not isinstance(rid, str) else rid.removeprefix("0x")),
+                    slash_amount_wei=int(a["slashAmount"]),
+                    challenger_bounty_wei=int(a["challengerBounty"]),
+                    foundation_share_wei=int(a["foundationShare"])))
+            if end == head:
+                break
+            start = end + 1
+        return out
 
     # ── Internals ──────────────────────────────────────────────
 
