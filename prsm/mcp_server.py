@@ -4134,7 +4134,16 @@ async def handle_prsm_analyze(
             f"{footer}"
         )
     except Exception as e:
-        return f"PRSM analysis failed: {str(e)}. Is your PRSM node running? (prsm node start)"
+        # sp1393 — the analysis (forge/Rings-1-10) pipeline needs an external LLM backend; when it's
+        # absent, point the model at the tool that DOES work on the node's local model so it can
+        # self-recover instead of dead-ending.
+        _msg = str(e)
+        _hint = ""
+        if "forge" in _msg.lower() or "backend" in _msg.lower():
+            _hint = (" The multi-agent analysis pipeline needs an external LLM backend (set "
+                     "OPENROUTER_API_KEY on the node). For a single-shot inference on the node's "
+                     "own local model, call the prsm_inference tool instead.")
+        return f"PRSM analysis failed: {_msg}.{_hint} Is your PRSM node running? (prsm node start)"
 
 
 async def handle_prsm_quote(arguments: Dict[str, Any]) -> str:

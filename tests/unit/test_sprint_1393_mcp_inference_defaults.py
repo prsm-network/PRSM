@@ -36,3 +36,16 @@ async def test_explicit_overrides_still_pass_through():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.asyncio
+async def test_analyze_backend_error_points_to_prsm_inference():
+    """sp1393 (F14) — when the forge/analysis pipeline has no LLM backend, the error self-guides the
+    model to prsm_inference (which works on the local model) instead of dead-ending."""
+    from prsm.mcp_server import handle_prsm_analyze
+    with patch("prsm.mcp_server._call_node_api",
+               new=AsyncMock(side_effect=RuntimeError(
+                   "HTTP 503: Agent forge not initialized. Check LLM backend configuration."))):
+        result = await handle_prsm_analyze({"query": "hi"})
+    r = result if isinstance(result, str) else str(result)
+    assert "prsm_inference" in r and "backend" in r.lower()
