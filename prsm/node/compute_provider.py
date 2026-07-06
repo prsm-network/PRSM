@@ -273,6 +273,10 @@ class ComputeProvider:
         self.active_jobs: Dict[str, ComputeJob] = {}
         self.completed_jobs: Dict[str, ComputeJob] = {}
         self._max_completed_jobs = 500  # Prevent unbounded memory growth
+        # sp1388 — cap the best-effort result gossip broadcast so a slow/peerless transport can't
+        # hang job completion (the result is stored in completed_jobs regardless).
+        self._result_publish_timeout = float(
+            os.environ.get("PRSM_JOB_RESULT_PUBLISH_TIMEOUT_S", "") or 10.0)
         self._running = False
         self.allow_self_compute = True  # Execute own jobs when no peers (single-node mode)
         self.ledger_sync = None  # Set by node.py after construction
@@ -507,6 +511,30 @@ class ComputeProvider:
             self.completed_jobs[job_id] = active
             logger.info(f"Job {job_id[:8]} cancelled by requester")
 
+    async def _publish_job_result_bounded(self, payload: Dict[str, Any]) -> None:
+        """Sprint 1388 — best-effort GOSSIP_JOB_RESULT broadcast that CANNOT hang job completion.
+
+        Skips entirely when there are no peers (single-node self-compute — nobody to broadcast to,
+        which used to leave /compute/query awaiting a blocking publish forever), and bounds it with a
+        timeout otherwise. The result is stored in ``completed_jobs`` by the caller's ``finally``
+        regardless, so a local reader always gets it and a remote requester can poll on timeout.
+        """
+        peers = getattr(self.transport, "peer_count", 0) if self.transport else 0
+        if not peers:
+            return
+        jid = payload.get("job_id")
+        jid_s = jid[:8] if isinstance(jid, str) else "?"
+        try:
+            await asyncio.wait_for(
+                self.gossip.publish(GOSSIP_JOB_RESULT, payload),
+                timeout=self._result_publish_timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "job %s result gossip-publish timed out (%.0fs); stored locally, requester can poll",
+                jid_s, self._result_publish_timeout)
+        except Exception as e:  # noqa: BLE001 — a broadcast failure must not fail the job
+            logger.warning("job %s result gossip-publish failed: %s", jid_s, e)
+
     async def _execute_job(self, job: ComputeJob) -> None:
         """Execute a compute job and publish the result."""
         job.status = JobStatus.RUNNING
@@ -538,8 +566,8 @@ class ComputeProvider:
             # Self-crediting would cause double-payment and ledger divergence
             # across nodes.
 
-            # Publish result
-            await self.gossip.publish(GOSSIP_JOB_RESULT, {
+            # Publish result (sp1388 — bounded/skipped so job completion never hangs on the broadcast)
+            await self._publish_job_result_bounded({
                 "job_id": job.job_id,
                 "provider_id": self.identity.node_id,
                 "status": "completed",
@@ -555,7 +583,7 @@ class ComputeProvider:
             job.error = str(e)
             job.completed_at = time.time()
 
-            await self.gossip.publish(GOSSIP_JOB_RESULT, {
+            await self._publish_job_result_bounded({
                 "job_id": job.job_id,
                 "provider_id": self.identity.node_id,
                 "status": "failed",

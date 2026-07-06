@@ -6098,8 +6098,17 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         if has_peers:
             try:
                 # Dynamic timeout: allow enough time for remote inference
-                # API timeout is the user-facing limit; gossip gets most of it
-                gossip_timeout = max(timeout * 0.8, 30.0)
+                # API timeout is the user-facing limit; gossip gets most of it.
+                # sp1388 — when THIS node can self-compute, don't block the request for the full
+                # 30-96s waiting on peers that may not serve inference (idle bootstrap peers made
+                # /compute/query hang for a single-node-ish user); fall through to local fast.
+                if getattr(node.compute_provider, "allow_self_compute", False):
+                    gossip_timeout = max(
+                        min(timeout * 0.3,
+                            float(os.environ.get("PRSM_COMPUTE_QUERY_GOSSIP_TIMEOUT_S", "") or 8.0)),
+                        2.0)
+                else:
+                    gossip_timeout = max(timeout * 0.8, 30.0)
 
                 # Submit via gossip for multi-node federation
                 # Pass our job_id so escrow and gossip track the same ID

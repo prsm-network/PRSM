@@ -82,5 +82,32 @@ async def test_falls_back_to_mock_on_executor_failure():
     assert res["source"] == "mock"                   # executor failure -> mock, never a crash
 
 
+# ── sp1388 — result-publish must not hang job completion ──
+@pytest.mark.asyncio
+async def test_result_publish_skipped_when_no_peers():
+    p = await _make_provider()
+    calls = []
+
+    async def _pub(*a, **k):
+        calls.append(a)
+    p.gossip.publish = _pub
+    await p._publish_job_result_bounded({"job_id": "j1"})
+    assert calls == []                               # peerless → no broadcast (the hang fix)
+
+
+@pytest.mark.asyncio
+async def test_result_publish_timeout_does_not_raise():
+    import asyncio as _a
+    import types as _t
+    p = await _make_provider()
+    p._result_publish_timeout = 0.1
+    p.transport = _t.SimpleNamespace(peer_count=5)    # force "has peers"
+
+    async def _hang(*a, **k):
+        await _a.sleep(10)
+    p.gossip.publish = _hang
+    await p._publish_job_result_bounded({"job_id": "j1"})   # returns ~0.1s, swallows timeout
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
