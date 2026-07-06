@@ -277,6 +277,9 @@ class ComputeProvider:
         self.allow_self_compute = True  # Execute own jobs when no peers (single-node mode)
         self.ledger_sync = None  # Set by node.py after construction
         self.orchestrator = None  # NWTN orchestrator, set by node.py after construction
+        # sp1387 — the node's real local-inference executor (build_local_inference_executor),
+        # set by node.py after construction. Self-compute uses it before the mock fallback.
+        self.inference_executor = None
 
         # Cross-node infrastructure
         self.escrow = PaymentEscrow(
@@ -638,6 +641,46 @@ class ComputeProvider:
                 )
             except Exception as e:
                 logger.warning(f"NWTN inference failed, falling back to mock: {e}")
+
+        # sp1387 — real local-inference fallback BEFORE the mock: run the node's inference_executor
+        # (the sp1184 local model /readyz reports ready) so single-node self-compute returns a REAL
+        # answer instead of a mock string. Fixes `compute run`/`compute submit` self-compute for a
+        # bare `pip install` user with no external LLM backend.
+        executor = getattr(self, "inference_executor", None)
+        if executor is not None:
+            try:
+                from decimal import Decimal
+
+                from prsm.compute.inference.models import InferenceRequest
+                try:
+                    served = list(executor.supported_models())
+                except Exception:  # noqa: BLE001
+                    served = []
+                # the compute-job model ("nwtn"/"local") usually isn't a served id → pick a served one
+                req_model = model if model in served else (served[0] if served else model)
+                req = InferenceRequest(
+                    prompt=prompt,
+                    model_id=req_model,
+                    budget_ftns=Decimal(str(job.ftns_budget or 0)),
+                    max_tokens=job.payload.get("max_tokens"),
+                    requester_node_id=self.identity.node_id,
+                )
+                res = await executor.execute(req)
+                if getattr(res, "success", False):
+                    return {
+                        "model": req_model,
+                        "prompt": prompt[:200],
+                        "response": getattr(res, "output", "") or "",
+                        "provider_node": self.identity.node_id,
+                        "source": "local_inference",
+                    }
+                logger.warning(
+                    "local_inference self-compute returned failure for %s: %s",
+                    job.job_id[:8], getattr(res, "error", "?"))
+            except Exception as e:  # noqa: BLE001 — fall through to the mock on any error
+                logger.warning(
+                    "local_inference self-compute failed for %s, using mock: %s",
+                    job.job_id[:8], e)
 
         # Fallback: mock response (alpha)
         return {

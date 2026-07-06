@@ -4961,6 +4961,9 @@ class PRSMNode:
             self.content_uploader.content_economy = self.content_economy
         if self.compute_provider:
             self.compute_provider.ledger_sync = self.ledger_sync
+            # sp1387 — give self-compute the real local model (so a single-node node's compute
+            # jobs return a REAL answer via _run_inference instead of a mock string).
+            self.compute_provider.inference_executor = getattr(self, "inference_executor", None)
             # Wire escrow and consensus into compute provider
             self.compute_provider.escrow = self._payment_escrow
             self.compute_provider.consensus = self._result_consensus
