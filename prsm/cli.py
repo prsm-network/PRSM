@@ -5486,6 +5486,74 @@ def node_slash_status_cli(
                     f"by {ev.challenger} (reason {ev.reason_id[:12]}) tx {ev.tx_hash[:14]}")
 
 
+@node.command("challenge-status")
+@click.argument("address", required=False)
+@click.option(
+    "--from-block", "from_block", type=int, default=None,
+    help="Scan from this block (default: last PRSM_SETTLEMENT_SCAN_LOOKBACK_BLOCKS ~300k).",
+)
+@click.option(
+    "--format", "output_format",
+    type=click.Choice(["text", "json"]), default="text", help="Output format",
+)
+def node_challenge_status_cli(
+    address: Optional[str], from_block: Optional[int], output_format: str,
+) -> None:
+    """Sprint 1381 — read-only per-batch challenge visibility: for each of this operator's committed
+    settlement batches that a challenger has disputed (ReceiptChallenged), shows the batch, reason,
+    invalidated value, challenger, and the batch's current status. EARLIER warning than slash-status
+    (a challenge appears here before it resolves into a Slashed penalty). NO key — pass an ADDRESS or
+    set PRSM_OPERATOR_ADDRESS; settlement registry + RPC resolve from PRSM_NETWORK.
+    """
+    import json as _json
+    import os as _os
+
+    op = (address or _os.environ.get("PRSM_OPERATOR_ADDRESS") or "").strip()
+    if not op:
+        raise click.ClickException(
+            "no operator address — pass it as an argument or set PRSM_OPERATOR_ADDRESS.")
+    from prsm.config.networks import resolve_endpoints
+    e = resolve_endpoints()
+    registry = (
+        _os.environ.get("PRSM_SETTLEMENT_REGISTRY_ADDRESS")
+        or getattr(e, "settlement_registry", "") or "").strip()
+    rpc = (_os.environ.get("PRSM_BASE_RPC_URL") or getattr(e, "rpc_url", "") or "").strip()
+    if not registry or not rpc:
+        raise click.ClickException(
+            "could not resolve settlement registry/RPC (set PRSM_NETWORK + "
+            "PRSM_SETTLEMENT_REGISTRY_ADDRESS).")
+    from prsm.economy.web3.batch_settlement_contract_client import (
+        Web3SettlementContractClient,
+    )
+    client = Web3SettlementContractClient(rpc_url=rpc, contract_address=registry)
+    challenges = client.get_challenges_for_provider(op, from_block=from_block)
+    _status = {0: "NONE", 1: "PENDING", 2: "FINALIZED", 3: "CHALLENGED"}
+    result = {
+        "operator": op, "registry": registry, "challenge_count": len(challenges),
+        "challenges": [
+            {"batch_id": c.batch_id, "reason": c.reason, "reason_code": c.reason_code,
+             "invalidated_value_ftns": c.invalidated_value_ftns, "challenger": c.challenger,
+             "batch_status": _status.get(c.batch_status, str(c.batch_status)),
+             "receipt_leaf_hash": c.receipt_leaf_hash, "block": c.block_number, "tx": c.tx_hash}
+            for c in challenges
+        ],
+    }
+    if output_format == "json":
+        click.echo(_json.dumps(result, indent=2))
+    else:
+        if not challenges:
+            click.echo(
+                f"operator {op}: no challenges against your committed batches in the scanned "
+                "window — clean.")
+        else:
+            click.echo(f"operator {op}: {len(challenges)} challenge(s) against your batches:")
+            for c in challenges:
+                click.echo(
+                    f"    batch {c.batch_id[:14]} [{_status.get(c.batch_status, c.batch_status)}]: "
+                    f"{c.reason} (-{c.invalidated_value_ftns} FTNS) by {c.challenger} "
+                    f"tx {c.tx_hash[:14]}")
+
+
 @node.command("stake-info")
 @click.option(
     "--format", "output_format",

@@ -93,9 +93,10 @@ export PRSM_PARALLAX_TRUST_STACK_KIND=production
 export PRSM_PARALLAX_STAKE_ELIGIBILITY=enforced
 ```
 The stake is **slashable** — a node that serves a bad result forfeits it — which is what makes the
-trust real rather than advisory. Monitor it with `prsm node slash-status` (read-only, no key): it
-shows your current stake plus any on-chain `Slashed` events against your node (block, challenger,
-reason, amount). To exit later: `prsm node stake-unbond` (BONDED → UNBONDING; slashing stays active
+trust real rather than advisory. Monitor it read-only (no key): `prsm node challenge-status`
+shows challenges against your committed batches (`ReceiptChallenged` — reason, invalidated value,
+challenger, batch status) as an **early** warning, and `prsm node slash-status` shows the `Slashed`
+penalties that a lost challenge resolves into (block, challenger, reason, amount). To exit later: `prsm node stake-unbond` (BONDED → UNBONDING; slashing stays active
 through the delay), then `prsm node stake-withdraw` once the unbond delay has elapsed (reverts if you
 call it early).
 

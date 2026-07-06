@@ -28,7 +28,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 try:
     from web3 import Web3
@@ -137,10 +138,43 @@ BATCH_SETTLEMENT_REGISTRY_ABI = [
             {"name": "metadataURI", "type": "string", "indexed": False},
         ],
     },
+    {
+        # sp1381 — ReceiptChallenged: batchId is indexed (NOT provider), so operator visibility
+        # cross-references the operator's own BatchCommitted batchIds against these.
+        "type": "event", "name": "ReceiptChallenged", "anonymous": False,
+        "inputs": [
+            {"name": "batchId", "type": "bytes32", "indexed": True},
+            {"name": "receiptLeafHash", "type": "bytes32", "indexed": True},
+            {"name": "challenger", "type": "address", "indexed": True},
+            {"name": "reason", "type": "uint8", "indexed": False},
+            {"name": "invalidatedValueFTNS", "type": "uint128", "indexed": False},
+        ],
+    },
 ]
+
+# sp1381 — ReasonCode enum (mirrors BatchSettlementRegistry.sol:ReasonCode).
+_REASON_CODES = {
+    0: "DOUBLE_SPEND", 1: "INVALID_SIGNATURE", 2: "NO_ESCROW",
+    3: "EXPIRED", 4: "MALFORMED", 5: "CONSENSUS_MISMATCH",
+}
 
 _BATCH_STATUS_FIELD_INDEX = 7  # uint8 status within the batches() struct getter
 _RECEIPT_TIMEOUT_SECONDS = 120
+
+
+@dataclass(frozen=True)
+class ChallengeEvent:
+    """Sprint 1381 — a decoded ``ReceiptChallenged`` against one of an operator's committed batches
+    (early visibility: a challenge shows here BEFORE it resolves into a Slashed penalty)."""
+    batch_id: str                 # 0x-hex
+    receipt_leaf_hash: str        # 0x-hex
+    challenger: str
+    reason_code: int
+    reason: str                   # human name from _REASON_CODES (or "UNKNOWN(n)")
+    invalidated_value_ftns: float
+    batch_status: int             # current batches() status (1=PENDING 2=FINALIZED 3=CHALLENGED…)
+    block_number: int
+    tx_hash: str
 # sp1040 — keep each recovery getLogs window under Base public RPC's ~10k cap
 # (the same ceiling sprint 542 hit; see ftns_onchain.scan_inbound_transfers_chunked).
 _SCAN_MAX_WINDOW = 9_000
@@ -260,6 +294,79 @@ class Web3SettlementContractClient:
         return await asyncio.to_thread(
             self._find_committed_batch_by_root_sync, provider_address, merkle_root,
         )
+
+    def get_challenges_for_provider(
+        self,
+        provider_address: str,
+        *,
+        from_block: Optional[int] = None,
+        to_block: Optional[int] = None,
+        lookback_blocks: Optional[int] = None,
+    ) -> List[ChallengeEvent]:
+        """Sprint 1381 — per-batch challenge visibility. ``ReceiptChallenged`` indexes batchId (NOT
+        provider), so this cross-references the operator's OWN committed batches: scan
+        ``BatchCommitted`` (provider indexed → server-filtered) for the operator's batchIds, then
+        scan ``ReceiptChallenged`` and keep the ones hitting those batchIds. EARLIER signal than a
+        Slashed penalty — a challenge shows here before it resolves. Read-only; both scans chunked
+        into ``_SCAN_MAX_WINDOW`` windows; default lookback ``PRSM_SETTLEMENT_SCAN_LOOKBACK_BLOCKS``
+        (~300k). Each result carries the challenged batch's CURRENT status (best-effort)."""
+        import os
+        provider = Web3.to_checksum_address(provider_address)
+        head = int(self.web3.eth.block_number) if to_block is None else int(to_block)
+        if from_block is None:
+            lb = lookback_blocks if lookback_blocks is not None else int(
+                os.environ.get("PRSM_SETTLEMENT_SCAN_LOOKBACK_BLOCKS", "") or 300_000)
+            from_block = max(0, head - lb)
+
+        # 1) the operator's committed batchIds (provider is indexed → filtered server-side)
+        my_batches: set = set()
+        committed = self.contract.events.BatchCommitted()
+        start = int(from_block)
+        while start <= head:
+            end = min(start + _SCAN_MAX_WINDOW - 1, head)
+            flt = committed.create_filter(
+                from_block=start, to_block=end, argument_filters={"provider": provider})
+            for e in flt.get_all_entries():
+                my_batches.add(bytes(e["args"]["batchId"]))
+            if end == head:
+                break
+            start = end + 1
+        if not my_batches:
+            return []
+
+        # 2) ReceiptChallenged hitting those batchIds (batchId not provider-filterable → scan all)
+        out: List[ChallengeEvent] = []
+        challenged = self.contract.events.ReceiptChallenged()
+        start = int(from_block)
+        while start <= head:
+            end = min(start + _SCAN_MAX_WINDOW - 1, head)
+            flt = challenged.create_filter(from_block=start, to_block=end)
+            for e in flt.get_all_entries():
+                a = e["args"]
+                bid = bytes(a["batchId"])
+                if bid not in my_batches:
+                    continue
+                code = int(a["reason"])
+                txh = e["transactionHash"]
+                try:
+                    status = int(
+                        self.contract.functions.batches(bid).call()[_BATCH_STATUS_FIELD_INDEX])
+                except Exception:  # noqa: BLE001 — status is best-effort enrichment
+                    status = 0
+                out.append(ChallengeEvent(
+                    batch_id="0x" + bid.hex(),
+                    receipt_leaf_hash="0x" + bytes(a["receiptLeafHash"]).hex(),
+                    challenger=a["challenger"],
+                    reason_code=code,
+                    reason=_REASON_CODES.get(code, f"UNKNOWN({code})"),
+                    invalidated_value_ftns=int(a["invalidatedValueFTNS"]) / 1e18,
+                    batch_status=status,
+                    block_number=int(e["blockNumber"]),
+                    tx_hash=txh.hex() if hasattr(txh, "hex") else str(txh)))
+            if end == head:
+                break
+            start = end + 1
+        return out
 
     def _find_committed_batch_by_root_sync(
         self, provider_address: str, merkle_root: bytes,
