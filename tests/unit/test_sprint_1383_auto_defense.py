@@ -90,6 +90,25 @@ def test_bad_verdict_callback_does_not_raise(monkeypatch):
     build_challenge_auto_defense(_Store(_Record()), on_verdict=boom)(_Chal())  # must not raise
 
 
+# ── sp1384 — ChallengeDefenseStats ──
+def test_defense_stats_buckets_by_verdict():
+    from prsm.settlement.challenge_auto_defense import ChallengeDefenseStats
+    s = ChallengeDefenseStats()
+    s.record(None, _Report(ok=True))      # bad-faith
+    s.record(None, _Report(ok=True))      # bad-faith
+    s.record(None, _Report(ok=False))     # legitimate
+    s.record(None, None)                  # no-receipt
+    assert (s.bad_faith, s.legitimate, s.no_receipt) == (2, 1, 1)
+
+
+def test_stats_plug_into_on_verdict(monkeypatch):
+    from prsm.settlement.challenge_auto_defense import ChallengeDefenseStats
+    _patch_verify(monkeypatch, _Report(ok=True))
+    s = ChallengeDefenseStats()
+    build_challenge_auto_defense(_Store(_Record()), on_verdict=s.record)(_Chal())
+    assert s.bad_faith == 1                # the auto-defense verdict flowed into the tally
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])

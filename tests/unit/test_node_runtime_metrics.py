@@ -339,5 +339,27 @@ def test_no_challenge_watcher_no_gauge():
     assert "prsm_settlement_challenges_active" not in m
 
 
+# ── sp1384 — auto-defense verdict gauges ──
+class _FakeDefenseStats:
+    bad_faith = 2
+    legitimate = 1
+    no_receipt = 3
+
+
+def test_challenge_defense_stats_gauges_emitted():
+    node = _Node()
+    node._challenge_defense_stats = _FakeDefenseStats()
+    m = _collect(NodeRuntimeMetrics(node))
+    assert m["prsm_challenge_defense_bad_faith_total"] == 2
+    assert m["prsm_challenge_defense_legitimate_total"] == 1
+    assert m["prsm_challenge_defense_no_receipt_total"] == 3
+
+
+def test_no_defense_stats_no_gauge():
+    node = _Node()                                    # no _challenge_defense_stats attr
+    m = _collect(NodeRuntimeMetrics(node))
+    assert "prsm_challenge_defense_legitimate_total" not in m
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -103,7 +103,9 @@ and exposes the `prsm_settlement_challenges_active` metric for AlertManager. Whe
 store is configured (settlement audit path), it also **auto-defends** — self-verifying the retained
 §7 receipt for each challenged batch and logging whether the challenge is **bad-faith** (your receipt
 verifies and is served for independent confirmation) or a **real problem** (the receipt fails, stake
-at risk). To exit later: `prsm node stake-unbond` (BONDED → UNBONDING; slashing stays active
+at risk). Verdicts are tallied into metrics: **alert on `prsm_challenge_defense_legitimate_total > 0`**
+(a genuinely-bad receipt of yours was challenged — real slash risk); `prsm_challenge_defense_bad_faith_total`
+rising just means you're being harassed with refutable challenges. To exit later: `prsm node stake-unbond` (BONDED → UNBONDING; slashing stays active
 through the delay), then `prsm node stake-withdraw` once the unbond delay has elapsed (reverts if you
 call it early).
 

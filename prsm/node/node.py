@@ -1379,7 +1379,8 @@ def _build_key_distribution_watcher_or_none(
         return None
 
 
-def _build_settlement_challenge_watcher_or_none(operator_address, receipt_store_getter=None):
+def _build_settlement_challenge_watcher_or_none(
+    operator_address, receipt_store_getter=None, defense_stats=None):
     """Sprint 1382 — construct a SettlementChallengeWatcher if the operator opted in AND has an
     address to watch. Env:
       PRSM_SETTLEMENT_CHALLENGE_WATCHER_ENABLED=1         (required)
@@ -1424,7 +1425,9 @@ def _build_settlement_challenge_watcher_or_none(operator_address, receipt_store_
             from prsm.settlement.challenge_auto_defense import (
                 build_challenge_auto_defense,
             )
-            on_new_challenge = build_challenge_auto_defense(receipt_store_getter)
+            on_new_challenge = build_challenge_auto_defense(
+                receipt_store_getter,
+                on_verdict=(defense_stats.record if defense_stats is not None else None))
         logger.info(
             "SettlementChallengeWatcher: watching challenges against %s (poll %.0fs, auto-defense %s)",
             operator_address, poll, "on" if on_new_challenge else "off")
@@ -2459,12 +2462,15 @@ class PRSMNode:
         self._operator_address = resolve_operator_address()
         # sp1382 — background settlement-challenge watcher (opt-in, read-only). sp1383 — the
         # store-getter is resolved lazily (the receipt store is built later in init) so a challenge
-        # auto-defends against the live retained-receipt store.
+        # auto-defends against the live retained-receipt store. sp1384 — verdict tallies for metrics.
+        from prsm.settlement.challenge_auto_defense import ChallengeDefenseStats
+        self._challenge_defense_stats = ChallengeDefenseStats()
         self._settlement_challenge_watcher = (
             _build_settlement_challenge_watcher_or_none(
                 self._operator_address,
                 receipt_store_getter=lambda: getattr(
-                    self, "_settlement_inference_receipt_store", None)))
+                    self, "_settlement_inference_receipt_store", None),
+                defense_stats=self._challenge_defense_stats))
         # Tasks created on start() — None until then.
         self._compensation_scheduler_task = None
         self._content_readvertise_task = None  # sp1343 — late-joiner catalog re-advertise

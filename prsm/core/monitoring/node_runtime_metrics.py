@@ -148,6 +148,21 @@ class NodeRuntimeMetrics(CustomMetric):
             except Exception:  # noqa: BLE001 — metrics must never raise
                 pass
 
+        # sp1384 — auto-defense verdict tallies. `legitimate` > 0 = a genuinely-bad receipt of this
+        # node's was challenged (real slash risk, the alert target); `bad_faith` = refutable
+        # challenges (harassment signal).
+        stats = getattr(self._node, "_challenge_defense_stats", None)
+        if stats is not None:
+            try:
+                out.append(MetricValue(
+                    "prsm_challenge_defense_bad_faith_total", int(stats.bad_faith), now))
+                out.append(MetricValue(
+                    "prsm_challenge_defense_legitimate_total", int(stats.legitimate), now))
+                out.append(MetricValue(
+                    "prsm_challenge_defense_no_receipt_total", int(stats.no_receipt), now))
+            except Exception:  # noqa: BLE001 — metrics must never raise
+                pass
+
         try:
             from prsm.settlement.client_wiring import get_settlement_status
 

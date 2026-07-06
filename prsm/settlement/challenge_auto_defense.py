@@ -24,6 +24,39 @@ from typing import Any, Callable, Optional
 logger = logging.getLogger(__name__)
 
 
+class ChallengeDefenseStats:
+    """Sprint 1384 — running tallies of auto-defense verdicts, a metric source. ``record`` matches
+    the ``build_challenge_auto_defense`` ``on_verdict(challenge, report_or_None)`` signature, so it
+    plugs straight in. The alerting signal is ``legitimate`` > 0 (a genuinely-bad receipt of this
+    node's was challenged → real slash risk); ``bad_faith`` rising means the node is being harassed
+    with refutable challenges (informational)."""
+
+    def __init__(self) -> None:
+        self._bad_faith = 0
+        self._legitimate = 0
+        self._no_receipt = 0
+
+    def record(self, _challenge: Any, report: Any) -> None:
+        if report is None:
+            self._no_receipt += 1
+        elif getattr(report, "receipt_ok", False):
+            self._bad_faith += 1
+        else:
+            self._legitimate += 1
+
+    @property
+    def bad_faith(self) -> int:
+        return self._bad_faith
+
+    @property
+    def legitimate(self) -> int:
+        return self._legitimate
+
+    @property
+    def no_receipt(self) -> int:
+        return self._no_receipt
+
+
 def build_challenge_auto_defense(
     receipt_store_getter: Any,
     *,
