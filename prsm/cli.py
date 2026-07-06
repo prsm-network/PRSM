@@ -13004,10 +13004,22 @@ def content_get_cli(
     if verify_provenance:
         auth_ok = bool(res.get("authenticity_verified"))
         detail = res.get("authenticity_detail") or ""
-        console.print(
-            f"  authenticity: {'[green]VERIFIED[/green]' if auth_ok else '[red]FAILED[/red]'}  "
-            f"[dim](on-chain creator {'==' if auth_ok else '!='} claimed)[/dim]"
-            + (f"  [dim]{detail}[/dim]" if not auth_ok and detail else ""))
+        # sp1394 — content with NO on-chain provenance isn't an authenticity FAILURE (which means a
+        # registered creator that doesn't match); it just isn't registered. Label it distinctly so a
+        # user doesn't distrust legitimately-free content.
+        unregistered = (not auth_ok) and (
+            not res.get("provenance_hash") or "unregistered" in detail.lower())
+        if auth_ok:
+            console.print(
+                "  authenticity: [green]VERIFIED[/green]  [dim](on-chain creator == claimed)[/dim]")
+        elif unregistered:
+            console.print(
+                "  authenticity: [yellow]UNREGISTERED[/yellow]  [dim](no on-chain provenance; "
+                "register with `storage upload` or `content publish-paid`)[/dim]")
+        else:
+            console.print(
+                "  authenticity: [red]FAILED[/red]  [dim](on-chain creator != claimed)[/dim]"
+                + (f"  [dim]{detail}[/dim]" if detail else ""))
         if res.get("registered_creator"):
             console.print(f"  registered_creator: [dim]{res['registered_creator']}[/dim]")
     if res.get("creator_eth_address"):
