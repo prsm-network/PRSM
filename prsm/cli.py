@@ -5281,6 +5281,67 @@ def node_preemption_status_cli(
     console.print(f"  Status: {flag_render}")
 
 
+@node.command("stake-bond")
+@click.argument("amount_ftns", type=float)
+@click.option(
+    "--tier-slash-rate-bps", "tier_slash_rate_bps", type=int, default=0,
+    help="Slash-rate tier this stake commits to, in basis points (0-10000). Higher = higher trust "
+    "tier + higher slash exposure. Default 0.",
+)
+@click.option(
+    "--format", "output_format",
+    type=click.Choice(["text", "json"]), default="text", help="Output format",
+)
+def node_stake_bond_cli(
+    amount_ftns: float, tier_slash_rate_bps: int, output_format: str,
+) -> None:
+    """Sprint 1379 — post FTNS stake to the StakeBond contract so this node passes the PRODUCTION
+    trust stake-eligibility filter (PRSM_PARALLAX_STAKE_ELIGIBILITY=enforced). ONE command: approve
+    FTNS + bond. The signing key comes from FTNS_WALLET_PRIVATE_KEY (env, never argv); the StakeBond
+    + FTNS addresses + RPC resolve from PRSM_NETWORK (override RPC with PRSM_BASE_RPC_URL). After
+    bonding, `prsm node stake-info` shows the stake; set PRSM_PARALLAX_TRUST_STACK_KIND=production to
+    serve under real trust.
+    """
+    import json as _json
+    import os as _os
+
+    key = (_os.environ.get("FTNS_WALLET_PRIVATE_KEY") or "").strip()
+    if not key:
+        raise click.ClickException(
+            "FTNS_WALLET_PRIVATE_KEY is unset (the operator's stake key). Export it in your "
+            "shell; never pass a private key on the CLI.")
+    if amount_ftns <= 0:
+        raise click.ClickException(f"amount_ftns must be positive (got {amount_ftns})")
+    from prsm.config.networks import resolve_endpoints
+    e = resolve_endpoints()
+    stake_bond = (
+        _os.environ.get("PRSM_STAKE_BOND_ADDRESS") or getattr(e, "stake_bond", "") or "").strip()
+    ftns = (getattr(e, "ftns_token", "") or "").strip()
+    rpc = (_os.environ.get("PRSM_BASE_RPC_URL") or getattr(e, "rpc_url", "") or "").strip()
+    if not stake_bond or not ftns or not rpc:
+        raise click.ClickException(
+            f"could not resolve StakeBond/FTNS/RPC (stake_bond={stake_bond!r} ftns={ftns!r} "
+            f"rpc={rpc!r}); set PRSM_NETWORK + PRSM_STAKE_BOND_ADDRESS.")
+    amount_wei = int(round(amount_ftns * 1e18))
+    from prsm.economy.web3.stake_manager import StakeManagerClient
+    client = StakeManagerClient(rpc_url=rpc, contract_address=stake_bond, private_key=key)
+    tx_hash, status = client.approve_and_bond(
+        ftns_token_address=ftns, amount_wei=amount_wei, tier_slash_rate_bps=tier_slash_rate_bps)
+    rec = client.stake_of(client.address)
+    result = {
+        "bonded_ftns": amount_ftns, "tier_slash_rate_bps": tier_slash_rate_bps,
+        "operator": client.address, "tx_hash": tx_hash, "status": str(status),
+        "on_chain_stake_ftns": rec.amount_wei / 1e18, "stake_bond": stake_bond,
+    }
+    if output_format == "json":
+        click.echo(_json.dumps(result, indent=2))
+    else:
+        click.echo(f"bonded {amount_ftns} FTNS (tier {tier_slash_rate_bps} bps) -> {status}")
+        click.echo(f"  tx: {tx_hash}")
+        click.echo(f"  operator {client.address} on-chain stake: {rec.amount_wei / 1e18} FTNS")
+        click.echo("  set PRSM_PARALLAX_TRUST_STACK_KIND=production to serve under real trust.")
+
+
 @node.command("stake-info")
 @click.option(
     "--format", "output_format",

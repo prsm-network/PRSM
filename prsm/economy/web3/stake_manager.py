@@ -358,6 +358,55 @@ class StakeManagerClient:
             ).build_transaction(self._tx_overrides())
             return self._sign_and_send(tx)
 
+    def approve_and_bond(
+        self,
+        *,
+        ftns_token_address: str,
+        amount_wei: int,
+        tier_slash_rate_bps: int,
+    ) -> Tuple[str, TransferStatus]:
+        """Sprint 1379 — one-call operator stake: approve FTNS to the StakeBond contract (only when
+        the current allowance is short), then bond. ``bond()`` deliberately keeps token + stake
+        concerns separate; this is the convenience the ``prsm node stake-bond`` CLI uses so an
+        operator posts stake in ONE command. The approve is awaited (``_sign_and_send`` blocks on the
+        receipt) before the bond, so the bond's ``transferFrom`` sees the allowance even against a
+        lagging RPC replica, and the sequential ``pending`` nonces stay correct. Returns the BOND
+        ``(tx_hash_hex, TransferStatus)``."""
+        if not self._account:
+            raise RuntimeError("private_key required for write calls")
+        if amount_wei <= 0:
+            raise ValueError(f"amount_wei must be positive (got {amount_wei})")
+        if amount_wei >= 2 ** 128:
+            raise ValueError(f"amount_wei must fit in uint128 (got {amount_wei})")
+        if not (0 <= tier_slash_rate_bps <= 10_000):
+            raise ValueError(
+                f"tier_slash_rate_bps must be in [0, 10000] (got {tier_slash_rate_bps})")
+        _erc20_abi = [
+            {"name": "approve", "type": "function", "stateMutability": "nonpayable",
+             "inputs": [{"name": "spender", "type": "address"},
+                        {"name": "amount", "type": "uint256"}],
+             "outputs": [{"name": "", "type": "bool"}]},
+            {"name": "allowance", "type": "function", "stateMutability": "view",
+             "inputs": [{"name": "owner", "type": "address"},
+                        {"name": "spender", "type": "address"}],
+             "outputs": [{"name": "", "type": "uint256"}]},
+        ]
+        ftns = self.web3.eth.contract(
+            address=Web3.to_checksum_address(ftns_token_address), abi=_erc20_abi)
+        owner = self._account.address
+        with self._tx_lock:
+            allowance = int(
+                ftns.functions.allowance(owner, self.contract_address).call())
+            if allowance < amount_wei:
+                approve_tx = ftns.functions.approve(
+                    self.contract_address, int(amount_wei)
+                ).build_transaction(self._tx_overrides())
+                self._sign_and_send(approve_tx)   # awaited — bond's transferFrom needs the allowance
+            bond_tx = self.contract.functions.bond(
+                int(amount_wei), int(tier_slash_rate_bps)
+            ).build_transaction(self._tx_overrides())
+            return self._sign_and_send(bond_tx)
+
     def request_unbond(self) -> Tuple[str, TransferStatus]:
         """Transition BONDED → UNBONDING. Slashing remains active during
         the unbond delay — a provider caught mid-unbond still forfeits."""
