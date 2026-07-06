@@ -133,6 +133,21 @@ class NodeRuntimeMetrics(CustomMetric):
             pass
 
         # ── on-chain settlement (real money mid-flight) ──
+        # sp1382 — settlement challenge watcher: active challenges against this operator's batches
+        # (the metric an operator alerts on) + the watcher's freshness.
+        watcher = getattr(self._node, "_settlement_challenge_watcher", None)
+        if watcher is not None:
+            try:
+                out.append(MetricValue(
+                    "prsm_settlement_challenges_active",
+                    int(watcher.active_challenge_count), now))
+                age = watcher.last_tick_age_seconds()
+                if age is not None:
+                    out.append(MetricValue(
+                        "prsm_settlement_challenge_watcher_last_tick_age_seconds", age, now))
+            except Exception:  # noqa: BLE001 — metrics must never raise
+                pass
+
         try:
             from prsm.settlement.client_wiring import get_settlement_status
 

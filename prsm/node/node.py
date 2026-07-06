@@ -1379,6 +1379,52 @@ def _build_key_distribution_watcher_or_none(
         return None
 
 
+def _build_settlement_challenge_watcher_or_none(operator_address):
+    """Sprint 1382 — construct a SettlementChallengeWatcher if the operator opted in AND has an
+    address to watch. Env:
+      PRSM_SETTLEMENT_CHALLENGE_WATCHER_ENABLED=1         (required)
+      PRSM_SETTLEMENT_CHALLENGE_WATCHER_POLL_SECONDS=60   (optional)
+    Read-only (no key); settlement registry + RPC resolve from PRSM_NETWORK. Returns None on
+    opt-out / no address / unresolvable config / any build error, so startup never breaks.
+    """
+    import os
+
+    if os.getenv("PRSM_SETTLEMENT_CHALLENGE_WATCHER_ENABLED", "").lower() not in (
+        "1", "true", "yes",
+    ):
+        return None
+    if not operator_address:
+        logger.info("SettlementChallengeWatcher: no operator address resolved — not started.")
+        return None
+    try:
+        from prsm.config.networks import resolve_endpoints
+        e = resolve_endpoints()
+        registry = (
+            os.getenv("PRSM_SETTLEMENT_REGISTRY_ADDRESS")
+            or getattr(e, "settlement_registry", "") or "").strip()
+        rpc = (os.getenv("PRSM_BASE_RPC_URL") or getattr(e, "rpc_url", "") or "").strip()
+        if not registry or not rpc:
+            logger.warning(
+                "SettlementChallengeWatcher: could not resolve registry/RPC — not started.")
+            return None
+        poll = float(os.getenv("PRSM_SETTLEMENT_CHALLENGE_WATCHER_POLL_SECONDS", "") or 60.0)
+        from prsm.economy.web3.batch_settlement_contract_client import (
+            Web3SettlementContractClient,
+        )
+        from prsm.economy.web3.settlement_challenge_watcher import (
+            SettlementChallengeWatcher,
+        )
+        client = Web3SettlementContractClient(rpc_url=rpc, contract_address=registry)
+        logger.info(
+            "SettlementChallengeWatcher: watching challenges against %s (poll %.0fs)",
+            operator_address, poll)
+        return SettlementChallengeWatcher(
+            client, operator_address, poll_interval_sec=poll)
+    except Exception as exc:  # noqa: BLE001 — never break startup on an optional watcher
+        logger.warning("SettlementChallengeWatcher build failed (%s) — not started.", exc)
+        return None
+
+
 def _build_storage_slashing_watcher_or_none(
     *, client, state_store=None, slash_event_log=None,
     heartbeat_log=None, webhook_deliverer=None,
@@ -2400,6 +2446,9 @@ class PRSMNode:
         # PRSM_OPERATOR_ADDRESS.
         from prsm.node.operator_address import resolve_operator_address
         self._operator_address = resolve_operator_address()
+        # sp1382 — background settlement-challenge watcher (opt-in, read-only).
+        self._settlement_challenge_watcher = (
+            _build_settlement_challenge_watcher_or_none(self._operator_address))
         # Tasks created on start() — None until then.
         self._compensation_scheduler_task = None
         self._content_readvertise_task = None  # sp1343 — late-joiner catalog re-advertise
@@ -2426,6 +2475,7 @@ class PRSMNode:
         self._heartbeat_scheduler_task = None
         self._key_distribution_watcher_task = None
         self._storage_slashing_watcher_task = None
+        self._settlement_challenge_watcher_task = None  # sp1382
         self._compensation_distributor_watcher_task = None
 
         # T3.6 (PRSM-PROV-1): LocalEmbeddingIndex backs the
@@ -5566,6 +5616,11 @@ class PRSMNode:
                 self._storage_slashing_watcher.run_forever(),
             )
             logger.info("StorageSlashingWatcher launched")
+        if self._settlement_challenge_watcher is not None:
+            self._settlement_challenge_watcher_task = asyncio.create_task(
+                self._settlement_challenge_watcher.run_forever(),
+            )
+            logger.info("SettlementChallengeWatcher launched")
         if self._compensation_distributor_watcher is not None:
             self._compensation_distributor_watcher_task = asyncio.create_task(
                 self._compensation_distributor_watcher.run_forever(),
@@ -6705,6 +6760,8 @@ class PRSMNode:
             await self._key_distribution_watcher.stop()
         if self._storage_slashing_watcher is not None:
             await self._storage_slashing_watcher.stop()
+        if getattr(self, "_settlement_challenge_watcher", None) is not None:
+            await self._settlement_challenge_watcher.stop()
         if self._compensation_distributor_watcher is not None:
             await self._compensation_distributor_watcher.stop()
         if getattr(self, "_job_reaper", None) is not None:
@@ -6734,6 +6791,7 @@ class PRSMNode:
             "_compensation_scheduler_task",
             "_key_distribution_watcher_task",
             "_storage_slashing_watcher_task",
+            "_settlement_challenge_watcher_task",  # sp1382
             "_compensation_distributor_watcher_task",
             "_pending_withdraw_reconciler_task",  # sp916
             "_settlement_poll_task",  # sp1038

@@ -96,7 +96,10 @@ The stake is **slashable** — a node that serves a bad result forfeits it — w
 trust real rather than advisory. Monitor it read-only (no key): `prsm node challenge-status`
 shows challenges against your committed batches (`ReceiptChallenged` — reason, invalidated value,
 challenger, batch status) as an **early** warning, and `prsm node slash-status` shows the `Slashed`
-penalties that a lost challenge resolves into (block, challenger, reason, amount). To exit later: `prsm node stake-unbond` (BONDED → UNBONDING; slashing stays active
+penalties that a lost challenge resolves into (block, challenger, reason, amount). To watch
+continuously without polling, set `PRSM_SETTLEMENT_CHALLENGE_WATCHER_ENABLED=1` (optional
+`PRSM_SETTLEMENT_CHALLENGE_WATCHER_POLL_SECONDS=60`): the node logs a WARNING on each new challenge
+and exposes the `prsm_settlement_challenges_active` metric for AlertManager. To exit later: `prsm node stake-unbond` (BONDED → UNBONDING; slashing stays active
 through the delay), then `prsm node stake-withdraw` once the unbond delay has elapsed (reverts if you
 call it early).
 

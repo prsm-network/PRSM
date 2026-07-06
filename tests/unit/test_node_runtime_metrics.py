@@ -317,5 +317,27 @@ def test_collateral_block_fail_soft(monkeypatch, tmp_path):
     assert "prsm_collateral_stale" not in m           # collateral block skipped
 
 
+# ── sp1382 — settlement challenge watcher gauge ──
+class _FakeChallengeWatcher:
+    active_challenge_count = 3
+
+    def last_tick_age_seconds(self):
+        return 12.5
+
+
+def test_settlement_challenge_watcher_gauge_emitted():
+    node = _Node()
+    node._settlement_challenge_watcher = _FakeChallengeWatcher()
+    m = _collect(NodeRuntimeMetrics(node))
+    assert m["prsm_settlement_challenges_active"] == 3
+    assert m["prsm_settlement_challenge_watcher_last_tick_age_seconds"] == 12.5
+
+
+def test_no_challenge_watcher_no_gauge():
+    node = _Node()                                    # no _settlement_challenge_watcher attr
+    m = _collect(NodeRuntimeMetrics(node))
+    assert "prsm_settlement_challenges_active" not in m
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
