@@ -7218,33 +7218,88 @@ def compute():
 
 @compute.command()
 @click.option('--prompt', required=True, help='Prompt to process')
-@click.option('--model', default='nwtn', help='Model to use (default: nwtn)')
-@click.option('--max-tokens', default=1000, type=int, help='Maximum tokens in response')
-@click.option('--budget', type=float, help='Maximum FTNS to spend')
-def submit(prompt: str, model: str, max_tokens: int, budget: Optional[float]):
-    """Submit a compute job to the local node."""
+@click.option('--model', default='distilgpt2', help='Model to use (default: distilgpt2)')
+@click.option('--max-tokens', default=64, type=int, help='Maximum tokens in response')
+@click.option('--budget', type=float, default=1.0, help='Max FTNS to spend (default: 1.0)')
+@click.option('--api-url', 'api_url', default=None, help='Node API URL override')
+def submit(prompt: str, model: str, max_tokens: int, budget: float, api_url: Optional[str]):
+    """Submit an async compute job to your running node (self-computes if no peer serves it).
+
+    Sprint 1391 — actually POSTs to the daemon's /compute/submit (previously this only wrote a local
+    file that nothing processed). Check progress with `prsm compute status <job_id>`.
+    """
+    import httpx as _httpx
     from prsm.compute.jobs_store import create_job
-
-    job = create_job(prompt=prompt, model=model, max_tokens=max_tokens, budget=budget)
-
+    url = _api_url_from_creds(api_url)
+    body = {
+        "job_type": "inference",
+        "payload": {"prompt": prompt, "model": model, "max_tokens": max_tokens},
+        "ftns_budget": budget,
+    }
+    try:
+        r = _httpx.post(f"{url}/compute/submit", json=body,
+                        headers=_node_api_key_headers(), timeout=30.0)
+    except _httpx.ConnectError:
+        console.print(f"[red]Cannot connect to node API at {url}[/red]")
+        console.print("  [dim]Start your daemon first: prsm node start[/dim]")
+        raise SystemExit(2)
+    if r.status_code != 200:
+        detail = (r.json().get("detail", r.text)
+                  if r.headers.get("content-type", "").startswith("application/json") else r.text)
+        console.print(f"[red]Submit failed (HTTP {r.status_code}):[/red] {str(detail)[:300]}")
+        raise SystemExit(1)
+    data = r.json()
+    job_id = data.get("job_id", "")
+    create_job(prompt=prompt, model=model, max_tokens=max_tokens, budget=budget,
+               job_id=job_id, status=data.get("status", "pending"))
     console.print(f"[bold green]✅ Job submitted[/bold green]")
-    console.print(f"   Job ID:  {job['job_id']}")
-    console.print(f"   Model:   {job['model']}")
-    console.print(f"   Status:  {job['status']}")
-    if job.get('budget'):
-        console.print(f"   Budget:  {job['budget']} FTNS")
+    console.print(f"   Job ID:  {job_id}")
+    console.print(f"   Model:   {model}")
+    console.print(f"   Status:  {data.get('status', 'pending')}")
+    console.print(f"   Budget:  {budget} FTNS")
     console.print()
-    console.print("  Jobs are processed by your local P2P node.", style="dim")
-    console.print("  Check status with:  prsm compute status " + job['job_id'], style="dim")
+    console.print("  Your node is processing it (self-computes if no peer serves it).", style="dim")
+    console.print(f"  Check status with:  prsm compute status {job_id}", style="dim")
+
+
+def _fetch_compute_job(job_id: str, api_url: Optional[str] = None) -> Optional[dict]:
+    """Sprint 1391 — fetch a submitted job's LIVE status from the daemon (/compute/job/{id}), sync it
+    into the local cache, and fall back to the cache when the node is unreachable or doesn't know the
+    job. Normalizes the daemon's {result:{response,model,prompt}} shape to a flat dict."""
+    import httpx as _httpx
+    from prsm.compute.jobs_store import get_job, update_job
+    url = _api_url_from_creds(api_url)
+    try:
+        r = _httpx.get(f"{url}/compute/job/{job_id}",
+                       headers=_node_api_key_headers(), timeout=10.0)
+    except Exception:  # noqa: BLE001 — node unreachable → local cache
+        return get_job(job_id)
+    if r.status_code != 200:
+        return get_job(job_id)   # 404 (daemon restarted / unknown) or error → local cache
+    d = r.json()
+    res = d.get("result") or {}
+    resp_text = res.get("response") if isinstance(res, dict) else res
+    model = res.get("model") if isinstance(res, dict) else None
+    prompt = res.get("prompt") if isinstance(res, dict) else None
+    update_job(job_id, status=d.get("status", "unknown"), result=resp_text, error=d.get("error"))
+    local = get_job(job_id) or {}
+    return {
+        "job_id": job_id,
+        "status": d.get("status", "unknown"),
+        "model": model or local.get("model") or "—",
+        "prompt": prompt or local.get("prompt") or "",
+        "result": resp_text,
+        "error": d.get("error"),
+        "budget": local.get("budget"),
+    }
 
 
 @compute.command()
 @click.argument('job_id')
-def status(job_id: str):
-    """Get status of a compute job."""
-    from prsm.compute.jobs_store import get_job
-
-    job = get_job(job_id)
+@click.option('--api-url', 'api_url', default=None, help='Node API URL override')
+def status(job_id: str, api_url: Optional[str]):
+    """Get status of a compute job (live from your running node)."""
+    job = _fetch_compute_job(job_id, api_url)
     if not job:
         console.print(f"[red]Job not found: {job_id}[/red]")
         raise SystemExit(1)
@@ -7254,12 +7309,12 @@ def status(job_id: str):
     table.add_column("Key", style="cyan")
     table.add_column("Value", style="green")
     table.add_row("Status", job.get("status", "unknown"))
-    table.add_row("Model", job.get("model", "—"))
+    table.add_row("Model", job.get("model", "—") or "—")
     table.add_row("Prompt", (job.get("prompt", "") or "")[:80])
     if job.get("result"):
         table.add_row("Result", str(job["result"])[:120])
     if job.get("error"):
-        table.add_row("Error", job["error"])
+        table.add_row("Error", str(job["error"]))
     if job.get("budget"):
         table.add_row("Budget", f"{job['budget']} FTNS")
     console.print(table)
@@ -7267,18 +7322,17 @@ def status(job_id: str):
 
 @compute.command()
 @click.argument('job_id')
-def result(job_id: str):
-    """Get result of a completed compute job."""
-    from prsm.compute.jobs_store import get_job
-
-    job = get_job(job_id)
+@click.option('--api-url', 'api_url', default=None, help='Node API URL override')
+def result(job_id: str, api_url: Optional[str]):
+    """Get result of a completed compute job (live from your running node)."""
+    job = _fetch_compute_job(job_id, api_url)
     if not job:
         console.print(f"[red]Job not found: {job_id}[/red]")
         raise SystemExit(1)
 
     if job.get("status") == "completed" and job.get("result"):
         console.print("[bold green]📄 Job Result:[/bold green]")
-        console.print(job["result"])
+        console.print(str(job["result"]))
     else:
         console.print(f"[yellow]Job is {job.get('status', 'unknown')} — no result yet.[/yellow]")
         if job.get("error"):

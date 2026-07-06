@@ -58,12 +58,16 @@ def create_job(
     model: str = "nwtn",
     max_tokens: int = 1000,
     budget: Optional[float] = None,
+    job_id: Optional[str] = None,
+    status: str = "pending",
 ) -> dict:
     import uuid
+    # sp1391 — allow pinning the id to the daemon's job_id so the CLI cache and the node agree.
     job = JobRecord(
-        job_id=uuid.uuid4().hex[:12],
+        job_id=job_id or uuid.uuid4().hex[:12],
         prompt=prompt,
         model=model,
+        status=status,
         max_tokens=max_tokens,
         budget=budget,
     )
