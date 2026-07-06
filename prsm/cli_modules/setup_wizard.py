@@ -647,7 +647,11 @@ def run_setup_wizard(dry_run: bool = False, minimal: bool = False, reset: bool =
             existing = PRSMConfig.load()
             if existing.setup_completed:
                 warning("PRSM is already configured.")
-                if not prompt_confirm("Re-run setup wizard?", default=False):
+                # sp1395 — --dry-run is a non-interactive PREVIEW and --minimal runs with defaults;
+                # neither should block on an interactive "re-run?" prompt. Only ask in the plain
+                # interactive path.
+                if (not dry_run and not minimal
+                        and not prompt_confirm("Re-run setup wizard?", default=False)):
                     info("Use 'prsm setup --reset' to start fresh.")
                     return
 
@@ -657,13 +661,15 @@ def run_setup_wizard(dry_run: bool = False, minimal: bool = False, reset: bool =
         # Detect system
         sys_info = _detect_system()
 
-        # Run steps (7 steps total)
-        _step_welcome(config, sys_info, minimal)
-        _step_role(config, minimal)
-        _step_resources(config, sys_info, minimal)
-        _step_api_keys(config, minimal)
-        _step_network(config, minimal)
-        _step_ai_integration(config, minimal)
+        # Run steps (7 steps total). sp1395 — --dry-run is a non-interactive PREVIEW, so run the
+        # steps with defaults (like --minimal) instead of prompting; nothing is saved anyway.
+        noninteractive = minimal or dry_run
+        _step_welcome(config, sys_info, noninteractive)
+        _step_role(config, noninteractive)
+        _step_resources(config, sys_info, noninteractive)
+        _step_api_keys(config, noninteractive)
+        _step_network(config, noninteractive)
+        _step_ai_integration(config, noninteractive)
         _step_review(config, dry_run)
 
     except click.Abort:

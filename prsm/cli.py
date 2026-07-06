@@ -9094,7 +9094,15 @@ def history(limit: int, search: Optional[str], onchain: bool, stats: bool, inbou
 
     headers = _auth_headers()
     if not headers:
-        console.print("❌ Not logged in. Run: prsm login", style="red")
+        # sp1395 (F11) — full history (search + pagination) needs login, but recent transactions ARE
+        # available login-free (unlike the bare "log in" this used to print). Point the user there so
+        # the balance/history auth difference isn't a confusing dead-end.
+        console.print(
+            "❌ Full transaction history (search + pagination) needs login. Run: prsm login",
+            style="red")
+        console.print(
+            "   [dim]Without login: `prsm ftns balance` shows your recent transactions, and "
+            "`prsm ftns history --onchain` shows on-chain transfers.[/dim]")
         raise SystemExit(1)
 
     url = _api_url_from_creds(api_url)
