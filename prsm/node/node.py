@@ -1379,13 +1379,17 @@ def _build_key_distribution_watcher_or_none(
         return None
 
 
-def _build_settlement_challenge_watcher_or_none(operator_address):
+def _build_settlement_challenge_watcher_or_none(operator_address, receipt_store_getter=None):
     """Sprint 1382 — construct a SettlementChallengeWatcher if the operator opted in AND has an
     address to watch. Env:
       PRSM_SETTLEMENT_CHALLENGE_WATCHER_ENABLED=1         (required)
       PRSM_SETTLEMENT_CHALLENGE_WATCHER_POLL_SECONDS=60   (optional)
     Read-only (no key); settlement registry + RPC resolve from PRSM_NETWORK. Returns None on
     opt-out / no address / unresolvable config / any build error, so startup never breaks.
+
+    sp1383 — when ``receipt_store_getter`` is provided, each new challenge is auto-defended:
+    the node self-verifies the retained §7 receipt for the challenged leaf and logs whether the
+    challenge is BAD-FAITH (receipt verifies) or LEGITIMATE (receipt fails).
     """
     import os
 
@@ -1415,11 +1419,18 @@ def _build_settlement_challenge_watcher_or_none(operator_address):
             SettlementChallengeWatcher,
         )
         client = Web3SettlementContractClient(rpc_url=rpc, contract_address=registry)
+        on_new_challenge = None
+        if receipt_store_getter is not None:
+            from prsm.settlement.challenge_auto_defense import (
+                build_challenge_auto_defense,
+            )
+            on_new_challenge = build_challenge_auto_defense(receipt_store_getter)
         logger.info(
-            "SettlementChallengeWatcher: watching challenges against %s (poll %.0fs)",
-            operator_address, poll)
+            "SettlementChallengeWatcher: watching challenges against %s (poll %.0fs, auto-defense %s)",
+            operator_address, poll, "on" if on_new_challenge else "off")
         return SettlementChallengeWatcher(
-            client, operator_address, poll_interval_sec=poll)
+            client, operator_address, poll_interval_sec=poll,
+            on_new_challenge=on_new_challenge)
     except Exception as exc:  # noqa: BLE001 — never break startup on an optional watcher
         logger.warning("SettlementChallengeWatcher build failed (%s) — not started.", exc)
         return None
@@ -2446,9 +2457,14 @@ class PRSMNode:
         # PRSM_OPERATOR_ADDRESS.
         from prsm.node.operator_address import resolve_operator_address
         self._operator_address = resolve_operator_address()
-        # sp1382 — background settlement-challenge watcher (opt-in, read-only).
+        # sp1382 — background settlement-challenge watcher (opt-in, read-only). sp1383 — the
+        # store-getter is resolved lazily (the receipt store is built later in init) so a challenge
+        # auto-defends against the live retained-receipt store.
         self._settlement_challenge_watcher = (
-            _build_settlement_challenge_watcher_or_none(self._operator_address))
+            _build_settlement_challenge_watcher_or_none(
+                self._operator_address,
+                receipt_store_getter=lambda: getattr(
+                    self, "_settlement_inference_receipt_store", None)))
         # Tasks created on start() — None until then.
         self._compensation_scheduler_task = None
         self._content_readvertise_task = None  # sp1343 — late-joiner catalog re-advertise
