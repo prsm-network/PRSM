@@ -8480,6 +8480,16 @@ def compute_run(prompt: str, query: str, budget: float, privacy: str, api: str):
         console.print(f"[red]Service not available[/red]")
         detail = resp.json().get("detail", "") if resp.headers.get("content-type", "").startswith("application/json") else resp.text
         console.print(f"  [dim]{detail[:300]}[/dim]")
+        # sp1389 — the forge pipeline (--query) needs an external LLM backend; point the user at the
+        # paths that work on the node's own local model instead of dead-ending.
+        if "forge" in detail.lower() or "backend" in detail.lower():
+            console.print()
+            console.print("  [dim]The forge pipeline (--query) needs an external LLM backend "
+                          "(e.g. set OPENROUTER_API_KEY).[/dim]")
+            console.print("  [dim]For a verifiable inference on this node's local model, use:[/dim]")
+            console.print(f'    prsm compute infer --prompt "{query or prompt}"')
+            console.print("  [dim]or the single-shot self-compute path:[/dim]")
+            console.print(f'    prsm compute run --prompt "{query or prompt}" --budget 1.0')
         raise SystemExit(1)
     elif resp.status_code == 404:
         console.print(f"[red]API endpoint not found on daemon[/red]")
