@@ -5281,6 +5281,40 @@ def node_preemption_status_cli(
     console.print(f"  Status: {flag_render}")
 
 
+def _resolve_stake_client(require_ftns: bool = False):
+    """Sprint 1379/1380 — resolve (StakeManagerClient, resolved_addrs) for the stake-lifecycle CLIs.
+
+    Key from FTNS_WALLET_PRIVATE_KEY (env, never argv); StakeBond + RPC (+ FTNS when require_ftns)
+    from PRSM_NETWORK (override RPC with PRSM_BASE_RPC_URL, StakeBond with PRSM_STAKE_BOND_ADDRESS).
+    Raises click.ClickException with an actionable message on any missing piece.
+    """
+    import os as _os
+
+    key = (_os.environ.get("FTNS_WALLET_PRIVATE_KEY") or "").strip()
+    if not key:
+        raise click.ClickException(
+            "FTNS_WALLET_PRIVATE_KEY is unset (the operator's stake key). Export it in your "
+            "shell; never pass a private key on the CLI.")
+    from prsm.config.networks import resolve_endpoints
+    e = resolve_endpoints()
+    stake_bond = (
+        _os.environ.get("PRSM_STAKE_BOND_ADDRESS") or getattr(e, "stake_bond", "") or "").strip()
+    rpc = (_os.environ.get("PRSM_BASE_RPC_URL") or getattr(e, "rpc_url", "") or "").strip()
+    ftns = (getattr(e, "ftns_token", "") or "").strip()
+    missing = [
+        name for name, val in (
+            ("StakeBond", stake_bond), ("RPC", rpc),
+            *((("FTNS", ftns),) if require_ftns else ()),
+        ) if not val
+    ]
+    if missing:
+        raise click.ClickException(
+            f"could not resolve {', '.join(missing)} (set PRSM_NETWORK + PRSM_STAKE_BOND_ADDRESS).")
+    from prsm.economy.web3.stake_manager import StakeManagerClient
+    client = StakeManagerClient(rpc_url=rpc, contract_address=stake_bond, private_key=key)
+    return client, {"stake_bond": stake_bond, "rpc": rpc, "ftns": ftns}
+
+
 @node.command("stake-bond")
 @click.argument("amount_ftns", type=float)
 @click.option(
@@ -5303,35 +5337,19 @@ def node_stake_bond_cli(
     serve under real trust.
     """
     import json as _json
-    import os as _os
 
-    key = (_os.environ.get("FTNS_WALLET_PRIVATE_KEY") or "").strip()
-    if not key:
-        raise click.ClickException(
-            "FTNS_WALLET_PRIVATE_KEY is unset (the operator's stake key). Export it in your "
-            "shell; never pass a private key on the CLI.")
     if amount_ftns <= 0:
         raise click.ClickException(f"amount_ftns must be positive (got {amount_ftns})")
-    from prsm.config.networks import resolve_endpoints
-    e = resolve_endpoints()
-    stake_bond = (
-        _os.environ.get("PRSM_STAKE_BOND_ADDRESS") or getattr(e, "stake_bond", "") or "").strip()
-    ftns = (getattr(e, "ftns_token", "") or "").strip()
-    rpc = (_os.environ.get("PRSM_BASE_RPC_URL") or getattr(e, "rpc_url", "") or "").strip()
-    if not stake_bond or not ftns or not rpc:
-        raise click.ClickException(
-            f"could not resolve StakeBond/FTNS/RPC (stake_bond={stake_bond!r} ftns={ftns!r} "
-            f"rpc={rpc!r}); set PRSM_NETWORK + PRSM_STAKE_BOND_ADDRESS.")
+    client, addrs = _resolve_stake_client(require_ftns=True)
     amount_wei = int(round(amount_ftns * 1e18))
-    from prsm.economy.web3.stake_manager import StakeManagerClient
-    client = StakeManagerClient(rpc_url=rpc, contract_address=stake_bond, private_key=key)
     tx_hash, status = client.approve_and_bond(
-        ftns_token_address=ftns, amount_wei=amount_wei, tier_slash_rate_bps=tier_slash_rate_bps)
+        ftns_token_address=addrs["ftns"], amount_wei=amount_wei,
+        tier_slash_rate_bps=tier_slash_rate_bps)
     rec = client.stake_of(client.address)
     result = {
         "bonded_ftns": amount_ftns, "tier_slash_rate_bps": tier_slash_rate_bps,
         "operator": client.address, "tx_hash": tx_hash, "status": str(status),
-        "on_chain_stake_ftns": rec.amount_wei / 1e18, "stake_bond": stake_bond,
+        "on_chain_stake_ftns": rec.amount_wei / 1e18, "stake_bond": addrs["stake_bond"],
     }
     if output_format == "json":
         click.echo(_json.dumps(result, indent=2))
@@ -5340,6 +5358,67 @@ def node_stake_bond_cli(
         click.echo(f"  tx: {tx_hash}")
         click.echo(f"  operator {client.address} on-chain stake: {rec.amount_wei / 1e18} FTNS")
         click.echo("  set PRSM_PARALLAX_TRUST_STACK_KIND=production to serve under real trust.")
+
+
+@node.command("stake-unbond")
+@click.option(
+    "--format", "output_format",
+    type=click.Choice(["text", "json"]), default="text", help="Output format",
+)
+def node_stake_unbond_cli(output_format: str) -> None:
+    """Sprint 1380 — request to unbond this node's StakeBond stake (BONDED -> UNBONDING). Slashing
+    stays ACTIVE during the unbond delay (a node caught mid-unbond still forfeits); after the delay
+    elapses, `prsm node stake-withdraw` returns the FTNS. Key from FTNS_WALLET_PRIVATE_KEY (env,
+    never argv); StakeBond + RPC resolve from PRSM_NETWORK.
+    """
+    import json as _json
+
+    client, addrs = _resolve_stake_client()
+    tx_hash, status = client.request_unbond()
+    rec = client.stake_of(client.address)
+    result = {
+        "action": "request_unbond", "operator": client.address, "tx_hash": tx_hash,
+        "status": str(status), "stake_status": str(rec.status),
+        "unbond_eligible_at": rec.unbond_eligible_at, "stake_ftns": rec.amount_wei / 1e18,
+        "stake_bond": addrs["stake_bond"],
+    }
+    if output_format == "json":
+        click.echo(_json.dumps(result, indent=2))
+    else:
+        click.echo(f"unbond requested -> {status} (stake now {rec.status})")
+        click.echo(f"  tx: {tx_hash}")
+        click.echo(
+            f"  withdraw available at unix {rec.unbond_eligible_at} (slashing active until then)")
+        click.echo("  run `prsm node stake-withdraw` after the unbond delay to reclaim the FTNS.")
+
+
+@node.command("stake-withdraw")
+@click.option(
+    "--format", "output_format",
+    type=click.Choice(["text", "json"]), default="text", help="Output format",
+)
+def node_stake_withdraw_cli(output_format: str) -> None:
+    """Sprint 1380 — finalize unbond (UNBONDING -> WITHDRAWN) and return the staked FTNS. Reverts
+    on-chain if the unbond delay hasn't elapsed — run `prsm node stake-unbond` first and wait it
+    out. Key from FTNS_WALLET_PRIVATE_KEY (env, never argv); StakeBond + RPC resolve from
+    PRSM_NETWORK.
+    """
+    import json as _json
+
+    client, addrs = _resolve_stake_client()
+    tx_hash, status = client.withdraw()
+    rec = client.stake_of(client.address)
+    result = {
+        "action": "withdraw", "operator": client.address, "tx_hash": tx_hash,
+        "status": str(status), "stake_status": str(rec.status),
+        "stake_ftns": rec.amount_wei / 1e18, "stake_bond": addrs["stake_bond"],
+    }
+    if output_format == "json":
+        click.echo(_json.dumps(result, indent=2))
+    else:
+        click.echo(f"withdraw -> {status} (stake now {rec.status})")
+        click.echo(f"  tx: {tx_hash}")
+        click.echo(f"  operator {client.address} on-chain stake: {rec.amount_wei / 1e18} FTNS")
 
 
 @node.command("stake-info")

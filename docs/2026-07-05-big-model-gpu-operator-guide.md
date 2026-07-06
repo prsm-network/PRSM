@@ -93,8 +93,9 @@ export PRSM_PARALLAX_TRUST_STACK_KIND=production
 export PRSM_PARALLAX_STAKE_ELIGIBILITY=enforced
 ```
 The stake is **slashable** — a node that serves a bad result forfeits it — which is what makes the
-trust real rather than advisory. Unbond later via the StakeBond contract (`requestUnbond` → `withdraw`
-after the unbond delay).
+trust real rather than advisory. To exit later: `prsm node stake-unbond` (BONDED → UNBONDING;
+slashing stays active through the delay), then `prsm node stake-withdraw` once the unbond delay has
+elapsed (reverts if you call it early).
 
 ## 4. Settlement (get paid per node)
 
