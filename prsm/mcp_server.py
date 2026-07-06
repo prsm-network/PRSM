@@ -3708,11 +3708,11 @@ TOOLS = [
                 "model_id": {
                     "type": "string",
                     "description": (
-                        "Identifier of the model to run. Foundation-curated models for "
-                        "Phase 3.x.1: mock-llama-3-8b, mock-mistral-7b, mock-phi-3 "
-                        "(real model registry lands in Task 4)."
+                        "Identifier of the model to run. Defaults to the node's local model "
+                        "(distilgpt2). Call prsm_models / `prsm compute models` to list what a "
+                        "node actually serves before overriding."
                     ),
-                    "default": "mock-llama-3-8b",
+                    "default": "distilgpt2",
                 },
                 "budget_ftns": {
                     "type": "number",
@@ -3722,9 +3722,13 @@ TOOLS = [
                 },
                 "privacy_tier": {
                     "type": "string",
-                    "description": "Inference-layer privacy: none, standard (ε=8), high (ε=4), maximum (ε=1)",
+                    "description": (
+                        "Inference-layer privacy. Default 'none' = usable output on any node. "
+                        "standard/high/maximum add activation-DP (ε=8/4/1) but need a hardware-TEE "
+                        "node and degrade quality (sp1234); real confidentiality is the TEE tier."
+                    ),
                     "enum": ["none", "standard", "high", "maximum"],
-                    "default": "standard",
+                    "default": "none",
                 },
                 "content_tier": {
                     "type": "string",
@@ -5010,9 +5014,13 @@ async def handle_prsm_inference(
     stream on the streaming path.
     """
     prompt = arguments.get("prompt", "")
-    model_id = arguments.get("model_id", "mock-llama-3-8b")
+    # sp1393 — default to the node's real local model (was "mock-llama-3-8b", which no node serves →
+    # prsm_inference dead-ended with "Unknown model_id" out of the box, the same class as sp1386).
+    model_id = arguments.get("model_id", "distilgpt2")
     budget = arguments.get("budget_ftns", 1.0)
-    privacy_tier = arguments.get("privacy_tier", "standard")
+    # sp1393 — default 'none' (usable output on any node). 'standard' required a hardware-TEE node,
+    # so the flagship prsm_inference tool dead-ended with a tier-gate refusal on a software node.
+    privacy_tier = arguments.get("privacy_tier", "none")
     content_tier = arguments.get("content_tier", "A")
     max_tokens = arguments.get("max_tokens")
     temperature = arguments.get("temperature")
