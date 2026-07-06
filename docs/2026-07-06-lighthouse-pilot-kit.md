@@ -80,7 +80,7 @@ pip install prsm-network
 ```bash
 prsm join-testnet          # fresh burner wallet + onboarding
 prsm wallet faucet         # testnet FTNS
-prsm wallet balance
+prsm ftns balance          # confirm the credits landed
 ```
 
 **Step 2 — do the workload (testnet first, then a small mainnet repeat):**
