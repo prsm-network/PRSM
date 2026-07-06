@@ -109,11 +109,29 @@ def test_body_uses_correct_field_names():
     assert "privacy" not in body
 
 
+def _empty_output_response():
+    # sp1386 — the node answers 200 but with no output (e.g. an unavailable model_id).
+    r = MagicMock()
+    r.status_code = 200
+    r.json.return_value = {"success": False, "output": "", "error": "Unknown model_id: nope"}
+    return r
+
+
+def test_empty_output_fails_loud_text_mode():
+    """sp1386 — an unavailable model used to print a blank 'Output:' and exit 0. Now it surfaces the
+    error and exits 1 so a new user isn't silently dead-ended."""
+    with patch("httpx.post", return_value=_empty_output_response()):
+        result = _invoke(["--prompt", "Hi", "--model", "nope"])
+    assert result.exit_code == 1
+    assert "no output" in result.output.lower()
+    assert "Unknown model_id" in result.output
+
+
 def test_default_values():
     with patch("httpx.post", return_value=_good_response()) as mp:
         _invoke(["--prompt", "Hi", "--format", "json"])
     body = mp.call_args.kwargs.get("json") or {}
-    assert body["model_id"] == "gpt2"
+    assert body["model_id"] == "distilgpt2"   # sp1386 — the node's actual default local model (was gpt2, which isn't served)
     assert body["content_tier"] == "A"
     assert body["privacy_tier"] == "none"
     assert body["budget_ftns"] == 1.0

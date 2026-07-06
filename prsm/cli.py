@@ -7341,8 +7341,9 @@ def list_compute_jobs(limit: int):
     help="Prompt text to send to the inference path.",
 )
 @click.option(
-    "--model", "model_id", default="gpt2",
-    help="model_id (default: gpt2)",
+    "--model", "model_id", default="distilgpt2",
+    help="model_id (default: distilgpt2 — the node's default local model; run "
+    "`prsm compute models` to list what this node serves)",
 )
 @click.option(
     "--max-tokens", "max_tokens", default=8, type=int,
@@ -7617,6 +7618,14 @@ def compute_infer_cli(
             receipt.get("cost_ftns", "?"),
         ),
     )
+    # Sprint 1386 — fail loud instead of printing a blank "Output:" when the node returned nothing
+    # (e.g. an unavailable model_id): no output AND (an explicit failure OR no receipt) => error.
+    if not out and (data.get("success") is False or not receipt):
+        err = data.get("error") or (
+            "the node returned no output — is the model loaded? Run `prsm compute models` to see "
+            "what this node serves, then pass a matching --model.")
+        console.print(f"[red]Inference produced no output:[/red] {err}")
+        raise SystemExit(1)
     console.print(f"[bold]Output:[/bold] {out}")
     console.print(f"[dim]Cost: {cost} FTNS[/dim]")
     if receipt:
@@ -7647,8 +7656,9 @@ def compute_infer_cli(
     help="Prompt text to send to the inference path.",
 )
 @click.option(
-    "--model", "model_id", default="gpt2",
-    help="model_id (default: gpt2)",
+    "--model", "model_id", default="distilgpt2",
+    help="model_id (default: distilgpt2 — the node's default local model; run "
+    "`prsm compute models` to list what this node serves)",
 )
 @click.option(
     "--max-tokens", "max_tokens", default=8, type=int,
@@ -15154,8 +15164,9 @@ def node_models_list_cli(output_format: str, registry_root: Optional[str]):
     help="Initial prompt text",
 )
 @click.option(
-    "--model", default="gpt2", show_default=True,
-    help="Model id (must be registered + available on at least one peer)",
+    "--model", default="distilgpt2", show_default=True,
+    help="Model id (must be registered + available on at least one peer; "
+    "distilgpt2 is the node's default local model)",
 )
 @click.option(
     "--max-tokens", "-n", type=int, default=10, show_default=True,

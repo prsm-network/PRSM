@@ -59,17 +59,22 @@ This shows your hardware supply tier (T1-T4), GPU detection, TFLOPS, and thermal
 prsm node start
 ```
 
-In another terminal:
-
-**Get a cost estimate first (free, no tokens spent):**
+In another terminal, confirm the local model is loaded and serving:
 ```bash
-prsm compute quote "EV adoption trends" --shards 5 --tier t2
+prsm node inference-status      # READY when the model is loaded
+prsm compute models             # lists what this node serves (distilgpt2 by default)
 ```
 
-**Then run with a budget:**
+**Run a verifiable inference (works out of the box on the local model):**
 ```bash
-prsm compute run --query "What is the capital of France?" --budget 0.01
+prsm compute infer --prompt "The capital of France is" --max-tokens 8
 ```
+This returns the model output, the FTNS cost, and a signed receipt you can verify. It uses the
+node's default local model (`distilgpt2`); pass `--model <id>` for another model the node serves.
+
+> `prsm compute run` and `prsm compute submit` route through the multi-agent "forge" pipeline, which
+> needs an external LLM backend (e.g. an OpenRouter key) — configure one before using them. For a
+> plain verifiable inference on the node's own model, use `prsm compute infer` above.
 
 **Check earnings estimate (what would I earn as a provider?):**
 ```bash
