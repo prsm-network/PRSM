@@ -65,7 +65,7 @@ export PRSM_PARALLAX_GPU_POOL_KIND=static-file
 export PRSM_PARALLAX_GPU_POOL_FILE=$HOME/parallax_pool.json
 export PRSM_PUBLISHER_KEY_ANCHOR_KIND=static
 export PRSM_PUBLISHER_KEY_ANCHOR_FILE=$HOME/anchor.json
-export PRSM_PARALLAX_TRUST_STACK_KIND=mock   # or production + real StakeBond stake per node
+export PRSM_PARALLAX_TRUST_STACK_KIND=mock   # dev / controlled cluster; for real trust see step (e)
 export PRSM_API_HOST=0.0.0.0 PRSM_ALLOW_INSECURE_PUBLIC_BIND=1   # settlement /per-stage-task delivery
 ```
 
@@ -78,6 +78,23 @@ and point the settlement endpoint map at `http://localhost:8100` for the worker.
 **d. Verify before spending:** `GET /admin/parallax/pool/snapshot` → `gpu_count == N`; `quote-multistage`
 → `multi_stage: true, stage_count: N` (budget must cover the cost, else the budget gate reads as
 "single node").
+
+**e. (Optional) Production trust — real stake instead of `mock`.** `mock` trust accepts any anchored
+peer; production trust drops nodes without on-chain stake (the `StakeWeightedTrustAdapter` eligibility
+filter). On **each** node, post stake (key in `FTNS_WALLET_PRIVATE_KEY`, never argv) — one command
+approves FTNS + bonds:
+```bash
+prsm node stake-bond 1 --tier-slash-rate-bps 100   # any bond >0 clears eligibility; >=1 FTNS = full confidence
+prsm node stake-info                                # confirm the on-chain stake landed
+```
+Then flip both nodes to enforced production trust and restart:
+```bash
+export PRSM_PARALLAX_TRUST_STACK_KIND=production
+export PRSM_PARALLAX_STAKE_ELIGIBILITY=enforced
+```
+The stake is **slashable** — a node that serves a bad result forfeits it — which is what makes the
+trust real rather than advisory. Unbond later via the StakeBond contract (`requestUnbond` → `withdraw`
+after the unbond delay).
 
 ## 4. Settlement (get paid per node)
 
@@ -97,5 +114,7 @@ per-stage escrow commit settles (no legacy double-pay).
 | run `stage_hf_model.py` | auto-staged at node-start (sp1377) |
 | hand-write pool + anchor per node | `gen_cluster_config.py` (sp1378) |
 
-Still operator-supplied (by nature): the funded settler keys, the requester escrow, the networking
-(private subnet or tunnel), and — for production trust — real on-chain stake per node.
+| serve under real (non-mock) trust | `prsm node stake-bond` (sp1379, step e) |
+
+Still operator-supplied (by nature): the funded settler keys, the requester escrow, and the networking
+(private subnet or tunnel).
