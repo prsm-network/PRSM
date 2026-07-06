@@ -5940,6 +5940,44 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                     payload=job.payload,
                     ftns_budget=job.ftns_budget,
                 )
+
+                # sp1390 — self-compute fallback so `compute submit` doesn't hang `pending` forever
+                # on a single node / with only non-serving peers (gossip broadcast finds no provider;
+                # gossip has no loopback so the node's own provider never learns of its own offer).
+                # Runs after a grace window (real peers get first chance) and delivers the result
+                # DIRECTLY to the requester. Opt-out: PRSM_SUBMIT_SELF_COMPUTE=0.
+                _self_ok = getattr(node.compute_provider, "allow_self_compute", False)
+                _submit_sc = (os.environ.get("PRSM_SUBMIT_SELF_COMPUTE", "1") or "1").strip().lower(
+                ) not in ("0", "false", "no")
+                if _self_ok and _submit_sc:
+                    async def _self_compute_submitted(_sub=submitted):
+                        from prsm.node.compute_provider import ComputeJob, JobStatus
+                        try:
+                            grace = float(
+                                os.environ.get("PRSM_SUBMIT_SELF_COMPUTE_GRACE_S", "") or 8.0)
+                            await asyncio.sleep(grace)
+                            req = node.compute_requester
+                            prov = node.compute_provider
+                            j = req.submitted_jobs.get(_sub.job_id)
+                            if j is None or j._result_event.is_set():
+                                return  # resolved by a peer already
+                            if (_sub.job_id in prov.active_jobs
+                                    or _sub.job_id in prov.completed_jobs):
+                                return
+                            cj = ComputeJob(
+                                job_id=_sub.job_id, job_type=_sub.job_type,
+                                requester_id=node.identity.node_id, payload=_sub.payload,
+                                ftns_budget=_sub.ftns_budget, status=JobStatus.ACCEPTED)
+                            await prov._execute_job(cj)
+                            done = prov.completed_jobs.get(_sub.job_id)
+                            if done and done.result and not j._result_event.is_set():
+                                req.deliver_local_result(_sub.job_id, done.result)
+                        except Exception as _exc:  # noqa: BLE001 — best-effort background fallback
+                            logger.warning(
+                                "self-compute of submitted job %s failed: %s",
+                                _sub.job_id[:8], _exc)
+                    asyncio.create_task(_self_compute_submitted())
+
                 return {
                     "job_id": submitted.job_id,
                     "status": submitted.status.value,

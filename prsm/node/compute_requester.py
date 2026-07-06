@@ -615,6 +615,23 @@ class ComputeRequester:
 
         job._result_event.set()
 
+    def deliver_local_result(self, job_id: str, result: Dict[str, Any]) -> bool:
+        """Sprint 1390 — deliver a SELF-COMPUTED result directly into the submitting job's tracking,
+        bypassing gossip. ``transport.gossip`` only sends to network peers (no loopback), so a
+        single-node self-compute result never reaches the requester via the normal GOSSIP_JOB_RESULT
+        path — this closes that gap so `compute submit` completes. Trusted (same node, no signature
+        check); self-compute payment is the API escrow release's job. Returns True iff a still-pending
+        job was completed."""
+        job = self.submitted_jobs.get(job_id)
+        if job is None or job._result_event.is_set():
+            return False
+        job.status = JobStatus.COMPLETED
+        job.result = result
+        job.result_verified = True
+        job.completed_at = time.time()
+        job._result_event.set()
+        return True
+
         logger.info(
             f"Job {job_id[:8]} completed by {provider_id[:8]}, "
             f"verified={verified}, paid {job.ftns_budget} FTNS"
