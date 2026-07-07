@@ -580,9 +580,14 @@ class ComputeRequester:
         job.result_verified = verified
         job.completed_at = time.time()
 
-        # Record success in discovery for reliability tracking
+        # Record success in discovery for reliability tracking. sp1402 — best-effort: a tracking
+        # error (e.g. a discovery impl missing this method) must NEVER block the provider payment
+        # below. Before this guard, an AttributeError here silently skipped every cross-node payout.
         if self.discovery:
-            self.discovery.record_job_success(provider_id)
+            try:
+                self.discovery.record_job_success(provider_id)
+            except Exception as _track_exc:  # noqa: BLE001
+                logger.debug("record_job_success failed (non-fatal): %s", _track_exc)
 
         # Record payment — only for remote providers.
         # Self-compute payment is handled by the API escrow release.

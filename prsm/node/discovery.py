@@ -1105,6 +1105,25 @@ class PeerDiscovery:
             ingested += 1
         return ingested
 
+    def record_job_success(self, node_id: str) -> None:
+        """Sprint 1402 — record a successful job completion for a peer (reliability tracking).
+
+        MUST exist on PeerDiscovery, not just Libp2pDiscovery: compute_requester._on_job_result
+        calls self.discovery.record_job_success(provider) AFTER marking the job complete but BEFORE
+        releasing payment. On the WebSocket transport (PeerDiscovery) the missing method raised
+        AttributeError, killing the handler before the provider was paid — cross-node jobs settled to
+        NO ONE (live 2026-07-07). PeerInfo already carries the counters."""
+        peer = self.known_peers.get(node_id)
+        if peer:
+            peer.job_success_count += 1
+
+    def record_job_failure(self, node_id: str) -> None:
+        """Sprint 1402 — record a job failure/timeout for a peer (reliability tracking)."""
+        peer = self.known_peers.get(node_id)
+        if peer:
+            peer.job_failure_count += 1
+            peer.last_failure_time = time.time()
+
     async def _handle_gossip(self, msg: P2PMessage, peer: PeerConnection) -> None:
         """Handle discovery-related gossip messages."""
         subtype = msg.payload.get("subtype", "")
