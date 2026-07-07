@@ -588,16 +588,29 @@ class ComputeRequester:
         # Self-compute payment is handled by the API escrow release.
         try:
             if provider_id != self.identity.node_id and job.ftns_budget > 0:
-                tx = await self.ledger.transfer(
-                    from_wallet=self.identity.node_id,
-                    to_wallet=provider_id,
-                    amount=job.ftns_budget,
-                    tx_type=TransactionType.COMPUTE_PAYMENT,
-                    description=f"Payment for job {job_id[:8]}",
-                )
+                # sp1401 — if this job locked ESCROW at submit-time, RELEASE that escrow to the
+                # provider. A second direct transfer here would DOUBLE-PAY: the requester's funds are
+                # already locked in the escrow wallet. release_escrow moves the locked funds to the
+                # provider and is idempotent (returns None on an already-released escrow). Only fall
+                # back to a direct transfer for a non-escrow job.
+                if getattr(job, "escrow_id", None) and self.escrow is not None:
+                    tx = await self.escrow.release_escrow(
+                        job_id=job_id,
+                        provider_id=provider_id,
+                        consensus_reached=True,
+                    )
+                else:
+                    tx = await self.ledger.transfer(
+                        from_wallet=self.identity.node_id,
+                        to_wallet=provider_id,
+                        amount=job.ftns_budget,
+                        tx_type=TransactionType.COMPUTE_PAYMENT,
+                        description=f"Payment for job {job_id[:8]}",
+                    )
 
-                # Broadcast payment via ledger sync
-                if self.ledger_sync:
+                # Broadcast payment via ledger sync so the provider's OWN ledger credits itself
+                # (its _on_ftns_transaction applies the tx whose to_wallet is the provider).
+                if tx is not None and self.ledger_sync:
                     try:
                         await self.ledger_sync.broadcast_transaction(tx)
                     except Exception:

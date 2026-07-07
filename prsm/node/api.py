@@ -5961,6 +5961,15 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                             j = req.submitted_jobs.get(_sub.job_id)
                             if j is None or j._result_event.is_set():
                                 return  # resolved by a peer already
+                            # sp1401 — a REMOTE provider accepted this job and is serving it. Do NOT
+                            # race it with a local self-compute: deliver_local_result settles nothing,
+                            # so self-computing here discards the provider's paid result and pays no
+                            # one (the cross-node settlement gap). Let the provider finish + get paid
+                            # via _on_job_result. Self-compute stays the fallback for the NO-provider
+                            # case (single node / non-serving peers), where provider_id is unset or self.
+                            if (getattr(j, "provider_id", None)
+                                    and j.provider_id != node.identity.node_id):
+                                return
                             if (_sub.job_id in prov.active_jobs
                                     or _sub.job_id in prov.completed_jobs):
                                 return
