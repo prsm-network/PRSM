@@ -49,7 +49,10 @@ Registry: **not paused**, owner = Foundation Safe `0x91b0e6f8…5791`, chainId 8
   This key IS sfo's on-chain payee. Record only the address: `SFO_OPERATOR_ADDRESS = 0x…`.
 - **us's escrow** — us is the payer, so **us must have FTNS deposited in the EscrowPool** ≥ the job
   budget (e.g. 1 FTNS), under us's payer address `US_OPERATOR_ADDRESS = 0x…`. Deposit path: see
-  `docs/2026-06-29-onchain-settlement-go-live-runbook.md` §3. Assistant verifies via `eth_call`.
+  `scripts/deposit_escrow.py` (key from env ONLY):
+  `PRSM_NETWORK=mainnet python scripts/deposit_escrow.py --check` (read-only) then
+  `PRSM_NETWORK=mainnet ESCROW_DEPOSIT_KEY=0x<us payer key> python scripts/deposit_escrow.py 1.0`.
+  Assistant verifies via `--check` / `eth_call`.
 
 ## 2. Configure the nodes (operator)
 
