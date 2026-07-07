@@ -649,6 +649,36 @@ class ComputeProvider:
             "memory_gb": self.resources.memory_total_gb,
         }
 
+    def _signed_shard_receipt(self, job: "ComputeJob", output: str) -> Optional[Dict[str, Any]]:
+        """Sprint 1403 — a signed ShardExecutionReceipt over this job's output, carried IN the result
+        so the REQUESTER can settle the job ON-CHAIN (feed its ReceiptAccumulator → commitBatch on the
+        BatchSettlementRegistry). Single-stage local inference → shard_index 0; provider_id/pubkey bind
+        the receipt to this node. Best-effort: returns None on any error (never breaks serving)."""
+        try:
+            import hashlib
+            import time as _time
+            from prsm.compute.shard_receipt import (
+                ShardExecutionReceipt,
+                build_receipt_signing_payload,
+            )
+            output_hash = hashlib.sha256((output or "").encode("utf-8")).hexdigest()
+            executed_at = int(_time.time())
+            payload = build_receipt_signing_payload(
+                job_id=job.job_id, shard_index=0,
+                output_hash=output_hash, executed_at_unix=executed_at)
+            return ShardExecutionReceipt(
+                job_id=job.job_id,
+                shard_index=0,
+                provider_id=self.identity.node_id,
+                provider_pubkey_b64=self.identity.public_key_b64,
+                output_hash=output_hash,
+                executed_at_unix=executed_at,
+                signature=self.identity.sign(payload),
+            ).to_dict()
+        except Exception as _exc:  # noqa: BLE001 — receipt is best-effort settlement metadata
+            logger.debug("shard receipt build failed for %s (non-fatal): %s", job.job_id[:8], _exc)
+            return None
+
     async def _run_inference(self, job: ComputeJob) -> Dict[str, Any]:
         """Run an inference job via NWTN orchestrator if available, else mock."""
         prompt = job.payload.get("prompt", "")
@@ -712,12 +742,15 @@ class ComputeProvider:
                 )
                 res = await executor.execute(req)
                 if getattr(res, "success", False):
+                    _out = getattr(res, "output", "") or ""
                     return {
                         "model": req_model,
                         "prompt": prompt[:200],
-                        "response": getattr(res, "output", "") or "",
+                        "response": _out,
                         "provider_node": self.identity.node_id,
                         "source": "local_inference",
+                        # sp1403 — carry a signed receipt so the requester can settle on-chain.
+                        "shard_receipt": self._signed_shard_receipt(job, _out),
                     }
                 logger.warning(
                     "local_inference self-compute returned failure for %s: %s",

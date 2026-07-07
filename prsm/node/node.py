@@ -4976,6 +4976,11 @@ class PRSMNode:
             if self.ftns_ledger is not None:
                 self._payment_escrow.broadcast_tx = self._on_chain_ftns_transfer
         self.compute_requester.ledger_sync = self.ledger_sync
+        # sp1403 — wire on-chain settlement so a settled cross-node job feeds the ReceiptAccumulator
+        # (commit/finalize still need a funded settler key). None → off-chain-only, no-op.
+        self.compute_requester.settlement_client = getattr(
+            self, "_onchain_settlement_client", None)
+        self.compute_requester.operator_address = getattr(self, "_operator_address", None)
         if hasattr(self.compute_requester, 'escrow'):
             self.compute_requester.escrow = self._payment_escrow
         # sp957 — wire CONSENSUS_MISMATCH evidence routing into the requester's
