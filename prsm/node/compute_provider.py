@@ -284,6 +284,10 @@ class ComputeProvider:
         # sp1387 — the node's real local-inference executor (build_local_inference_executor),
         # set by node.py after construction. Self-compute uses it before the mock fallback.
         self.inference_executor = None
+        # sp1397 — deliver a self-requested job's result directly to the local requester (gossip has
+        # no loopback, so a job this node requested from ITSELF would otherwise stall "accepted").
+        # Set by node.py to ComputeRequester.deliver_local_result.
+        self.local_result_sink = None
 
         # Cross-node infrastructure
         self.escrow = PaymentEscrow(
@@ -602,6 +606,19 @@ class ComputeProvider:
             # Move from active to completed
             self.active_jobs.pop(job.job_id, None)
             self.completed_jobs[job.job_id] = job
+
+            # sp1397 — if THIS node requested the job (single-node self-accept), deliver the result
+            # straight to the local requester. gossip.publish above has no loopback, so otherwise the
+            # requester never learns its own provider finished → it stalls at "accepted" forever.
+            if (self.local_result_sink is not None
+                    and job.requester_id == self.identity.node_id
+                    and job.result is not None):
+                try:
+                    self.local_result_sink(job.job_id, job.result)
+                except Exception as _sink_exc:  # noqa: BLE001 — never let delivery break job cleanup
+                    logger.warning(
+                        "local result delivery for %s failed: %s",
+                        job.job_id[:8], _sink_exc)
 
             # Evict oldest completed jobs to prevent memory leak
             if len(self.completed_jobs) > self._max_completed_jobs:

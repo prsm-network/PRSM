@@ -111,3 +111,33 @@ async def test_result_publish_timeout_does_not_raise():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ── sp1397 — deliver a SELF-requested job's result to the local requester (gossip has no loopback) ──
+@pytest.mark.asyncio
+async def test_self_requested_job_delivers_to_local_sink():
+    p = await _make_provider()
+    p.orchestrator = None
+    p.inference_executor = _FakeExecutor(_Res(True, " Paris"))
+    delivered = []
+    p.local_result_sink = lambda jid, result: delivered.append((jid, result))
+    job = ComputeJob(
+        job_id="jself", job_type=JobType.INFERENCE, requester_id=p.identity.node_id,
+        payload={"prompt": "hi", "model": "nwtn"}, ftns_budget=0.0)
+    await p._execute_job(job)
+    assert len(delivered) == 1 and delivered[0][0] == "jself"      # delivered locally
+    assert delivered[0][1]["source"] == "local_inference"          # the real result
+
+
+@pytest.mark.asyncio
+async def test_foreign_job_not_delivered_locally():
+    p = await _make_provider()
+    p.orchestrator = None
+    p.inference_executor = _FakeExecutor(_Res(True, " Paris"))
+    delivered = []
+    p.local_result_sink = lambda jid, result: delivered.append(jid)
+    job = ComputeJob(
+        job_id="jforeign", job_type=JobType.INFERENCE, requester_id="some-other-node",
+        payload={"prompt": "hi"}, ftns_budget=0.0)
+    await p._execute_job(job)
+    assert delivered == []                                          # foreign → gossip, not local sink

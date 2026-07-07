@@ -4964,6 +4964,11 @@ class PRSMNode:
             # sp1387 — give self-compute the real local model (so a single-node node's compute
             # jobs return a REAL answer via _run_inference instead of a mock string).
             self.compute_provider.inference_executor = getattr(self, "inference_executor", None)
+            # sp1397 — deliver a self-requested job's result straight to the local requester (gossip
+            # has no loopback, so a job this node requests from itself would stall "accepted").
+            if getattr(self, "compute_requester", None) is not None:
+                self.compute_provider.local_result_sink = (
+                    self.compute_requester.deliver_local_result)
             # Wire escrow and consensus into compute provider
             self.compute_provider.escrow = self._payment_escrow
             self.compute_provider.consensus = self._result_consensus
