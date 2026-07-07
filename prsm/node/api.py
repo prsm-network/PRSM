@@ -13930,6 +13930,65 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             raise HTTPException(status_code=422, detail=str(e))
         return record.to_dict()
 
+    @app.get("/admin/settlement/onchain/status", tags=["admin"])
+    async def settlement_onchain_status() -> Dict[str, Any]:
+        """Sprint 1404 — read-only status of the on-chain settlement client that receives sp1403
+        cross-node receipts. OFF (client None) unless PRSM_ONCHAIN_SETTLEMENT=1 + PRSM_OPERATOR_ADDRESS.
+        Use before commit to confirm batches accumulated. No key, no tx."""
+        client = getattr(node, "_onchain_settlement_client", None)
+        if client is None:
+            return {"onchain_settlement": "off",
+                    "detail": "set PRSM_ONCHAIN_SETTLEMENT=1 + PRSM_OPERATOR_ADDRESS (+ "
+                              "FTNS_WALLET_PRIVATE_KEY for commit)"}
+        try:
+            stats = client.get_stats() if hasattr(client, "get_stats") else {}
+        except Exception as _e:  # noqa: BLE001
+            stats = {"error": str(_e)}
+        return {"onchain_settlement": "on", "operator_address": getattr(
+            node, "_operator_address", None), "stats": stats}
+
+    @app.post("/admin/settlement/onchain/commit-ready", tags=["admin"])
+    async def settlement_commit_ready() -> Dict[str, Any]:
+        """Sprint 1404 — operator-triggered driver: commit all READY accumulated batches (from settled
+        cross-node jobs, sp1403) to the BatchSettlementRegistry in ONE cycle. A controlled trigger for
+        a canary (there is deliberately no auto-commit loop). Needs a write-capable client (funded
+        FTNS_WALLET_PRIVATE_KEY). Returns each committed batch's id + commit tx."""
+        client = getattr(node, "_onchain_settlement_client", None)
+        if client is None:
+            raise HTTPException(
+                status_code=503,
+                detail="on-chain settlement off (PRSM_ONCHAIN_SETTLEMENT=1 + PRSM_OPERATOR_ADDRESS "
+                       "+ FTNS_WALLET_PRIVATE_KEY)")
+        try:
+            committed = await client.commit_ready_batches()
+        except Exception as _e:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"commit_ready_batches failed: {_e}")
+        return {"committed": [
+            {"batch_id": cb.batch_id.hex(), "tx_hash": cb.tx_hash,
+             "provider_address": cb.provider_address,
+             "requester_address": cb.requester_address,
+             "receipt_count": cb.receipt_count,
+             "total_value_ftns": str(cb.total_value_ftns),
+             "commit_timestamp": cb.commit_timestamp}
+            for cb in committed]}
+
+    @app.post("/admin/settlement/onchain/finalize-ready", tags=["admin"])
+    async def settlement_finalize_ready() -> Dict[str, Any]:
+        """Sprint 1404 — operator-triggered driver: finalize every committed batch past its challenge
+        window in ONE cycle → EscrowPool draws the requester's escrow and pays the provider. Returns
+        the finalized batch ids."""
+        client = getattr(node, "_onchain_settlement_client", None)
+        if client is None:
+            raise HTTPException(status_code=503, detail="on-chain settlement off")
+        try:
+            finalized = await client.finalize_ready_batches()
+        except Exception as _e:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"finalize_ready_batches failed: {_e}")
+        return {"finalized": [
+            {"batch_id": fb.batch_id.hex(),
+             "tx_hash": getattr(fb, "tx_hash", None)}
+            for fb in finalized]}
+
     @app.post("/admin/escrow/recover-orphans", tags=["admin"])
     async def recover_orphan_escrows(
         dry_run: bool = True,
