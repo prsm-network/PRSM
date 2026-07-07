@@ -50,6 +50,28 @@ from .models import (
 logger = logging.getLogger(__name__)
 
 
+def _split_host_port(addr: str):
+    """Sprint 1399 — split "host:port" into (host, int port), IPv6-safe. Returns (addr, None) when
+    there is no numeric port. Handles "[::1]:9002" (bracketed IPv6), "1.2.3.4:9002", bare IPv6 "::1"
+    (multiple colons, no port), and plain "host". Used so a peer's advertise_address ("host:port") is
+    stored with the port split OUT of PeerInfo.address (which is host-only) — otherwise /peers renders
+    "host:port:port" (the client sends both an address that already has the port AND a port field)."""
+    s = addr.strip()
+    if s.startswith("["):                       # bracketed IPv6: [host]:port  or  [host]
+        rb = s.find("]")
+        if rb == -1:
+            return s, None
+        host, rest = s[: rb + 1], s[rb + 1:]
+        if rest.startswith(":") and rest[1:].isdigit():
+            return host, int(rest[1:])
+        return host, None
+    if s.count(":") == 1:                        # host:port (bare IPv6 has >1 colon, so it's excluded)
+        h, _, p = s.partition(":")
+        if p.isdigit():
+            return h, int(p)
+    return s, None                               # bare IPv6 or no port → leave untouched
+
+
 class RateLimiter:
     """Simple rate limiter for peer connections."""
     
@@ -461,6 +483,14 @@ class BootstrapServer:
             and supplied_address.strip()
         ):
             effective_address = supplied_address.strip()
+            # sp1399 — PRSM_ADVERTISE_ADDRESS is documented as "host:port", but PeerInfo.address holds
+            # the HOST only (there's a separate port field). Storing host:port here rendered peers as
+            # "host:port:port" in /peers. Split the port off — it's the dialable one for NAT/port-
+            # forward setups — so address stays host-only and the port field is authoritative.
+            _host, _port = _split_host_port(effective_address)
+            if _port is not None:
+                effective_address = _host
+                port = _port
         else:
             effective_address = client_ip
 
