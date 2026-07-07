@@ -303,16 +303,21 @@ class BatchSettlementClient:
     # ── Commit path ──────────────────────────────────────────────
 
     @_locked
-    async def commit_ready_batches(self) -> List[CommittedBatch]:
+    async def commit_ready_batches(self, force: bool = False) -> List[CommittedBatch]:
         """Poll the accumulator for batches that crossed a threshold;
         commit each one on chain. On commit failure the receipts stay
         in the accumulator (no data loss); caller retries next poll.
 
         Returns the list of successfully-committed CommittedBatch
         records in the order processed.
+
+        sp1407 — ``force`` commits EVERY pending batch regardless of the count/time/value thresholds
+        (evaluated as-of a far-future time so the TIME trigger fires for all). This is the controlled
+        one-shot a ceremony/canary uses to commit a single small batch without waiting an hour.
         """
+        at_unix = (2 ** 62) if force else None
         committed: List[CommittedBatch] = []
-        for ready in self._accumulator.ready_batches():
+        for ready in self._accumulator.ready_batches(at_unix=at_unix):
             leaf_hashes, root = self._build_leaves_root(ready)
             # sp1040 review #10 — key the WAL by (accumulator_key, root), NOT root
             # alone: two distinct ready batches that happen to share a merkle_root

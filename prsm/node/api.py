@@ -13948,11 +13948,14 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             node, "_operator_address", None), "stats": stats}
 
     @app.post("/admin/settlement/onchain/commit-ready", tags=["admin"])
-    async def settlement_commit_ready() -> Dict[str, Any]:
+    async def settlement_commit_ready(force: bool = False) -> Dict[str, Any]:
         """Sprint 1404 — operator-triggered driver: commit all READY accumulated batches (from settled
         cross-node jobs, sp1403) to the BatchSettlementRegistry in ONE cycle. A controlled trigger for
         a canary (there is deliberately no auto-commit loop). Needs a write-capable client (funded
-        FTNS_WALLET_PRIVATE_KEY). Returns each committed batch's id + commit tx."""
+        FTNS_WALLET_PRIVATE_KEY). Returns each committed batch's id + commit tx.
+
+        sp1407 — ``?force=1`` commits EVERY pending batch regardless of the count/time/value thresholds
+        (a single small canary batch would otherwise wait for the 1-hour time trigger)."""
         client = getattr(node, "_onchain_settlement_client", None)
         if client is None:
             raise HTTPException(
@@ -13960,7 +13963,7 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 detail="on-chain settlement off (PRSM_ONCHAIN_SETTLEMENT=1 + PRSM_OPERATOR_ADDRESS "
                        "+ FTNS_WALLET_PRIVATE_KEY)")
         try:
-            committed = await client.commit_ready_batches()
+            committed = await client.commit_ready_batches(force=force)
         except Exception as _e:  # noqa: BLE001
             raise HTTPException(status_code=500, detail=f"commit_ready_batches failed: {_e}")
         return {"committed": [
