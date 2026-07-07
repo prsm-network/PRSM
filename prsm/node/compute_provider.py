@@ -145,6 +145,9 @@ class ComputeJob:
     ftns_budget: float
     status: JobStatus = JobStatus.PENDING
     accepted_by: Optional[str] = None
+    # sp1405 — the requester's on-chain payer (eth) address, carried in the job offer so the PROVIDER
+    # can name it as `requester` when it commits its earning on-chain (commitBatch → provider=msg.sender).
+    requester_operator_address: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
     result_signature: Optional[str] = None
     created_at: float = field(default_factory=time.time)
@@ -288,6 +291,11 @@ class ComputeProvider:
         # no loopback, so a job this node requested from ITSELF would otherwise stall "accepted").
         # Set by node.py to ComputeRequester.deliver_local_result.
         self.local_result_sink = None
+        # sp1405 — PROVIDER-side on-chain settlement: the earner commits (commitBatch → provider=
+        # msg.sender), so the node that SERVED a remote job accumulates its own earning here. Both set
+        # by node.py; None → off-chain only.
+        self.settlement_client = None
+        self.operator_address = None
 
         # Cross-node infrastructure
         self.escrow = PaymentEscrow(
@@ -415,6 +423,8 @@ class ComputeProvider:
             ftns_budget=ftns_budget,
             status=JobStatus.ACCEPTED,
             accepted_by=self.identity.node_id,
+            # sp1405 — carry the requester's payer eth-address from the offer for on-chain settlement.
+            requester_operator_address=data.get("requester_operator_address"),
         )
 
         # Announce acceptance
@@ -620,6 +630,11 @@ class ComputeProvider:
                         "local result delivery for %s failed: %s",
                         job.job_id[:8], _sink_exc)
 
+            # sp1405 — a job served for a REMOTE requester is this node's on-chain EARNING: accumulate
+            # it (the earner commits; commitBatch → provider=msg.sender). Best-effort + fully gated.
+            if job.requester_id != self.identity.node_id and job.result:
+                await self._maybe_accumulate_onchain_earning(job)
+
             # Evict oldest completed jobs to prevent memory leak
             if len(self.completed_jobs) > self._max_completed_jobs:
                 excess = len(self.completed_jobs) - self._max_completed_jobs
@@ -678,6 +693,43 @@ class ComputeProvider:
         except Exception as _exc:  # noqa: BLE001 — receipt is best-effort settlement metadata
             logger.debug("shard receipt build failed for %s (non-fatal): %s", job.job_id[:8], _exc)
             return None
+
+    async def _maybe_accumulate_onchain_earning(self, job: "ComputeJob") -> None:
+        """Sprint 1405 — accumulate THIS node's earning for a served remote job into the on-chain
+        ReceiptAccumulator. On-chain settlement is PROVIDER-side: commitBatch sets provider=msg.sender,
+        so the earner (this node) accumulates + later commits with its own funded settler key, naming
+        the requester as payer. Gated on settlement_client + own operator_address + the requester's
+        operator_address (from the offer) + a signed shard_receipt. Best-effort; never raises."""
+        client = getattr(self, "settlement_client", None)
+        provider_addr = (getattr(self, "operator_address", "") or "").strip()
+        requester_addr = (getattr(job, "requester_operator_address", "") or "").strip()
+        if client is None or not provider_addr or not requester_addr:
+            return
+        result = job.result if isinstance(job.result, dict) else {}
+        receipt_dict = result.get("shard_receipt") or self._signed_shard_receipt(
+            job, result.get("response", ""))
+        if not receipt_dict:
+            return
+        try:
+            from prsm.compute.shard_receipt import ShardExecutionReceipt
+            from prsm.settlement.accumulator import BatchedReceipt
+            value_ftns = int(round(float(job.ftns_budget or 0) * (10 ** 18)))
+            if value_ftns <= 0:
+                return
+            br = BatchedReceipt(
+                receipt=ShardExecutionReceipt.from_dict(receipt_dict),
+                requester_address=requester_addr,
+                provider_address=provider_addr,   # == this node's settler key (asserted at commit)
+                value_ftns=value_ftns,
+                local_escrow_id=f"job-{job.job_id}",
+            )
+            await client.accumulate(br)
+            logger.info(
+                "on-chain accumulate (earning): job %s ← payer %s (%d FTNS wei)",
+                job.job_id[:8], requester_addr[:10], value_ftns)
+        except Exception as _exc:  # noqa: BLE001 — settlement must not disturb job cleanup
+            logger.debug("on-chain earning accumulate for %s failed (non-fatal): %s",
+                         job.job_id[:8], _exc)
 
     async def _run_inference(self, job: ComputeJob) -> Dict[str, Any]:
         """Run an inference job via NWTN orchestrator if available, else mock."""

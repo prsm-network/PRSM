@@ -421,6 +421,9 @@ class ComputeRequester:
             "requester_id": self.identity.node_id,
             "payload": payload,
             "ftns_budget": ftns_budget,
+            # sp1405 — advertise the payer eth-address so the PROVIDER can name it as `requester`
+            # when it commits its earning on-chain (omitted when off-chain settlement isn't configured).
+            "requester_operator_address": (getattr(self, "operator_address", "") or "") or None,
         }
 
         # Add target peers if smart routing
@@ -631,59 +634,11 @@ class ComputeRequester:
         except ValueError as e:
             logger.error(f"Payment failed for job {job_id[:8]}: {e}")
 
-        # sp1403 — additionally bridge this settled cross-node job to ON-CHAIN settlement: hand the
-        # provider's signed shard_receipt to the accumulator so a funded settler key commits the
-        # batch to the BatchSettlementRegistry. Best-effort + fully gated (no-op without a settlement
-        # client + operator addresses); the off-chain settlement above stands regardless.
-        if provider_id != self.identity.node_id and job.ftns_budget > 0:
-            await self._maybe_accumulate_onchain(job, provider_id, result)
-
+        # sp1405 — on-chain settlement is PROVIDER-side (the earner commits: commitBatch →
+        # provider=msg.sender). The requester does NOT accumulate/commit — it funds the on-chain escrow
+        # and is named as `requester` in the batch the provider commits. (Superseded the sp1403
+        # requester-side accumulate, which would have set the payer as the on-chain earner.)
         job._result_event.set()
-
-    def _resolve_operator_address(self, provider_id: str) -> Optional[str]:
-        """sp1403 — a peer's on-chain operator (payee) address, from discovery's advertised
-        hardware_profile (sp690/788 relayed operator_address). None if unknown."""
-        disc = getattr(self, "discovery", None)
-        peer = getattr(disc, "known_peers", {}).get(provider_id) if disc else None
-        hw = getattr(peer, "hardware_profile", None) if peer else None
-        if isinstance(hw, dict):
-            addr = (hw.get("operator_address") or "").strip()
-            return addr or None
-        return None
-
-    async def _maybe_accumulate_onchain(
-        self, job: "SubmittedJob", provider_id: str, result: Dict[str, Any]
-    ) -> None:
-        """sp1403 — feed a settled cross-node gossip job into the on-chain ReceiptAccumulator. Gated:
-        needs a settlement_client, both operator eth-addresses, and the provider's signed shard_receipt.
-        Any missing piece → silent no-op. Never raises (settlement must not disturb result delivery)."""
-        client = getattr(self, "settlement_client", None)
-        if client is None:
-            return
-        receipt_dict = (result or {}).get("shard_receipt")
-        if not receipt_dict:
-            return
-        requester_addr = (getattr(self, "operator_address", "") or "").strip()
-        provider_addr = self._resolve_operator_address(provider_id)
-        if not requester_addr or not provider_addr:
-            return
-        try:
-            from prsm.compute.shard_receipt import ShardExecutionReceipt
-            from prsm.settlement.accumulator import BatchedReceipt
-            value_ftns = int(round(float(job.ftns_budget) * (10 ** 18)))
-            br = BatchedReceipt(
-                receipt=ShardExecutionReceipt.from_dict(receipt_dict),
-                requester_address=requester_addr,
-                provider_address=provider_addr,
-                value_ftns=value_ftns,
-                local_escrow_id=(getattr(job, "escrow_id", "") or ""),
-            )
-            await client.accumulate(br)
-            logger.info(
-                "on-chain accumulate: job %s → provider %s (%d FTNS wei)",
-                job.job_id[:8], provider_addr[:10], value_ftns)
-        except Exception as _exc:  # noqa: BLE001
-            logger.debug("on-chain accumulate for %s failed (non-fatal): %s", job.job_id[:8], _exc)
 
     def deliver_local_result(self, job_id: str, result: Dict[str, Any]) -> bool:
         """Sprint 1390 — deliver a SELF-COMPUTED result directly into the submitting job's tracking,
