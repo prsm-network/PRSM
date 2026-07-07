@@ -233,6 +233,36 @@ class EmptyAllocationError(RoutingError):
     from 'allocation ran but had no GPUs'."""
 
 
+def _empty_allocation_detail(model_info: "ModelInfo", gpus: "List[ParallaxGPU]") -> str:
+    """Sprint 1396 — build an ACTIONABLE message for an empty allocation: the memory-derived decoder
+    capacity the pool can host vs the model's layer count, per node, plus concrete fixes. Fail-soft:
+    on any error, fall back to the original terse message so diagnostics never mask the failure."""
+    base = ("AllocationResult has no pipelines — Phase-1 allocator produced an empty result, or you "
+            "passed allocation that was never run")
+    try:
+        if not gpus:
+            return base + " (the pool is empty — no nodes advertised compute capacity)."
+        from prsm.compute.parallax_scheduling.prsm_types import to_parallax_node
+        caps = []
+        total_cap = 0
+        for g in gpus:
+            c = int(to_parallax_node(g, model_info).get_decoder_layer_capacity())
+            caps.append(f"{g.node_id[:8]}={c}L@{g.memory_gb}GB")
+            total_cap += c
+        need = int(model_info.num_layers)
+        if total_cap >= need:
+            return base  # not a capacity shortfall — keep the terse message
+        return (
+            f"AllocationResult has no pipelines: the {len(gpus)}-node pool can host {total_cap} "
+            f"decoder layer(s) but the model needs {need}. Per-node capacity (memory-derived): "
+            + ", ".join(caps)
+            + ". Fixes: raise PRSM_PARALLAX_MEMORY_GB_OVERRIDE (allocator budgets ~14 layers/GB), "
+            "add nodes to the pool, use PRSM_INFERENCE_EXECUTOR=local for robust single-node "
+            "serving, or serve a smaller model.")
+    except Exception:  # noqa: BLE001 — diagnostics must never crash the (already-failing) path
+        return base
+
+
 class NoCoverageError(RoutingError):
     """No chain in the (preferred or any) region covers all model
     layers. Caller should rerun Phase-1 allocation — this is the
@@ -286,11 +316,10 @@ class RequestRouter:
         original_gpus: List[ParallaxGPU],
     ) -> None:
         if allocation.total_pipeline_count() == 0:
-            raise EmptyAllocationError(
-                "AllocationResult has no pipelines — Phase-1 allocator "
-                "produced an empty result, or you passed allocation that "
-                "was never run"
-            )
+            # sp1396 — a bare "no pipelines" dead-ends the operator (I hit it live on a single-node
+            # seed: memory_gb=0.8 derived capacity 11 < gpt2's 12 layers → empty, with no hint why).
+            # Explain the exact capacity shortfall + how to fix it.
+            raise EmptyAllocationError(_empty_allocation_detail(model_info, original_gpus))
         self._allocation = allocation
         self._profile_source = profile_source
         self._model_info = model_info
