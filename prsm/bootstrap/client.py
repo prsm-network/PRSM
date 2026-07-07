@@ -343,27 +343,57 @@ class BootstrapClient:
         )
 
     async def _heartbeat_loop(self) -> None:
-        """Send periodic heartbeats to the bootstrap server."""
-        while self._connected and self._ws:
+        """Send periodic heartbeats; reconnect + re-register if the server drops/restarts.
+
+        sp1400 — a dropped connection no longer ENDS the loop. Previously a failed heartbeat set
+        _connected=False and broke, so a bootstrap-server restart silently de-registered this node
+        until an operator restarted the daemon (live 2026-07-07: sfo lapsed from the registry after a
+        server restart). The loop now runs until cancelled by disconnect(); while disconnected it
+        reconnects via connect() — which re-registers — on each tick (the interval is the backoff)."""
+        while True:
             try:
                 await asyncio.sleep(self.heartbeat_interval)
-                if not self._connected or not self._ws:
-                    break
-
-                heartbeat = {
-                    "type": "heartbeat",
-                    "peer_id": self.node_id,
-                    "uptime": time.monotonic() - (self._connect_time or 0),
-                }
-                await self._ws.send(json.dumps(heartbeat))
-                logger.debug("Heartbeat sent to bootstrap server")
+                if self._connected and self._ws:
+                    heartbeat = {
+                        "type": "heartbeat",
+                        "peer_id": self.node_id,
+                        "uptime": time.monotonic() - (self._connect_time or 0),
+                    }
+                    await self._ws.send(json.dumps(heartbeat))
+                    logger.debug("Heartbeat sent to bootstrap server")
+                else:
+                    await self._reconnect_once()
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning("Heartbeat failed: %s", e)
-                self._connected = False
-                break
+                logger.warning("Heartbeat failed: %s (will reconnect)", e)
+                self._connected = False  # next tick reconnects + re-registers
+
+    async def _reconnect_once(self) -> None:
+        """sp1400 — one best-effort reconnect + re-register attempt (the heartbeat cadence is the
+        retry backoff). On success the fresh peer list re-fires on_peers_discovered so the node's
+        auto-dial sweep re-runs against whatever the (possibly-restarted) server now knows."""
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:  # noqa: BLE001 — best-effort cleanup of a half-open socket
+                pass
+            self._ws = None
+        self._connected = False
+        try:
+            peers = await self.connect()
+        except Exception as e:  # noqa: BLE001 — server still down; retry on the next tick
+            logger.warning("Bootstrap reconnect failed: %s (retry next tick)", e)
+            return
+        self._peers = list(peers)
+        logger.info(
+            "Re-registered with bootstrap server after reconnect (%d peer(s))", len(peers))
+        if self.on_peers_discovered and peers:
+            try:
+                self.on_peers_discovered(peers)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("on_peers_discovered after reconnect raised: %s", e)
 
     async def start_peer_refresh(self, interval: float = 60.0) -> None:
         """Sprint 632 — start background periodic peer-list refresh.
@@ -407,13 +437,15 @@ class BootstrapClient:
         # before we kick off the first refresh tick.
         await asyncio.sleep(0)
         first_tick = True
-        while self._connected and self._ws:
+        while True:
             try:
                 if not first_tick:
                     await asyncio.sleep(interval)
                 first_tick = False
+                # sp1400 — disconnected is transient now (the heartbeat loop owns reconnect), so
+                # skip this tick instead of ENDING the loop; resume refreshing once reconnected.
                 if not self._connected or not self._ws:
-                    break
+                    continue
                 prev_ids = {p.peer_id for p in self._peers}
                 # get_peers updates self._peers + fires callback (the
                 # callback-fires-on-non-empty contract from sprint
