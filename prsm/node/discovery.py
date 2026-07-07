@@ -460,10 +460,15 @@ class PeerDiscovery:
         self._bootstrap_client = None
         await self.bootstrap()
 
-        # If P2P transport bootstrap failed, try the bootstrap client protocol
-        if self.bootstrap_degraded_mode and self.bootstrap_nodes:
+        # sp1398 — ALWAYS run the bootstrap-client protocol (register + get_peers + auto-dial), not
+        # only when the P2P transport bootstrap FAILED. bootstrap() above merely opens a transport
+        # connection to the signaling server; it does NOT register this node for discovery, pull the
+        # server's peer list, or dial peer compute nodes. Gating discovery behind degraded_mode meant
+        # two nodes that BOTH reached the bootstrap never learned about each other — operators had to
+        # POST /peers/connect by hand after every start (2026-07-07 live: us + sfo, 0 auto-peers).
+        if self.bootstrap_nodes:
             connected = await self._try_bootstrap_client()
-            if connected:
+            if connected and self.bootstrap_degraded_mode:
                 self.bootstrap_degraded_mode = False
                 self.bootstrap_connected_count = 1
 
