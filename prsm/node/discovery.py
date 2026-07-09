@@ -1306,6 +1306,17 @@ class PeerDiscovery:
         _prev = self.known_peers.get(node_id)
         if _prev is not None and _announce_is_stale_replay(msg.payload, _prev.last_announce_time):
             return
+        # sp1414 — bound the routing table on the capability-announce path too (memory +
+        # eclipse-magnitude defense). sp1005 capped _handle_announce + _handle_peer_response,
+        # but this handler's new-peer branch below inserted uncapped — so one authenticated peer
+        # minting keypairs and flooding DISCOVERY_CAPABILITY_ANNOUNCE grew known_peers without
+        # bound. Only NEW node_ids are gated; a tracked peer always refreshes (the branch below).
+        if _prev is None and len(self.known_peers) >= _max_known_peers():
+            logger.debug(
+                "known_peers at cap (%d) — dropping new capability announce from %s",
+                _max_known_peers(), node_id[:8],
+            )
+            return
         announce_time = float(msg.payload.get("announce_time") or 0.0)
         capabilities = msg.payload.get("capabilities", [])
         supported_backends = msg.payload.get("supported_backends", [])
