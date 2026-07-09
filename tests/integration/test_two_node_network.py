@@ -17,8 +17,10 @@ def real_asyncio_sleep():
     with patch("asyncio.sleep", _REAL_SLEEP):
         yield
 
+from types import SimpleNamespace
+
 from prsm.node.compute_provider import ComputeProvider, JobType
-from prsm.node.compute_requester import ComputeRequester
+from prsm.node.compute_requester import ComputeRequester, JobStatus
 from prsm.node.config import NodeConfig, NodeRole
 from prsm.node.discovery import PeerDiscovery
 from prsm.node.gossip import GossipProtocol
@@ -81,6 +83,29 @@ async def _setup_node(name, p2p_port, bootstrap=None):
         "provider": provider,
         "requester": requester,
     }
+
+
+def _wire_embedding_backend(node, dimensions_ok=True):
+    """Give a node a real embedding backend, the way a production node has one.
+
+    ``ComputeProvider._run_embedding`` calls ``orchestrator.backend_registry
+    .embed_with_fallback(...)`` and labels the result ``source: "backend_registry"``.
+    Only when that is absent does it fabricate the ``source: "mock"`` sha256 pseudo-vector.
+    """
+
+    class _Registry:
+        async def embed_with_fallback(self, text, model_id=None, dimensions=1536):
+            # deterministic, but a genuine function of the text under a named model
+            vec = [((i * 7 + len(text)) % 200 - 100) / 100.0 for i in range(dimensions)]
+            return SimpleNamespace(
+                embedding=vec,
+                model_id=model_id or "test-embed-v1",
+                provider=SimpleNamespace(value="local"),
+                token_count=len(text.split()),
+            )
+
+    node["provider"].orchestrator = SimpleNamespace(backend_registry=_Registry())
+    return node
 
 
 async def _start_node(node):
@@ -185,9 +210,16 @@ async def test_two_nodes_compute_job_and_payment():
 @pytest.mark.asyncio
 @pytest.mark.integration
 async def test_two_nodes_embedding_job():
-    """End-to-end embedding job between two nodes."""
+    """End-to-end embedding job between two nodes, with the worker actually backed.
+
+    sp1408 — the worker must serve a REAL embedding. Previously this passed against
+    ``_run_embedding``'s ``source: "mock"`` sha256 pseudo-vector fallback, i.e. the
+    requester paid 2 FTNS for a hash. Wire the worker's backend registry so the job
+    travels the production ``source: "backend_registry"`` path.
+    """
     node_a = await _setup_node("client", 19420)
     node_b = await _setup_node("worker", 19421, bootstrap="127.0.0.1:19420")
+    _wire_embedding_backend(node_b)
 
     try:
         await _start_node(node_a)
@@ -205,6 +237,46 @@ async def test_two_nodes_embedding_job():
         assert result is not None
         assert len(result["embedding"]) == 64
         assert result["provider_node"] == node_b["identity"].node_id
+        assert result["source"] == "backend_registry"     # a real answer, not a mock
+
+    finally:
+        await _stop_node(node_b)
+        await _stop_node(node_a)
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_two_nodes_unbacked_worker_mock_is_rejected_and_unpaid():
+    """sp1408 — a worker with NO embedding backend fabricates a `source: "mock"` pseudo-vector
+    and signs it. The signature is valid (it really is from that provider), so the requester
+    used to accept it and pay. It must now refuse: no result, no payment."""
+    node_a = await _setup_node("client", 19422)
+    node_b = await _setup_node("worker", 19423, bootstrap="127.0.0.1:19422")
+    # NOTE: node_b deliberately has no embedding backend → _run_embedding fabricates.
+
+    try:
+        await _start_node(node_a)
+        await _start_node(node_b)
+        await asyncio.sleep(0.5)
+
+        worker_id = node_b["identity"].node_id
+        before = await node_b["ledger"].get_balance(worker_id)
+
+        submitted = await node_a["requester"].submit_job(
+            job_type=JobType.EMBEDDING,
+            payload={"text": "decentralized AI for science", "dimensions": 64},
+            ftns_budget=2.0,
+        )
+        result = await node_a["requester"].get_result(submitted.job_id, timeout=10.0)
+
+        assert result is None, "a self-declared mock must never be delivered as a result"
+        job = node_a["requester"].submitted_jobs[submitted.job_id]
+        assert job.status is JobStatus.FAILED
+        assert "mock" in (job.error or "").lower()
+
+        await asyncio.sleep(0.3)   # let any (erroneous) payment gossip land
+        after = await node_b["ledger"].get_balance(worker_id)
+        assert after == before, "the fabricating worker must not be paid"
 
     finally:
         await _stop_node(node_b)

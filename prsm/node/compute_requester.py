@@ -578,6 +578,34 @@ class ComputeRequester:
             )
             return
 
+        # sp1408 — MOCK GUARD: a signature proves ORIGIN, not that any compute happened.
+        # A provider with no inference backend (bare `pip install prsm`, no `.[ml]` extra)
+        # does not fail the job — `compute_provider._run_inference` fabricates a placeholder
+        # and tags it `source: "mock"`, then signs it with the provider's real key. That
+        # signature verifies, so the job completed and the locked escrow was RELEASED: the
+        # requester paid its full budget for "[PRSM node abcd1234 processed inference]".
+        # Never pay for a result the provider's own software labels a mock. Self-compute is
+        # exempt (payer == payee, so no value moves).
+        if (
+            provider_id != self.identity.node_id
+            and isinstance(result, dict)
+            and result.get("source") == "mock"
+        ):
+            job.status = JobStatus.FAILED
+            job.error = (
+                f"provider {str(provider_id)[:8]} returned a MOCK result "
+                f"(no inference backend configured on that node) — not paying for it"
+            )
+            job.completed_at = time.time()
+            logger.warning("Job %s: %s", job_id[:8], job.error)
+            if self.discovery:
+                try:
+                    self.discovery.record_job_failure(provider_id)
+                except Exception as _track_exc:  # noqa: BLE001 — tracking must never raise here
+                    logger.debug("record_job_failure failed (non-fatal): %s", _track_exc)
+            job._result_event.set()
+            return
+
         job.status = JobStatus.COMPLETED
         job.result = result
         job.result_verified = verified
