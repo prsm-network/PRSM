@@ -55,6 +55,83 @@ def _resolve_state_store(environ) -> Optional[SettlementStateStore]:
     return SettlementStateStore(path)
 
 
+def _resolve_accumulator_config(environ) -> Optional[Any]:
+    """sp1410 — operator-tunable commit thresholds, or ``None`` to keep the defaults.
+
+    ``AccumulatorConfig`` decides when accumulated receipts become a committable batch
+    (1000 receipts / 1h / 100 FTNS). Those were hard-coded, so a small node or a canary
+    waited an hour to be paid — or the operator hand-POSTed ``commit-ready?force=1``.
+
+      - ``PRSM_SETTLEMENT_COUNT_THRESHOLD``     receipts (int)
+      - ``PRSM_SETTLEMENT_TIME_THRESHOLD_S``    seconds (int)
+      - ``PRSM_SETTLEMENT_VALUE_THRESHOLD_FTNS`` FTNS (decimal; stored as wei)
+
+    A malformed field WARNS and keeps that field's default; a value the config itself
+    rejects (non-positive) WARNS and keeps ALL defaults. This resolver must never raise:
+    ``build_onchain_settlement_client_or_none`` swallows any exception into
+    "settlement OFF", so a typo in a tuning knob would silently disable the money path.
+
+    No artificial floor is imposed. Commit frequency is already bounded by the settlement
+    poll loop (``PRSM_SETTLEMENT_POLL_INTERVAL_S``, default 600s), which is what drives
+    ``commit_ready_batches`` — a low threshold cannot commit once per receipt.
+    """
+    from decimal import Decimal, InvalidOperation
+
+    from prsm.settlement.accumulator import AccumulatorConfig
+
+    def _raw(name: str) -> str:
+        return (environ.get(name, "") or "").strip()
+
+    raw_count = _raw("PRSM_SETTLEMENT_COUNT_THRESHOLD")
+    raw_time = _raw("PRSM_SETTLEMENT_TIME_THRESHOLD_S")
+    raw_value = _raw("PRSM_SETTLEMENT_VALUE_THRESHOLD_FTNS")
+    if not (raw_count or raw_time or raw_value):
+        return None   # untouched → byte-identical default path
+
+    kwargs = {}
+    for name, raw, key in (
+        ("PRSM_SETTLEMENT_COUNT_THRESHOLD", raw_count, "count_threshold"),
+        ("PRSM_SETTLEMENT_TIME_THRESHOLD_S", raw_time, "time_threshold_seconds"),
+    ):
+        if not raw:
+            continue
+        try:
+            kwargs[key] = int(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "%s=%r is not an integer — ignoring it and keeping the default",
+                name, raw,
+            )
+    if raw_value:
+        try:
+            wei = int(Decimal(raw_value) * (10 ** 18))
+        except (InvalidOperation, ValueError, TypeError, ArithmeticError, OverflowError):
+            logger.warning(
+                "PRSM_SETTLEMENT_VALUE_THRESHOLD_FTNS=%r is not a decimal FTNS amount — "
+                "ignoring it and keeping the default", raw_value,
+            )
+        else:
+            kwargs["value_threshold_ftns"] = wei
+
+    if not kwargs:
+        return None
+    try:
+        config = AccumulatorConfig(**kwargs)
+    except (ValueError, TypeError, OverflowError) as exc:
+        logger.warning(
+            "settlement accumulator thresholds rejected (%s) — keeping ALL defaults "
+            "(1000 receipts / %ds / 100 FTNS). Settlement stays ON.",
+            exc, AccumulatorConfig().time_threshold_seconds,
+        )
+        return None
+    logger.info(
+        "settlement commit thresholds overridden: count=%d time=%ds value=%d wei",
+        config.count_threshold, config.time_threshold_seconds,
+        config.value_threshold_ftns,
+    )
+    return config
+
+
 def _commit_with_attestation_selector_hex() -> str:
     """The 4-byte selector for ``commitBatchWithAttestation`` (sp1241), DERIVED
     from the registry ABI so it can never drift from the contract — the same
@@ -210,8 +287,12 @@ def build_onchain_settlement_client_or_none(
         # a restart or the money strands. PRSM_SETTLEMENT_STATE_FILE overrides the
         # path; ":memory:" disables durability (in-memory only — for tests/diagnostics).
         _state = state_store if state_store is not None else _resolve_state_store(environ)
-        _acc = ReceiptAccumulator(accumulator_config) if accumulator_config is not None \
-            else ReceiptAccumulator()
+        # sp1410 — an EXPLICIT accumulator_config (the per-stage path's count_threshold=1)
+        # always wins; otherwise the operator's env thresholds apply, else the defaults.
+        _acc = ReceiptAccumulator(
+            accumulator_config if accumulator_config is not None
+            else _resolve_accumulator_config(environ)
+        )
         return BatchSettlementClient(
             accumulator=_acc,
             contract_client=contract_client,

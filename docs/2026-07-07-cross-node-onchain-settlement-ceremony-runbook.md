@@ -99,8 +99,30 @@ address from the offer). Off-chain balances still move (sfo +1) — the on-chain
 
 ## 5. Commit on sfo (operator triggers; assistant verifies)
 
+> **What actually drives a commit (sp1410 correction).** With `PRSM_ONCHAIN_SETTLEMENT=1` the node
+> ALWAYS runs the sp1038 settlement poll loop (`Node._settlement_poll_loop`, every
+> `PRSM_SETTLEMENT_POLL_INTERVAL_S`, default 600s) — there is no flag that disables it. Each cycle
+> commits every batch that has crossed an accumulator threshold and finalizes every batch past its
+> challenge window. It is NOT a no-op you opt into.
+>
+> A ceremony batch stays put only because it crosses no threshold: the defaults are **1000 receipts
+> OR 1 hour OR 100 FTNS**, and a lone 1-FTNS receipt hits none of them — for the first hour. After
+> that the poll loop commits it unattended. The two POSTs below force an *immediate* cycle; they are
+> not what makes a commit possible.
+>
+> So there are two clean ways to run this canary:
+> - **Deterministic (preferred, sp1410):** set `PRSM_SETTLEMENT_COUNT_THRESHOLD=1` on sfo so the
+>   single share is ready at once, and let the poll loop commit it (or POST to go now).
+> - **Explicit one-shot:** keep the defaults and POST `commit-ready?force=1` (sp1407), which commits
+>   every pending batch regardless of thresholds.
+>
+> Either way, do the ceremony inside the first hour if you want the commit to be *yours* rather than
+> the loop's.
+
 ```
 curl -sX POST http://127.0.0.1:8002/admin/settlement/onchain/commit-ready   # ON SFO
+# ...or, for a single small canary batch that has crossed no threshold:
+curl -sX POST 'http://127.0.0.1:8002/admin/settlement/onchain/commit-ready?force=1'
 ```
 
 Returns the committed batch: `batch_id`, `tx_hash`, `provider_address` (sfo's), `requester_address`
@@ -139,9 +161,26 @@ by the batch value; us's escrow down by the same. Conservation: escrow-out == pr
   loop) and each is verified before the next.
 - us's deposited-but-unused escrow is recoverable via the EscrowPool withdraw path; never stranded.
 
+## Settlement env quick-ref (sfo)
+
+| Var | Default | Effect |
+|---|---|---|
+| `PRSM_SETTLEMENT_POLL_INTERVAL_S` | `600` | How often the poll loop commits/finalizes (floor 5s). |
+| `PRSM_SETTLEMENT_COUNT_THRESHOLD` | `1000` | Receipts before a batch is committable. `1` = commit each. |
+| `PRSM_SETTLEMENT_TIME_THRESHOLD_S` | `3600` | Age before a batch is committable. |
+| `PRSM_SETTLEMENT_VALUE_THRESHOLD_FTNS` | `100` | Accrued FTNS before a batch is committable. |
+| `PRSM_SETTLEMENT_STATE_FILE` | `~/.prsm/settlement_state.json` | Durable state; `:memory:` disables. |
+
+A malformed threshold is WARNed and ignored (that field keeps its default); settlement stays ON.
+Pending receipts are durable across restarts (sp1409), so a redeploy mid-accumulation no longer
+loses the provider's un-committed earnings.
+
 ## Notes
 
-- **No auto-commit loop** by design — a first ceremony is controlled. The two POSTs (`commit-ready`,
-  `finalize-ready`, sp1404) each drive exactly one cycle, on **sfo**.
+- **The poll loop is always on** whenever `PRSM_ONCHAIN_SETTLEMENT=1` (sp1038): it commits any
+  threshold-ready batch and finalizes any batch past the challenge window, every
+  `PRSM_SETTLEMENT_POLL_INTERVAL_S`. The two POSTs (`commit-ready`, `finalize-ready`, sp1404) force
+  an immediate cycle on **sfo**; they do not gate whether settlement happens. A first ceremony stays
+  controlled only because the default thresholds keep a small batch pending for its first hour — see §5.
 - `PRSM_SETTLEMENT_SUPPORTS_ATTESTATION` stays **off** — software nodes, no TEE → legacy
   `commitBatch(bytes32(0))`. Real SEV-SNP attestation carriage is the parallax-path story.
