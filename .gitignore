@@ -343,6 +343,7 @@ sdks/javascript/package-lock.json
 secrets/
 
 # Local scratch that keeps landing in the repo root (screenshots, pasted command
-# output). Kept on disk, never committed — the root stays audit-clean.
+# output, ad-hoc review notes). Kept on disk, never committed — the root stays audit-clean.
 /Untitled*.png
 /Phase_1_Output.txt
+/fable5-review/
