@@ -780,6 +780,7 @@ class PRSMClient:
         _content: Any = None,
         _fetch_wrapped_key: Any = None,
         _key_client: Any = None,
+        _creator_reader: Any = None,
     ) -> bytes:
         """Sprint 1355 (+1359 F1 redesign) — buy + decrypt a Tier B/C paid dataset.
 
@@ -850,16 +851,20 @@ class PRSMClient:
         # the key depositor (KeyDistribution publisher) — the signature of squatting. Best-effort:
         # if the registry can't be read, skip (the fee check is the hard gate); a real mismatch
         # raises SquatMismatchError and aborts before any payment.
-        _creator_reader = None
-        try:
-            from prsm.economy.web3.provenance_registry_v2 import ProvenanceRegistryV2Client
-            _reg = ProvenanceRegistryV2Client(
-                rpc_url=rpc, contract_address=verifier_client.registry_address())
-            _creator_reader = (
-                lambda c, _r=_reg: _r.contract.functions.getCreatorAndRate(c).call()[0])
-        except Exception:  # noqa: BLE001 — unreadable registry ⇒ skip (not a mismatch)
-            _creator_reader = None
-        assert_publisher_controls_payee(key_client, _creator_reader, ch)
+        # sp1417 — ``_creator_reader`` is injectable so the guard's INVOCATION is testable; without a
+        # seam its construction failed under injected clients (rpc unresolved) and the guard silently
+        # skipped, so nothing could verify pay_and_unlock_content actually calls it.
+        creator_reader = _creator_reader
+        if creator_reader is None:
+            try:
+                from prsm.economy.web3.provenance_registry_v2 import ProvenanceRegistryV2Client
+                _reg = ProvenanceRegistryV2Client(
+                    rpc_url=rpc, contract_address=verifier_client.registry_address())
+                creator_reader = (
+                    lambda c, _r=_reg: _r.contract.functions.getCreatorAndRate(c).call()[0])
+            except Exception:  # noqa: BLE001 — unreadable registry ⇒ skip (not a mismatch)
+                creator_reader = None
+        assert_publisher_controls_payee(key_client, creator_reader, ch)
 
         # sp1363 (R5 MEDIUM): when no authoritative commitment was supplied, read it from the
         # gated KeyReleased event (acquire_released_key) AFTER payment — never from the untrusted

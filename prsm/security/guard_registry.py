@@ -108,6 +108,28 @@ GUARDS: List[Guard] = [
         kills_test_id="test_concurrent_release_pays_the_provider_exactly_once",
     ),
     Guard(
+        id="paid-unlock-fee-guard-invoked",
+        sprint="sp1361/sp1417",
+        file="prsm/sdk/client.py",
+        anchor="assert_fee_matches_deposit(key_client, ch, int(fee_wei))",
+        protects="pay_and_unlock_content paying a non-refundable fee that doesn't match the on-chain "
+                 "deposit (pure buyer fund loss) — the pure function is tested by sp1361, but this "
+                 "is the CALL SITE: deleting it silently bypasses the guard on the live path",
+        killed_by="tests/unit/test_sprint_1417_paid_unlock_guard_wiring.py",
+        kills_test_id="test_pay_and_unlock_invokes_the_fee_guard",
+    ),
+    Guard(
+        id="paid-unlock-squat-guard-invoked",
+        sprint="sp1365/sp1417",
+        file="prsm/sdk/client.py",
+        anchor="assert_publisher_controls_payee(key_client, creator_reader, ch)",
+        protects="pay_and_unlock_content paying a squatter (fee payee != key depositor, so the fee "
+                 "can't reach whoever can unlock) — the CALL SITE for the sp1365 guard, whose "
+                 "invocation the sp1417 _creator_reader seam makes testable",
+        killed_by="tests/unit/test_sprint_1417_paid_unlock_guard_wiring.py",
+        kills_test_id="test_pay_and_unlock_invokes_the_squat_guard",
+    ),
+    Guard(
         id="discovery-capability-announce-cap",
         sprint="sp1414",
         file="prsm/node/discovery.py",
