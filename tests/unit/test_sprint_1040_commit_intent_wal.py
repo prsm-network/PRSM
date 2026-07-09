@@ -141,10 +141,12 @@ def test_crash_between_commit_and_persist_is_recovered_by_chain_scan(tmp_path):
         if calls["n"] == 2:
             raise OSError("crash before promote persist")
         return real_save(state)
-    store.save = flaky  # type: ignore[assignment]
-
     c1 = BatchSettlementClient(_acc(), contract, PROVIDER_ADDR, state_store=store)
     _run(c1.accumulate(_make_batched()))
+    # sp1409 — accumulate() now persists the receipt too, so install the flaky save
+    # AFTER it: `calls` must count only the COMMIT path's saves (1 = the sp1040 intent
+    # write-ahead, 2 = the post-commit promote, which is the crash this test simulates).
+    store.save = flaky  # type: ignore[assignment]
     with pytest.raises(OSError):
         _run(c1.commit_ready_batches())
 
@@ -176,9 +178,12 @@ def test_recover_keeps_intent_when_not_landed(tmp_path):
         if calls["n"] == 2:
             raise OSError("crash")
         return real_save(state)
-    store.save = flaky  # type: ignore[assignment]
     c1 = BatchSettlementClient(_acc(), contract, PROVIDER_ADDR, state_store=store)
     _run(c1.accumulate(_make_batched()))
+    # sp1409 — accumulate() now persists the receipt too, so install the flaky save
+    # AFTER it: `calls` must count only the COMMIT path's saves (1 = the sp1040 intent
+    # write-ahead, 2 = the post-commit promote, which is the crash this test simulates).
+    store.save = flaky  # type: ignore[assignment]
     with pytest.raises(OSError):
         _run(c1.commit_ready_batches())
 
@@ -203,9 +208,12 @@ def test_recover_is_noop_when_contract_lacks_scan_method(tmp_path):
         if calls["n"] == 2:
             raise OSError("crash")
         return real_save(state)
-    store.save = flaky  # type: ignore[assignment]
     c1 = BatchSettlementClient(_acc(), contract, PROVIDER_ADDR, state_store=store)
     _run(c1.accumulate(_make_batched()))
+    # sp1409 — accumulate() now persists the receipt too, so install the flaky save
+    # AFTER it: `calls` must count only the COMMIT path's saves (1 = the sp1040 intent
+    # write-ahead, 2 = the post-commit promote, which is the crash this test simulates).
+    store.save = flaky  # type: ignore[assignment]
     with pytest.raises(OSError):
         _run(c1.commit_ready_batches())
 
@@ -242,9 +250,12 @@ def test_recovery_scans_by_msg_sender_when_available(tmp_path):
         if calls["n"] == 2:
             raise OSError("crash")
         return real_save(state)
-    store.save = flaky  # type: ignore[assignment]
     c1 = BatchSettlementClient(_acc(), contract, PROVIDER_ADDR, state_store=store)
     _run(c1.accumulate(_make_batched()))
+    # sp1409 — accumulate() now persists the receipt too, so install the flaky save
+    # AFTER it: `calls` must count only the COMMIT path's saves (1 = the sp1040 intent
+    # write-ahead, 2 = the post-commit promote, which is the crash this test simulates).
+    store.save = flaky  # type: ignore[assignment]
     with pytest.raises(OSError):
         _run(c1.commit_ready_batches())
 

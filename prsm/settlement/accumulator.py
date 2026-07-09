@@ -295,3 +295,32 @@ class ReceiptAccumulator:
     def total_pending_value_ftns(self) -> int:
         """Sum of all pending batches' cumulative value."""
         return sum(b.total_value_ftns for b in self._pending.values())
+
+    # ── Durability seam (sp1409) ─────────────────────────────────
+
+    def pending_items(self) -> List[Tuple[AccumulatorKey, PendingBatch]]:
+        """Every non-empty pending batch, for a durable snapshot. The accumulator
+        stays JSON-agnostic — BatchSettlementClient owns the serialization."""
+        return [(k, v) for k, v in self._pending.items() if not v.is_empty()]
+
+    def restore_pending(
+        self,
+        key: AccumulatorKey,
+        receipts: List[BatchedReceipt],
+        started_at_unix: int,
+    ) -> None:
+        """sp1409 — rehydrate one pending batch from a durable snapshot.
+
+        Replays ``append`` rather than trusting persisted derived state, so the
+        batch-level invariants (matching tier_slash_rate_bps / consensus_group_id) are
+        re-checked and the sp973 ``seen_escrow_ids`` dedup set is rebuilt — a receipt
+        re-delivered after a restart is then still a no-op. ``started_at_unix`` is
+        restored exactly: it drives the TIME threshold, so resetting it would push a
+        restarting node's commit an hour further out on every restart."""
+        batch = PendingBatch()
+        for br in receipts:
+            batch.append(br, started_at_unix)
+        if batch.is_empty():
+            return
+        batch.started_at_unix = started_at_unix
+        self._pending[key] = batch

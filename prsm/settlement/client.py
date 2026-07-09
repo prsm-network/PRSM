@@ -299,6 +299,12 @@ class BatchSettlementClient:
                 f"the client's bound address"
             )
         self._accumulator.add(br)
+        # sp1409 — persist the receipt NOW, not at commit time. The accumulation window
+        # is up to `time_threshold_seconds` (1h by default); a restart inside it used to
+        # drop every receipt in it, so the provider was never paid on-chain for work it
+        # had already done. _persist re-raises on IO failure (sp1039 review #6) — the
+        # caller (run_settlement_accumulate) never unwinds the off-chain settle.
+        self._persist()
 
     # ── Commit path ──────────────────────────────────────────────
 
@@ -784,7 +790,59 @@ class BatchSettlementClient:
                 rh: self._intent_to_dict(ci)
                 for rh, ci in self._committing.items()
             },
+            # sp1409 — accumulated-but-uncommitted receipts. Additive + OPTIONAL: an
+            # older state file simply lacks the key (see _restore_pending), so
+            # _STATE_VERSION does NOT change; bumping it would make _apply_state raise
+            # SettlementStateCorruptError and turn settlement OFF for every operator
+            # upgrading across this commit.
+            "pending_batches": self._serialize_pending(),
         }
+
+    def _serialize_pending(self) -> list:
+        """sp1409 — JSON-able snapshot of the accumulator's pending batches."""
+        from prsm.settlement.published_batch_store import _batched_receipt_to_dict
+        out = []
+        for key, batch in self._accumulator.pending_items():
+            requester, provider, group_id, slash_bps = key
+            out.append({
+                "accumulator_key": [requester, provider, group_id.hex(), slash_bps],
+                "started_at_unix": batch.started_at_unix,
+                "receipts": [_batched_receipt_to_dict(br) for br in batch.receipts],
+            })
+        return out
+
+    def _restore_pending(self, entries: list) -> None:
+        """sp1409 — rehydrate accumulated-but-uncommitted receipts.
+
+        INVARIANT: a batch is either in the accumulator OR captured by a commit intent,
+        never both. The sp1040 WAL persists the intent while the batch is STILL in the
+        accumulator (see commit_ready_batches), so a crash in that window leaves both on
+        disk. Restoring both would let the commit phase re-commit receipts that
+        recover_committing_intents may separately adopt as a landed batch — a second
+        on-chain batchId for the same receipts, i.e. a DOUBLE SETTLE (the class sp1040 /
+        sp1052 exist to prevent). The intent WINS: it already owns recovery for those
+        receipts (adopt-if-landed, else surfaced as funds_in_flight for the operator).
+
+        Must run AFTER ``_committing`` is rehydrated.
+        """
+        from prsm.settlement.published_batch_store import _batched_receipt_from_dict
+        intent_keys = {ci.accumulator_key for ci in self._committing.values()}
+        for entry in entries:
+            requester, provider, group_hex, slash_bps = entry["accumulator_key"]
+            key = (requester, provider, bytes.fromhex(group_hex), slash_bps)
+            if key in intent_keys:
+                logger.warning(
+                    "sp1409 — pending batch %s is owned by a surviving commit intent; "
+                    "NOT restoring it to the accumulator (the intent's recover-by-root "
+                    "path owns those receipts; re-committing them would double-settle)",
+                    key[:2],
+                )
+                continue
+            self._accumulator.restore_pending(
+                key,
+                [_batched_receipt_from_dict(d) for d in entry["receipts"]],
+                int(entry["started_at_unix"]),
+            )
 
     def _apply_state(self, state: dict) -> None:
         """Rehydrate the three dicts from a serialized snapshot.
@@ -818,6 +876,11 @@ class BatchSettlementClient:
                 rh: self._intent_from_dict(d)
                 for rh, d in (state.get("committing") or {}).items()
             }
+            # sp1409 — LAST: the pending restore consults the rehydrated intents so a
+            # batch a commit intent already owns is never re-added to the accumulator.
+            # An older file has no "pending_batches" key → nothing to restore (the
+            # pre-1409 behavior), so upgrades load cleanly.
+            self._restore_pending(state.get("pending_batches") or [])
         except (KeyError, ValueError, TypeError, AttributeError) as exc:
             raise SettlementStateCorruptError(
                 f"settlement state schema is unreadable: "
