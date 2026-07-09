@@ -14,16 +14,18 @@
   "base-sepolia": {
     "_comment": "Base Sepolia. Used for cross-network testing matching FTNS layout.",
     "publisher_key_anchor": null,
-    "provenance_registry_v2": "0xe75F0c24a9e63B63456d170d99F03Ab7fC3450A7",
-    "provenance_registry_v2_deployed_at": "2026-05-06T19:13:00Z",
-    "provenance_registry_v2_deployer": "0xBbEB1cb42F1D5ad05B46eE023D6e4871D813C9a0",
+    "provenance_registry_v2": "0xCBe377Ae09fdD5F63875Aa5313C65A3C8C073731",
+    "provenance_registry_v2_deployed_at": "2026-07-02T21:24:58Z",
+    "provenance_registry_v2_deployer": "0xCCAc7b21695De068979b1ca47B0cfBD328654220",
     "provenance_registry_v2_chain_id": 84532,
-    "_provenance_registry_v2_exercise_status": "live dispute round-trip (positive + negative + anti-zero-forgery) verified 2026-05-06 against deployed address",
+    "_provenance_registry_v2_note": "sp1413 — repointed to the registry the deployed ContentAccessVerifier actually reads. Base Sepolia had TWO live V2s: this one and the superseded 0xe75F0c24 below. The CAV's payForAccess does registry.getCreatorAndRate(hash) and reverts ContentNotRegistered on a zero creator, so a publisher following the OLD config registered where the verifier never looks and every payForAccess reverted. Mainnet always had one registry for both roles; testnet now mirrors it.",
+    "_provenance_registry_v2_superseded": "0xe75F0c24a9e63B63456d170d99F03Ab7fC3450A7",
+    "_provenance_registry_v2_superseded_evidence": "Read-only event census 2026-07-09: the superseded registry holds exactly 3 ContentRegistered events, all within ~60 blocks of its own 2026-05-06 deploy (uris ipfs://placeholder x2, ipfs://legacy), creator 0xbbeb1cb4.., and ZERO activity in the 64 days since. 0 OwnershipTransferred. Nothing in the repo references those hashes. Its live dispute round-trip (positive + negative + anti-zero-forgery, 2026-05-06) remains historically valid for that address.",
     "content_access_verifier": "0x99264Bca75d63DB9b8B5C7C1e2ECBf78d133905a",
     "content_access_verifier_deployed_at": "2026-07-02T00:00:00Z",
     "content_access_verifier_deployer": "0xCCAc7b21695De068979b1ca47B0cfBD328654220",
     "content_access_verifier_registry": "0xCBe377Ae09fdD5F63875Aa5313C65A3C8C073731",
-    "_content_access_verifier_note": "Tier B/C paid-decrypt verifier (sp1364). Wired to a FRESH ProvenanceRegistryV2 0xCBe377... (NOT the pre-existing 0xe75F...); the CAV reads getCreatorAndRate from 0xCBe377..., so the smoke-test publisher must register content there. FTNS 0x7F5f...8e6a. Verified on Basescan."
+    "_content_access_verifier_note": "Tier B/C paid-decrypt verifier (sp1364), wired to ProvenanceRegistryV2 0xCBe377.. + FTNS 0x7F5f..8e6a, verified on Basescan. As of sp1413 that registry IS this network's canonical provenance_registry_v2, so a publisher using the default config registers where the CAV reads (invariant pinned by test_sprint_1413_registry_alignment.py)."
   },
   "base": {
     "_comment": "Base mainnet. PublisherKeyAnchor still gated on Phase 3.x.3 audit. ProvenanceRegistryV2 mainnet deploy authorized 2026-05-06 by PRSM-CR-2026-05-06-2 (council ratification on existing evidence: Hardhat 15-test suite + Python 33-unit-test suite + Sepolia live exercise).",

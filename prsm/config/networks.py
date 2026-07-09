@@ -162,6 +162,15 @@ TESTNET = NetworkConfig(
     # not in scope of this T1 rehearsal. Testnet versions can be deployed
     # later if/when content-registration flow needs validating on testnet.
     provenance_registry=None,
+    # sp1413 — V2 IS deployed on Sepolia and the Tier B/C ContentAccessVerifier
+    # (0x99264Bca..) reads getCreatorAndRate from it. Leaving this None made the
+    # node skip the V2 client entirely on testnet (node.py: `v2_addr = ep.
+    # provenance_registry_v2 or ""`), so a paid-content publisher registered
+    # nowhere the verifier looks and payForAccess reverted ContentNotRegistered.
+    # Pinned to the CAV's registry so testnet mirrors mainnet's single-registry
+    # shape. (Superseded: 0xe75F0c24.., 3 placeholder registrations, dormant
+    # since 2026-05-06 — see contract_addresses.json base-sepolia.)
+    provenance_registry_v2="0xCBe377Ae09fdD5F63875Aa5313C65A3C8C073731",
     royalty_distributor=None,
     foundation_safe="0xCCAc7b21695De068979b1ca47B0cfBD328654220",  # deployer EOA per §9 ratified decision
     escrow_pool="0xaa28b5818242608e04C1773c3e34bF7bFfb96248",
