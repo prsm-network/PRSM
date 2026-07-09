@@ -1,0 +1,22 @@
+{
+  "bundle": "prsm-prov-1-item-7-provenance-registry-v2",
+  "network": "base-sepolia",
+  "chainId": "84532",
+  "timestamp": "2026-07-02T21:24:58.677Z",
+  "deployer": "0xCCAc7b21695De068979b1ca47B0cfBD328654220",
+  "contracts": {
+    "ProvenanceRegistryV2": "0xCBe377Ae09fdD5F63875Aa5313C65A3C8C073731"
+  },
+  "constructorArgs": {},
+  "invariants": {
+    "MAX_ROYALTY_RATE_BPS": 9800,
+    "anti_zero_forgery_guard": "verifyEmbeddingCommitment(_, zero) === false"
+  },
+  "postDeployNotes": [
+    "ProvenanceRegistryV2 has no admin role and no constructor args — it is a pure storage contract for content provenance + embedding commitment.",
+    "v1 (Base mainnet 0xdF47...9915) is unaffected by this deploy. Both registries co-exist; off-chain readers consult both.",
+    "Base mainnet deploy of v2 authorized 2026-05-06 by PRSM-CR-2026-05-06-2 (council ratification on existing evidence). Ethereum mainnet is still blocked unless a separate resolution authorizes it.",
+    "Copy this address into prsm/deployments/contract_addresses.json under <network>.provenance_registry_v2 before merging.",
+    "Operators who run V2Client set PRSM_PROVENANCE_REGISTRY_V2_ADDRESS to this address."
+  ]
+}

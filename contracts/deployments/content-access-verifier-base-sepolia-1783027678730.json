@@ -1,0 +1,19 @@
+{
+  "bundle": "tier-bc-content-access-verifier",
+  "network": "base-sepolia",
+  "chainId": "84532",
+  "timestamp": "2026-07-02T21:27:58.730Z",
+  "deployer": "0xCCAc7b21695De068979b1ca47B0cfBD328654220",
+  "contracts": {
+    "ContentAccessVerifier": "0x99264Bca75d63DB9b8B5C7C1e2ECBf78d133905a"
+  },
+  "constructorArgs": {
+    "ftns": "0x7F5f00FAA2421c4C585cc66c87420b1659c98e6a",
+    "registry": "0xCBe377Ae09fdD5F63875Aa5313C65A3C8C073731"
+  },
+  "postDeployNotes": [
+    "ContentAccessVerifier is NOT Ownable and holds no funds at deploy — no ownership ceremony.",
+    "Publishers name THIS address as the royalty verifier in KeyDistribution.deposit_key.",
+    "Copy the address into prsm/deployments/contract_addresses.json under <network>.content_access_verifier and set PRSM_CONTENT_ACCESS_VERIFIER for operators (PRSM_PAID_KEY_SERVE nodes) and consumers."
+  ]
+}
