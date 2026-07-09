@@ -292,9 +292,17 @@ Each ships behind the default-off flag, fully tested, money-path-gated.
           funded EOAs, the wallet-map==settler-key invariant, per-node env, the full
           quote→sign→infer→deliver→commit→finalize flow, read-only verification, GO/NO-GO
           criteria, and mainnet activation as a separate user-gated ceremony).
-- **S4 — Per-node settler-key provisioning + funding runbook.** Operator guidance: each stage
-  node needs a funded settler key bound to its provider address (reuse the sp1301 go-live
-  preflight, extended per-node). Risk: LOW (ops/docs).
+- **S4 — Per-node settler-key provisioning + funding preflight. ✅ DONE (sp1337, 9aa31e55).**
+  `run_multistage_go_live_preflight` (in `prsm/settlement/go_live_preflight.py`) — the sp1301
+  single-stage preflight run per-node (in Design A each stage node self-commits with its OWN
+  funded settler key, so the base gate IS the per-node gate) PLUS the multi-stage config checks:
+  `multistage_settlement` (PRSM_MULTISTAGE_SETTLEMENT on — FAIL if off, the path is inert),
+  `compute_wallet_map` (node_id→payee entries resolve — FAIL if empty, the splitter fail-closes),
+  and advisory `per_stage_state_file` / `endpoint_resolution` / `worker_per_stage_sigs`. Runnable
+  `python -m prsm.settlement.go_live_preflight multistage`; a live `node` can be injected for the
+  fuller per-stage client / receiver-store checks. 6 TDD + 617 settlement regression. **The full
+  arc S1–S5 is code-complete AND has its production go/no-go gate; only the user-gated mainnet
+  activation ceremony remains.**
 - **S5 — SDK/CLI paid-multistage surface. ✅ DONE (sp1330, da6bce09).**
   `PRSMClient.pay_and_infer_multistage(prompt, *, requester_key, model_id, ...)` — quote → sign
   ONE per-stage auth over the quoted (price-based, sp1328) payees → POST the paid request;
