@@ -47,6 +47,16 @@ GUARDS: List[Guard] = [
         kills_test_id="test_signed_remote_mock_result_is_never_paid",
     ),
     Guard(
+        id="requester-signature-reject-gate",
+        sprint="sp924/sp1416",
+        file="prsm/node/compute_requester.py",
+        anchor="if not verified and provider_id != self.identity.node_id:",
+        protects="paying a remote provider for a result whose signature does not verify under the "
+                 "accepted provider's key (an unsigned or forged result from the right ids)",
+        killed_by="tests/unit/test_sprint_1416_live_defense_killing_tests.py",
+        kills_test_id="test_unsigned_result_from_accepted_provider_is_rejected",
+    ),
+    Guard(
         id="requester-verification-sampler-trigger",
         sprint="sp1412",
         file="prsm/node/compute_requester.py",
@@ -85,6 +95,17 @@ GUARDS: List[Guard] = [
                  "validly-signed receipt verifies, so a receipt_ok-based verdict never fired)",
         killed_by="tests/unit/test_sprint_1411_auto_defense_reason_code.py",
         kills_test_id="test_double_spend_with_a_verifying_receipt_alerts_as_slashing",
+    ),
+    Guard(
+        id="escrow-per-job-serialization-lock",
+        sprint="sp907/sp1416",
+        file="prsm/node/payment_escrow.py",
+        anchor="return self._job_locks.setdefault(job_id, asyncio.Lock())",
+        protects="concurrent release/refund/split on one escrow both paying (the escrow wallet goes "
+                 "negative — FTNS minted from nothing) — the per-job lock must be the SAME object per "
+                 "job_id, so this setdefault is the lock-identity primitive",
+        killed_by="tests/unit/test_sprint_1416_live_defense_killing_tests.py",
+        kills_test_id="test_concurrent_release_pays_the_provider_exactly_once",
     ),
     Guard(
         id="discovery-capability-announce-cap",
