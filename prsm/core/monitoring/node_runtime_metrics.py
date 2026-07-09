@@ -148,9 +148,14 @@ class NodeRuntimeMetrics(CustomMetric):
             except Exception:  # noqa: BLE001 — metrics must never raise
                 pass
 
-        # sp1384 — auto-defense verdict tallies. `legitimate` > 0 = a genuinely-bad receipt of this
-        # node's was challenged (real slash risk, the alert target); `bad_faith` = refutable
-        # challenges (harassment signal).
+        # sp1384/sp1411 — auto-defense verdict tallies, keyed on the challenge's ON-CHAIN reason
+        # code (not on whether our retained receipt happened to verify — see challenge_auto_defense).
+        #   legitimate    > 0 → a SLASHING challenge (DOUBLE_SPEND / INVALID_SIGNATURE /
+        #                       CONSENSUS_MISMATCH) landed: stake at risk. THE ALERT TARGET.
+        #   bad_faith     > 0 → NO_ESCROW: value invalidated, no slash. Requester-attestation
+        #                       ground, so this is the griefing/harassment signal.
+        #   expired       > 0 → EXPIRED: value invalidated, no slash (commit sooner).
+        #   no_receipt    > 0 → could not self-assess (coverage, orthogonal to the three above).
         stats = getattr(self._node, "_challenge_defense_stats", None)
         if stats is not None:
             try:
@@ -160,6 +165,12 @@ class NodeRuntimeMetrics(CustomMetric):
                     "prsm_challenge_defense_legitimate_total", int(stats.legitimate), now))
                 out.append(MetricValue(
                     "prsm_challenge_defense_no_receipt_total", int(stats.no_receipt), now))
+                # sp1411 — appended LAST, read via getattr: these four share one try, so an
+                # AttributeError on the newest field would otherwise silently drop the gauges
+                # after it (exactly what a stats object predating this field would cause).
+                out.append(MetricValue(
+                    "prsm_challenge_defense_expired_total",
+                    int(getattr(stats, "expired", 0)), now))
             except Exception:  # noqa: BLE001 — metrics must never raise
                 pass
 

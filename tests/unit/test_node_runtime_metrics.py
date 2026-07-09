@@ -339,8 +339,16 @@ def test_no_challenge_watcher_no_gauge():
     assert "prsm_settlement_challenges_active" not in m
 
 
-# ── sp1384 — auto-defense verdict gauges ──
+# ── sp1384 — auto-defense verdict gauges (sp1411 added `expired`) ──
 class _FakeDefenseStats:
+    bad_faith = 2
+    legitimate = 1
+    no_receipt = 3
+    expired = 4
+
+
+class _LegacyDefenseStats:
+    """A stats object predating sp1411's `expired` field."""
     bad_faith = 2
     legitimate = 1
     no_receipt = 3
@@ -353,6 +361,18 @@ def test_challenge_defense_stats_gauges_emitted():
     assert m["prsm_challenge_defense_bad_faith_total"] == 2
     assert m["prsm_challenge_defense_legitimate_total"] == 1
     assert m["prsm_challenge_defense_no_receipt_total"] == 3
+    assert m["prsm_challenge_defense_expired_total"] == 4
+
+
+def test_legacy_stats_without_expired_still_emits_every_other_gauge():
+    """sp1411 — the four appends share one try/except. A missing newest field must not silently
+    drop the gauges emitted after it (the alert target among them)."""
+    node = _Node()
+    node._challenge_defense_stats = _LegacyDefenseStats()
+    m = _collect(NodeRuntimeMetrics(node))
+    assert m["prsm_challenge_defense_legitimate_total"] == 1   # THE alert target survives
+    assert m["prsm_challenge_defense_no_receipt_total"] == 3
+    assert m["prsm_challenge_defense_expired_total"] == 0      # defaulted, not dropped
 
 
 def test_no_defense_stats_no_gauge():

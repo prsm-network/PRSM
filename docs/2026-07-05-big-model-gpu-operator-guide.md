@@ -102,11 +102,25 @@ continuously without polling, set `PRSM_SETTLEMENT_CHALLENGE_WATCHER_ENABLED=1` 
 `PRSM_SETTLEMENT_CHALLENGE_WATCHER_POLL_SECONDS=60`): the node logs a WARNING on each new challenge
 and exposes the `prsm_settlement_challenges_active` metric for AlertManager. When a retained-receipt
 store is configured (settlement audit path), it also **auto-defends** — self-verifying the retained
-§7 receipt for each challenged batch and logging whether the challenge is **bad-faith** (your receipt
-verifies and is served for independent confirmation) or a **real problem** (the receipt fails, stake
-at risk). Verdicts are tallied into metrics: **alert on `prsm_challenge_defense_legitimate_total > 0`**
-(a genuinely-bad receipt of yours was challenged — real slash risk); `prsm_challenge_defense_bad_faith_total`
-rising just means you're being harassed with refutable challenges. To exit later: `prsm node stake-unbond` (BONDED → UNBONDING; slashing stays active
+§7 receipt for each challenged batch as *evidence*, and classifying the challenge by its **on-chain
+reason code** (sp1411).
+
+Read the classification carefully: the registry emits `ReceiptChallenged` only *after* proving the
+ground, and it has already invalidated that receipt's value. So a challenge is never "groundless" —
+the question is only whether your **stake** is also slashed:
+
+| Metric | Reason codes | What it means |
+|---|---|---|
+| **`prsm_challenge_defense_legitimate_total`** | DOUBLE_SPEND, INVALID_SIGNATURE, CONSENSUS_MISMATCH | **Alert on `> 0`.** These are the three reasons the registry slashes your bond. Stake at risk. |
+| `prsm_challenge_defense_bad_faith_total` | NO_ESCROW | Value invalidated, no slash. This ground is the *requester's attestation*, not a proof — the griefing vector. Dispute off-chain. |
+| `prsm_challenge_defense_expired_total` | EXPIRED | Value invalidated, no slash. Your receipt fell outside the batch's committed lookback window — commit sooner. |
+| `prsm_challenge_defense_no_receipt_total` | (any) | You couldn't self-assess (receipt evicted / store unwired). A coverage counter — it does **not** replace the verdict above, and the alert still fires. |
+
+Note a receipt that *verifies* does **not** clear you: a DOUBLE_SPEND is a validly-signed receipt
+replayed into two batches, so it verifies and still slashes. Before sp1411 that case was reported as
+bad-faith with no alert.
+
+To exit later: `prsm node stake-unbond` (BONDED → UNBONDING; slashing stays active
 through the delay), then `prsm node stake-withdraw` once the unbond delay has elapsed (reverts if you
 call it early).
 
