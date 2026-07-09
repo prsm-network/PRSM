@@ -213,29 +213,58 @@ async def test_self_compute_records_earnings():
     provider.ledger.credit.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_self_compute_publishes_result_on_gossip():
-    """Self-executed job publishes result via gossip (for observability)."""
-    provider = _make_provider(node_id="node-self", peer_count=0, allow_self_compute=True)
-
+async def _run_self_compute(provider, job_id="job-007"):
     job_data = {
-        "job_id": "job-007",
+        "job_id": job_id,
         "job_type": "benchmark",
         "ftns_budget": 1.0,
         "requester_id": "node-self",
         "payload": {"iterations": 1000},
     }
-
     await provider._on_job_offer("job_offer", job_data, "node-self")
-
     for _ in range(20):
         await asyncio.sleep(0.2)
-        if "job-007" in provider.completed_jobs:
+        if job_id in provider.completed_jobs:
             break
+    assert job_id in provider.completed_jobs
+    return [call.args[0] for call in provider.gossip.publish.call_args_list]
 
-    assert "job-007" in provider.completed_jobs
-    # Should have published both accept and result on gossip
-    publish_calls = provider.gossip.publish.call_args_list
-    subtypes = [call.args[0] for call in publish_calls]
+
+@pytest.mark.asyncio
+async def test_self_compute_with_no_peers_skips_the_result_gossip_and_delivers_locally():
+    """sp1388 + sp1397 (this test replaced an obsolete one asserting a job_result gossip).
+
+    ``_publish_job_result_bounded`` short-circuits on ``peer_count == 0`` — there is nobody to
+    broadcast to, and awaiting that publish used to hang /compute/query forever. The result instead
+    reaches the submitting requester through ``local_result_sink``, because ``transport.gossip`` has
+    no loopback (a self-computed result could never have reached the only GOSSIP_JOB_RESULT
+    subscriber, ``ComputeRequester._on_job_result``, on the same node).
+    """
+    provider = _make_provider(node_id="node-self", peer_count=0, allow_self_compute=True)
+    delivered = []
+    provider.local_result_sink = lambda job_id, result: delivered.append((job_id, result))
+
+    subtypes = await _run_self_compute(provider)
+
     assert "job_accept" in subtypes
-    assert "job_result" in subtypes
+    assert "job_result" not in subtypes, "no peers → nothing to broadcast to"
+    assert len(delivered) == 1 and delivered[0][0] == "job-007"
+    assert delivered[0][1], "the self-computed result must reach the requester directly"
+
+
+@pytest.mark.asyncio
+async def test_result_gossip_is_skipped_only_when_there_are_no_peers():
+    """The other side of the sp1388 branch, tested at its own unit.
+
+    A node with peers never SELF-computes (``_on_job_offer``: self-accept requires
+    ``peer_count == 0``), so the peers-present path can only be reached by driving
+    ``_publish_job_result_bounded`` directly — which is the branch sp1388 actually added.
+    """
+    quiet = _make_provider(peer_count=0)
+    await quiet._publish_job_result_bounded({"job_id": "job-009", "result": {"ok": True}})
+    quiet.gossip.publish.assert_not_called()
+
+    connected = _make_provider(peer_count=3)
+    await connected._publish_job_result_bounded({"job_id": "job-009", "result": {"ok": True}})
+    connected.gossip.publish.assert_awaited_once()
+    assert connected.gossip.publish.call_args.args[0] == "job_result"

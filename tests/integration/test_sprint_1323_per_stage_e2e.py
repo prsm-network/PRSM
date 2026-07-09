@@ -110,7 +110,12 @@ def _node(node_id, tmp_path, name):
     n.identity.node_id = node_id
     n.transport = None
     n._settlement_per_stage_receiver_store = PerStageReceiverStore(tmp_path / f"{name}.json")
-    n._onchain_settlement_client = _FakeClient()
+    # sp1329 moved the per-stage commit cycle onto a DEDICATED client read from
+    # `_onchain_per_stage_settlement_client` (count_threshold=1, distinct state file). `n` is a
+    # MagicMock, so leaving that attribute unset auto-vivifies a truthy child mock that
+    # resolve_per_stage_settlement_client happily returns — and awaiting it raises
+    # "'MagicMock' object can't be awaited". Set the attribute the production code actually reads.
+    n._onchain_per_stage_settlement_client = _FakeClient()
     client = TestClient(create_api_app(n, enable_security=False), raise_server_exceptions=False)
     return n, client
 
@@ -155,14 +160,14 @@ def test_full_chain_deliver_stage_commit(tmp_path, monkeypatch):
     rb = asyncio.run(run_per_stage_commit_cycle(node_b))
     assert ra["per_stage_commit"] == "committed 1/1"
     assert rb["per_stage_commit"] == "committed 1/1"
-    assert len(node_a._onchain_settlement_client.committed) == 1
-    assert len(node_b._onchain_settlement_client.committed) == 1
+    assert len(node_a._onchain_per_stage_settlement_client.committed) == 1
+    assert len(node_b._onchain_per_stage_settlement_client.committed) == 1
     assert node_a._settlement_per_stage_receiver_store.all_staged() == []
     assert node_b._settlement_per_stage_receiver_store.all_staged() == []
     # conservation: the two committed shares sum to the settled total
     sa = node_a._settlement_per_stage_receiver_store  # drained — read committed via client
     total_committed = sum(
-        n._onchain_settlement_client.committed[0].local_escrow_id is not None
+        n._onchain_per_stage_settlement_client.committed[0].local_escrow_id is not None
         for n in (node_a, node_b))
     assert total_committed == 2
 

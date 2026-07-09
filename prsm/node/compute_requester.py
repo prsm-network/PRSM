@@ -668,23 +668,6 @@ class ComputeRequester:
         # requester-side accumulate, which would have set the payer as the on-chain earner.)
         job._result_event.set()
 
-    def deliver_local_result(self, job_id: str, result: Dict[str, Any]) -> bool:
-        """Sprint 1390 — deliver a SELF-COMPUTED result directly into the submitting job's tracking,
-        bypassing gossip. ``transport.gossip`` only sends to network peers (no loopback), so a
-        single-node self-compute result never reaches the requester via the normal GOSSIP_JOB_RESULT
-        path — this closes that gap so `compute submit` completes. Trusted (same node, no signature
-        check); self-compute payment is the API escrow release's job. Returns True iff a still-pending
-        job was completed."""
-        job = self.submitted_jobs.get(job_id)
-        if job is None or job._result_event.is_set():
-            return False
-        job.status = JobStatus.COMPLETED
-        job.result = result
-        job.result_verified = True
-        job.completed_at = time.time()
-        job._result_event.set()
-        return True
-
         logger.info(
             f"Job {job_id[:8]} completed by {provider_id[:8]}, "
             f"verified={verified}, paid {job.ftns_budget} FTNS"
@@ -695,6 +678,12 @@ class ComputeRequester:
         # sample_rate, re-execute this job on an independent provider and
         # penalize the outlier on a mismatch. Fire-and-forget: a verification
         # error must never block or unwind the pay path above.
+        #
+        # sp1412 — this block MUST stay inside _on_job_result. sp1390 (be9528cc) inserted
+        # `deliver_local_result` immediately after the `job._result_event.set()` above (the diff
+        # anchored on that context line), which left everything below it stranded after that
+        # method's `return True` — unreachable. The sp928 defense was silently inert in
+        # production for every remote-provider payment until sp1412 moved the method back below.
         if (
             self.sampler is not None
             and not job.verification_run
@@ -710,6 +699,27 @@ class ComputeRequester:
             # Keep a strong ref so the task is not GC'd mid-flight.
             self._verify_tasks.add(task)
             task.add_done_callback(self._verify_tasks.discard)
+
+    def deliver_local_result(self, job_id: str, result: Dict[str, Any]) -> bool:
+        """Sprint 1390 — deliver a SELF-COMPUTED result directly into the submitting job's tracking,
+        bypassing gossip. ``transport.gossip`` only sends to network peers (no loopback), so a
+        single-node self-compute result never reaches the requester via the normal GOSSIP_JOB_RESULT
+        path — this closes that gap so `compute submit` completes. Trusted (same node, no signature
+        check); self-compute payment is the API escrow release's job. Returns True iff a still-pending
+        job was completed.
+
+        Not sampled: sp928 verification re-executes on an INDEPENDENT provider, and a self-computed
+        job has none (the requester is the provider). ``_on_job_result`` already skips sampling when
+        ``provider_id == self.identity.node_id`` for the same reason."""
+        job = self.submitted_jobs.get(job_id)
+        if job is None or job._result_event.is_set():
+            return False
+        job.status = JobStatus.COMPLETED
+        job.result = result
+        job.result_verified = True
+        job.completed_at = time.time()
+        job._result_event.set()
+        return True
 
     async def _run_verification(
         self, job: SubmittedJob, provider_id: str, original_hash: str
