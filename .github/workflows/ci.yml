@@ -62,7 +62,12 @@ jobs:
         # multiaddr fixtures). Run locally with `pytest -m e2e` after
         # building libp2p shared library via `make -C libp2p build`.
         # See pytest.ini § markers for the full rationale.
-        run: pytest -m "not e2e" --timeout=120 --cov=prsm --cov-report=xml --cov-report=term -q
+        #
+        # sp1418 — "not docker" deselects the two LIVE image build/run guards. They are NOT dropped:
+        # they run once in the dedicated `docker-image` job below. Keeping them here would build the
+        # SAME python:3.11-slim + torch image once per matrix leg (pure duplication, the image does
+        # not depend on the host Python) and blow this job's 20-minute cap.
+        run: pytest -m "not e2e and not docker" --timeout=120 --cov=prsm --cov-report=xml --cov-report=term -q
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
@@ -71,6 +76,49 @@ jobs:
           name: coverage-xml
           path: coverage.xml
           retention-days: 14
+
+  # ───────────────────────────────────────────────────────────────
+  # Docker image: the LOAD-BEARING deployability guards (sprint 1418).
+  #
+  # tests/unit/test_enterprise_docker.py's two live tests actually
+  # `docker build` deploy/enterprise-demo and `docker run` the demo
+  # inside it ("if this fails, the file-level artifacts are not
+  # actually deployable"). Nothing else builds this image — deploy.yml
+  # does not.
+  #
+  # They had NEVER executed in CI: collection aborted for months, and
+  # once it didn't, the unit lane's --timeout=120 killed a test whose
+  # own subprocess budget is 900s (a cold `pip install torch` inside
+  # the image is slow). Rather than drop a real guard to get green,
+  # they get their own job: ONE build (not once per Python leg — the
+  # image is python:3.11-slim regardless of host Python) with a budget
+  # that matches reality.
+  # ───────────────────────────────────────────────────────────────
+  docker-image:
+    name: Docker image (build + demo boot)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        # Same install as the test matrix. A trimmed install is tempting (the
+        # image builds its OWN deps), but tests/conftest.py imports prsm inside
+        # fixtures and pytest.ini requires --strict-config + asyncio_mode=auto,
+        # so a partial env risks a broken job rather than a real signal.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e ".[dev]"
+
+      - name: Build image + boot the demo inside it
+        run: pytest -m docker tests/unit/test_enterprise_docker.py -v -p no:cacheprovider
 
   # ───────────────────────────────────────────────────────────────
   # Lint: ruff + mypy — ADVISORY for now.

@@ -313,6 +313,7 @@ def _docker_available() -> bool:
     return False
 
 
+@pytest.mark.docker
 @pytest.mark.skipif(
     not _docker_available(),
     reason="Docker daemon not available",
@@ -349,6 +350,7 @@ def test_live_docker_build_succeeds(real_subprocess):
     )
 
 
+@pytest.mark.docker
 @pytest.mark.skipif(
     not _docker_available(),
     reason="Docker daemon not available",
