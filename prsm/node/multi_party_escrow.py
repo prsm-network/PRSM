@@ -315,11 +315,22 @@ class MultiPartyEscrow:
                         )
                     self._total_settled += settled_amount
                 else:
-                    # Atomic settlement (batch/multicall/simulation) — all or nothing
-                    for creator_id in creators_to_settle:
-                        if creator_id in self._pending:
+                    # Atomic settlement (batch/multicall/simulation) — all or nothing FOR THE
+                    # RECIPIENTS. sp1426: but the recipients are ONLY the creators with a
+                    # resolvable on-chain address — _execute_onchain_settlement silently drops
+                    # address-less creators from recipients/amounts (require_onchain_address is
+                    # False by default). So clear + book ONLY the creators that were actually
+                    # paid; a creator with no address was NOT in the transfer and MUST stay
+                    # pending (so it can be retried once an address resolves). Booking it as
+                    # settled would mark its on-chain claim satisfied without paying it — a fund
+                    # loss — and delete the only record that could recover it. This mirrors the
+                    # `partial` branch above, which already clears only what actually settled.
+                    settled_amount = 0.0
+                    for creator_id, acc in creators_to_settle.items():
+                        if acc.onchain_address and creator_id in self._pending:
+                            settled_amount += self._pending[creator_id].total_amount
                             del self._pending[creator_id]
-                    self._total_settled += batch.total_amount
+                    self._total_settled += settled_amount
 
                 if batch.gas_used:
                     self._total_gas_used += batch.gas_used

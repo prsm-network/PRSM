@@ -189,6 +189,21 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1424_slash_reputation_bridge.py",
         kills_test_id="test_a_slashed_provider_loses_reputation_and_is_flagged",
     ),
+    Guard(
+        id="escrow-settle-books-only-paid-creators",
+        sprint="sp1426",
+        file="prsm/node/multi_party_escrow.py",
+        anchor="if acc.onchain_address and creator_id in self._pending:",
+        protects="MultiPartyEscrow booking an UNPAID creator as settled. The atomic on-chain "
+                 "settlement branch used to delete EVERY creator from _pending + add the full "
+                 "batch total to _total_settled, but _execute_onchain_settlement silently drops "
+                 "address-less creators from the transfer — so in a mixed batch each address-less "
+                 "creator's royalty was booked-settled, deleted (no retry record), and never paid. "
+                 "This gate books/clears ONLY creators actually paid on-chain; drop it and the "
+                 "fund loss returns the moment the on-chain royalty path carries value",
+        killed_by="tests/unit/test_sprint_1426_escrow_settle_only_pays_addressed.py",
+        kills_test_id="test_addressless_creator_stays_pending_and_is_not_booked",
+    ),
 ]
 
 
