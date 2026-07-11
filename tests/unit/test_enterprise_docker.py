@@ -317,6 +317,11 @@ def _docker_available() -> bool:
     not _docker_available(),
     reason="Docker daemon not available",
 )
+# sp1418 — override the suite-wide `--timeout=120` (CI). This test's own subprocess budget is 900s
+# because a cold `pip install torch` inside the image is slow. Without this, pytest-timeout killed it
+# at 120s the moment CI actually started running tests (it never had, until collection was fixed) —
+# the guard would have been red forever, or silently deselected. Give it the budget it already assumes.
+@pytest.mark.timeout(960)
 def test_live_docker_build_succeeds(real_subprocess):
     """LOAD-BEARING: actually build the image. If this
     fails, the file-level artifacts are not actually
@@ -348,6 +353,9 @@ def test_live_docker_build_succeeds(real_subprocess):
     not _docker_available(),
     reason="Docker daemon not available",
 )
+# sp1418 — same as above: its subprocess budgets are build(900s) + run(180s), so the suite-wide
+# `--timeout=120` would kill it long before either could finish.
+@pytest.mark.timeout(1200)
 def test_live_docker_run_demo_succeeds(real_subprocess):
     """LOAD-BEARING: build the image (idempotent if
     layers cached) + run the demo inside; expect rc=0 +
