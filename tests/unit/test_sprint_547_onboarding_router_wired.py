@@ -33,6 +33,27 @@ def _make_app():
     return create_api_app(_stub_node(), enable_security=False)
 
 
+def _all_paths(routes) -> set:
+    """Every registered path, recursing into FastAPI's ``_IncludedRouter`` wrappers.
+
+    FastAPI >= ~0.13x no longer FLATTENS ``include_router()`` into ``app.routes``: it appends one
+    ``_IncludedRouter`` delegate that holds the sub-router in ``.original_router`` and dispatches to
+    it at match time. The routes are mounted and serve normally (verified: /onboarding/* → 200) —
+    they are just one level down, and the delegate has no ``.path``. Older FastAPI copied them in
+    flat. This handles both, and fails CLOSED: it can only find FEWER paths, never invent one, so a
+    genuinely un-mounted router still trips the assertions below.
+    """
+    found = set()
+    for r in routes:
+        p = getattr(r, "path", None)
+        if p:
+            found.add(p)
+        inner = getattr(r, "original_router", None)
+        if inner is not None:
+            found |= _all_paths(inner.routes)
+    return found
+
+
 def test_onboarding_welcome_returns_200():
     """The dogfood arc F6 symptom: /onboarding/ returned 404
     pre-sprint. After wiring the router, the welcome step must
@@ -51,8 +72,8 @@ def test_onboarding_router_in_app_routes():
     least one route under the ``/onboarding`` prefix."""
     app = _make_app()
     onboarding_routes = [
-        r for r in app.routes
-        if getattr(r, "path", "").startswith("/onboarding")
+        p for p in _all_paths(app.routes)
+        if p.startswith("/onboarding")
     ]
     assert onboarding_routes, (
         "create_api_app did not include the onboarding router. "
@@ -65,9 +86,8 @@ def test_onboarding_router_has_all_six_steps():
     paths registered should be the full set, not a subset."""
     app = _make_app()
     paths = {
-        getattr(r, "path", "")
-        for r in app.routes
-        if getattr(r, "path", "").startswith("/onboarding")
+        p for p in _all_paths(app.routes)
+        if p.startswith("/onboarding")
     }
     expected_get_paths = {
         "/onboarding/",

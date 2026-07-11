@@ -96,7 +96,8 @@ def test_create_torrent_uses_set_priv_when_method_exists(tmp_file):
     client._initialized = True
     client._loop = asyncio.new_event_loop()
     try:
-        with patch("prsm.core.bittorrent_client.lt", lt_mod):
+        with patch("prsm.core.bittorrent_client.LT_AVAILABLE", True), \
+             patch("prsm.core.bittorrent_client.lt", lt_mod):
             result = client._loop.run_until_complete(
                 client.create_torrent(tmp_file, private=True),
             )
@@ -124,7 +125,8 @@ def test_create_torrent_falls_back_to_priv_attr(tmp_file):
     client._initialized = True
     client._loop = asyncio.new_event_loop()
     try:
-        with patch("prsm.core.bittorrent_client.lt", lt_mod):
+        with patch("prsm.core.bittorrent_client.LT_AVAILABLE", True), \
+             patch("prsm.core.bittorrent_client.lt", lt_mod):
             result = client._loop.run_until_complete(
                 client.create_torrent(tmp_file, private=True),
             )
@@ -148,7 +150,8 @@ def test_create_torrent_uses_torrent_info_fallback_on_new_api(
     client._initialized = True
     client._loop = asyncio.new_event_loop()
     try:
-        with patch("prsm.core.bittorrent_client.lt", lt_mod):
+        with patch("prsm.core.bittorrent_client.LT_AVAILABLE", True), \
+             patch("prsm.core.bittorrent_client.lt", lt_mod):
             result = client._loop.run_until_complete(
                 client.create_torrent(tmp_file),
             )
@@ -174,7 +177,8 @@ def test_create_torrent_does_not_set_priv_when_not_private(
     client._initialized = True
     client._loop = asyncio.new_event_loop()
     try:
-        with patch("prsm.core.bittorrent_client.lt", lt_mod):
+        with patch("prsm.core.bittorrent_client.LT_AVAILABLE", True), \
+             patch("prsm.core.bittorrent_client.lt", lt_mod):
             result = client._loop.run_until_complete(
                 client.create_torrent(tmp_file, private=False),
             )

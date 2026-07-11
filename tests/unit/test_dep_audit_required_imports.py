@@ -83,6 +83,10 @@ ALLOWED_UNDECLARED_TOP_LEVEL = {
     # Stable list kept here so the audit doesn't churn on
     # docstring edits.
     "AggregationCommitMismatchError",  # docstring example
+    # paid_content.py's module docstring wraps onto a line beginning
+    # "from B1 on a wrong key / tampered content)" — B1/B2/B3 are the
+    # brick names, not modules. The line-based regex reads it as an import.
+    "B1",
     "EOS",  # constant name
     "EmissionController",  # class name in docstring
     "GPUtil",  # imported in legacy module

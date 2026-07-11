@@ -130,7 +130,11 @@ def test_state_store_non_object_json_raises_not_silent(tmp_path):
         SettlementStateCorruptError,
     )
     for content in ("null", "0", "[]", '"hi"'):
-        p = tmp_path / f"state_{content.strip('[]\"')}.json"
+        # NOTE: hoisted out of the f-string — a backslash inside an f-string EXPRESSION is a
+        # SyntaxError before Python 3.12 (PEP 701). Inlined, this aborted pytest COLLECTION on the
+        # 3.11 CI leg, so that leg ran zero tests.
+        stem = content.strip('[]"')
+        p = tmp_path / f"state_{stem}.json"
         p.write_text(content)
         with pytest.raises(SettlementStateCorruptError):
             SettlementStateStore(p).load()

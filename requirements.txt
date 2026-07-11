@@ -13,7 +13,10 @@
 # --require-hashes path is the operator adoption step (gate it on a green suite run).
 
 # Core Framework
-fastapi>=0.104.0
+# Bound like numpy/transformers/scipy: an UNBOUNDED pin let CI jump to fastapi 0.139,
+# whose include_router() no longer flattens sub-routes into app.routes. Cap at the
+# version that is empirically green; raise deliberately, not by silent resolution.
+fastapi>=0.104.0,<0.140.0
 uvicorn[standard]>=0.24.0
 pydantic>=2.5.0
 pydantic-settings>=2.1.0
@@ -36,12 +39,26 @@ py-multiaddr>=0.0.3
 py-multicodec>=0.2.1
 
 # AI & ML
+# NOTE: these caps MUST match pyproject.toml (numpy <2.0 in [project].dependencies; transformers
+# <5.0 in the [ml] extra). CI runs `pip install -r requirements.txt` BEFORE `pip install -e .[dev]`,
+# and .[dev] does not carry the transformers cap — so leaving these unbounded here resolved the whole
+# numpy-2-era stack (numpy 2.5, transformers 5.13, scipy 1.18, sklearn 1.9, sentence-transformers 5.6)
+# first, after which .[dev]'s numpy<2 cap DOWNGRADED numpy to 1.26 and left the numpy-2-era packages
+# behind. Result: `np.long` (exists in numpy 2, removed in 1.24) blew up collection with 20 errors,
+# and transformers 5.x broke the slice-loader imports. Keep these pinned in lockstep with pyproject.
 openai>=1.6.0
 anthropic>=0.8.0
-transformers>=4.36.0
+transformers>=4.36.0,<5.0
 torch>=2.1.0
-numpy>=1.24.0
+numpy>=1.24.0,<2.0
 scikit-learn>=1.3.0
+# scipy is only a TRANSITIVE dep (via scikit-learn / sentence-transformers), but it must be pinned
+# here: scipy 1.18 DROPPED numpy-1 support — its sparse/_sputils.py reads `np.long` unguarded, and
+# `np.long` exists on numpy 2.x but was REMOVED in numpy 1.24. With our numpy<2.0 cap, an unpinned
+# resolve picks scipy 1.18 and every `import sklearn` dies with
+# "AttributeError: module 'numpy' has no attribute 'long'" (14 CI collection errors).
+# scipy 1.17 imports the GUARDED np_long from scipy._lib._util, which falls back cleanly on numpy 1.x.
+scipy>=1.11,<1.18
 
 # Vector Database
 pinecone-client>=2.2.4
