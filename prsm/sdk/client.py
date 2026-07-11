@@ -6,9 +6,15 @@ Async Python client for PRSM node Ring 1-10 APIs.
 """
 
 import logging
+import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# sp1421 — distinguishes "caller said nothing" (use the default store path) from an explicit
+# `issued_auth_store_path=None` (deliberately disable retention). Cannot use None for both.
+_UNSET = object()
 
 
 def _fetch_paid_key_sync(base_url: str, content_hash: bytes, requester_key: str):
@@ -56,10 +62,70 @@ class PRSMClient:
         status = await client.status()
     """
 
-    def __init__(self, base_url: str = "http://localhost:8000", api_key: str = ""):
+    def __init__(
+        self,
+        base_url: str = "http://localhost:8000",
+        api_key: str = "",
+        issued_auth_store_path: Any = _UNSET,
+    ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self._session = None
+        # sp1421 — where THIS requester retains the PaymentAuthorizations it has issued.
+        # Pass an explicit path to relocate it, or None to disable retention entirely
+        # (see _issued_auth_store for why disabling is dangerous).
+        self._issued_auth_store_path = issued_auth_store_path
+        self._issued_auth_store_cached: Any = None
+
+    def _issued_auth_store(self):
+        """The requester's ledger of PaymentAuthorizations IT has issued. ON by default.
+
+        sp1421 — this is not bookkeeping, it is the requester's ONLY evidence in a live
+        escrow-drain path. On-chain, `BatchSettlementRegistry.commitBatch(address requester, …)`
+        takes the requester as a PLAIN, UNVERIFIED argument — no signature, no authorization,
+        and no bond — and `finalizeBatch` then calls
+        `EscrowPool.settleFromRequester(requester, provider, value)`, which checks only that the
+        caller is the registry and that the victim HAS the balance. So ANY address can commit a
+        batch naming ANY requester and, after the challenge window, drain their escrow for the
+        cost of gas.
+
+        The requester's sole defense is a NO_ESCROW challenge — and `_handleNoEscrow` reverts
+        unless `msg.sender == batch.requester`, so nobody else can defend them. Raising it means
+        proving "I never authorized this batch", which requires knowing what you DID authorize.
+        That is this store.
+
+        It was built (sp1172 et al) and never wired: every SDK payment called the plain
+        `build_payment_authorization`, so the store stayed EMPTY and the matcher
+        (`match_unauthorized_batches`) had nothing to match against. The defense could not fire.
+
+        Recording is best-effort and can never break a payment (the wrapper swallows and logs).
+        Disable with PRSM_ISSUED_AUTH_STORE=0 or `issued_auth_store_path=None` ONLY for a
+        stateless client that will never fund escrow — a client that pays from escrow with
+        retention off is undefendable.
+        """
+        if self._issued_auth_store_cached is not None:
+            return self._issued_auth_store_cached
+
+        path = self._issued_auth_store_path
+        if path is None:
+            return None
+        if os.environ.get("PRSM_ISSUED_AUTH_STORE", "1").strip().lower() in ("0", "false", "no"):
+            return None
+        if path is _UNSET:
+            path = Path.home() / ".prsm" / "issued_authorizations.json"
+
+        try:
+            from prsm.settlement.issued_authorization_store import IssuedAuthorizationStore
+
+            self._issued_auth_store_cached = IssuedAuthorizationStore(path)
+        except Exception as exc:  # noqa: BLE001 — retention must NEVER break a payment
+            logger.warning(
+                "sp1421: could not open the issued-authorization store at %s (%s). Payments "
+                "still work, but this requester cannot prove an unauthorized batch (NO_ESCROW) "
+                "if one is committed against its escrow.", path, exc,
+            )
+            return None
+        return self._issued_auth_store_cached
 
     def _headers(self) -> Dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -266,7 +332,12 @@ class PRSMClient:
         authorization surfaces as HTTP 402 in the response. ``verify_pubkey_b64`` runs the
         inline receipt verification like ``infer``."""
         import time
-        from prsm.settlement.payment_client import build_payment_authorization
+        # sp1421 — the RECORDING variant. Identical auth (byte-for-byte); additionally
+        # retains it so this requester can later PROVE a committed batch was never
+        # authorized (the NO_ESCROW defense). See _issued_auth_store.
+        from prsm.settlement.issued_authorization_store import (
+            build_and_record_payment_authorization,
+        )
 
         if provider_address is None:
             info = await self._get("/info")
@@ -281,7 +352,8 @@ class PRSMClient:
         if expiry_unix is None:
             expiry_unix = int(time.time()) + 300
         _max_tokens = int(max_tokens or 0)
-        auth = build_payment_authorization(
+        auth = build_and_record_payment_authorization(
+            store=self._issued_auth_store(),
             requester_key=requester_key,
             provider_address=provider_address,
             model_id=model_id,
@@ -427,7 +499,12 @@ class PRSMClient:
         the funder's cap. Returns the server payload; a rejected chain surfaces as HTTP 402.
         ``verify_pubkey_b64`` runs the inline receipt verification like ``pay_and_infer``."""
         import time
-        from prsm.settlement.payment_client import build_payment_authorization
+        # sp1421 — the RECORDING variant. Identical auth (byte-for-byte); additionally
+        # retains it so this requester can later PROVE a committed batch was never
+        # authorized (the NO_ESCROW defense). See _issued_auth_store.
+        from prsm.settlement.issued_authorization_store import (
+            build_and_record_payment_authorization,
+        )
 
         if provider_address is None:
             info = await self._get("/info")
@@ -444,7 +521,8 @@ class PRSMClient:
         _max_tokens = int(max_tokens or 0)
         # The RELAYER signs the per-request auth (auth.requester == relayer); the funder's
         # delegation (signed separately) authorizes this relayer to spend from its escrow.
-        auth = build_payment_authorization(
+        auth = build_and_record_payment_authorization(
+            store=self._issued_auth_store(),
             requester_key=relayer_key,
             provider_address=provider_address,
             model_id=model_id,
@@ -1028,7 +1106,12 @@ class PRSMClient:
         payee from GET /info when ``provider_address`` is absent; you need escrow balance ≥
         the charge (see ``deposit_escrow``); ``chain_id`` MUST match the network."""
         import time
-        from prsm.settlement.payment_client import build_payment_authorization
+        # sp1421 — the RECORDING variant. Identical auth (byte-for-byte); additionally
+        # retains it so this requester can later PROVE a committed batch was never
+        # authorized (the NO_ESCROW defense). See _issued_auth_store.
+        from prsm.settlement.issued_authorization_store import (
+            build_and_record_payment_authorization,
+        )
 
         if provider_address is None:
             info = await self._get("/info")
@@ -1043,7 +1126,8 @@ class PRSMClient:
         if expiry_unix is None:
             expiry_unix = int(time.time()) + 300
         _max_tokens = int(max_tokens or 0)
-        auth = build_payment_authorization(
+        auth = build_and_record_payment_authorization(
+            store=self._issued_auth_store(),
             requester_key=requester_key,
             provider_address=provider_address,
             model_id=model_id,

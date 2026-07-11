@@ -157,6 +157,24 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1419_reconciliation_dead_on_default_ledger.py",
         kills_test_id="test_reconciliation_sends_a_balance_request_on_the_default_dag_ledger",
     ),
+    Guard(
+        id="requester-records-issued-payment-authorizations",
+        sprint="sp1421",
+        file="prsm/sdk/client.py",
+        anchor="def _issued_auth_store(self):",
+        protects="the requester's ONLY defense against an escrow drain. On-chain, commitBatch("
+                 "address requester, ...) takes the requester as a PLAIN, UNVERIFIED argument — no "
+                 "signature, no authorization, NO BOND — and finalizeBatch (callable by anyone) "
+                 "then drains that requester's escrow via settleFromRequester. The victim's sole "
+                 "defense is a NO_ESCROW challenge, which _handleNoEscrow lets ONLY the victim "
+                 "raise, and which requires proving 'I never authorized this batch' — i.e. it "
+                 "requires knowing what you DID authorize. That is this store. Un-wire it and "
+                 "the store goes empty, the matcher goes blind (it then flags even the "
+                 "requester's OWN legitimate batches), and any address can drain any funded "
+                 "escrow for the cost of gas",
+        killed_by="tests/unit/test_sprint_1421_issued_auth_recording_wired.py",
+        kills_test_id="test_forged_batch_is_flagged_unauthorized_and_the_real_one_is_not",
+    ),
 ]
 
 
