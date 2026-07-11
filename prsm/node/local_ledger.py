@@ -683,68 +683,11 @@ class LocalLedger(LedgerNodeServicesMixin):
         return await cursor.fetchone() is not None
 
     # ── Agent allowances (delegated payments) ───────────────────
-
-    async def grant_agent_allowance(
-        self,
-        principal_id: str,
-        agent_id: str,
-        amount: float,
-        epoch_hours: float = 24.0,
-    ) -> None:
-        """Grant an agent a spending allowance from the principal's wallet.
-
-        The allowance resets at each epoch boundary (epoch_hours interval).
-        """
-        now = time.time()
-        await self._db.execute(
-            """INSERT INTO agent_allowances
-               (agent_id, principal_id, allowance, spent, epoch_hours, epoch_start, created_at, revoked)
-               VALUES (?, ?, ?, 0, ?, ?, ?, 0)
-               ON CONFLICT(agent_id) DO UPDATE SET
-                   allowance = excluded.allowance,
-                   spent = 0,
-                   epoch_hours = excluded.epoch_hours,
-                   epoch_start = excluded.epoch_start,
-                   revoked = 0""",
-            (agent_id, principal_id, amount, epoch_hours, now, now),
-        )
-        await self._db.commit()
-
-    async def get_agent_allowance(self, agent_id: str) -> Optional[dict]:
-        """Get an agent's current allowance state. Returns None if not found."""
-        cursor = await self._db.execute(
-            "SELECT principal_id, allowance, spent, epoch_hours, epoch_start, revoked "
-            "FROM agent_allowances WHERE agent_id = ?",
-            (agent_id,),
-        )
-        row = await cursor.fetchone()
-        if not row:
-            return None
-
-        principal_id, allowance, spent, epoch_hours, epoch_start, revoked = row
-
-        # Check if epoch has rolled over — if so, reset spent
-        now = time.time()
-        epoch_seconds = epoch_hours * 3600
-        if now - epoch_start >= epoch_seconds:
-            spent = 0.0
-            epoch_start = now
-            await self._db.execute(
-                "UPDATE agent_allowances SET spent = 0, epoch_start = ? WHERE agent_id = ?",
-                (now, agent_id),
-            )
-            await self._db.commit()
-
-        return {
-            "agent_id": agent_id,
-            "principal_id": principal_id,
-            "allowance": allowance,
-            "spent": spent,
-            "remaining": max(0.0, allowance - spent),
-            "epoch_hours": epoch_hours,
-            "epoch_start": epoch_start,
-            "revoked": bool(revoked),
-        }
+    #
+    # sp1425 — grant_agent_allowance / get_agent_allowance / revoke_agent_allowance moved to
+    # LedgerNodeServicesMixin (shared by BOTH ledgers) so the DEFAULT dag backend carries them
+    # too. agent_debit STAYS here: it needs _debit_locked + _write_lock (LocalLedger-specific) and
+    # has zero production callers.
 
     async def agent_debit(
         self,
@@ -793,16 +736,6 @@ class LocalLedger(LedgerNodeServicesMixin):
             await self._db.commit()
             return tx
 
-    async def revoke_agent_allowance(self, principal_id: str, agent_id: str) -> bool:
-        """Revoke an agent's spending authority. Returns True if found."""
-        cursor = await self._db.execute(
-            "UPDATE agent_allowances SET revoked = 1 "
-            "WHERE agent_id = ? AND principal_id = ?",
-            (agent_id, principal_id),
-        )
-        await self._db.commit()
-        return cursor.rowcount > 0
-
     # ── Provenance Registry ──────────────────────────────────────
 
     async def list_provenance_by_creator(
@@ -831,165 +764,10 @@ class LocalLedger(LedgerNodeServicesMixin):
         ]
 
     # ── Collaboration Persistence ────────────────────────────────
-
-    async def save_task(self, data: Dict[str, Any]) -> None:
-        """Upsert a collaboration task record."""
-        await self._db.execute(
-            """INSERT OR REPLACE INTO collab_tasks
-               (task_id, requester_agent_id, requester_node_id, title, description,
-                required_capabilities, ftns_budget, deadline_seconds, status,
-                assigned_agent_id, bids, result, created_at, escrow_tx_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                data["task_id"],
-                data["requester_agent_id"],
-                data["requester_node_id"],
-                data.get("title", ""),
-                data.get("description", ""),
-                json.dumps(data.get("required_capabilities", [])),
-                data.get("ftns_budget", 0),
-                data.get("deadline_seconds", 3600),
-                data.get("status", "open"),
-                data.get("assigned_agent_id"),
-                json.dumps(data.get("bids", [])),
-                json.dumps(data.get("result")) if data.get("result") else None,
-                data["created_at"],
-                data.get("escrow_tx_id"),
-            ),
-        )
-        await self._db.commit()
-
-    async def save_review(self, data: Dict[str, Any]) -> None:
-        """Upsert a collaboration review record."""
-        await self._db.execute(
-            """INSERT OR REPLACE INTO collab_reviews
-               (review_id, submitter_agent_id, submitter_node_id, content_cid,
-                description, required_capabilities, ftns_per_review, max_reviewers,
-                status, reviews, created_at, escrow_tx_id, paid_reviewers)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                data["review_id"],
-                data["submitter_agent_id"],
-                data["submitter_node_id"],
-                data.get("content_cid", ""),
-                data.get("description", ""),
-                json.dumps(data.get("required_capabilities", [])),
-                data.get("ftns_per_review", 0.1),
-                data.get("max_reviewers", 3),
-                data.get("status", "pending"),
-                json.dumps(data.get("reviews", [])),
-                data["created_at"],
-                data.get("escrow_tx_id"),
-                json.dumps(data.get("paid_reviewers", [])),
-            ),
-        )
-        await self._db.commit()
-
-    async def save_query(self, data: Dict[str, Any]) -> None:
-        """Upsert a collaboration query record."""
-        await self._db.execute(
-            """INSERT OR REPLACE INTO collab_queries
-               (query_id, requester_agent_id, requester_node_id, topic, question,
-                ftns_per_response, max_responses, responses, created_at,
-                escrow_tx_id, paid_responders)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                data["query_id"],
-                data["requester_agent_id"],
-                data["requester_node_id"],
-                data.get("topic", ""),
-                data.get("question", ""),
-                data.get("ftns_per_response", 0.05),
-                data.get("max_responses", 5),
-                json.dumps(data.get("responses", [])),
-                data["created_at"],
-                data.get("escrow_tx_id"),
-                json.dumps(data.get("paid_responders", [])),
-            ),
-        )
-        await self._db.commit()
-
-    async def load_active_tasks(self) -> List[Dict[str, Any]]:
-        """Load non-terminal collaboration tasks."""
-        cursor = await self._db.execute(
-            """SELECT task_id, requester_agent_id, requester_node_id, title,
-                      description, required_capabilities, ftns_budget,
-                      deadline_seconds, status, assigned_agent_id, bids,
-                      result, created_at, escrow_tx_id
-               FROM collab_tasks WHERE status NOT IN ('completed', 'cancelled')"""
-        )
-        rows = await cursor.fetchall()
-        return [
-            {
-                "task_id": r[0], "requester_agent_id": r[1],
-                "requester_node_id": r[2], "title": r[3],
-                "description": r[4],
-                "required_capabilities": json.loads(r[5]),
-                "ftns_budget": r[6], "deadline_seconds": r[7],
-                "status": r[8], "assigned_agent_id": r[9],
-                "bids": json.loads(r[10]),
-                "result": json.loads(r[11]) if r[11] else None,
-                "created_at": r[12], "escrow_tx_id": r[13],
-            }
-            for r in rows
-        ]
-
-    async def load_active_reviews(self) -> List[Dict[str, Any]]:
-        """Load non-terminal collaboration reviews."""
-        cursor = await self._db.execute(
-            """SELECT review_id, submitter_agent_id, submitter_node_id,
-                      content_cid, description, required_capabilities,
-                      ftns_per_review, max_reviewers, status, reviews,
-                      created_at, escrow_tx_id, paid_reviewers
-               FROM collab_reviews WHERE status NOT IN ('accepted', 'rejected')"""
-        )
-        rows = await cursor.fetchall()
-        return [
-            {
-                "review_id": r[0], "submitter_agent_id": r[1],
-                "submitter_node_id": r[2], "content_cid": r[3],
-                "description": r[4],
-                "required_capabilities": json.loads(r[5]),
-                "ftns_per_review": r[6], "max_reviewers": r[7],
-                "status": r[8], "reviews": json.loads(r[9]),
-                "created_at": r[10], "escrow_tx_id": r[11],
-                "paid_reviewers": json.loads(r[12]),
-            }
-            for r in rows
-        ]
-
-    async def load_active_queries(self) -> List[Dict[str, Any]]:
-        """Load active collaboration queries (not yet at max responses)."""
-        cursor = await self._db.execute(
-            """SELECT query_id, requester_agent_id, requester_node_id,
-                      topic, question, ftns_per_response, max_responses,
-                      responses, created_at, escrow_tx_id, paid_responders
-               FROM collab_queries"""
-        )
-        rows = await cursor.fetchall()
-        results = []
-        for r in rows:
-            responses = json.loads(r[7])
-            max_responses = r[6]
-            if len(responses) < max_responses:
-                results.append({
-                    "query_id": r[0], "requester_agent_id": r[1],
-                    "requester_node_id": r[2], "topic": r[3],
-                    "question": r[4], "ftns_per_response": r[5],
-                    "max_responses": max_responses,
-                    "responses": responses,
-                    "created_at": r[8], "escrow_tx_id": r[9],
-                    "paid_responders": json.loads(r[10]),
-                })
-        return results
-
-    async def delete_collab_record(self, table: str, id_column: str, record_id: str) -> None:
-        """Delete a completed/archived collaboration record from SQLite."""
-        allowed = {"collab_tasks": "task_id", "collab_reviews": "review_id", "collab_queries": "query_id"}
-        if table not in allowed or allowed[table] != id_column:
-            return
-        await self._db.execute(f"DELETE FROM {table} WHERE {id_column} = ?", (record_id,))
-        await self._db.commit()
+    # sp1425 — save_task/save_review/save_query + load_active_* + delete_collab_record moved to
+    # LedgerNodeServicesMixin so the default dag backend persists collaboration state too (they
+    # were LocalLedger-only, so AgentCollaboration's hasattr(ledger,"save_task") probe was always
+    # False on a raw DAGLedger and every task/review/query was in-memory-only, lost on restart).
 
     # ── Internal ─────────────────────────────────────────────────
 
