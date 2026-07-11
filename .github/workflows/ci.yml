@@ -36,7 +36,13 @@ jobs:
   python-tests:
     name: Python ${{ matrix.python-version }} tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # sp1418 — was 20. That budget was calibrated when CI never actually ran a
+    # test: collection aborted at ~4.5 min for months, so 20 looked generous.
+    # With collection fixed, 17.6k tests genuinely execute — the first honest run
+    # was cancelled at exactly 20m15s with 3.11 only 34% through. Sized from the
+    # real thing (coverage-instrumented suite on a 4-core runner is ~45 min; the
+    # uninstrumented leg is far quicker), with headroom.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -66,8 +72,18 @@ jobs:
         # sp1418 — "not docker" deselects the two LIVE image build/run guards. They are NOT dropped:
         # they run once in the dedicated `docker-image` job below. Keeping them here would build the
         # SAME python:3.11-slim + torch image once per matrix leg (pure duplication, the image does
-        # not depend on the host Python) and blow this job's 20-minute cap.
-        run: pytest -m "not e2e and not docker" --timeout=120 --cov=prsm --cov-report=xml --cov-report=term -q
+        # not depend on the host Python).
+        #
+        # sp1418 — coverage ONLY on 3.12. `--cov` instrumentation is the dominant cost of this job
+        # (~8 min uninstrumented vs ~45 min instrumented for the same 17.6k tests), and only the 3.12
+        # leg uploads the artifact — so the 3.11 leg was paying that tax for nothing. Both legs still
+        # run the identical test selection; 3.11 just runs it uninstrumented.
+        run: |
+          if [ "${{ matrix.python-version }}" = "3.12" ]; then
+            pytest -m "not e2e and not docker" --timeout=120 --cov=prsm --cov-report=xml --cov-report=term -q
+          else
+            pytest -m "not e2e and not docker" --timeout=120 -q
+          fi
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
