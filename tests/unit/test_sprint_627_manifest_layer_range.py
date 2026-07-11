@@ -156,16 +156,23 @@ def test_manifest_from_model_propagates_layer_range():
     assert manifest.shards[0].layer_range == (3, 7)
 
 
-def test_filesystem_registry_get_round_trips_layer_range(tmp_path):
+def test_filesystem_registry_get_round_trips_layer_range(
+    tmp_path, prsm_home_with_identity,
+):
     """End-to-end: register a model with layer_range=(0,12), get it
     back, verify the loaded shard's layer_range matches.
+
+    sp1418 — the identity comes from the prsm_home_with_identity fixture.
+    This used to do `load_node_identity(NodeConfig.load().identity_path)`,
+    i.e. read the DEVELOPER'S real ~/.prsm: green on any box that had run
+    `prsm setup`, and on a clean CI runner it got identity=None and the
+    round-trip blew up. The registry's signing path is what's under test
+    here, not identity discovery — so hand it a real, isolated identity.
     """
     from prsm.compute.model_registry.registry import FilesystemModelRegistry
     from prsm.compute.model_sharding.models import ShardedModel, ModelShard
-    from prsm.node.config import NodeConfig
-    from prsm.node.identity import load_node_identity
 
-    identity = load_node_identity(NodeConfig.load().identity_path)
+    identity = prsm_home_with_identity
     root = tmp_path / "sprint627"
     root.mkdir(parents=True, exist_ok=True)
     registry = FilesystemModelRegistry(root=root)

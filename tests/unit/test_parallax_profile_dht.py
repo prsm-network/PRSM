@@ -213,13 +213,24 @@ class TestAnchorVerification:
             rtt_to_peers={},
             timestamp_unix=clock(),
         )
+        # Flip the first base64 char to a DIFFERENT one. Hardcoding "A" was a
+        # NO-OP whenever the real signature already began with "A" — b64[0]=="A"
+        # iff signature byte0 < 4, i.e. 4/256 = 1/64 of freshly-generated Ed25519
+        # keys. The "tampered" entry was then byte-identical to the genuine one,
+        # verified True (correctly!), and the test failed "assert True is False"
+        # on ~1.6% of runs. Measured: of 3000 fresh identities, 59 signatures
+        # started with "A" and all 59 "tampers" were no-ops; zero GENUINE tampers
+        # were ever accepted. The verifier was never the problem — the test was
+        # signing its own no-op.
+        sig = entry.signature_b64
+        flipped = ("B" if sig[0] == "A" else "A") + sig[1:]
+        assert flipped != sig, "tamper must actually change the signature"
         tampered = SignedProfileEntry(
             node_id=entry.node_id,
             layer_latency_ms=entry.layer_latency_ms,
             rtt_to_peers=dict(entry.rtt_to_peers),
             timestamp_unix=entry.timestamp_unix,
-            # Flip the first character — different sig, doesn't verify.
-            signature_b64="A" + entry.signature_b64[1:],
+            signature_b64=flipped,
         )
         assert tampered.verify_with_anchor(anchor) is False
 

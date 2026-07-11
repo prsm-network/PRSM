@@ -793,6 +793,26 @@ def temp_directory(tmp_path):
     return tmp_path
 
 
+@pytest.fixture
+def prsm_home_with_identity(tmp_path, monkeypatch):
+    """An isolated $HOME containing a freshly-generated ~/.prsm/identity.json.
+
+    Opt-in (NOT autouse). Tests that sign, register or otherwise need a node
+    identity used to reach through to the DEVELOPER'S REAL ~/.prsm — so they
+    passed on a machine that had ever run `prsm setup` and failed on a clean
+    CI runner, where `load_node_identity()` returns None. Depend on this
+    fixture instead of the ambient home; it yields the identity it created.
+    """
+    from prsm.node.identity import generate_node_identity, save_node_identity
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))  # Windows parity
+    identity = generate_node_identity("test-node")
+    save_node_identity(identity, home / ".prsm" / "identity.json")
+    return identity
+
+
 @pytest.fixture(autouse=True)
 def setup_test_logging():
     """Auto-use fixture to configure logging for tests"""

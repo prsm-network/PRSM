@@ -38,10 +38,14 @@ def _runner():
 # ── prsm node peers (enhanced) ───────────────────────────────────
 
 
-def test_peers_shows_known_but_unconnected():
+def test_peers_shows_known_but_unconnected(prsm_home_with_identity):
     """Enhanced `prsm node peers` displays known-but-unconnected
     peers in addition to connected ones — operators can see the
     gap between bootstrap-discovered and actually-connected.
+
+    sp1418 — takes prsm_home_with_identity: the command loads the node
+    identity, so without an isolated $HOME this silently read the
+    developer's real ~/.prsm and failed on a clean CI runner.
     """
     from prsm.cli import node
 

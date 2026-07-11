@@ -2933,7 +2933,40 @@ async def _make_async_queue(loop, maxsize: int = 0):
     queue fills, blocking new put_nowait calls with QueueFull.
     """
     import asyncio as _asyncio
-    return _asyncio.Queue(maxsize=maxsize)
+
+    class _FifoFairQueue(_asyncio.Queue):
+        """asyncio.Queue whose put() is FIFO-fair across concurrent putter
+        TASKS.
+
+        sp1418. `handle_chain_stream_response` schedules ONE put-task per
+        inbound frame (and one for STREAM_END). Stock asyncio.Queue.put()
+        orders only putters ALREADY PARKED in `_putters`: a putter whose
+        first step runs while a slot happens to be free calls put_nowait()
+        immediately, BARGING ahead of putters that a get() woke but that
+        have not been rescheduled yet. Under bounded-queue back-pressure
+        (sp713) that lets STREAM_END overtake the final frame(s) — the
+        consumer in `_remote_token_stream_dispatch` sees `end` and returns
+        early, silently LOSING them (and reordering others). Using the same
+        scheduling primitive for END (sp715 F50 / sp716 F51) is NOT enough,
+        because the barge happens inside put() itself. asyncio.Lock IS
+        FIFO-fair (a fresh acquirer does not take the fast path while
+        non-cancelled waiters exist), so serializing put() through one
+        restores strict wire order.
+
+        This was pre-existing but latent — the F54 per-frame yield in
+        handle_chain_stream_request changes send timing enough to expose it
+        deterministically, so the two land together.
+        """
+
+        def __init__(self, maxsize: int = 0) -> None:
+            super().__init__(maxsize)
+            self._prsm_put_lock = _asyncio.Lock()
+
+        async def put(self, item):
+            async with self._prsm_put_lock:
+                return await super().put(item)
+
+    return _FifoFairQueue(maxsize=maxsize)
 
 
 async def handle_chain_stream_request(node: Any, msg: Any) -> bool:
@@ -3211,6 +3244,23 @@ async def _handle_stream_request_body(
                     ).decode("ascii"),
                 },
             )
+            # sp1418 F54 hardening: hand control back to the event loop BEFORE
+            # each send. `websocket.send()` only suspends when the write buffer
+            # is PAUSED or the transport is closing, and the uncontended
+            # _peers_lock inside send_to_peer does not suspend either — so
+            # without this yield the ENTIRE stream runs in one uninterrupted
+            # event-loop slice. The transport read loop then never runs, never
+            # parses the requester's Close frame, and never drops the peer, so
+            # the `send_ok` check below could only ever fire once the KERNEL
+            # socket buffers filled. On Linux (autotuned loopback buffers,
+            # megabytes) a cleanly-closing requester got the whole remaining
+            # stream generated into a dead socket: measured 9,950 of 10,000
+            # frames and ~30s of compute burned AFTER the peer was gone (3
+            # frames with this yield). That is also why the F54 regression test
+            # passed only on macOS, whose 128KB buffer forced the suspend.
+            # Secondary benefit: a long stream can no longer starve the event
+            # loop (P2P heartbeats, other peers' read loops).
+            await asyncio.sleep(0)
             send_ok = await node.transport.send_to_peer(
                 sender_id, frame_msg,
             )

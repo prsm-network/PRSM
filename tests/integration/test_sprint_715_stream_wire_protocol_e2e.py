@@ -495,14 +495,41 @@ async def test_sprint_720_server_stops_streaming_on_requester_disconnect():
             f"regression. frames_at_disconnect={frames_at_disconnect} "
             f"final_count={final_count}"
         )
-        # If F54 is un-fixed, we'd burn through all 10000 frames
-        # (or get very close). With F54 engaged, send_to_peer
-        # returns False once the websocket detects close + we exit
-        # the loop + call .close() on the generator.
-        assert final_count < TOTAL_AVAILABLE, (
-            f"server iterated entire {TOTAL_AVAILABLE}-frame supply "
-            f"despite peer disconnect — F54 fix did NOT engage. "
-            f"frames_at_disconnect={frames_at_disconnect}"
+        # sp1418 — TWO assertions, because either one ALONE is defeatable, and
+        # the pre-1418 test shipped with only the weaker of them. Measured
+        # against the real product bug (server's send loop never yielded to the
+        # event loop, so it could not see the peer's Close until the KERNEL
+        # socket buffers filled):
+        #
+        #   config                      at_disconnect  final   old assert
+        #   with fix (any buffer)             426        431   pass
+        #   BUG, Linux 4MB buffers (CI)     10000      10000   FAIL  <- true positive
+        #   BUG, macOS 128KB buffers         4861       7153   pass  <- MISSED IT
+        #
+        # (1) FIXTURE SANITY. The disconnect must actually land mid-stream. On
+        # Linux the entire 3.6MB / 10k-frame supply fits in the autotuned
+        # loopback buffer, so a non-yielding server finishes streaming before
+        # the test's first `await` even resumes: frames_at_disconnect==10000 and
+        # F54 is never exercised. Assert the precondition instead of silently
+        # relying on it.
+        assert frames_at_disconnect < TOTAL_AVAILABLE, (
+            f"server streamed the ENTIRE {TOTAL_AVAILABLE}-frame supply before "
+            f"the requester could even disconnect — its send loop is not "
+            f"yielding to the event loop, so F54 can never engage (it can only "
+            f"fire once the kernel socket buffers fill). This is the bug, not a "
+            f"flaky fixture."
+        )
+        # (2) THE F54 BOUND. Once the peer is gone the server must stop within a
+        # handful of frames. Measured delta with the fix: 5 frames (direct probe:
+        # 3), so 500 is ~100x headroom — while still catching the macOS case
+        # above, where the un-yielding server burned 2,292 frames after the peer
+        # had gone yet still slipped under the old `final < TOTAL` assertion.
+        ABORT_BUDGET = 500
+        assert final_count <= frames_at_disconnect + ABORT_BUDGET, (
+            f"server kept iterating after the peer disconnected — F54 fix "
+            f"did NOT engage. frames_at_disconnect={frames_at_disconnect} "
+            f"final_count={final_count} budget={ABORT_BUDGET} "
+            f"(supply={TOTAL_AVAILABLE})"
         )
 
     finally:
