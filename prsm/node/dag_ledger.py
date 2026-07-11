@@ -1586,7 +1586,20 @@ class DAGLedger(LedgerNodeServicesMixin):
             )
             for r in rows
         ]
-    
+
+    async def get_recent_tx_ids(self, wallet_id: str, limit: int = 50) -> List[str]:
+        """Recent transaction IDs for this wallet — the balance-proof payload.
+
+        Sprint 1419. This existed on LocalLedger and on DAGLedgerAdapter, but NOT here — and
+        `Node._initialize()` builds a bare DAGLedger whenever `config.ledger_type == "dag"`, which
+        is the DEFAULT. (DAGLedgerAdapter is never instantiated anywhere in prsm/.) So on every
+        default node, LedgerSync's `self.ledger.get_recent_tx_ids(...)` raised AttributeError, and
+        `_reconciliation_loop` swallowed it — the node silently never sent a balance proof and never
+        answered a peer's balance_request. Balance reconciliation was inert across the whole network.
+        """
+        history = await self.get_transaction_history(wallet_id, limit)
+        return [tx.tx_id for tx in history]
+
     async def transfer(
         self,
         from_wallet: str,

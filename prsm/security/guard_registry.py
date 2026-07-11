@@ -139,6 +139,24 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1414_capability_announce_cap.py",
         kills_test_id="test_capability_announce_respects_the_known_peers_cap",
     ),
+    Guard(
+        id="ledger-reconciliation-tx-ids-on-default-ledger",
+        sprint="sp1419",
+        file="prsm/node/dag_ledger.py",
+        # NB: `async def get_recent_tx_ids` is NOT unique in this file — the DEAD DAGLedgerAdapter
+        # (never instantiated anywhere in prsm/) defines one too, and that decoy is precisely why
+        # everyone believed the default ledger was covered. Anchor on the real method's body, which
+        # calls self.get_transaction_history (the adapter's delegates to self._dag).
+        anchor="history = await self.get_transaction_history(wallet_id, limit)",
+        protects="balance reconciliation silently dying on EVERY default node. LedgerSync calls "
+                 "self.ledger.get_recent_tx_ids() to build its balance proof, but Node builds a "
+                 "bare DAGLedger by default (config.ledger_type='dag') and DAGLedger never had the "
+                 "method — so every cycle raised AttributeError into a bare `except Exception: "
+                 "logger.error(...)`. The node never sent a balance proof and never answered a "
+                 "peer's balance_request: cross-node ledger divergence went undetected network-wide",
+        killed_by="tests/unit/test_sprint_1419_reconciliation_dead_on_default_ledger.py",
+        kills_test_id="test_reconciliation_sends_a_balance_request_on_the_default_dag_ledger",
+    ),
 ]
 
 

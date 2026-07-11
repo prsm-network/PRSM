@@ -22,10 +22,18 @@ import logging
 import uuid
 from typing import Any, Dict, List, Optional
 
+from prsm.node.dag_ledger import DAGLedger
 from prsm.node.gossip import GOSSIP_FTNS_TRANSACTION, GossipProtocol
 from prsm.node.identity import NodeIdentity, verify_signature
 from prsm.node.local_ledger import LocalLedger, Transaction, TransactionType
 from prsm.node.transport import MSG_DIRECT, P2PMessage, PeerConnection, WebSocketTransport
+
+# Sprint 1419 — `ledger` is annotated LocalLedger|DAGLedger because Node builds EITHER
+# (config.ledger_type, defaulting to "dag"). The old `ledger: LocalLedger` annotation was simply
+# wrong about production, and it is exactly why a DAGLedger missing get_recent_tx_ids type-checked
+# fine while silently killing balance reconciliation on every default node. DAGLedger is NOT a
+# subclass of LocalLedger, so the annotation bought no safety at all.
+# tests/unit/test_sprint_1419_*.py pins the full interface against BOTH impls.
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +58,7 @@ class LedgerSync:
         self,
         identity: NodeIdentity,
         gossip: GossipProtocol,
-        ledger: LocalLedger,
+        ledger: "LocalLedger | DAGLedger",
         transport: WebSocketTransport,
         reconciliation_interval: float = DEFAULT_RECONCILIATION_INTERVAL,
     ):
