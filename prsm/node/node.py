@@ -2476,6 +2476,7 @@ class PRSMNode:
         self._content_readvertise_task = None  # sp1343 — late-joiner catalog re-advertise
         self._settlement_poll_task = None  # sp1038 brick 2
         self._settlement_audit_task = None  # sp1140 brick E.2 (opt-in audit loop)
+        self._escrow_drain_watch_task = None  # sp1422 — unauthorized-batch watch (opt-in)
         self._compute_integrity_watcher = None  # sp1307 — §7 ChallengeWatcher (opt-in)
         self._compute_integrity_watcher_task = None  # sp1307
         self._peer_compute_integrity_watcher = None  # sp1308 — cross-provider audit
@@ -6568,6 +6569,108 @@ class PRSMNode:
             cursor_path, max(5.0, interval),
         )
 
+        # sp1422 — ESCROW-DRAIN WATCH. The audit engine above hunts fraud in batches this node
+        # PRODUCED. This is the other direction: batches someone else committed AGAINST THIS
+        # NODE'S ESCROW. On-chain, commitBatch(address requester, ...) takes the requester as a
+        # plain, unverified, un-bonded argument and finalizeBatch (callable by anyone) pays out
+        # of that requester's escrow — so anyone can name us and drain us for the cost of gas.
+        # Our only defense is a NO_ESCROW challenge that ONLY WE may raise (_handleNoEscrow
+        # reverts unless msg.sender == b.requester). If we are not looking, nobody is.
+        self._escrow_drain_watch_task = asyncio.create_task(
+            self._escrow_drain_watch_loop(contract_client, max(5.0, interval)),
+        )
+
+    async def _escrow_drain_watch_loop(
+        self, contract_client: Any, interval: float,
+    ) -> None:
+        """sp1422 — periodically ask the chain: has anyone committed a batch against MY escrow
+        that I never authorized?
+
+        Reads only. NEVER submits a challenge — raising NO_ESCROW is a signed, user-gated tx.
+        This loop's job is to make sure the operator FINDS OUT while the challenge window is
+        still open, because after it closes the funds are simply gone.
+
+        Scans a rolling lookback rather than a cursor: a batch is only defensible while PENDING,
+        so re-examining the recent window every pass is both correct and self-healing (a missed
+        pass is picked up by the next one). PRSM_ESCROW_DRAIN_LOOKBACK_BLOCKS sizes it — the
+        default 50k blocks is ~24h+ on Base's ~2s blocks, comfortably covering the challenge
+        window. The scan is O(batches in window) because BatchCommitted does not carry (let alone
+        index) the requester, so we cannot filter for "batches against me" — see
+        no_escrow_assembler.scan_for_unauthorized_batches.
+        """
+        import os as _os
+
+        from prsm.settlement.issued_authorization_store import IssuedAuthorizationStore
+        from prsm.settlement.no_escrow_assembler import scan_for_unauthorized_batches
+
+        me = self._operator_address
+        if not me:
+            logger.warning(
+                "sp1422 escrow-drain watch: no operator address; OFF. If this node ever funds "
+                "escrow it will be undefended against an unauthorized-batch drain.",
+            )
+            return
+
+        store_path = (
+            _os.environ.get("PRSM_ISSUED_AUTH_STORE_FILE", "").strip()
+            or str(Path.home() / ".prsm" / "issued_authorizations.json")
+        )
+        try:
+            store = IssuedAuthorizationStore(store_path)
+        except Exception as exc:  # noqa: BLE001 — never take down the node
+            logger.error(
+                "sp1422 escrow-drain watch: cannot open the issued-auth store at %s (%s); OFF. "
+                "This node cannot prove an unauthorized batch against its escrow.",
+                store_path, exc,
+            )
+            return
+
+        try:
+            lookback = int(_os.environ.get("PRSM_ESCROW_DRAIN_LOOKBACK_BLOCKS", "50000"))
+        except (TypeError, ValueError):
+            lookback = 50_000
+
+        logger.info(
+            "sp1422 escrow-drain watch launched (read-only, never-submits; requester=%s, "
+            "lookback=%d blocks, interval=%.0fs).", me, lookback, interval,
+        )
+
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                web3 = getattr(contract_client, "web3", None)
+                if web3 is None:
+                    continue
+                head = int(await asyncio.to_thread(lambda: web3.eth.block_number))
+                alerts = await asyncio.to_thread(
+                    scan_for_unauthorized_batches,
+                    enumerate_batches=lambda f, t: (
+                        contract_client._enumerate_committed_batches_sync(f, t, None)
+                    ),
+                    read_batch=contract_client._get_batch_sync,
+                    store=store,
+                    my_address=me,
+                    from_block=max(0, head - lookback),
+                    to_block=head,
+                )
+                # scan_for_unauthorized_batches already logs each hit at CRITICAL; this is the
+                # roll-up an operator's alerting can key on.
+                if alerts:
+                    savable = [a for a in alerts if a.challengeable]
+                    logger.critical(
+                        "sp1422: %d UNAUTHORIZED batch(es) drawn against this node's escrow "
+                        "(%d still challengeable). Raise NO_ESCROW challenges NOW — only THIS "
+                        "key can. See scripts/settlement_challenge_prepare.py.",
+                        len(alerts), len(savable),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — a bad pass must not kill the watch
+                logger.error(
+                    "sp1422 escrow-drain watch pass failed (%s); retrying next interval. "
+                    "This node is BLIND to an escrow drain until a pass succeeds.", exc,
+                )
+
         # sp1307 — also launch the COMPUTE-INTEGRITY watcher (the §7 counterpart to the
         # settlement-fraud audit engine above): self-audit this node's own committed
         # batches by running the §7 verifier on each retained receipt + DRY-RUNNING any
@@ -6835,6 +6938,7 @@ class PRSMNode:
             "_pending_withdraw_reconciler_task",  # sp916
             "_settlement_poll_task",  # sp1038
             "_settlement_audit_task",  # sp1140 (Brick E.2)
+            "_escrow_drain_watch_task",  # sp1422
             "_compute_integrity_watcher_task",  # sp1307
             "_peer_integrity_watcher_task",  # sp1308
             "_collateral_refresh_task",  # sp1081
