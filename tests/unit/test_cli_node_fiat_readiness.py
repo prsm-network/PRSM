@@ -14,6 +14,11 @@ just wrapped for CLI discoverability.
 from __future__ import annotations
 
 import json
+
+# sp1418 — parse .stdout (the DATA channel), not .output. In click >=8.2 Result.output is
+# stdout+stderr MIXED (what a terminal shows), so ANY advisory on stderr corrupts a JSON
+# parse. The CLI's first-run 'not configured' nudge now correctly goes to stderr; these
+# assertions must therefore read stdout, which is what a real `| jq` consumer receives.
 from unittest.mock import patch
 
 import pytest
@@ -119,7 +124,7 @@ def test_json_output_shape(runner):
         result = runner.invoke(
             cli, ["node", "fiat-readiness", "--format", "json"],
         )
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert "findings" in payload
     assert "overall_status" in payload
     assert payload["overall_status"] in ("ok", "warn", "error")
@@ -135,7 +140,7 @@ def test_json_output_un_commissioned_clean(runner):
         result = runner.invoke(
             cli, ["node", "fiat-readiness", "--format", "json"],
         )
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["overall_status"] == "ok"
     assert payload["findings"] == []
 
@@ -153,7 +158,7 @@ def test_json_failure_still_emits_valid_json(runner):
             cli, ["node", "fiat-readiness", "--format", "json"],
         )
     assert result.exit_code != 0
-    payload = json.loads(result.output)  # must parse
+    payload = json.loads(result.stdout)  # must parse
     assert payload["overall_status"] == "error"
 
 

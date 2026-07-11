@@ -8,6 +8,11 @@ from __future__ import annotations
 
 import json
 
+# sp1418 — parse .stdout (the DATA channel), not .output. In click >=8.2 Result.output is
+# stdout+stderr MIXED (what a terminal shows), so ANY advisory on stderr corrupts a JSON
+# parse. The CLI's first-run 'not configured' nudge now correctly goes to stderr; these
+# assertions must therefore read stdout, which is what a real `| jq` consumer receives.
+
 from click.testing import CliRunner
 
 from prsm.cli import main
@@ -16,7 +21,7 @@ from prsm.cli import main
 def test_buyer_keygen_json_emits_a_working_keypair():
     r = CliRunner().invoke(main, ["content", "buyer-keygen", "--format", "json"])
     assert r.exit_code == 0, r.output
-    d = json.loads(r.output)
+    d = json.loads(r.stdout)
     assert set(d) == {"x25519_pubkey_b64", "x25519_privkey_b64"}
 
     # the generated pair must round-trip: wrap the content key to the PUBLIC key, unwrap with PRIVATE
@@ -41,8 +46,8 @@ def test_buyer_keygen_text_marks_public_vs_private():
 
 
 def test_two_keygens_differ():
-    a = json.loads(CliRunner().invoke(main, ["content", "buyer-keygen", "--format", "json"]).output)
-    b = json.loads(CliRunner().invoke(main, ["content", "buyer-keygen", "--format", "json"]).output)
+    a = json.loads(CliRunner().invoke(main, ["content", "buyer-keygen", "--format", "json"]).stdout)
+    b = json.loads(CliRunner().invoke(main, ["content", "buyer-keygen", "--format", "json"]).stdout)
     assert a["x25519_privkey_b64"] != b["x25519_privkey_b64"]
 
 

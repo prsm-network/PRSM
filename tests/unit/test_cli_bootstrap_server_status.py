@@ -9,6 +9,11 @@ for remote probes. --format json for ops automation.
 from __future__ import annotations
 
 import json
+
+# sp1418 — parse .stdout (the DATA channel), not .output. In click >=8.2 Result.output is
+# stdout+stderr MIXED (what a terminal shows), so ANY advisory on stderr corrupts a JSON
+# parse. The CLI's first-run 'not configured' nudge now correctly goes to stderr; these
+# assertions must therefore read stdout, which is what a real `| jq` consumer receives.
 from unittest.mock import patch, AsyncMock
 
 import pytest
@@ -92,7 +97,7 @@ def test_status_json_output_shape(runner):
              "--host", "x", "--format", "json"],
         )
     assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["status"] == "ok"
     assert payload["health"]["healthy"] is True
     assert payload["metrics"]["total_connections"] == 100
@@ -131,7 +136,7 @@ def test_status_connect_refused_json_still_renders(runner):
              "--format", "json"],
         )
     assert result.exit_code != 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["status"] == "connect_fail"
     assert payload["error"]
 

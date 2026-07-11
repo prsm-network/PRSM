@@ -757,8 +757,16 @@ def main(ctx):
         invoked = ctx.invoked_subcommand or ""
         safe_commands = {"setup", None}  # None = no subcommand (shows help)
         if invoked not in safe_commands:
-            click.echo("  ◇ PRSM is not configured yet. Run: prsm setup")
-            click.echo()
+            # sp1418 — err=True: this nudge MUST go to stderr. On stdout it CORRUPTS every
+            # machine-readable output on a fresh machine — i.e. for every new user:
+            #     $ prsm content buyer-keygen --format json | jq
+            #       ◇ PRSM is not configured yet. Run: prsm setup      <-- prepended to the JSON
+            #     parse error: Invalid numeric literal
+            # stdout is the DATA channel; human advisories belong on stderr. A terminal user still
+            # sees this identically (stderr is not hidden); a pipe/consumer now gets clean JSON.
+            # Caught by CI the first time it ever executed these tests on a clean HOME (7 failures).
+            click.echo("  ◇ PRSM is not configured yet. Run: prsm setup", err=True)
+            click.echo(err=True)
 
 
 # ── Theme + icons (used by config/mcp subcommands below) ─────────────
