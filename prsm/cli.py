@@ -15542,19 +15542,6 @@ def node_infer_cli(
     # ── Load settler identity ──
     cfg = NodeConfig.load()
     settler = load_node_identity(cfg.identity_path)
-    if not settler:
-        # sp1420 — the two sibling call sites (`prsm node info`, `prsm node fiat-readiness`)
-        # both guard this; this one did not, and `settler.node_id` is dereferenced below to
-        # sign the §7 receipt. load_node_identity returns None whenever ~/.prsm/identity.json
-        # is absent. "The daemon answered" does NOT imply "we have a local identity" — --api
-        # can point at a REMOTE daemon, so a box that never ran `prsm setup` reaches here and
-        # dies on AttributeError: 'NoneType' object has no attribute 'node_id'.
-        console.print(
-            "[red]✗ No node identity found[/red] — cannot sign the inference receipt.\n"
-            "[dim]Run `prsm setup` first (the §7 receipt is signed with YOUR key, so it is "
-            "needed even when --api points at a remote daemon).[/dim]"
-        )
-        _sys.exit(1)
 
     # ── Load tokenizer + embedding layer ──
     # Lazy import — operators without HF installed should still see a
@@ -15570,6 +15557,21 @@ def node_infer_cli(
         console.print(
             f"[red]✗ HuggingFace deps missing[/red]: {exc}\n"
             f"[dim]Install with: pip install transformers torch[/dim]"
+        )
+        _sys.exit(1)
+
+    # sp1420 — identity guard. Placed AFTER the HF-deps check (which is the more fundamental
+    # precondition: no runtime, no inference at all) but BEFORE `settler.node_id` is dereferenced
+    # to sign the §7 receipt below. The two sibling call sites (`prsm node info`,
+    # `prsm node fiat-readiness`) both guard this; this one did not. load_node_identity returns
+    # None whenever ~/.prsm/identity.json is absent, and "the daemon answered" does NOT imply "we
+    # have a local identity" — --api can point at a REMOTE daemon, so a box that never ran
+    # `prsm setup` reaches here and would die on AttributeError: 'NoneType' has no 'node_id'.
+    if not settler:
+        console.print(
+            "[red]✗ No node identity found[/red] — cannot sign the inference receipt.\n"
+            "[dim]Run `prsm setup` first (the §7 receipt is signed with YOUR key, so it is "
+            "needed even when --api points at a remote daemon).[/dim]"
         )
         _sys.exit(1)
 

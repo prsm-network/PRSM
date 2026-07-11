@@ -18,7 +18,7 @@ test-isolation bugs: code that assumes the developer's ambient ~/.prsm always ex
 """
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
 
@@ -26,7 +26,13 @@ from prsm.cli import main
 
 
 def test_node_infer_without_an_identity_fails_cleanly_not_with_attributeerror():
-    """No identity -> a clean, actionable error and a non-zero exit. Never a raw traceback."""
+    """No identity -> a clean, actionable error and a non-zero exit. Never a raw traceback.
+
+    The identity guard fires AFTER the HuggingFace-deps check (the more fundamental precondition —
+    no runtime, no inference), so this stubs `transformers` in sys.modules to deterministically
+    clear that block and reach the guard. Stubbing (rather than importing the real transformers)
+    matches the sibling sp644 tests and avoids their lazy-loader flakiness.
+    """
     runner = CliRunner()
 
     peers = {"connected": [{"peer_id": "b" * 32, "address": "1.2.3.4:9001"}]}
@@ -42,11 +48,17 @@ def test_node_infer_without_an_identity_fails_cleanly_not_with_attributeerror():
         def json():
             return peers
 
-    # Daemon reachable (as --api at a remote host would be), but NO local identity.
-    # node_infer_cli imports load_node_identity function-locally, so patch it at the SOURCE
-    # module (prsm.node.identity) — patching prsm.cli would not intercept the local import.
+    transformers_stub = MagicMock(
+        AutoTokenizer=MagicMock(),
+        AutoModelForCausalLM=MagicMock(),
+    )
+
+    # Daemon reachable (as --api at a remote host would be) + HF deps present, but NO local
+    # identity. node_infer_cli imports load_node_identity function-locally, so patch it at the
+    # SOURCE module (prsm.node.identity) — patching prsm.cli would not intercept the local import.
     with patch("prsm.node.identity.load_node_identity", return_value=None), \
-         patch("httpx.get", return_value=_Resp()):
+         patch("httpx.get", return_value=_Resp()), \
+         patch.dict("sys.modules", {"transformers": transformers_stub}):
         result = runner.invoke(
             main, ["node", "infer", "--prompt", "hi", "--api", "http://remote:8000"],
         )
