@@ -18,11 +18,15 @@ class _TxHash:
         return "0x" + "ab" * 32
 
 
-def _entry(block, amount):
+def _entry(block, amount, provider="0x" + "aa" * 20):
+    # sp1424: `provider` is an INDEXED param of the Slashed event, so real web3-decoded logs
+    # always carry args["provider"]. The mock omitted it because the pre-1424 code read the
+    # provider from the filter argument instead of the log; get_all_slash_events (no filter)
+    # forced the shared scan to read it per-log, which is what real decoding does.
     return (block, {
-        "args": {"challenger": "0x" + "cc" * 20, "reasonId": b"\x11" * 32,
-                 "slashAmount": amount, "challengerBounty": amount // 10,
-                 "foundationShare": amount // 5},
+        "args": {"provider": provider, "challenger": "0x" + "cc" * 20,
+                 "reasonId": b"\x11" * 32, "slashAmount": amount,
+                 "challengerBounty": amount // 10, "foundationShare": amount // 5},
         "blockNumber": block, "transactionHash": _TxHash()})
 
 
@@ -58,11 +62,50 @@ def test_get_slash_events_decodes_and_chunks():
     assert ev.challenger == "0x" + "cc" * 20
     assert ev.reason_id == "0x" + "11" * 32
     assert ev.tx_hash == "0x" + "ab" * 32
+    # sp1424 — provider is now decoded from the log itself (checksummed), not the filter arg.
+    from web3 import Web3
+    assert ev.provider == Web3.to_checksum_address("0x" + "aa" * 20)
 
 
 def test_get_slash_events_empty_window_is_clean():
     c, _ = _client_with_events(head=5_000, entries=[])
     assert c.get_slash_events("0x" + "aa" * 20, from_block=0) == []
+
+
+def test_get_all_slash_events_scans_without_a_provider_filter(monkeypatch):
+    """sp1424 — the reputation bridge needs EVERY slashed provider, not just self, so
+    get_all_slash_events must query with argument_filters=None and decode each log's own
+    provider address."""
+    filters_seen = []
+    c, _ = _client_with_events(head=10_000, entries=[
+        _entry(9_400, 10 ** 18, provider="0x" + "aa" * 20),
+        _entry(9_600, 2 * 10 ** 18, provider="0x" + "bb" * 20),
+    ])
+    # capture the argument_filters the scan passes
+    orig_event = c.contract.events.Slashed
+
+    class _CapturingEvent:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def create_filter(self, from_block, to_block, argument_filters):
+            filters_seen.append(argument_filters)
+            return self._inner.create_filter(
+                from_block=from_block, to_block=to_block, argument_filters=argument_filters,
+            )
+
+    c.contract.events.Slashed = lambda: _CapturingEvent(orig_event())
+
+    evs = c.get_all_slash_events(lookback_blocks=15_000)
+    from web3 import Web3
+    providers = sorted(e.provider for e in evs)
+    assert providers == sorted([
+        Web3.to_checksum_address("0x" + "aa" * 20),
+        Web3.to_checksum_address("0x" + "bb" * 20),
+    ]), "get_all_slash_events must decode DIFFERENT providers from the logs, not a fixed one"
+    assert filters_seen and all(f is None for f in filters_seen), (
+        "get_all_slash_events must NOT filter by provider — it needs all of them"
+    )
 
 
 # ── CLI ──

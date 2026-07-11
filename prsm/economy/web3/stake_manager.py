@@ -509,6 +509,43 @@ class StakeManagerClient:
         ``PRSM_STAKE_SCAN_LOOKBACK_BLOCKS`` (300k ≈ a week on Base), overridable per call.
         """
         provider_cs = Web3.to_checksum_address(provider)
+        return self._scan_slashed(
+            argument_filters={"provider": provider_cs},
+            from_block=from_block, to_block=to_block, lookback_blocks=lookback_blocks,
+        )
+
+    def get_all_slash_events(
+        self,
+        *,
+        from_block: Optional[int] = None,
+        to_block: Optional[int] = None,
+        lookback_blocks: Optional[int] = None,
+    ) -> List[SlashEvent]:
+        """Sprint 1424 — decode ``Slashed`` events for ALL providers (no ``provider`` filter).
+
+        ``get_slash_events`` above answers "was I slashed?"; this answers "who has been slashed?",
+        which is what the reputation bridge needs — it must penalize ANY slashed provider, including
+        ones this node has not itself dispatched to yet. Same read-only chunked scan.
+        """
+        return self._scan_slashed(
+            argument_filters=None,
+            from_block=from_block, to_block=to_block, lookback_blocks=lookback_blocks,
+        )
+
+    def _scan_slashed(
+        self,
+        *,
+        argument_filters: Optional[dict],
+        from_block: Optional[int],
+        to_block: Optional[int],
+        lookback_blocks: Optional[int],
+    ) -> List[SlashEvent]:
+        """Shared ``Slashed`` window scan for get_slash_events / get_all_slash_events.
+
+        ``argument_filters`` narrows server-side (e.g. {"provider": addr}) or is None for all.
+        The event's ``provider`` field is used per-log (not a fixed arg) so this works filtered
+        OR unfiltered.
+        """
         head = int(self.web3.eth.block_number) if to_block is None else int(to_block)
         if from_block is None:
             lb = lookback_blocks if lookback_blocks is not None else int(
@@ -521,7 +558,7 @@ class StakeManagerClient:
             end = min(start + _SCAN_MAX_WINDOW - 1, head)
             flt = event.create_filter(
                 from_block=start, to_block=end,
-                argument_filters={"provider": provider_cs})
+                argument_filters=argument_filters)
             for e in flt.get_all_entries():
                 a = e["args"]
                 txh = e["transactionHash"]
@@ -529,7 +566,7 @@ class StakeManagerClient:
                 out.append(SlashEvent(
                     block_number=int(e["blockNumber"]),
                     tx_hash=txh.hex() if hasattr(txh, "hex") else str(txh),
-                    provider=provider_cs,
+                    provider=Web3.to_checksum_address(a["provider"]),
                     challenger=a["challenger"],
                     reason_id="0x" + (bytes(rid).hex() if not isinstance(rid, str) else rid.removeprefix("0x")),
                     slash_amount_wei=int(a["slashAmount"]),

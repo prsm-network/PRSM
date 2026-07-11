@@ -175,6 +175,20 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1421_issued_auth_recording_wired.py",
         kills_test_id="test_forged_batch_is_flagged_unauthorized_and_the_real_one_is_not",
     ),
+    Guard(
+        id="onchain-slash-penalizes-reputation",
+        sprint="sp1424",
+        file="prsm/marketplace/slash_reputation_bridge.py",
+        anchor="tracker.record_slash(",
+        protects="a provider slashed on-chain for fraud (double-spend / forged signature) keeping "
+                 "FULL aggregator-selection weight. The ReputationTracker is read on every "
+                 "dispatch but was written never on the live path, so score_for() was a constant "
+                 "0.5 and has_been_slashed() was False for everyone. This bridge is the only thing "
+                 "that carries a real StakeBond.Slashed event into the tracker (mapped operator "
+                 "eth-address -> node_id); without this call the slash never affects selection",
+        killed_by="tests/unit/test_sprint_1424_slash_reputation_bridge.py",
+        kills_test_id="test_a_slashed_provider_loses_reputation_and_is_flagged",
+    ),
 ]
 
 

@@ -2477,6 +2477,7 @@ class PRSMNode:
         self._settlement_poll_task = None  # sp1038 brick 2
         self._settlement_audit_task = None  # sp1140 brick E.2 (opt-in audit loop)
         self._escrow_drain_watch_task = None  # sp1422 — unauthorized-batch watch (opt-in)
+        self._reputation_slash_watch_task = None  # sp1424 — on-chain slash -> reputation
         self._compute_integrity_watcher = None  # sp1307 — §7 ChallengeWatcher (opt-in)
         self._compute_integrity_watcher_task = None  # sp1307
         self._peer_compute_integrity_watcher = None  # sp1308 — cross-provider audit
@@ -5709,6 +5710,23 @@ class PRSMNode:
                 _audit_launch_exc,
             )
 
+        # sp1424 — REPUTATION SLASH WATCH. The provider ReputationTracker is READ on every
+        # marketplace dispatch but was WRITTEN never on the live path, so every provider scored a
+        # constant 0.5 forever and a provider slashed on-chain for fraud kept full selection
+        # weight. This loop bridges the real StakeBond.Slashed events into the tracker. Launched
+        # only when reputation-based selection is actually in play (the tracker exists, i.e. QO is
+        # enabled) and a stake client + discovery are available to read/resolve. Read-only on
+        # chain (never signs/broadcasts); fail-closed.
+        try:
+            if getattr(self, "reputation_tracker", None) is not None:
+                self._reputation_slash_watch_task = asyncio.create_task(
+                    self._reputation_slash_watch_loop(),
+                )
+        except Exception as _slash_launch_exc:  # noqa: BLE001 — never crash startup
+            logger.warning(
+                "sp1424 reputation slash-watch launch failed (OFF): %s", _slash_launch_exc,
+            )
+
         # Sprint 1081 — attestation collateral (Intel PCK CRL + QE-Identity) auto
         # refresh. Opt-in via PRSM_COLLATERAL_AUTO_REFRESH so a long-running node keeps
         # revocation enforcement current instead of silently lapsing when a static CRL
@@ -6682,6 +6700,93 @@ class PRSMNode:
                     "This node is BLIND to an escrow drain until a pass succeeds.", exc,
                 )
 
+    async def _reputation_slash_watch_loop(self) -> None:
+        """sp1424 — periodically bridge on-chain StakeBond.Slashed events into the provider
+        ReputationTracker, so a provider slashed for fraud stops scoring a clean 0.5 and stops
+        keeping full aggregator-selection weight.
+
+        Read-only on chain (never signs, never broadcasts). Resolves each slashed operator
+        eth-address -> node_id via the SAME self-advertised hardware_profile.operator_address the
+        sp1309 discovery resolver uses; a peer can only ever map a slash onto its own node_id or
+        the address's genuine owner, so this cannot forge a penalty onto an innocent third party.
+        Dedup persists across passes so overlapping block windows never double-count a slash.
+        """
+        import os as _os
+
+        from prsm.marketplace.slash_reputation_bridge import (
+            apply_onchain_slashes_to_reputation,
+        )
+
+        tracker = getattr(self, "reputation_tracker", None)
+        if tracker is None:
+            return
+
+        reader = getattr(self, "_compute_stake_reader", None)
+        get_client = getattr(reader, "_get_client", None) if reader is not None else None
+        if get_client is None:
+            logger.info(
+                "sp1424 reputation slash-watch: no on-chain stake reader; OFF. Slashed providers "
+                "will keep full selection weight on this node.",
+            )
+            return
+
+        try:
+            interval = float(_os.environ.get("PRSM_SLASH_WATCH_INTERVAL_S", "600"))
+        except (TypeError, ValueError):
+            interval = 600.0
+
+        seen: set = set()
+
+        def _resolve_node_id(operator_address: str):
+            """operator eth-address -> node_id via discovery's advertised hardware_profile."""
+            disc = getattr(self, "discovery", None)
+            if disc is None or not operator_address:
+                return None
+            try:
+                peers = disc.get_known_peers()
+            except Exception:  # noqa: BLE001 — discovery hiccup: no resolution this cycle
+                return None
+            target = str(operator_address).lower()
+            for p in (peers or []):
+                hw = getattr(p, "hardware_profile", None)
+                if not isinstance(hw, dict):
+                    continue
+                op = hw.get("operator_address")
+                if op and str(op).lower() == target:
+                    return getattr(p, "node_id", None)
+            return None
+
+        logger.info(
+            "sp1424 reputation slash-watch launched (read-only, never-signs; interval=%.0fs).",
+            interval,
+        )
+
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                client = get_client()
+                if client is None:
+                    continue
+                events = await asyncio.to_thread(client.get_all_slash_events)
+                recorded, unmapped = await asyncio.to_thread(
+                    apply_onchain_slashes_to_reputation,
+                    events=events,
+                    tracker=tracker,
+                    resolve_node_id=_resolve_node_id,
+                    already_recorded=seen,
+                )
+                if recorded or unmapped:
+                    logger.info(
+                        "sp1424 slash-watch: recorded %d new on-chain slash(es) into reputation, "
+                        "%d unmapped (operator not yet in discovery).", recorded, unmapped,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — a bad pass must not kill the watch
+                logger.error(
+                    "sp1424 slash-watch pass failed (%s); retrying next interval.", exc,
+                )
+
         # sp1307 — also launch the COMPUTE-INTEGRITY watcher (the §7 counterpart to the
         # settlement-fraud audit engine above): self-audit this node's own committed
         # batches by running the §7 verifier on each retained receipt + DRY-RUNNING any
@@ -6950,6 +7055,7 @@ class PRSMNode:
             "_settlement_poll_task",  # sp1038
             "_settlement_audit_task",  # sp1140 (Brick E.2)
             "_escrow_drain_watch_task",  # sp1422
+            "_reputation_slash_watch_task",  # sp1424
             "_compute_integrity_watcher_task",  # sp1307
             "_peer_integrity_watcher_task",  # sp1308
             "_collateral_refresh_task",  # sp1081
