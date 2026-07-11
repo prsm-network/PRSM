@@ -4997,6 +4997,17 @@ class PRSMNode:
             self.compute_requester.mismatch_log = self._consensus_mismatch_log
         if self.storage_provider:
             self.storage_provider.ledger_sync = self.ledger_sync
+        if self.bt_provider:
+            # sp1423 — bt_provider was the ONE reward-earning subsystem this block forgot.
+            # BitTorrentProvider.__init__ sets `self.ledger_sync = None  # Set by node.py` and
+            # node.py never did, so `if self.ledger_sync:` in its _reward_loop was ALWAYS False:
+            # seeding rewards were credited to the local ledger and NEVER broadcast. The network
+            # saw none of those mints (LedgerSync gossips self-credits precisely "for
+            # transparency"), and record_nonce was skipped with them. Every other reward path
+            # broadcasts — this asymmetry was an omission, not a design choice. It also poisons
+            # the sp1419 balance reconciliation, which compares our balance against peers who
+            # never saw the mint.
+            self.bt_provider.ledger_sync = self.ledger_sync
         self.agent_collaboration.ledger_sync = self.ledger_sync
         self.agent_collaboration.agent_registry = self.agent_registry
 
