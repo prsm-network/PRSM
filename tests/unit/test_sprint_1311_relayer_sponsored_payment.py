@@ -24,12 +24,13 @@ _PROVIDER = "0x" + "33" * 20
 def test_delegation_shape_and_fields():
     funder = Account.create()
     d = build_payment_delegation(
-        funder_key=funder.key.hex(), relayer_address=_RELAYER,
+        funder_key=funder.key.hex(), relayer_address=_RELAYER, provider_address=_PROVIDER,
         max_total_spend_ftns=10, expiry_unix=9999999999, chain_id=84532)
     assert set(d) == {"payload", "signature"}
     p = d["payload"]
     assert p["requester"].lower() == funder.address.lower()   # funder pays
     assert p["relayer"].lower() == _RELAYER.lower()
+    assert p["provider"].lower() == _PROVIDER.lower()         # sp1437 — bound to one provider
     assert p["max_total_spend_wei"] == 10 * 10 ** 18
     assert p["expiry_unix"] == 9999999999
     assert p["delegation_nonce"].startswith("0x") and len(p["delegation_nonce"]) == 66
@@ -39,7 +40,7 @@ def test_delegation_shape_and_fields():
 def test_delegation_signature_recovers_funder():
     funder = Account.create()
     d = build_payment_delegation(
-        funder_key=funder.key.hex(), relayer_address=_RELAYER,
+        funder_key=funder.key.hex(), relayer_address=_RELAYER, provider_address=_PROVIDER,
         max_total_spend_ftns=5, expiry_unix=9999999999, chain_id=8453)
     rec = verify_payment_delegation_signature(d["payload"], d["signature"], chain_id=8453)
     assert rec.lower() == funder.address.lower()
@@ -49,7 +50,7 @@ def test_delegation_chain_id_bound():
     """Signed for chain 8453 must NOT recover the funder under 84532 (domain binds chainId)."""
     funder = Account.create()
     d = build_payment_delegation(
-        funder_key=funder.key.hex(), relayer_address=_RELAYER,
+        funder_key=funder.key.hex(), relayer_address=_RELAYER, provider_address=_PROVIDER,
         max_total_spend_ftns=1, expiry_unix=9999999999, chain_id=8453)
     rec = verify_payment_delegation_signature(d["payload"], d["signature"], chain_id=84532)
     assert rec.lower() != funder.address.lower()
@@ -58,12 +59,15 @@ def test_delegation_chain_id_bound():
 def test_delegation_nonce_random_per_call_but_explicit_honored():
     funder = Account.create()
     d1 = build_payment_delegation(funder_key=funder.key.hex(), relayer_address=_RELAYER,
+                                  provider_address=_PROVIDER,
                                   max_total_spend_ftns=1, expiry_unix=9999999999)
     d2 = build_payment_delegation(funder_key=funder.key.hex(), relayer_address=_RELAYER,
+                                  provider_address=_PROVIDER,
                                   max_total_spend_ftns=1, expiry_unix=9999999999)
     assert d1["payload"]["delegation_nonce"] != d2["payload"]["delegation_nonce"]
     fixed = "0x" + "ab" * 32
     d3 = build_payment_delegation(funder_key=funder.key.hex(), relayer_address=_RELAYER,
+                                  provider_address=_PROVIDER,
                                   max_total_spend_ftns=1, expiry_unix=9999999999,
                                   delegation_nonce=fixed)
     assert d3["payload"]["delegation_nonce"] == fixed
@@ -76,7 +80,7 @@ async def test_relayed_infer_sends_auth_and_delegation():
     from prsm.sdk.client import PRSMClient
     funder, relayer = Account.create(), Account.create()
     delegation = build_payment_delegation(
-        funder_key=funder.key.hex(), relayer_address=relayer.address,
+        funder_key=funder.key.hex(), relayer_address=relayer.address, provider_address=_PROVIDER,
         max_total_spend_ftns=10, expiry_unix=9999999999, chain_id=84532)
 
     captured = {}
@@ -111,7 +115,7 @@ async def test_relayed_infer_verify_pubkey_sets_receipt_verified():
     from prsm.sdk.client import PRSMClient
     funder, relayer = Account.create(), Account.create()
     delegation = build_payment_delegation(
-        funder_key=funder.key.hex(), relayer_address=relayer.address,
+        funder_key=funder.key.hex(), relayer_address=relayer.address, provider_address=_PROVIDER,
         max_total_spend_ftns=10, expiry_unix=9999999999)
 
     async def _fake_post(path, body):

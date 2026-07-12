@@ -9,10 +9,18 @@ wallet / signing each request, while the funder keeps custody (escrow) + caps.
   PaymentDelegation {
     address requester           // funds escrow; the delegating party (pays via settleFromRequester)
     address relayer             // authorized to sign PaymentAuthorizations on requester's behalf
+    address provider            // sp1437 — the ONE provider node this delegation may be spent at
     uint256 max_total_spend_wei // cumulative ceiling across all auths under this delegation
     bytes32 delegation_nonce    // unique per delegation (anti-replay + revocation handle)
     uint256 expiry_unix         // delegation invalid after this
   }
+
+sp1437 (money-path audit #3): the cumulative cap is enforced by a PER-NODE budget store keyed
+by delegation_nonce, so a provider-AGNOSTIC delegation with cap C could be replayed at N
+providers for a C×N drain (N× the signed cap). Binding the delegation to a single ``provider``
+— checked here against the auth's provider, which the verifier in turn pins to the local node —
+makes it spendable at exactly one node. To fund N providers a funder signs N delegations, each
+with its own cap.
 
 Same network-locked domain as PaymentAuthorization (PRSM-Payment / v1 / chainId) so both
 live in one signature scheme. The verifier (``verify_delegated_authorization``) checks the
@@ -42,7 +50,7 @@ from prsm.settlement.payment_authorization import (
 )
 
 _REQUIRED = (
-    "requester", "relayer", "max_total_spend_wei",
+    "requester", "relayer", "provider", "max_total_spend_wei",
     "delegation_nonce", "expiry_unix",
 )
 
@@ -60,6 +68,8 @@ def _build_typed_data(payload: Dict[str, Any], chain_id: int) -> Dict[str, Any]:
         raise ValueError("requester must be an address string")
     if not isinstance(payload["relayer"], str):
         raise ValueError("relayer must be an address string")
+    if not isinstance(payload["provider"], str):
+        raise ValueError("provider must be an address string")
     return {
         "types": {
             "EIP712Domain": [
@@ -70,6 +80,7 @@ def _build_typed_data(payload: Dict[str, Any], chain_id: int) -> Dict[str, Any]:
             "PaymentDelegation": [
                 {"name": "requester", "type": "address"},
                 {"name": "relayer", "type": "address"},
+                {"name": "provider", "type": "address"},
                 {"name": "max_total_spend_wei", "type": "uint256"},
                 {"name": "delegation_nonce", "type": "bytes32"},
                 {"name": "expiry_unix", "type": "uint256"},
@@ -84,6 +95,7 @@ def _build_typed_data(payload: Dict[str, Any], chain_id: int) -> Dict[str, Any]:
         "message": {
             "requester": str(payload["requester"]),
             "relayer": str(payload["relayer"]),
+            "provider": str(payload["provider"]),
             "max_total_spend_wei": int(payload["max_total_spend_wei"]),
             "delegation_nonce": _to_bytes32("delegation_nonce", payload["delegation_nonce"]),
             "expiry_unix": int(payload["expiry_unix"]),
@@ -163,14 +175,24 @@ def verify_delegated_authorization(
       2. The PaymentDelegation is signed by its own ``requester`` (the funder).
       3. The auth's ``requester`` == the delegation's ``requester`` (the auth charges the
          funder's escrow, not some third party).
+      3b. sp1437 — the auth's ``provider`` == the delegation's ``provider`` (the delegation
+         may be spent at exactly ONE provider node; the caller/verifier then pins that
+         provider to the LOCAL node, so a delegation cannot be replayed across providers for
+         a C×N drain past the signed cap).
       4. Neither the delegation nor the auth is expired.
       5. The per-request ``max_spend_wei`` does not exceed the delegation's
          ``max_total_spend_wei`` (cumulative tracking across requests is a later brick).
     """
     funder = str(delegation_payload.get("requester") or "")
     relayer = str(delegation_payload.get("relayer") or "")
+    deleg_provider = str(delegation_payload.get("provider") or "")
     if not funder or not relayer:
         raise DelegatedAuthError("delegation missing requester/relayer")
+    if not deleg_provider:
+        # sp1437 — fail closed: a provider-less delegation is the pre-fix provider-AGNOSTIC
+        # hole (spendable at any node → C×N drain). Never treat a missing provider as a
+        # wildcard.
+        raise DelegatedAuthError("delegation missing provider (sp1437 provider binding)")
 
     # 2. delegation signed by the funder it names.
     try:
@@ -200,6 +222,15 @@ def verify_delegated_authorization(
         raise DelegatedAuthError(
             "authorization requester does not match the delegation funder — "
             f"{auth_requester} != {funder}")
+
+    # 3b. sp1437 — the auth pays the provider named in the delegation. The auth's provider is
+    # pinned to the local node by the verifier, so this ties the delegation to one node and
+    # blocks the cross-provider C×N drain.
+    auth_provider = str(auth_payload.get("provider") or "")
+    if auth_provider.lower() != deleg_provider.lower():
+        raise DelegatedAuthError(
+            "authorization provider does not match the delegation provider — "
+            f"{auth_provider} != {deleg_provider} (delegation is bound to one provider)")
 
     # 4. freshness — both must be unexpired.
     if is_delegation_expired(delegation_payload, now=now):

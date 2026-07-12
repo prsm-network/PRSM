@@ -235,6 +235,23 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1436_committed_escrow_dedup.py",
         kills_test_id="test_redelivery_after_commit_is_dropped_no_second_settle",
     ),
+    Guard(
+        id="delegation-provider-binding",
+        sprint="sp1437",
+        file="prsm/settlement/payment_delegation.py",
+        anchor="auth_provider.lower() != deleg_provider.lower()",
+        protects="a relayer draining a funder's escrow N× the signed cap. A PaymentDelegation's "
+                 "cumulative cap (max_total_spend_wei) is enforced by a PER-NODE budget store keyed "
+                 "only by delegation_nonce; the per-request auth is provider-pinned but the "
+                 "delegation was NOT, so one delegation with cap C could be presented (with a fresh "
+                 "provider-matched auth) at each of N providers, each reserving up to C against its "
+                 "own store from consumed=0 → C×N drain. This check binds the delegation to the ONE "
+                 "provider named in its signed struct; combined with the verifier's auth.provider== "
+                 "this_node pin, a delegation is spendable at exactly one node. Delete it and the "
+                 "cross-provider drain returns",
+        killed_by="tests/unit/test_sprint_1437_delegation_provider_binding.py",
+        kills_test_id="test_delegation_bound_to_one_provider_cannot_be_spent_at_another",
+    ),
 ]
 
 

@@ -81,6 +81,7 @@ def build_payment_delegation(
     *,
     funder_key: Union[str, bytes],
     relayer_address: str,
+    provider_address: str,
     max_total_spend_ftns: Union[str, float, Decimal],
     expiry_unix: int,
     delegation_nonce: Optional[str] = None,
@@ -96,17 +97,22 @@ def build_payment_delegation(
     from the FUNDER's escrow — so END-USERS transact WITHOUT holding a wallet or signing.
 
     Returns ``{"payload": {...}, "signature": "0x.."}`` for the request body's
-    ``payment_delegation`` field. ``max_total_spend_ftns`` is the cumulative cap across ALL
-    requests the relayer makes under this delegation (the node tracks spend against it,
-    sp1092). ``delegation_nonce`` defaults to a fresh random 32-byte value — it is the
-    anti-replay value AND the revocation handle. A production funder signs the same typed
-    data with a wallet; this is the reference/python-client builder."""
+    ``payment_delegation`` field. ``max_total_spend_ftns`` is the cumulative cap across all
+    requests the relayer makes under this delegation AT ``provider_address`` — sp1437 binds a
+    delegation to ONE provider node (the cap is enforced by that node's local budget store,
+    so a provider-agnostic delegation would be drainable N× by replaying it at N providers).
+    To sponsor across multiple providers a funder signs one delegation per provider, each with
+    its own cap; total exposure is the sum of the signed caps. ``delegation_nonce`` defaults to
+    a fresh random 32-byte value — it is the anti-replay value AND the revocation handle. A
+    production funder signs the same typed data with a wallet; this is the reference/python-
+    client builder."""
     funder = Account.from_key(funder_key).address
     if delegation_nonce is None:
         delegation_nonce = "0x" + secrets.token_bytes(32).hex()
     payload = {
         "requester": funder,                    # the funding party (escrow is charged here)
         "relayer": relayer_address,             # authorized to sign per-request auths
+        "provider": provider_address,           # sp1437 — the ONE provider this cap may be spent at
         "max_total_spend_wei": int(
             Decimal(str(max_total_spend_ftns)) * (Decimal(10) ** 18)),
         "delegation_nonce": delegation_nonce,

@@ -41,6 +41,7 @@ def _rhash():
 
 def _signed_pair(rhash):
     d = {"requester": _FUNDER.address, "relayer": _RELAYER.address,
+         "provider": _PROVIDER.address,  # sp1437 — bound to the provider _verifier() pins
          "max_total_spend_wei": 10**18, "delegation_nonce": "0x" + "cd" * 32,
          "expiry_unix": 9999999999}
     a = {"requester": _FUNDER.address, "provider": _PROVIDER.address,

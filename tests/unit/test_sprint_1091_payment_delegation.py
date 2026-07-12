@@ -37,10 +37,13 @@ _DNONCE = "0x" + "cd" * 32
 _RHASH = "0x" + "ef" * 32
 
 
-def _delegation(*, requester=None, relayer=None, max_total=10**18, expiry=9999999999):
+def _delegation(*, requester=None, relayer=None, provider=None, max_total=10**18, expiry=9999999999):
     return {
         "requester": requester or _FUNDER.address,
         "relayer": relayer or _RELAYER.address,
+        # sp1437 — the delegation is now bound to one provider; default to the same provider
+        # the _auth() helper names so the chain verifies.
+        "provider": provider or _PROVIDER,
         "max_total_spend_wei": max_total,
         "delegation_nonce": _DNONCE,
         "expiry_unix": expiry,

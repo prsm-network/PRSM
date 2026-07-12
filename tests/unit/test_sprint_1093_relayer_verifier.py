@@ -31,7 +31,9 @@ def _rhash():
 
 
 def _delegation(*, max_total=10**18, expiry=9999999999, nonce="0x" + "cd" * 32):
+    # sp1437 — bound to the same provider _auth() names (and the verifier pins).
     return {"requester": _FUNDER.address, "relayer": _RELAYER.address,
+            "provider": _PROVIDER.address,
             "max_total_spend_wei": max_total, "delegation_nonce": nonce,
             "expiry_unix": expiry}
 
