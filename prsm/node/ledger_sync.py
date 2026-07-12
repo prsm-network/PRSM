@@ -20,7 +20,16 @@ import asyncio
 import json
 import logging
 import uuid
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional
+
+# sp1428 — bounds on the reconciliation balance_response path (money-path DoS hardening).
+# A legitimate response echoes at most the request path's `limit=20` ids; the cap is generous
+# headroom over that, so an oversized/hostile list can't drive an unbounded per-element DB storm
+# on the shared ledger connection. The outstanding-request set is bounded so correlation tracking
+# can't itself leak. See tests/unit/test_sprint_1428_balance_response_dos.py.
+_MAX_RECONCILIATION_TX_IDS = 64
+_MAX_OUTSTANDING_REQUEST_IDS = 1024
 
 from prsm.node.dag_ledger import DAGLedger
 from prsm.node.gossip import GOSSIP_FTNS_TRANSACTION, GossipProtocol
@@ -77,6 +86,19 @@ class LedgerSync:
 
         self._running = False
         self._tasks: List[asyncio.Task] = []
+
+        # sp1428 — request_ids we have SENT and not yet matched to a response, bounded + one-shot.
+        # `_handle_balance_response` drops any response whose request_id we didn't send, so a peer
+        # cannot make us process (and DB-scan) an UNSOLICITED balance_response.
+        self._outstanding_request_ids: "OrderedDict[str, None]" = OrderedDict()
+
+    def _register_outstanding_request(self) -> str:
+        """Mint + record a request_id for a balance_request we are about to send. Bounded FIFO."""
+        rid = str(uuid.uuid4())
+        self._outstanding_request_ids[rid] = None
+        while len(self._outstanding_request_ids) > _MAX_OUTSTANDING_REQUEST_IDS:
+            self._outstanding_request_ids.popitem(last=False)  # evict oldest
+        return rid
 
     def start(self) -> None:
         """Subscribe to gossip and register direct message handlers."""
@@ -266,7 +288,7 @@ class LedgerSync:
                     sender_id=self.identity.node_id,
                     payload={
                         "subtype": "balance_request",
-                        "request_id": str(uuid.uuid4()),
+                        "request_id": self._register_outstanding_request(),
                         "requester_balance": my_balance,
                         "recent_tx_ids": my_recent_txs,
                     },
@@ -307,8 +329,23 @@ class LedgerSync:
         automatically.  At small network scale, discrepancies typically
         resolve within a gossip round.
         """
+        # sp1428 — DROP unsolicited responses. We only process a balance_response whose request_id
+        # matches a balance_request we actually SENT (and consume it, one-shot). Without this, any
+        # connected peer could push an unsolicited response and make us DB-scan its payload.
+        request_id = msg.payload.get("request_id", "")
+        if request_id not in self._outstanding_request_ids:
+            logger.debug(
+                "Dropping balance_response with unknown/duplicate request_id from %s...",
+                peer.peer_id[:12],
+            )
+            return
+        del self._outstanding_request_ids[request_id]
+
         responder_balance = msg.payload.get("responder_balance", 0)
-        peer_recent_txs = msg.payload.get("recent_tx_ids", [])
+        # sp1428 — CAP the id count. A legit response echoes <=20 ids (the request path's limit);
+        # this bound stops a hostile/oversized list from driving an unbounded per-element DB storm
+        # on the shared ledger connection (a money-path DoS).
+        peer_recent_txs = list(msg.payload.get("recent_tx_ids", []) or [])[:_MAX_RECONCILIATION_TX_IDS]
 
         # Check if we have all of the peer's recent transactions
         missing = 0

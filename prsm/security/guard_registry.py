@@ -204,6 +204,20 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1426_escrow_settle_only_pays_addressed.py",
         kills_test_id="test_addressless_creator_stays_pending_and_is_not_booked",
     ),
+    Guard(
+        id="reconciliation-balance-response-tx-cap",
+        sprint="sp1428",
+        file="prsm/node/ledger_sync.py",
+        anchor="[:_MAX_RECONCILIATION_TX_IDS]",
+        protects="a resource-exhaustion DoS of the money event loop. sp1419 activated "
+                 "reconciliation on every default node, turning on _handle_balance_response, which "
+                 "iterated a peer-supplied recent_tx_ids list with up to 2 awaited SQLite lookups "
+                 "per element on the shared ledger connection. Without this cap a hostile peer "
+                 "sends one oversized balance_response (a 256MB frame ~= millions of ids) and "
+                 "monopolizes the ledger connection, starving concurrent transfers/credits",
+        killed_by="tests/unit/test_sprint_1428_balance_response_dos.py",
+        kills_test_id="test_a_giant_tx_id_list_does_not_produce_unbounded_db_lookups",
+    ),
 ]
 
 
