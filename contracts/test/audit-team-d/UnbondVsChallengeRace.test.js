@@ -123,9 +123,12 @@ describe("[Team D] D3 — Unbond/withdraw races slash under misconfigured window
 
     // Challenger fires DOUBLE_SPEND at day 5 — slash now SUCCEEDS
     // because stake is still UNBONDING (slashable).
+    // sp1429 first-committer-wins: challenge the LATER duplicate (batchId2) citing the EARLIER
+    // original (batchId1). Both are the provider's, so this slashes the same provider — the guard
+    // requires the cited conflict to be strictly earlier.
     const auxData = ethers.AbiCoder.defaultAbiCoder().encode(
       ["bytes32", "bytes32[]"],
-      [batchId2, []]
+      [batchId1, []]
     );
 
     const fdReserveBefore = await stakeBond.foundationReserveBalance();
@@ -133,7 +136,7 @@ describe("[Team D] D3 — Unbond/withdraw races slash under misconfigured window
 
     await expect(
       registry.connect(challenger).challengeReceipt(
-        batchId1, leaf, [], 0 /* DOUBLE_SPEND */, auxData
+        batchId2, leaf, [], 0 /* DOUBLE_SPEND */, auxData
       )
     ).to.emit(stakeBond, "Slashed");
 

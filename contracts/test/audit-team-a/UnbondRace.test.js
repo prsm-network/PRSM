@@ -149,9 +149,13 @@ describe("AUDIT-TEAM-A — A02 Unbond/Challenge race lets attacker dodge slash",
     //              discovers fraud and lands a DOUBLE_SPEND challenge.
     //              The slasher fires successfully because the stake is
     //              still UNBONDING (status==2), not WITHDRAWN.
+    // sp1429 first-committer-wins: challenge the LATER duplicate (batchId2) citing the EARLIER
+    // original (batchId1). Both are the attacker's, so this slashes the attacker either way — but
+    // the guard only slashes the later duplicate (protecting the honest first committer), so the
+    // conflict must be the strictly-earlier batch.
     const auxData = ethers.AbiCoder.defaultAbiCoder().encode(
       ["bytes32", "bytes32[]"],
-      [batchId2, []]
+      [batchId1, []]
     );
 
     const reserveBefore = await stakeBond.foundationReserveBalance();
@@ -159,7 +163,7 @@ describe("AUDIT-TEAM-A — A02 Unbond/Challenge race lets attacker dodge slash",
 
     await expect(
       registry.connect(challenger).challengeReceipt(
-        batchId1, leaf, [], 0, auxData  // 0 = DOUBLE_SPEND
+        batchId2, leaf, [], 0, auxData  // 0 = DOUBLE_SPEND
       )
     ).to.emit(stakeBond, "Slashed");
 
