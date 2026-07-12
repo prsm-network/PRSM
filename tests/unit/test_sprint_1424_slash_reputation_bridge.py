@@ -37,7 +37,13 @@ class _Slash:
 
 
 def _resolver(mapping):
-    return lambda op: mapping.get(str(op))
+    # sp1430 — resolver now returns a LIST of node_ids for an operator (all claimants).
+    def _r(op):
+        v = mapping.get(str(op))
+        if v is None:
+            return []
+        return list(v) if isinstance(v, (list, tuple, set)) else [v]
+    return _r
 
 
 class TestSlashesReachTheScore:
@@ -50,7 +56,7 @@ class TestSlashesReachTheScore:
         recorded, unmapped = apply_onchain_slashes_to_reputation(
             events=[_Slash(OP_A, "0x" + "11" * 32, 10**18, "0x" + "aa" * 32)],
             tracker=tracker,
-            resolve_node_id=_resolver({OP_A: NODE_A}),
+            resolve_node_ids=_resolver({OP_A: NODE_A}),
             already_recorded=seen,
         )
 
@@ -69,7 +75,7 @@ class TestSlashesReachTheScore:
         apply_onchain_slashes_to_reputation(
             events=[_Slash(OP_A, "0x" + "11" * 32, 10**18, "0x" + "aa" * 32)],
             tracker=tracker,
-            resolve_node_id=_resolver({OP_A: NODE_A}),
+            resolve_node_ids=_resolver({OP_A: NODE_A}),
             already_recorded=set(),
         )
         assert tracker.has_been_slashed(NODE_A) is True
@@ -83,11 +89,11 @@ class TestIdempotency:
         ev = _Slash(OP_A, "0x" + "11" * 32, 10**18, "0x" + "aa" * 32)
         seen = set()
         r1, _ = apply_onchain_slashes_to_reputation(
-            events=[ev], tracker=tracker, resolve_node_id=_resolver({OP_A: NODE_A}),
+            events=[ev], tracker=tracker, resolve_node_ids=_resolver({OP_A: NODE_A}),
             already_recorded=seen,
         )
         r2, _ = apply_onchain_slashes_to_reputation(
-            events=[ev], tracker=tracker, resolve_node_id=_resolver({OP_A: NODE_A}),
+            events=[ev], tracker=tracker, resolve_node_ids=_resolver({OP_A: NODE_A}),
             already_recorded=seen,  # SAME set — simulates the next scan of overlapping windows
         )
         assert (r1, r2) == (1, 0), "the second scan re-recorded a slash it had already applied"
@@ -105,7 +111,7 @@ class TestUnmappableSlashes:
             recorded, unmapped = apply_onchain_slashes_to_reputation(
                 events=[_Slash(OP_B, "0x" + "22" * 32, 10**18, "0x" + "bb" * 32)],
                 tracker=tracker,
-                resolve_node_id=_resolver({}),  # OP_B not known to discovery
+                resolve_node_ids=_resolver({}),  # OP_B not known to discovery
                 already_recorded=set(),
             )
         assert (recorded, unmapped) == (0, 1)
@@ -121,7 +127,7 @@ class TestUnmappableSlashes:
                 _Slash(OP_B, "0x" + "22" * 32, 10**18, "0x" + "bb" * 32),
             ],
             tracker=tracker,
-            resolve_node_id=_resolver({OP_A: NODE_A}),  # only A is known
+            resolve_node_ids=_resolver({OP_A: NODE_A}),  # only A is known
             already_recorded=set(),
         )
         assert (recorded, unmapped) == (1, 1)
@@ -142,7 +148,7 @@ class TestFailSafe:
         recorded, _ = apply_onchain_slashes_to_reputation(
             events=[_Bad(), good],
             tracker=tracker,
-            resolve_node_id=_resolver({OP_A: NODE_A}),
+            resolve_node_ids=_resolver({OP_A: NODE_A}),
             already_recorded=set(),
         )
         assert recorded == 1, "a single corrupt event swallowed a real, recordable slash"
@@ -157,7 +163,7 @@ class TestFailSafe:
         recorded, unmapped = apply_onchain_slashes_to_reputation(
             events=[_Slash(OP_A, "0x" + "11" * 32, 10**18, "0x" + "aa" * 32)],
             tracker=tracker,
-            resolve_node_id=_boom,
+            resolve_node_ids=_boom,
             already_recorded=set(),
         )
         assert (recorded, unmapped) == (0, 1)
@@ -195,3 +201,40 @@ class TestTheWatchIsWiredIntoTheNode:
             assert forbidden not in body, (
                 f"the slash-watch must never {forbidden} — it is read-only chain observability"
             )
+
+
+class TestDecoyCannotAbsorbTheSlash:
+    """sp1430 (money-path audit #4) — a slashed provider must not evade the penalty by running a
+    decoy peer that advertises its operator_address to soak the one-shot slash."""
+
+    def test_every_node_claiming_the_operator_is_penalized_not_just_the_first(self):
+        tracker = ReputationTracker()
+        decoy = "d" * 32
+        # BOTH the real dispatch node (NODE_A) and a throwaway decoy advertise OP_A.
+        recorded, unmapped = apply_onchain_slashes_to_reputation(
+            events=[_Slash(OP_A, "0x" + "11" * 32, 10**18, "0x" + "aa" * 32)],
+            tracker=tracker,
+            resolve_node_ids=_resolver({OP_A: [decoy, NODE_A]}),  # decoy listed FIRST
+            already_recorded=set(),
+        )
+        assert (recorded, unmapped) == (2, 0)
+        assert tracker.has_been_slashed(NODE_A) is True, (
+            "the provider's REAL node kept full reputation — a decoy absorbed the one-shot slash "
+            "and defeated sp1424"
+        )
+        assert tracker.has_been_slashed(decoy) is True  # the decoy penalizes itself (harmless)
+
+    def test_multi_node_slash_is_deduped_per_node_across_rescans(self):
+        tracker = ReputationTracker()
+        seen = set()
+        ev = _Slash(OP_A, "0x" + "11" * 32, 10**18, "0x" + "aa" * 32)
+        r1, _ = apply_onchain_slashes_to_reputation(
+            events=[ev], tracker=tracker, resolve_node_ids=_resolver({OP_A: [NODE_A, NODE_B]}),
+            already_recorded=seen,
+        )
+        r2, _ = apply_onchain_slashes_to_reputation(
+            events=[ev], tracker=tracker, resolve_node_ids=_resolver({OP_A: [NODE_A, NODE_B]}),
+            already_recorded=seen,  # SAME set — next overlapping-window scan
+        )
+        assert (r1, r2) == (2, 0), "a re-scan re-applied a slash already recorded per node"
+        assert tracker.slashed_count(NODE_A) == 1 and tracker.slashed_count(NODE_B) == 1

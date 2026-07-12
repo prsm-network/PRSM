@@ -6737,24 +6737,32 @@ class PRSMNode:
 
         seen: set = set()
 
-        def _resolve_node_id(operator_address: str):
-            """operator eth-address -> node_id via discovery's advertised hardware_profile."""
+        def _resolve_node_ids(operator_address: str):
+            """operator eth-address -> ALL node_ids advertising it, via discovery hardware_profile.
+
+            sp1430 (audit #4) — returns EVERY match, not just the first: a slashed provider could
+            otherwise run a decoy peer advertising its operator_address to soak the one-shot slash
+            while its real dispatch node kept full selection weight.
+            """
             disc = getattr(self, "discovery", None)
             if disc is None or not operator_address:
-                return None
+                return []
             try:
                 peers = disc.get_known_peers()
             except Exception:  # noqa: BLE001 — discovery hiccup: no resolution this cycle
-                return None
+                return []
             target = str(operator_address).lower()
+            out = []
             for p in (peers or []):
                 hw = getattr(p, "hardware_profile", None)
                 if not isinstance(hw, dict):
                     continue
                 op = hw.get("operator_address")
                 if op and str(op).lower() == target:
-                    return getattr(p, "node_id", None)
-            return None
+                    nid = getattr(p, "node_id", None)
+                    if nid:
+                        out.append(nid)
+            return out
 
         logger.info(
             "sp1424 reputation slash-watch launched (read-only, never-signs; interval=%.0fs).",
@@ -6772,7 +6780,7 @@ class PRSMNode:
                     apply_onchain_slashes_to_reputation,
                     events=events,
                     tracker=tracker,
-                    resolve_node_id=_resolve_node_id,
+                    resolve_node_ids=_resolve_node_ids,
                     already_recorded=seen,
                 )
                 if recorded or unmapped:

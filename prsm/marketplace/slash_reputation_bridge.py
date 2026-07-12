@@ -51,42 +51,53 @@ def apply_onchain_slashes_to_reputation(
     *,
     events: Iterable[Any],
     tracker: Any,
-    resolve_node_id: Callable[[str], Optional[str]],
-    already_recorded: Set[Tuple[str, str]],
+    resolve_node_ids: Callable[[str], Iterable[str]],
+    already_recorded: Set[Tuple[str, ...]],
 ) -> Tuple[int, int]:
-    """Record each NEW on-chain slash into ``tracker`` under the provider's node_id.
+    """Record each NEW on-chain slash into ``tracker`` under EVERY node_id that claims the slashed
+    operator address.
 
     ``events``: iterable of ``stake_manager.SlashEvent``.
     ``tracker``: a ``ReputationTracker`` (calls ``record_slash``).
-    ``resolve_node_id``: ``(operator_eth_address) -> node_id | None`` (injected; discovery-backed
-        in prod). Returns None when the operator is not known — that slash is counted as unmapped.
-    ``already_recorded``: a MUTABLE dedup set (see ``slash_dedup_key``), updated in place so the
-        caller's next scan skips slashes already applied.
+    ``resolve_node_ids``: ``(operator_eth_address) -> iterable[node_id]`` (injected; discovery-backed
+        in prod). Returns ALL node_ids advertising that operator_address, or empty when unknown.
 
-    Returns ``(recorded, unmapped)``. Never raises — a single bad event is logged and skipped so
-    one malformed log cannot blind the whole sweep.
+        sp1430 (money-path audit #4): this MUST resolve to every match, not just the first. A slashed
+        provider can run a throwaway DECOY peer that advertises the slashed operator_address; if only
+        one node_id absorbs the (per-slash) penalty, the decoy soaks it while the provider's real
+        dispatch node keeps score_for()=0.5 and has_been_slashed()=False — evading sp1424 entirely.
+        The same under-penalty hit an honest multi-device operator (1 of N node_ids penalized).
+        Penalizing EVERY claimant closes the evasion; the only "cost" is that a decoy also penalizes
+        itself, which is harmless (self-harm), and the mapping still cannot forge a penalty onto a
+        node that does not itself advertise the address.
+
+    ``already_recorded``: a MUTABLE dedup set, updated in place. Keyed per ``(tx_hash, reason_id,
+        node_id)`` for applied slashes (so overlapping rescans don't double-count into a node's
+        deque) and per ``(tx_hash, reason_id, "")`` for the unmapped case (so we don't re-log it).
+
+    Returns ``(recorded, unmapped)`` where recorded counts node-level applications. Never raises — a
+    single bad event is logged and skipped so one malformed log cannot blind the whole sweep.
     """
     recorded = 0
     unmapped = 0
     for ev in events:
         try:
-            key = slash_dedup_key(ev)
-            if key in already_recorded:
-                continue
+            tx_hash, reason_id = slash_dedup_key(ev)
 
             operator = str(getattr(ev, "provider", "") or "")
-            node_id = None
+            node_ids = []
             try:
-                node_id = resolve_node_id(operator) if operator else None
+                if operator:
+                    node_ids = [str(n) for n in (resolve_node_ids(operator) or []) if n]
             except Exception as exc:  # noqa: BLE001 — a resolver hiccup must not abort the sweep
                 logger.debug("sp1424 slash node-id resolve failed for %s: %s", operator, exc)
-                node_id = None
+                node_ids = []
 
-            if not node_id:
-                # Mark it seen so we don't re-log it every cycle, but count it: an operator we
-                # cannot map today may become mappable once it appears in discovery, and either
-                # way the operator should know a slashed provider is out there unaccounted for.
-                already_recorded.add(key)
+            if not node_ids:
+                unmapped_key = (tx_hash, reason_id, "")
+                if unmapped_key in already_recorded:
+                    continue
+                already_recorded.add(unmapped_key)
                 unmapped += 1
                 logger.warning(
                     "sp1424: on-chain slash of operator %s (batch %s, %s wei) could NOT be mapped "
@@ -96,21 +107,25 @@ def apply_onchain_slashes_to_reputation(
                 )
                 continue
 
-            tracker.record_slash(
-                provider_id=node_id,
-                batch_id=str(getattr(ev, "reason_id", "") or "unknown"),
-                slash_amount_wei=int(getattr(ev, "slash_amount_wei", 0) or 0),
-                reason=_ONCHAIN_SLASH_REASON,
-                tx_hash=str(getattr(ev, "tx_hash", "") or "") or None,
-            )
-            already_recorded.add(key)
-            recorded += 1
-            logger.critical(
-                "sp1424: recorded on-chain SLASH against provider node %s (operator %s, batch %s, "
-                "%s wei) — its reputation score is now penalized and has_been_slashed()=True.",
-                node_id, operator, getattr(ev, "reason_id", "?"),
-                getattr(ev, "slash_amount_wei", "?"),
-            )
+            for node_id in dict.fromkeys(node_ids):  # de-dupe within one event, preserve order
+                key = (tx_hash, reason_id, node_id)
+                if key in already_recorded:
+                    continue
+                tracker.record_slash(
+                    provider_id=node_id,
+                    batch_id=str(getattr(ev, "reason_id", "") or "unknown"),
+                    slash_amount_wei=int(getattr(ev, "slash_amount_wei", 0) or 0),
+                    reason=_ONCHAIN_SLASH_REASON,
+                    tx_hash=str(getattr(ev, "tx_hash", "") or "") or None,
+                )
+                already_recorded.add(key)
+                recorded += 1
+                logger.critical(
+                    "sp1424: recorded on-chain SLASH against provider node %s (operator %s, batch "
+                    "%s, %s wei) — its reputation score is now penalized and has_been_slashed()=True.",
+                    node_id, operator, getattr(ev, "reason_id", "?"),
+                    getattr(ev, "slash_amount_wei", "?"),
+                )
         except Exception as exc:  # noqa: BLE001 — never let one event abort the batch
             logger.error("sp1424: failed to apply a slash event (%s); skipped.", exc)
 
