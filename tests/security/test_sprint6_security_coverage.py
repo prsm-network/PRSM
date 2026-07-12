@@ -115,7 +115,6 @@ from prsm.core.cryptography.post_quantum_production import (
 # ---------------------------------------------------------------------------
 from prsm.node.dag_ledger import (
     DAGLedger,
-    DAGLedgerAdapter,
     DAGTransaction,
     DAGState,
     TransactionType,
@@ -1215,104 +1214,6 @@ class TestDAGLedgerExtended:
         assert isinstance(state.tips, set)
         assert isinstance(state.transactions, dict)
         assert isinstance(state.approvals, dict)
-
-
-class TestDAGLedgerAdapter:
-    """Tests for DAGLedgerAdapter."""
-
-    @pytest_asyncio.fixture
-    async def adapter(self):
-        dag = DAGLedger(db_path=":memory:", verify_signatures=False)
-        adapter = DAGLedgerAdapter(dag)
-        await adapter.initialize()
-        yield adapter
-        await adapter.close()
-
-    @pytest.mark.asyncio
-    async def test_create_wallet(self, adapter):
-        await adapter.create_wallet("w1", "Wallet 1")
-        assert await adapter.wallet_exists("w1") is True
-
-    @pytest.mark.asyncio
-    async def test_get_balance(self, adapter):
-        balance = await adapter.get_balance("nobody")
-        assert balance == 0.0
-
-    @pytest.mark.asyncio
-    async def test_credit_and_transfer(self, adapter):
-        await adapter.credit("alice", 100.0, TransactionType.WELCOME_GRANT, "Grant")
-        balance = await adapter.get_balance("alice")
-        assert balance == 100.0
-        tx = await adapter.transfer("alice", "bob", 30.0, TransactionType.TRANSFER, "Pay")
-        assert tx is not None
-        assert await adapter.get_balance("alice") == 70.0
-
-    @pytest.mark.asyncio
-    async def test_get_transaction_history(self, adapter):
-        await adapter.credit("alice", 100.0, TransactionType.WELCOME_GRANT)
-        history = await adapter.get_transaction_history("alice")
-        assert len(history) >= 1
-
-    @pytest.mark.asyncio
-    async def test_get_transaction_count(self, adapter):
-        await adapter.credit("alice", 50.0, TransactionType.WELCOME_GRANT)
-        count = await adapter.get_transaction_count("alice")
-        assert count >= 1
-
-    @pytest.mark.asyncio
-    async def test_nonce_ops(self, adapter):
-        assert await adapter.has_seen_nonce("n1") is False
-        await adapter.record_nonce("n1", "origin")
-        assert await adapter.has_seen_nonce("n1") is True
-
-    @pytest.mark.asyncio
-    async def test_issue_welcome_grant(self, adapter):
-        tx = await adapter.issue_welcome_grant("user1")
-        assert tx.tx_type == TransactionType.WELCOME_GRANT
-
-    @pytest.mark.asyncio
-    async def test_has_transaction(self, adapter):
-        assert await adapter.has_transaction("genesis") is True
-        assert await adapter.has_transaction("fake") is False
-
-    @pytest.mark.asyncio
-    async def test_get_recent_tx_ids(self, adapter):
-        await adapter.credit("alice", 50.0, TransactionType.WELCOME_GRANT)
-        ids = await adapter.get_recent_tx_ids("alice")
-        assert isinstance(ids, list)
-
-    @pytest.mark.asyncio
-    async def test_agent_allowance_methods(self, adapter):
-        """Test agent allowance methods on DAGLedgerAdapter."""
-        # Create a principal wallet with balance for agent debit
-        await adapter.credit("p1", 100.0, TransactionType.WELCOME_GRANT)
-
-        await adapter.grant_agent_allowance("p1", "a1", 10.0)
-        result = await adapter.get_agent_allowance("a1")
-        assert result is not None
-        assert result["allowance"] == 10.0
-        assert result["remaining"] == 10.0
-
-        debit_tx = await adapter.agent_debit("a1", 5.0, TransactionType.TRANSFER)
-        assert debit_tx is not None
-        updated = await adapter.get_agent_allowance("a1")
-        assert updated["spent"] == 5.0
-
-        revoked = await adapter.revoke_agent_allowance("p1", "a1")
-        assert revoked is True
-        after_revoke = await adapter.get_agent_allowance("a1")
-        assert after_revoke["revoked"] is True
-
-    def test_get_stats_sync(self, adapter):
-        """Test the sync get_stats wrapper.
-
-        When called inside a running event loop (as happens under pytest-asyncio),
-        get_stats returns either the real stats or a stub dict with dag_mode=True.
-        """
-        stats = adapter.get_stats()
-        assert isinstance(stats, dict)
-        # May contain real stats or the stub with dag_mode
-        assert "total_transactions" in stats or "dag_mode" in stats
 
 
 # =============================================================================

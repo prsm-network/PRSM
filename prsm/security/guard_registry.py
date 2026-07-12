@@ -143,10 +143,10 @@ GUARDS: List[Guard] = [
         id="ledger-reconciliation-tx-ids-on-default-ledger",
         sprint="sp1419",
         file="prsm/node/dag_ledger.py",
-        # NB: `async def get_recent_tx_ids` is NOT unique in this file — the DEAD DAGLedgerAdapter
-        # (never instantiated anywhere in prsm/) defines one too, and that decoy is precisely why
-        # everyone believed the default ledger was covered. Anchor on the real method's body, which
-        # calls self.get_transaction_history (the adapter's delegates to self._dag).
+        # Anchor on the method BODY (not `async def get_recent_tx_ids`): the body line is the
+        # distinctive, behaviour-bearing part. (A dead DAGLedgerAdapter used to define a rival
+        # get_recent_tx_ids that made the signature non-unique and the default ledger look
+        # covered; the adapter was removed in sp1427, but the body anchor remains the right pin.)
         anchor="history = await self.get_transaction_history(wallet_id, limit)",
         protects="balance reconciliation silently dying on EVERY default node. LedgerSync calls "
                  "self.ledger.get_recent_tx_ids() to build its balance proof, but Node builds a "

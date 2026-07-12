@@ -5,8 +5,8 @@ DEFAULT (`prsm/node/config.py`: `ledger_type: str = "dag"`). It then hands that 
 `LedgerSync`, whose `_run_reconciliation()` and `_handle_balance_request()` both call
 `self.ledger.get_recent_tx_ids(...)`.
 
-`DAGLedger` never had that method. Only `LocalLedger` (the non-default legacy ledger) and
-`DAGLedgerAdapter` (which is dead code — never instantiated anywhere in prsm/) do. So on a default
+`DAGLedger` never had that method. Only `LocalLedger` (the non-default legacy ledger) had it (plus
+a dead `DAGLedgerAdapter` that made it look present — since removed in sp1427). So on a default
 node every reconciliation cycle raised AttributeError, and `_reconciliation_loop` swallowed it:
 
     try:

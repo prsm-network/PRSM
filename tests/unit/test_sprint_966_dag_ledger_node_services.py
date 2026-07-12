@@ -7,7 +7,7 @@ prune_gossip_log / upsert_provenance / get_provenance / get_signed_provenance) a
 had no provenance_chains table — so gossip-log persistence + digest catch-up and
 the durable provenance cache/lookup were SILENTLY DEAD on the default backend
 (every call AttributeError'd and was swallowed by callers' try/except). The
-DAGLedgerAdapter built to provide this surface was never wired. This made
+DAGLedgerAdapter built to provide this surface was never wired (and was removed in sp1427). This made
 sp961/964/965 dormant on default nodes.
 
 Fix: additively mirror the node-services surface (the same SQL LocalLedger uses)
