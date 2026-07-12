@@ -218,6 +218,23 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1428_balance_response_dos.py",
         kills_test_id="test_a_giant_tx_id_list_does_not_produce_unbounded_db_lookups",
     ),
+    Guard(
+        id="settlement-durable-committed-escrow-dedup",
+        sprint="sp1436",
+        file="prsm/settlement/client.py",
+        anchor="br.local_escrow_id and br.local_escrow_id in self._committed_escrow_ids",
+        protects="double-settle by RE-DELIVERY. sp973's dedup lives on the per-batch "
+                 "PendingBatch.seen_escrow_ids set, which is discarded the instant a batch commits "
+                 "and pops. A receipt re-delivered AFTER its batch committed (a crash in the "
+                 "commit->discard window, or an upstream retry) therefore sailed past the per-batch "
+                 "dedup, built a FRESH batch, and committed a SECOND time under a distinct on-chain "
+                 "batchId — the registry has no content dedup, so the provider is paid / the escrow "
+                 "is drained twice for one unit of work. This reject consults the DURABLE "
+                 "_committed_escrow_ids ledger (persisted across restarts) and drops an "
+                 "already-settled escrow id. Delete it and the re-delivery double-settle returns",
+        killed_by="tests/unit/test_sprint_1436_committed_escrow_dedup.py",
+        kills_test_id="test_redelivery_after_commit_is_dropped_no_second_settle",
+    ),
 ]
 
 

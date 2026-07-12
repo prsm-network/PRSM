@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Protocol, Tuple, TYPE_CHECKING
 
@@ -57,6 +58,14 @@ from prsm.economy.web3.provenance_registry import BroadcastFailedError
 logger = logging.getLogger(__name__)
 
 _STATE_VERSION = 1
+
+# sp1436 (money-path audit #2) — cap on the DURABLE committed-escrow-id ledger. Each on-chain
+# commit records its receipts' local_escrow_ids here so a re-delivered receipt (crash in the
+# commit→discard window, or an upstream retry after commit) cannot double-settle. Bounded FIFO: an
+# id evicted after this many commits is far past any re-delivery window (bounded by the sp1316
+# auth-validity), so eviction cannot re-open the hole in practice while keeping the set + its
+# persisted size bounded on a long-running node.
+_MAX_COMMITTED_ESCROW_IDS = 200_000
 
 
 def _locked(method):
@@ -256,6 +265,15 @@ class BatchSettlementClient:
         # cleared once the batch is promoted to _tracked; leftovers on restart are
         # resolved by recover_committing_intents (chain scan by root).
         self._committing: Dict[str, CommitIntent] = {}
+        # sp1436 (money-path audit #2) — the DURABLE committed-escrow-id ledger. Every
+        # local_escrow_id whose batch has been committed on-chain is recorded here (bounded FIFO)
+        # and PERSISTED. accumulate() rejects a receipt whose escrow_id is already in it, so a
+        # re-delivered receipt cannot be re-committed as a second on-chain batch → no double-settle.
+        # This closes the window recover_committing_intents/_restore_pending do NOT: a crash AFTER a
+        # clean commit (batch in _tracked, _committing empty) but BEFORE the receiver-store discard,
+        # OR any upstream retry after commit. Unlike the accumulator's per-batch seen_escrow_ids
+        # (which resets on pop), this spans committed batches and survives restart.
+        self._committed_escrow_ids: "OrderedDict[str, None]" = OrderedDict()
         # sp1053 — serializes the state-mutating async methods (see @_locked) so a
         # concurrent accumulate (inference settle path) + poll cycle can't race.
         self._lock = asyncio.Lock()
@@ -298,6 +316,19 @@ class BatchSettlementClient:
                 f"requester={br.requester_address!r} — neither matches "
                 f"the client's bound address"
             )
+        # sp1436 (money-path audit #2) — DURABLE cross-batch dedup. If this receipt's escrow id was
+        # already committed on-chain, DROP it: re-accumulating would build a fresh batch and settle
+        # the same work a SECOND time (distinct on-chain batchId; the registry has no content
+        # dedup). This fires on a re-delivery after commit — a crash in the commit→discard window,
+        # or an upstream retry. Silent-drop + return is correct: the receipt is already settled, so
+        # the caller's subsequent discard of its staged task is right and no task gets stuck.
+        if br.local_escrow_id and br.local_escrow_id in self._committed_escrow_ids:
+            logger.warning(
+                "BatchSettlementClient.accumulate: DROPPING already-committed escrow id %s — a "
+                "re-delivered receipt would otherwise double-settle. (Durable dedup working.)",
+                br.local_escrow_id,
+            )
+            return
         self._accumulator.add(br)
         # sp1409 — persist the receipt NOW, not at commit time. The accumulation window
         # is up to `time_threshold_seconds` (1h by default); a restart inside it used to
@@ -391,6 +422,11 @@ class BatchSettlementClient:
             self._accumulator.pop_batch(ready.key)
             self._tracked[record.batch_id] = record
             self._committing.pop(intent_key, None)
+            # sp1436 — record this batch's escrow ids in the durable ledger BEFORE the persist, so
+            # the "already committed" set and the tracked batch land in the SAME state write. A
+            # re-delivery after this point is dropped by accumulate().
+            for br in ready.batch.receipts:
+                self._record_committed_escrow_id(br.local_escrow_id)
             self._persist()
             # sp1135 (data-plane Brick A) — best-effort retention of the ordered
             # receipt set for this committed batch. STRICTLY ADDITIVE: only runs
@@ -748,6 +784,22 @@ class BatchSettlementClient:
 
     # ── Durable state (sp1039, brick 2.5) ────────────────────────
 
+    def _record_committed_escrow_id(self, escrow_id: Optional[str]) -> None:
+        """sp1436 — add an on-chain-committed escrow id to the durable dedup ledger (bounded FIFO).
+
+        Empty ids are skipped (nothing to dedup on). Re-recording moves the id to newest. Over the
+        cap, the OLDEST id is evicted — far past any re-delivery window, so this cannot re-open the
+        double-settle hole in practice.
+        """
+        if not escrow_id:
+            return
+        if escrow_id in self._committed_escrow_ids:
+            self._committed_escrow_ids.move_to_end(escrow_id)
+        else:
+            self._committed_escrow_ids[escrow_id] = None
+        while len(self._committed_escrow_ids) > _MAX_COMMITTED_ESCROW_IDS:
+            self._committed_escrow_ids.popitem(last=False)  # evict oldest
+
     def _persist(self) -> None:
         """Atomically persist the three post-commit state dicts. No-op when no
         store is configured (preserves pre-1039 in-memory behavior).
@@ -796,6 +848,10 @@ class BatchSettlementClient:
             # SettlementStateCorruptError and turn settlement OFF for every operator
             # upgrading across this commit.
             "pending_batches": self._serialize_pending(),
+            # sp1436 — the durable committed-escrow-id ledger, order-preserved (oldest first) so
+            # FIFO eviction survives the round-trip. ADDITIVE + OPTIONAL: an older state file lacks
+            # the key (see _apply_state), so _STATE_VERSION does NOT change.
+            "committed_escrow_ids": list(self._committed_escrow_ids.keys()),
         }
 
     def _serialize_pending(self) -> list:
@@ -876,6 +932,13 @@ class BatchSettlementClient:
                 rh: self._intent_from_dict(d)
                 for rh, d in (state.get("committing") or {}).items()
             }
+            # sp1436 — rehydrate the durable committed-escrow-id ledger. Order-preserved so FIFO
+            # eviction is consistent across restarts. An older file has no key → empty (harmless:
+            # the only cost is that pre-upgrade committed ids aren't deduped, which is exactly the
+            # pre-1436 behavior — no regression).
+            self._committed_escrow_ids = OrderedDict.fromkeys(
+                state.get("committed_escrow_ids") or []
+            )
             # sp1409 — LAST: the pending restore consults the rehydrated intents so a
             # batch a commit intent already owns is never re-added to the accumulator.
             # An older file has no "pending_batches" key → nothing to restore (the

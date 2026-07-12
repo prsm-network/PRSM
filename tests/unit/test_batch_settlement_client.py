@@ -39,6 +39,7 @@ def _make_batched(
     requester: str = REQUESTER_A,
     provider: str = PROVIDER_ADDR,
     value_ftns: int = ONE_FTNS,
+    escrow_id: str = None,
 ) -> BatchedReceipt:
     receipt = ShardExecutionReceipt(
         job_id=f"job-{shard_index}",
@@ -56,7 +57,7 @@ def _make_batched(
         requester_address=requester,
         provider_address=provider,
         value_ftns=value_ftns,
-        local_escrow_id=f"escrow-{shard_index}",
+        local_escrow_id=escrow_id if escrow_id is not None else f"escrow-{shard_index}",
     )
 
 
@@ -250,18 +251,25 @@ def test_commit_multiple_pair_batches_handled_independently():
 
 
 def test_commit_distinct_batch_ids_across_commits():
-    """Two batches with identical content still get distinct batchIds from
-    the contract (per-provider sequence counter). Verifies the mock's
-    default side_effect produces distinct ids."""
+    """Two batches with identical RECEIPT content (same shard_index → same
+    job/output hashes) still get distinct batchIds from the contract
+    (per-provider sequence counter). Verifies the mock's default side_effect
+    produces distinct ids.
+
+    The two receipts carry DISTINCT escrow ids — a genuinely separate escrow
+    allocation for identical logical work. Reusing the SAME escrow id here
+    would (correctly, since sp1436) be dropped as a re-delivery/double-settle,
+    which is a different concern from batchId uniqueness. The escrow id, not
+    the receipt content, is the settlement dedup key."""
     cfg = AccumulatorConfig(count_threshold=1, time_threshold_seconds=3600, value_threshold_ftns=10**30)
     acc = ReceiptAccumulator(cfg)
     contract = _make_mock_contract()
     client = BatchSettlementClient(acc, contract, PROVIDER_ADDR)
 
-    _run(client.accumulate(_make_batched(shard_index=0, requester=REQUESTER_A)))
+    _run(client.accumulate(_make_batched(shard_index=0, requester=REQUESTER_A, escrow_id="escrow-a")))
     c1 = _run(client.commit_ready_batches())
 
-    _run(client.accumulate(_make_batched(shard_index=0, requester=REQUESTER_A)))
+    _run(client.accumulate(_make_batched(shard_index=0, requester=REQUESTER_A, escrow_id="escrow-b")))
     c2 = _run(client.commit_ready_batches())
 
     assert c1[0].batch_id != c2[0].batch_id
