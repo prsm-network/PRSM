@@ -736,7 +736,7 @@ contract BatchSettlementRegistry is Ownable2Step, Pausable {
 
         bool proven;
         if (reason == ReasonCode.DOUBLE_SPEND) {
-            proven = _handleDoubleSpend(leaf, leafHash, auxData);
+            proven = _handleDoubleSpend(batchId, b, leafHash, auxData);
         } else if (reason == ReasonCode.INVALID_SIGNATURE) {
             proven = _handleInvalidSignature(leaf, auxData, b.signatureVerifierAtCommit);
         } else if (reason == ReasonCode.NO_ESCROW) {
@@ -813,28 +813,55 @@ contract BatchSettlementRegistry is Ownable2Step, Pausable {
     }
 
     /**
-     * @dev DOUBLE_SPEND: the same receipt was committed in a different
-     *      batch. auxData layout:
+     * @dev DOUBLE_SPEND: the same receipt was committed in a DIFFERENT,
+     *      EARLIER batch. auxData layout:
      *        abi.encode(bytes32 conflictingBatchId, bytes32[] conflictingProof)
-     *      Succeeds iff the receipt's leafHash is provable in both
-     *      `this batch` (already verified by caller) and the conflicting
-     *      batch.
+     *      Succeeds iff the receipt's leafHash is provable in both `this
+     *      batch` (already verified by caller) and the conflicting batch,
+     *      AND the conflicting batch is a distinct batch committed strictly
+     *      BEFORE this one (first-committer-wins).
+     *
+     *      Audit fix (money-path #1): this handler previously had NEITHER
+     *      guard its sibling _handleConsensusMismatch enforces, so:
+     *        (A) self-reference — passing THIS batch as its own conflict made
+     *            the caller-verified proof re-verify against the same root, so
+     *            ANY receipt in ANY pending batch could be "double-spend"
+     *            challenged against itself; and
+     *        (B) copycat framing — an attacker commits a throwaway batch
+     *            (commitBatch is permissionless) copying the victim's leaf,
+     *            then challenges the HONEST provider's batch citing it.
+     *      Either invalidated the honest provider's payment, slashed their
+     *      stake, and paid the challenger the 70% bounty. The two guards below
+     *      (distinct batch + first-committer-wins) close both, mirroring the
+     *      protections _handleConsensusMismatch already had.
      */
     function _handleDoubleSpend(
-        ReceiptLeaf calldata leaf,
+        bytes32 batchId,
+        Batch storage b,
         bytes32 leafHash,
         bytes calldata auxData
     ) internal view returns (bool) {
         (bytes32 conflictingBatchId, bytes32[] memory conflictingProof) =
             abi.decode(auxData, (bytes32, bytes32[]));
 
+        // (A) Self-referential challenges are blocked — a batch cannot be its
+        //     own conflicting double-spend. (Mirrors _handleConsensusMismatch.)
+        if (conflictingBatchId == batchId) return false;
+
         Batch storage other = batches[conflictingBatchId];
         if (other.status == BatchStatus.NONEXISTENT) {
             revert ConflictingBatchNotCommitted(conflictingBatchId);
         }
-        // Conflicting batch may be PENDING, FINALIZED, or VOIDED — all
-        // establish that the receipt was claimed there too.
 
+        // (B) First-committer-wins: the cited conflict must have been committed
+        //     STRICTLY EARLIER than the challenged batch, so the honest first
+        //     committer is protected and only a later duplicate is slashable. A
+        //     copycat batch committed at or after the victim's batch cannot be
+        //     used to slash the victim. Equal timestamps (same block, ambiguous
+        //     order) fail closed — no slash.
+        if (other.commitTimestamp >= b.commitTimestamp) return false;
+
+        // The receipt must also be provable in the (earlier) conflicting batch.
         return MerkleProof.verify(conflictingProof, other.merkleRoot, leafHash);
     }
 

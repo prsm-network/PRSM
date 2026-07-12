@@ -156,6 +156,67 @@ describe("BatchSettlementRegistry — challengeReceipt", function () {
       expect(batch.invalidatedValueFTNS).to.equal(sharedLeaf.valueFtns);
     });
 
+    it("SECURITY: rejects a self-referential DOUBLE_SPEND (a batch cannot be its own conflict)", async function () {
+      // Money-path audit #1, variant A. Pre-fix, citing THIS batch as its own
+      // conflict re-verified the caller-verified proof against the same root, so
+      // ANY receipt in ANY pending batch could be "double-spend" challenged
+      // against itself — invalidating payment + slashing the honest provider +
+      // paying the challenger the 70% bounty.
+      const leaf = makeLeaf({ valueFtns: ONE_FTNS * 5n });
+      const root = hashLeaf(leaf);
+      const tx = await registry
+        .connect(provider)
+        .commitBatch(requester.address, root, 1, leaf.valueFtns, 0, ethers.ZeroHash, "self");
+      const id = (await tx.wait()).logs.find(
+        (l) => l.fragment && l.fragment.name === "BatchCommitted"
+      ).args[0];
+      // Cite THIS batch as its own conflict.
+      const aux = ethers.AbiCoder.defaultAbiCoder().encode(
+        ["bytes32", "bytes32[]"],
+        [id, []]
+      );
+      await expect(
+        registry.connect(challenger).challengeReceipt(id, leaf, [], 0, aux)
+      ).to.be.revertedWithCustomError(registry, "ChallengeNotProven");
+      expect((await registry.getBatch(id)).invalidatedValueFTNS).to.equal(0);
+    });
+
+    it("SECURITY: rejects a copycat batch committed AFTER the victim (first-committer-wins)", async function () {
+      // Money-path audit #1, variant B. An attacker commits a throwaway batch
+      // copying the victim's leaf AFTER the victim's batch (commitBatch is
+      // permissionless), then challenges the HONEST provider's earlier batch
+      // citing the copycat. Pre-fix this slashed the honest first committer.
+      // The first-committer-wins guard requires the cited conflict to be
+      // STRICTLY EARLIER, so this reverts.
+      const sharedLeaf = makeLeaf({ valueFtns: ONE_FTNS * 5n });
+      const root = hashLeaf(sharedLeaf);
+
+      const txVictim = await registry
+        .connect(provider)
+        .commitBatch(requester.address, root, 1, sharedLeaf.valueFtns, 0, ethers.ZeroHash, "victim");
+      const idVictim = (await txVictim.wait()).logs.find(
+        (l) => l.fragment && l.fragment.name === "BatchCommitted"
+      ).args[0];
+
+      // Attacker's copycat, committed LATER, same leaf.
+      const txCopycat = await registry
+        .connect(challenger)
+        .commitBatch(requester.address, root, 1, sharedLeaf.valueFtns, 0, ethers.ZeroHash, "copycat");
+      const idCopycat = (await txCopycat.wait()).logs.find(
+        (l) => l.fragment && l.fragment.name === "BatchCommitted"
+      ).args[0];
+
+      const aux = ethers.AbiCoder.defaultAbiCoder().encode(
+        ["bytes32", "bytes32[]"],
+        [idCopycat, []]
+      );
+      // Challenge the VICTIM's earlier batch citing the later copycat → must revert.
+      await expect(
+        registry.connect(challenger).challengeReceipt(idVictim, sharedLeaf, [], 0, aux)
+      ).to.be.revertedWithCustomError(registry, "ChallengeNotProven");
+      expect((await registry.getBatch(idVictim)).invalidatedValueFTNS).to.equal(0);
+    });
+
     it("reverts when the conflicting batch does not exist", async function () {
       const { batchId, leaf } = await commitOneLeafBatch();
       const fakeOtherId = ethers.keccak256(
