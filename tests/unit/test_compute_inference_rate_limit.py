@@ -5,13 +5,14 @@ PRSM_INFERENCE_MAX_RPS_PER_REQUESTER. Independent bucket from
 from __future__ import annotations
 
 import os
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 from prsm.node.api import create_api_app
-from prsm.node.rate_limiter import reset_global_bucket
+from prsm.node.rate_limiter import get_or_build_bucket, reset_global_bucket
 
 
 def _node():
@@ -49,6 +50,16 @@ class TestInferenceRateLimit:
         with patch.dict(os.environ, {
             "PRSM_INFERENCE_MAX_RPS_PER_REQUESTER": "2",
         }):
+            # sp1434 — freeze the bucket clock so no token refills mid-test. Same wall-clock flake
+            # (and same fix) as the /compute/forge test: without this the assertion silently
+            # required all 3 round-trips inside 0.5s (burst=2 refills at 2 tok/sec), so a loaded CI
+            # runner refilled a token and the 3rd request sailed past the limiter into the
+            # inference_executor-is-None 503 → "assert 503 == 429". The endpoint fetches this SAME
+            # process-global bucket (name="inference"; rate unchanged → get_or_build_bucket returns
+            # this instance), so freezing _now here holds inside the handler.
+            frozen = time.time()
+            bucket = get_or_build_bucket(2.0, name="inference")
+            bucket._now = lambda: frozen
             client = _client(node)
             for _ in range(2):
                 resp = client.post(
@@ -58,6 +69,11 @@ class TestInferenceRateLimit:
                 # Through to 503 (inference_executor None) — cap
                 # not exceeded.
                 assert resp.status_code == 503
+            # Fail LOUD if the endpoint stopped using the bucket we froze.
+            assert bucket._buckets, (
+                "endpoint did not consume the frozen 'inference' bucket — test no longer measures "
+                "what it thinks it does"
+            )
             resp = client.post(
                 "/compute/inference",
                 json={"prompt": "x", "model_id": "m"},
