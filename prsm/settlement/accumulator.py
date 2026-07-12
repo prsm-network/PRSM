@@ -101,9 +101,16 @@ class PendingBatch:
     tier_slash_rate_bps: int = 0
     consensus_group_id: bytes = b"\x00" * 32
     # sp973 — local_escrow_ids already counted in THIS batch, so a duplicate
-    # add() is a no-op (defense-in-depth against a future replay/double-call into
-    # the accumulator when it is exposed to gossip/API). Resets per batch — a
-    # fresh PendingBatch is created on the next add after pop_batch drains this.
+    # add() is a no-op WITHIN a single un-committed batch. NOT a cross-batch
+    # replay guard: this set is PER-PendingBatch and pop_batch() discards it on
+    # commit, so the next add() for the same key creates a fresh PendingBatch
+    # with an EMPTY seen_escrow_ids. sp1431 (money-path audit #2): callers MUST
+    # NOT rely on this as durable idempotency against a receipt whose batch
+    # already committed — the client keeps NO durable committed-escrow-id ledger
+    # and the registry has no content dedup, so a re-delivered receipt (crash in
+    # the commit→discard window, or an upstream retry) double-settles on-chain.
+    # The real fix (deferred, latent behind gated per-stage settlement) is a
+    # durable committed-escrow-id/leaf ledger consulted here + at commit.
     seen_escrow_ids: Set[str] = field(default_factory=set)
 
     @property

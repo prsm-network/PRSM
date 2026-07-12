@@ -357,9 +357,18 @@ async def drain_and_commit_staged(
     """Drain the staged tasks (oldest-first) and commit each on its node's own client.
 
     Each task is committed via ``commit_staged_task``; on a landed commit it is DISCARDED from the
-    store (``discard_committed=True``) so the next drain won't re-attempt it (the accumulator's
-    ``local_escrow_id`` dedup is the second guard). A task that did NOT commit STAYS staged
-    (retryable next drain). NEVER raises — a per-task failure is isolated in its result."""
+    store (``discard_committed=True``) so the next drain won't re-attempt it. A task that did NOT
+    commit STAYS staged (retryable next drain). NEVER raises — a per-task failure is isolated in its
+    result.
+
+    sp1431 (money-path audit #2) — the discard is the ONLY idempotency for a committed task; the
+    accumulator's ``seen_escrow_ids`` is NOT a durable cross-batch backstop (it resets when the
+    batch pops). So a crash AFTER the on-chain commit lands but BEFORE this discard's atomic persist
+    completes leaves the staged task on disk with no client-side marker, and the next drain
+    re-commits the same receipt as a distinct on-chain batchId → double-settle. The durable fix (a
+    committed-escrow-id ledger, or an idempotency-token check against the client's _tracked before
+    re-committing) is deferred — this path is gated OFF (PRSM_MULTISTAGE_SETTLEMENT + a funded
+    per-stage settler key, both currently unset), so the double-settle is latent, not live."""
     results: List[StageCommitResult] = []
     for staged in store.all_staged():
         try:
