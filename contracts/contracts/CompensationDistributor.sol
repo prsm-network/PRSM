@@ -181,6 +181,14 @@ contract CompensationDistributor is Ownable2Step, ReentrancyGuard {
         emissionController.mintAuthorized(toMint);
     }
 
+    // slither-disable-start reentrancy-balance
+    // TRIAGE (SAST baseline): FALSE POSITIVE. _distribute is internal and reached only through
+    // pullAndDistribute()/distribute(), which are `nonReentrant` (this contract is a
+    // ReentrancyGuard). ftnsToken is the project's own OZ-based FTNSTokenSimple — a plain ERC20
+    // with no ERC777/transfer-callback hooks, so transfer() cannot re-enter. The transfers all
+    // check their return and revert TransferFailed, and `available` is read once and consumed, not
+    // re-read across the calls. No exploitable reentrancy. Suppressed at the site so `fail-on:high`
+    // still catches any NEW reentrancy-balance elsewhere.
     function _distribute() internal {
         uint256 available = ftnsToken.balanceOf(address(this));
         if (available == 0) return;
@@ -204,6 +212,7 @@ contract CompensationDistributor is Ownable2Step, ReentrancyGuard {
         lastDistributionTimestamp = uint64(block.timestamp);
         emit Distributed(toCreator, toOperator, toGrant);
     }
+    // slither-disable-end reentrancy-balance
 
     // -------------------------------------------------------------------------
     // Weight scheduling

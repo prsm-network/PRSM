@@ -85,9 +85,17 @@ jobs:
 
       - name: Upload SARIF to GitHub code scanning
         uses: github/codeql-action/upload-sarif@v3
+        # sp1432 — the crytic/slither-action is a DOCKER action, so the job's
+        # `working-directory: contracts` does NOT apply to it; with target
+        # `contracts/` + `sarif: slither.sarif` it writes the SARIF to the repo
+        # ROOT, not contracts/. The upload previously pointed at
+        # `contracts/slither.sarif` → "Path does not exist" → job red on every
+        # commit. continue-on-error so a code-scanning plumbing hiccup can't
+        # fail the real gate (the fail-on:high Slither step above).
         if: always()
+        continue-on-error: true
         with:
-          sarif_file: contracts/slither.sarif
+          sarif_file: slither.sarif
           category: slither
 
       - name: Upload Slither artifacts
@@ -96,8 +104,9 @@ jobs:
         with:
           name: slither-report
           path: |
-            contracts/slither.sarif
+            slither.sarif
           retention-days: 90
+          if-no-files-found: warn
 
   # ───────────────────────────────────────────────────────────────
   # Fast tier — Aderyn (Cyfrin's Rust-based SAST, complementary to Slither)
@@ -123,11 +132,16 @@ jobs:
         run: npm ci
 
       - name: Install Aderyn
+        # sp1432 — the old cyfrinup install script (raw.githubusercontent.com/Cyfrin/aderyn/dev/
+        # cyfrinup/install) is GONE (404 → the shell ran "404:" → exit 127 → job red on every
+        # commit). Aderyn now ships a cargo-dist installer + prebuilt binaries per release. Pin the
+        # version (supply-chain: bump deliberately, like the slither-action SHA pin above).
         run: |
-          curl -L https://raw.githubusercontent.com/Cyfrin/aderyn/dev/cyfrinup/install \
-            | bash
-          # cyfrinup installs to ~/.cyfrin/bin
-          echo "$HOME/.cyfrin/bin" >> $GITHUB_PATH
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/Cyfrin/aderyn/releases/download/aderyn-v0.6.8/aderyn-installer.sh | sh
+          # cargo-dist installs to $CARGO_HOME/bin (or ~/.cargo/bin) and may fall back to ~/.local/bin.
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Verify Aderyn install
         run: aderyn --version

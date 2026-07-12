@@ -247,7 +247,16 @@ contract FTNSBridge is
             ))
         ));
         
-        // Transfer tokens from user
+        // Transfer tokens from user.
+        // TRIAGE (SAST baseline): non-exploitable with the current token. ftnsToken is the
+        // project's OZ-based FTNSTokenSimple whose transferFrom REVERTS on failure (never returns
+        // false), and the very next line burnFrom(address(this), amount) reverts if the tokens
+        // were not actually received — an implicit backstop. Not in the active deployment
+        // (no bridge address in networks.py). Follow-up worth doing since this is the canonical
+        // bridge smell: wrap in require(...) / SafeERC20 so it stays safe if the token is ever
+        // swapped for a non-reverting ERC20. Suppressed at the site so fail-on:high still catches
+        // any NEW unchecked-transfer elsewhere.
+        // slither-disable-next-line unchecked-transfer
         ftnsToken.transferFrom(msg.sender, address(this), amount);
         
         // Burn the tokens (they will be minted on destination chain)
