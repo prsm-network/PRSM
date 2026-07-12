@@ -59,7 +59,28 @@ any old-bond withdraw (so no batch can be committed against now-un-slashable sta
 StakeBond stake is ~0 (per the F cutover record), so this is likely a no-op — CONFIRM with a live read
 before cutover.
 
-## 4. Fork rehearsal (do this first; operator step — needs a Base archive RPC)
+## 4. Fork rehearsal — ✅ DONE (assistant-rehearsed 2026-07-12, sp1435)
+
+**RESULT: GO.** The full ceremony was dress-rehearsed against a LOCAL fork of Base mainnet
+(`--fork` at block 48550403, real FTNS + Safe state), all green:
+
+- `deploy-audit-bundle.js` → clean deploy + cross-wire; post-deploy invariants all ✅
+  (`escrow.settlementRegistry`/`registry.escrowPool`/`stakeBond.slasher`/`foundationReserveWallet`).
+- `verify-audit-bundle-deployment.js` → "All on-chain state matches manifest."
+- `verify-attestation-commitment-deployment.js` → sp1240 selector present + `batchId` INVARIANT to
+  attestation (roadmap F carries over unchanged).
+- ★ `verify-doublespend-fix-active.js` → **exit 0** on the freshly-deployed registry (self-ref +
+  copycat blocked, legit intact). **NEGATIVE CONTROL: the SAME script against the OLD live registry
+  `0x12a01F6C…` exits 1 — the self-reference AND copycat attacks ACTUALLY SUCCEED on the real
+  deployed mainnet contract (forked state).** This is on-chain confirmation the vuln is live today
+  and that the fresh bundle closes it.
+- `transfer-ownership.js` → `pendingOwner` set to the Foundation Safe on all 3 (Registry/EscrowPool/
+  StakeBond); the 2-of-3 `acceptOwnership` is the gated step (F-rehearsed; `build-f-activation-safe-txs.js`
+  is bundle-agnostic).
+
+The commands below are the reproducible recipe (operator re-runs with their own Base archive RPC).
+
+### 4.x Reproduce (operator — needs a Base archive RPC)
 
 The F ceremony scripts (deploy/verify/Safe-tx/cutover) are already mainnet-fork-rehearsed and
 hardened (sp1293-1295). The ONE new thing here is proving the DS-fix is live, which sp1435 added +
