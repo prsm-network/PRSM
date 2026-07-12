@@ -146,9 +146,15 @@ def deposit_commitment_and_retain(
     if int(fee_wei) <= 0:
         raise ValueError("fee_wei must be > 0")
     assert_content_hash_unclaimed(key_client, content_hash, getattr(key_client, "address", None))
+    # sp1438 (audit B5 #2) — RETAIN the wrapped key BEFORE the on-chain deposit, matching the
+    # sibling publish_paid_content's sp1361 F5 invariant. deposit_key can raise OnChainPendingError
+    # on a receipt-wait timeout while the tx still MINES later; if put() ran after it, that (or any
+    # crash/409 in between) would leave a LIVE payment gate with NO retained key → a buyer pays and
+    # gets a permanent 404 with no refund. A retained key with no live gate is harmless (no one can
+    # pay for it), so retain-first is the only safe order.
+    paid_key_store.put(content_hash, wrapped_key, int(fee_wei))
     tx, status = key_client.deposit_key(
         content_hash, commitment, verifier_address, int(fee_wei))
-    paid_key_store.put(content_hash, wrapped_key, int(fee_wei))
     return tx, status
 
 

@@ -252,6 +252,38 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1437_delegation_provider_binding.py",
         kills_test_id="test_delegation_bound_to_one_provider_cannot_be_spent_at_another",
     ),
+    Guard(
+        id="paid-key-store-durable-default",
+        sprint="sp1438",
+        file="prsm/node/node.py",
+        anchor="resolve_paid_key_store_path(os.environ)",
+        protects="a paid buyer stranded (permanent 404, no refund) after a node restart. The node "
+                 "used to wire PaidKeyStore(PRSM_PAID_KEY_STORE_FILE or None): an unset env var "
+                 "silently degraded the 'DURABLE' retained-key store to IN-MEMORY, so a restart "
+                 "wiped every wrapped key while the on-chain payment gate persists forever. A buyer "
+                 "who then pays via ContentAccessVerifier.payForAccess (FTNS pulled, creator "
+                 "credited, paid=true) GETs /content/paid-key and hits a 404 — the live CAV has no "
+                 "refund. resolve_paid_key_store_path defaults to a durable ~/.prsm path (mirroring "
+                 "the settlement store); reverting to `or None` re-opens the fund loss",
+        killed_by="tests/unit/test_sprint_1438_paid_decrypt_fund_loss.py",
+        kills_test_id="test_resolve_path_defaults_durable_when_env_unset",
+    ),
+    Guard(
+        id="paid-publish-retain-before-deposit",
+        sprint="sp1438",
+        file="prsm/economy/paid_content.py",
+        anchor="paid_key_store.put(content_hash, wrapped_key, int(fee_wei))",
+        protects="a paid buyer stranded via a live gate with no key. deposit_commitment_and_retain "
+                 "(the sole HTTP-wired paid-publish path) used to deposit_key (create the on-chain "
+                 "payment gate) BEFORE retaining the wrapped key — the reverse of the sibling "
+                 "publish_paid_content's sp1361 F5 invariant. deposit_key raises OnChainPendingError "
+                 "on a receipt-wait timeout while the tx still MINES, so put() was skipped yet the "
+                 "gate went live: a buyer pays and gets a permanent 404 (no refund). This put() must "
+                 "stay BEFORE the deposit_key call below it; a retained key with no gate is harmless "
+                 "(no one can pay for it), a live gate with no key is the fund loss",
+        killed_by="tests/unit/test_sprint_1438_paid_decrypt_fund_loss.py",
+        kills_test_id="test_key_is_retained_before_a_failing_deposit_so_it_is_not_stranded",
+    ),
 ]
 
 

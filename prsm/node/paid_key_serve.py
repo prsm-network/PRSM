@@ -82,6 +82,20 @@ class PaidKeyStore:
         return len(self._d)
 
 
+def resolve_paid_key_store_path(environ: Any) -> str:
+    """sp1438 (audit B5 #1) — the DURABLE store path the node wires PaidKeyStore with.
+
+    Returns the operator override ``PRSM_PAID_KEY_STORE_FILE`` if set, else a durable per-user
+    default (``~/.prsm/paid_key_store.json``). The on-chain payment gate persists forever, so the
+    retained wrapped key MUST be durable: an unset env var must NOT silently degrade the store to
+    in-memory, or a buyer who pays after a node restart gets a 404 with no refund (the live
+    ContentAccessVerifier has no refund path). Mirrors the settlement verified-batch store's durable
+    default in node.py — NEVER returns None/empty on the production path."""
+    from pathlib import Path
+    explicit = (environ.get("PRSM_PAID_KEY_STORE_FILE") or "").strip()
+    return explicit or str(Path.home() / ".prsm" / "paid_key_store.json")
+
+
 def build_paid_key_verify_payment(verifier_client: Any) -> Callable[[str, bytes, int], bool]:
     """sp1360 — adapt a ContentAccessVerifierClient into the ``verify_payment(payer, content_hash,
     fee_wei) -> bool`` callable ``serve_paid_key`` gates on (reads verifyPayment on-chain)."""

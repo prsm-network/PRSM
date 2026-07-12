@@ -4618,10 +4618,15 @@ class PRSMNode:
                     from prsm.node.paid_key_serve import (
                         PaidKeyStore,
                         build_paid_key_verify_payment,
+                        resolve_paid_key_store_path,
                     )
-                    # sp1362 (R5 HIGH): durable store so paid buyers aren't stranded on restart.
+                    # sp1362 (R5 HIGH) / sp1438 (audit B5 #1): durable store so paid buyers aren't
+                    # stranded on restart. resolve_paid_key_store_path defaults to a durable
+                    # ~/.prsm path when PRSM_PAID_KEY_STORE_FILE is unset — the bare `or None` here
+                    # silently degraded to in-memory, so a paid buyer got a permanent 404 (no
+                    # refund) after any restart.
                     self._paid_key_store = PaidKeyStore(
-                        os.environ.get("PRSM_PAID_KEY_STORE_FILE", "").strip() or None)
+                        resolve_paid_key_store_path(os.environ))
                     _cav = (os.environ.get("PRSM_CONTENT_ACCESS_VERIFIER") or "").strip()
                     if _cav:
                         from prsm.config.networks import resolve_endpoints
