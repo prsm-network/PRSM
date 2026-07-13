@@ -557,6 +557,23 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1450_per_stage_no_escrow_coverage.py",
         kills_test_id="test_honest_per_stage_batches_are_authorized",
     ),
+    Guard(
+        id="per-stage-published-batch-store-for-observer-challenge",
+        sprint="sp1451",
+        file="prsm/settlement/client_wiring.py",
+        anchor='published_batch_store=getattr(node, "_settlement_published_batch_store", None))',
+        protects="the observer/watchdog challenge data plane being BLIND to per-stage fraud. The "
+                 "settlement audit engine's double-spend/invalid-sig/expired scanners read the "
+                 "VerifiedBatchCache, populated by ingesting receipts fetched via a gossiped announce "
+                 "CID; the announce step advertises every batch in the node's PublishedBatchStore. "
+                 "Passing the node's store to the per-stage client is what makes per-stage committed "
+                 "batches RETAINED + ANNOUNCED (parity with single-stage). Delete it and the per-stage "
+                 "client keeps published_batch_store=None → per-stage batches are never announced → the "
+                 "observer scanners never see them → per-stage fraud by an authorized node goes "
+                 "unsurfaced (the requester's sp1450 NO_ESCROW defense covers only UNauthorized batches)",
+        killed_by="tests/unit/test_sprint_1451_per_stage_observer_challenge_coverage.py",
+        kills_test_id="test_per_stage_client_receives_the_nodes_published_batch_store",
+    ),
 ]
 
 

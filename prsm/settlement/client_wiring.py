@@ -751,7 +751,14 @@ def resolve_per_stage_settlement_client(node: Any, environ=os.environ) -> Option
         client = build_onchain_settlement_client_or_none(
             provider_address=op, env=environ,
             accumulator_config=AccumulatorConfig(count_threshold=1),
-            state_store=SettlementStateStore(Path(state_path)))
+            state_store=SettlementStateStore(Path(state_path)),
+            # sp1451 (challenge-coverage audit wqpo3rg5u) — retain per-stage committed batches into the
+            # node's OWN PublishedBatchStore (the same store the single-stage client uses + the
+            # announce-after-commit step reads). Without this the per-stage client discarded its
+            # receipts, so per-stage batches were never announced → the observer audit engine's
+            # double-spend/invalid-sig/expired scanners were structurally BLIND to per-stage fraud while
+            # single-stage batches were covered. None when the audit data plane is off (parity, no-op).
+            published_batch_store=getattr(node, "_settlement_published_batch_store", None))
     except Exception as exc:  # noqa: BLE001 — never crash the commit cycle on a build error
         logger.warning("resolve_per_stage_settlement_client: build failed (%s: %s)",
                        type(exc).__name__, exc)
