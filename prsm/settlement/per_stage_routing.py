@@ -156,6 +156,24 @@ def verify_routed_settlement_task(
         return PerStageAuthorizationVerdict(
             False, "routed task carries no per-stage authorization (payload, signature) — "
             "refusing to commit an unauthorized share (fail-closed)")
+    # sp1449 (money-audit wgktvg9wk) — BIND the on-chain-settled amount to the AUTHORIZED amount. The
+    # authorization commits to (payee, share_wei) and the gate below enforces membership + cap over
+    # share_wei — but the amount that actually settles on-chain is batched_receipt.value_ftns
+    # (accumulate() sums value_ftns → commitBatch(totalValueFTNS) → settleFromRequester). The honest
+    # splitter sets value_ftns = share_wei, so this only ever rejects a MALFORMED/tampered routed task
+    # whose settled value diverges from what the requester signed — which would over/under-draw the
+    # requester's escrow and get the committing node challenged + slashed. Fail-closed either direction.
+    try:
+        settled_value = int(task.batched_receipt.value_ftns)
+        authorized_share = int(task.share_wei)
+    except (TypeError, ValueError) as exc:
+        return PerStageAuthorizationVerdict(
+            False, f"routed task has a non-integer value_ftns/share_wei: {exc!s} (fail-closed)")
+    if settled_value != authorized_share:
+        return PerStageAuthorizationVerdict(
+            False,
+            f"settled value_ftns ({settled_value}) != authorized share_wei ({authorized_share}) — "
+            "the routed task would settle a different amount than the requester signed (fail-closed)")
     try:
         return verify_per_stage_authorization(
             auth["payload"], auth["signature"],

@@ -523,6 +523,23 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1448_per_stage_commit_failure_double_settle.py",
         kills_test_id="test_per_stage_commit_cycle_runs_recovery_phases",
     ),
+    Guard(
+        id="per-stage-value-bound-to-authorized-share",
+        sprint="sp1449",
+        file="prsm/settlement/per_stage_routing.py",
+        anchor="if settled_value != authorized_share:",
+        protects="a per-stage node settling a DIFFERENT amount than the requester authorized. The "
+                 "per-stage authorization commits to (payee, share_wei) and the gate enforces "
+                 "membership + the cumulative cap over share_wei — but the amount that settles on-chain "
+                 "is batched_receipt.value_ftns (accumulate→commitBatch(totalValueFTNS)→"
+                 "settleFromRequester). The honest splitter sets value_ftns == share_wei, so nothing "
+                 "re-asserted it; a malformed/tampered routed task with value_ftns > share_wei would "
+                 "pass the gate yet over-draw the requester's escrow (and get the committing node "
+                 "challenged + slashed). This binds settled==authorized both directions; delete it and "
+                 "the gate authorizes a share while a different value settles",
+        killed_by="tests/unit/test_sprint_1449_per_stage_value_bound_to_authorized_share.py",
+        kills_test_id="test_gate_rejects_value_ftns_exceeding_authorized_share",
+    ),
 ]
 
 
