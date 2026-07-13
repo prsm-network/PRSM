@@ -492,12 +492,17 @@ def test_double_spend_fraud_defense_onchain_e2e(hardhat_node, deployed):
     a_hex, b_hex = batch_a.batch_id.hex(), batch_b.batch_id.hex()
 
     receipts_by_batch = {a_hex: [dup, filler_a], b_hex: [dup, filler_b]}
+    # sp1429 first-committer-wins: a DOUBLE_SPEND challenge must target the LATER duplicate
+    # (batch_b, committed second) citing the EARLIER original (batch_a). Challenging the FIRST
+    # committer citing a later copycat is correctly rejected on-chain (ChallengeNotProven) — the
+    # honest first commit wins. The preparer treats occurrences[0] as the target (the challenged
+    # batch) and occurrences[1] as the conflicting/cited batch, so batch_b leads the list.
     record = AuditFindingRecord(
-        reason="double_spend", batch_id_hex=a_hex, target_index=0, on_chain_reason=0,
+        reason="double_spend", batch_id_hex=b_hex, target_index=0, on_chain_reason=0,
         detail={"leaf_hash": hash_leaf(batched_receipt_to_leaf(dup)).hex(),
                 "occurrences": [
-                    {"batch_id": a_hex, "leaf_index": 0, "provider_address": provider},
-                    {"batch_id": b_hex, "leaf_index": 0, "provider_address": provider}]})
+                    {"batch_id": b_hex, "leaf_index": 0, "provider_address": provider},
+                    {"batch_id": a_hex, "leaf_index": 0, "provider_address": provider}]})
     prepared = prepare_challenge_from_finding(
         record=record,
         receipt_lookup=lambda b: receipts_by_batch.get(str(b).lower().removeprefix("0x")))
@@ -506,11 +511,12 @@ def test_double_spend_fraud_defense_onchain_e2e(hardhat_node, deployed):
     submitter = ChallengeSubmitter(
         rpc_url=hardhat_node, registry_address=deployed["registry"],
         private_key=deployed["challengerKey"])
-    before = int(cc.contract.functions.batches(batch_a.batch_id).call()[5])
+    # The invalidation lands in the CHALLENGED (target) batch — now batch_b.
+    before = int(cc.contract.functions.batches(batch_b.batch_id).call()[5])
     outcome = gated_broadcast_prepared(prepared, submitter=submitter, broadcast_enabled=True)
     assert outcome.dry_run_ok is True, f"double-spend dry-run should pass: {outcome.dry_run_reason}"
     assert outcome.broadcast is True, f"double-spend should broadcast: {outcome.error_message}"
-    after = int(cc.contract.functions.batches(batch_a.batch_id).call()[5])
+    after = int(cc.contract.functions.batches(batch_b.batch_id).call()[5])
     assert after - before == dup.value_ftns, (
         f"the double-spent receipt must be invalidated in the TARGET batch on-chain; "
         f"before={before} after={after}")
