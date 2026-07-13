@@ -91,16 +91,39 @@ async def test_link_eth_address_rejects_bad_format(ledger):
 
 
 @pytest.mark.asyncio
-async def test_link_eth_address_move_semantics(ledger):
-    """Re-linking the same address to a different wallet moves it
-    (UNIQUE constraint forces this)."""
+async def test_link_eth_address_refuses_cross_wallet_relink(ledger):
+    """sp1441 (deposit-audit hardening) — re-linking an address ALREADY bound to a
+    DIFFERENT wallet is REFUSED (deposit-theft guard), not silently moved. The credit
+    path resolves the wallet at scan time, so a silent move let whoever links a known
+    deposit address LAST steal its next inbound transfer. alice keeps her address."""
     addr = "0x" + "a" * 40
     await ledger.link_eth_address("alice", addr)
-    await ledger.link_eth_address("bob", addr)
-    # bob now owns it; alice has nothing
-    assert await ledger.wallet_for_eth_address(addr) == "bob"
-    assert await ledger.eth_address_for_wallet("alice") is None
-    assert await ledger.eth_address_for_wallet("bob") == addr
+    with pytest.raises(ValueError):
+        await ledger.link_eth_address("bob", addr)
+    # alice still owns it; bob got nothing.
+    assert await ledger.wallet_for_eth_address(addr) == "alice"
+    assert await ledger.eth_address_for_wallet("alice") == addr
+    assert await ledger.eth_address_for_wallet("bob") is None
+
+
+@pytest.mark.asyncio
+async def test_link_eth_address_same_wallet_relink_is_idempotent(ledger):
+    """sp1441 — re-linking the SAME address to the SAME wallet is a harmless no-op."""
+    addr = "0x" + "a" * 40
+    await ledger.link_eth_address("alice", addr)
+    await ledger.link_eth_address("alice", addr)  # must not raise
+    assert await ledger.wallet_for_eth_address(addr) == "alice"
+
+
+@pytest.mark.asyncio
+async def test_link_eth_address_wallet_can_rebind_to_a_fresh_address(ledger):
+    """sp1441 — a wallet rebinding ITS OWN link to a NEW (unclaimed) address is unaffected
+    by the guard (only ANOTHER wallet's claimed address is protected)."""
+    a1, a2 = "0x" + "a" * 40, "0x" + "b" * 40
+    await ledger.link_eth_address("alice", a1)
+    await ledger.link_eth_address("alice", a2)   # rebind to a fresh address — allowed
+    assert await ledger.eth_address_for_wallet("alice") == a2
+    assert await ledger.wallet_for_eth_address(a1) is None
 
 
 @pytest.mark.asyncio

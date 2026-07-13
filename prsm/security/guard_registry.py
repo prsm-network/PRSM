@@ -314,6 +314,23 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1439_withdraw_reconciler_lost_debit.py",
         kills_test_id="test_is_dropped_true_only_when_confirmed_nonce_advanced_past_tx_nonce",
     ),
+    Guard(
+        id="deposit-link-no-cross-wallet-steal",
+        sprint="sp1441",
+        file="prsm/node/local_ledger.py",
+        anchor="existing is not None and existing != wallet_id",
+        protects="deposit THEFT via the eth_address→wallet link. _credit_deposit resolves the "
+                 "destination wallet via wallet_for_eth_address at SCAN time, and link_eth_address "
+                 "used to SILENTLY MOVE an address already bound to another wallet (last-write-wins) "
+                 "— so whoever re-linked a known deposit address LAST before the scan received its "
+                 "next inbound on-chain transfer. Safe today only because the /wallet/* API is "
+                 "loopback-bound + API-key-gated (single-tenant); this guard makes the protection "
+                 "boundary-INDEPENDENT (refuses a cross-wallet re-link) so the theft primitive stays "
+                 "closed if the daemon is ever exposed multi-tenant. Deleting it restores the silent "
+                 "move (the deposit-audit-flagged latent theft)",
+        killed_by="tests/unit/test_sprint_540_bridge_deposit_pattern_a.py",
+        kills_test_id="test_link_eth_address_refuses_cross_wallet_relink",
+    ),
 ]
 
 

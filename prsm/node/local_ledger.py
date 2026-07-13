@@ -311,8 +311,19 @@ class LocalLedger(LedgerNodeServicesMixin):
         Bridge deposits route inbound on-chain transfers from this
         address into the wallet's off-chain balance. Each address
         can be linked to at most ONE wallet_id (UNIQUE index).
-        Re-linking the same address to a different wallet replaces
-        the prior link.
+
+        sp1441 (deposit-audit hardening) — FAIL-SAFE re-link: an address already
+        linked to a DIFFERENT wallet is REFUSED, not silently moved. The credit
+        path (_credit_deposit) resolves the destination wallet via
+        wallet_for_eth_address at SCAN time, so silent move-semantics was a latent
+        deposit-theft primitive: whoever links a known deposit address LAST before
+        the scan receives that address's next inbound transfer. Under the current
+        single-tenant/loopback trust model (the /wallet/* API is loopback-bound and
+        API-key-gated on any public bind) only the operator links their own address,
+        so this never fired — but making the guard boundary-INDEPENDENT means the
+        primitive stays closed if the daemon is ever exposed multi-tenant. Same-wallet
+        re-link stays idempotent; a wallet rebinding its OWN address to a new one is
+        unaffected (only ANOTHER wallet's claimed address is protected).
         """
         if not wallet_id:
             raise ValueError("wallet_id must be non-empty")
@@ -322,8 +333,16 @@ class LocalLedger(LedgerNodeServicesMixin):
             )
         # Normalize: lowercase (we'll checksum on read paths)
         addr_norm = eth_address.lower()
+        # sp1441 — refuse to steal an address already bound to a different wallet.
+        existing = await self.wallet_for_eth_address(addr_norm)
+        if existing is not None and existing != wallet_id:
+            raise ValueError(
+                f"eth_address {addr_norm} is already linked to a different wallet; "
+                f"it must be explicitly unlinked from that wallet before re-linking "
+                f"(refusing a silent move — deposit-theft guard)"
+            )
         await self._ensure_wallet(wallet_id)
-        # Clear any existing link for this eth_address (move semantics)
+        # Clear any existing link for this eth_address (idempotent same-wallet re-link).
         await self._db.execute(
             "UPDATE wallets SET eth_address = NULL WHERE eth_address = ?",
             (addr_norm,),
