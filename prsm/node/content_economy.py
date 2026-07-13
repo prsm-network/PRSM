@@ -543,6 +543,25 @@ class ContentEconomy:
         if distributor is None:
             return None
 
+        # sp1455 (money-audit w6x780nqe) — COLLECTION GATE. distribute_royalty pulls `gross` FROM THIS
+        # OPERATOR's own wallet (transferFrom msg.sender). process_content_access Step 1 debits/escrows
+        # ONLY when accessor_id == our node; a REMOTE accessor "pays via their own node" and is never
+        # charged here. Funding the on-chain royalty for a remote access would therefore spend the
+        # operator's FTNS with no offsetting collection — and since the on-chain leg has no per-access
+        # dedup and each request mints a fresh random payment_id (royalty_dispatch_key forbids a random
+        # key), ANY peer replaying the same content request N times would drive N operator-funded
+        # distributions and drain the wallet while over-crediting creators. So: only fund the on-chain
+        # royalty for an access THIS node collected. Remote accesses fall through to LOCAL royalty
+        # bookkeeping (return None); their real on-chain royalty settles via the settlement/forge path
+        # (sp911), which claims a STABLE per-settlement idempotency key.
+        if payment.accessor_id != self.identity.node_id:
+            logger.debug(
+                "on-chain royalty skipped for content %s: access by %s was not collected by this "
+                "node (remote accessors settle via their own node) — using local bookkeeping",
+                payment.content_id[:12], payment.accessor_id,
+            )
+            return None
+
         serving_node_addr = self._serving_node_address()
         if not serving_node_addr:
             logger.debug("on-chain distribute skipped: no serving-node 0x address")

@@ -621,6 +621,23 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1454_withdraw_requires_sig_failclosed.py",
         kills_test_id="test_fails_closed_on_read_error",
     ),
+    Guard(
+        id="content-royalty-collection-gate",
+        sprint="sp1455",
+        file="prsm/node/content_economy.py",
+        anchor="if payment.accessor_id != self.identity.node_id:",
+        protects="an unprivileged peer DRAINING the operator's FTNS wallet via replayed content "
+                 "requests. _try_onchain_distribute funds the on-chain royalty by pulling `gross` from "
+                 "the OPERATOR's own wallet (RoyaltyDistributor transferFrom msg.sender), but "
+                 "process_content_access charges only accessor==this-node; a REMOTE accessor is never "
+                 "collected, and the on-chain leg has no per-access dedup (each request mints a fresh "
+                 "random payment_id). Without this gate, N replayed remote requests = N operator-funded "
+                 "distributions → wallet drain + over-credited creators, at zero attacker cost. The gate "
+                 "only funds the on-chain royalty for an access THIS node collected; delete it and any "
+                 "peer drains the operator once PRSM_ONCHAIN_PROVENANCE is enabled",
+        killed_by="tests/unit/test_sprint_1455_content_royalty_collection_gate.py",
+        kills_test_id="test_remote_uncollected_access_does_not_fund_onchain_royalty",
+    ),
 ]
 
 
