@@ -919,6 +919,45 @@ async def run_per_stage_commit_cycle(node: Any, environ=os.environ) -> dict:
     return {"per_stage_commit": f"committed {committed}/{len(results)}"}
 
 
+# sp1447 — the FINALIZE half of the per-stage lifecycle. run_per_stage_commit_cycle (sp1322)
+# self-commits each node's share-batch, but a committed batch stays PENDING (escrow locked) until
+# its challenge window elapses and finalize_ready_batches() releases it to the payee. The
+# single-stage poll cycle finalizes the single-stage client's batches; the per-stage client's
+# committed batches had NO finalize driver, so a self-committed share would never pay out on-chain.
+_PER_STAGE_FINALIZE_PHASES = (
+    ("finalize", "finalize_ready_batches"),
+    ("reconcile_finalized", "reconcile_finalized"),
+)
+
+
+async def run_per_stage_finalize_cycle(node: Any, environ=os.environ) -> dict:
+    """sp1447 — drive ONE per-stage FINALIZE cycle on this node: finalize its OWN committed
+    per-stage share-batches whose challenge window has elapsed (releasing the escrow to the payee),
+    on the SAME per-stage client run_per_stage_commit_cycle commits to. Run it from the settlement
+    poll loop right after the per-stage commit cycle.
+
+    GATED + fail-soft (NEVER raises), mirroring the commit cycle:
+      - ``skipped:disabled`` when ``PRSM_MULTISTAGE_SETTLEMENT`` is off,
+      - ``skipped:no-client`` when the node's per-stage settlement client is absent,
+      - otherwise a per-phase status dict. With the default VIEW-ONLY client (no funded per-stage
+        settler key) finalize raises (private_key required) and is recorded as an error — inert
+        until the funded-key ceremony, exactly like the single-stage finalize."""
+    if not multistage_settlement_enabled(environ):
+        return {"per_stage_finalize": "skipped:disabled"}
+    client = resolve_per_stage_settlement_client(node, environ)
+    if client is None:
+        return {"per_stage_finalize": "skipped:no-client"}
+    results: dict = {}
+    for status_key, method_name in _PER_STAGE_FINALIZE_PHASES:
+        try:
+            method = getattr(client, method_name)
+            res = await method()
+            results[f"per_stage_{status_key}"] = "ok" if res is None else str(res)
+        except Exception as exc:  # noqa: BLE001 — phase isolation; never raise
+            results[f"per_stage_{status_key}"] = f"error:{type(exc).__name__}"
+    return results
+
+
 async def run_settlement_poll_cycle(client: Any) -> dict:
     """Sprint 1038 (brick 2) — drive ONE commit/finalize/reconcile cycle of the
     on-chain settlement client.

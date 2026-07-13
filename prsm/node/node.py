@@ -6405,6 +6405,7 @@ class PRSMNode:
         import os as _os
         from prsm.settlement.client_wiring import (
             run_per_stage_commit_cycle,
+            run_per_stage_finalize_cycle,
             run_settlement_poll_cycle,
         )
         try:
@@ -6428,6 +6429,14 @@ class PRSMNode:
                     logger.debug("Sprint 1322 per-stage commit cycle: %s", ps_results)
                 except Exception as _ps_exc:  # noqa: BLE001 — never break the loop
                     logger.debug("sp1322 per-stage commit cycle skipped (%s)", _ps_exc)
+                # sp1447 — per-stage FINALIZE cycle: finalize this node's own committed share-batches
+                # whose challenge window elapsed (releasing escrow to the payee). Without it a
+                # self-committed share stays PENDING forever. Same gate/fail-soft as the commit cycle.
+                try:
+                    psf_results = await run_per_stage_finalize_cycle(self)
+                    logger.debug("Sprint 1447 per-stage finalize cycle: %s", psf_results)
+                except Exception as _psf_exc:  # noqa: BLE001 — never break the loop
+                    logger.debug("sp1447 per-stage finalize cycle skipped (%s)", _psf_exc)
                 # sp1140 (Brick E.2) — best-effort announce-after-commit. Only when
                 # the audit data plane is opted in AND an announcer exists; never
                 # raises, never broadcasts (gossips an UNTRUSTED availability ad only).
