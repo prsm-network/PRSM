@@ -5421,12 +5421,14 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 # replay token (varies per body+ts).
                 # Onfido: signature header IS the hex hmac.
                 if _vendor_lower == "persona":
-                    replay_token = ""
-                    for piece in persona_sig_header.split(","):
-                        piece = piece.strip()
-                        if piece.startswith("v1="):
-                            replay_token = piece[3:].strip()
-                            break
+                    # sp1453 — extract the replay token with the SAME parser the signature verifier
+                    # uses, so a whitespace variant the verifier ACCEPTS (`v1 = <hex>`) can never leave
+                    # replay_token='' and silently skip the replay ring below (a defense-that-cannot-fire
+                    # bypass the fiat-onramp audit found). A strict inline startswith('v1=') here drifted.
+                    from prsm.economy.web3.kyc_webhook_verifier import (
+                        parse_persona_signature_header,
+                    )
+                    replay_token = parse_persona_signature_header(persona_sig_header).get("v1", "")
                 else:
                     replay_token = (
                         request.headers.get(

@@ -591,6 +591,21 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1452_delegation_nonce_alias_cap_multiplication.py",
         kills_test_id="test_aliased_delegation_nonce_cannot_double_the_cap_end_to_end",
     ),
+    Guard(
+        id="kyc-webhook-replay-token-shared-parser",
+        sprint="sp1453",
+        file="prsm/node/api.py",
+        anchor='parse_persona_signature_header(persona_sig_header).get("v1", "")',
+        protects="the KYC-webhook replay ring being SILENTLY SKIPPED for a whitespace variant of the "
+                 "Persona-Signature header. The signature verifier parses the header tolerantly "
+                 "(partition('=')+strip(), so `v1 = <hex>` verifies), so the replay-token extractor MUST "
+                 "parse it the SAME way — else a signature-valid spaced header leaves replay_token='' and "
+                 "the `if replay_token:` guard skips replay_ring.record(), letting a captured KYC-approval "
+                 "webhook be REPLAYED (bounded only by the ±300s freshness window). Reverting this to a "
+                 "strict inline startswith('v1=') re-drifts the two parsers and re-opens the ring bypass",
+        killed_by="tests/unit/test_sprint_1453_kyc_webhook_replay_parser_parity.py",
+        kills_test_id="test_replay_token_extraction_agrees_with_the_verifier_on_a_spaced_header",
+    ),
 ]
 
 

@@ -28,6 +28,26 @@ from typing import Dict, Mapping, Tuple
 logger = logging.getLogger(__name__)
 
 
+def parse_persona_signature_header(signature_header: str) -> Dict[str, str]:
+    """sp1453 — parse a Persona ``Persona-Signature`` header (``t=<unix_ts>,v1=<hex_hmac>``) into its
+    ``{t, v1}`` parts, TOLERANT of surrounding whitespace (``t=123, v1 = <hex>``).
+
+    This is the SINGLE source of truth for reading the header, shared by the signature verifier AND the
+    node's replay-token extractor. They previously parsed it INDEPENDENTLY — the verifier via
+    partition('=')+strip() (tolerant) and the replay-token extractor via a strict ``startswith('v1=')``
+    — so a spaced variant verified fine yet left the replay token empty, silently skipping the replay
+    ring (a defense that could not fire for that header). One parser can't drift from itself.
+    """
+    parts: Dict[str, str] = {}
+    for piece in (signature_header or "").split(","):
+        piece = piece.strip()
+        if "=" not in piece:
+            continue
+        k, _, v = piece.partition("=")
+        parts[k.strip()] = v.strip()
+    return parts
+
+
 def verify_persona_signature(
     body: bytes, signature_header: str, secret: str,
 ) -> Tuple[bool, str]:
@@ -45,14 +65,7 @@ def verify_persona_signature(
     if not signature_header:
         return (False, "missing Persona-Signature header")
 
-    parts: Dict[str, str] = {}
-    for piece in signature_header.split(","):
-        piece = piece.strip()
-        if "=" not in piece:
-            continue
-        k, _, v = piece.partition("=")
-        parts[k.strip()] = v.strip()
-
+    parts = parse_persona_signature_header(signature_header)
     ts = parts.get("t")
     v1 = parts.get("v1")
     if not ts or not v1:
