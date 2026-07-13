@@ -447,6 +447,22 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1445_authz_default_deny.py",
         kills_test_id="test_a_new_unlisted_route_is_protected_by_default",
     ),
+    Guard(
+        id="per-stage-stable-escrow-id-for-dedup",
+        sprint="sp1446",
+        file="prsm/settlement/per_stage_settlement_split.py",
+        anchor='local_escrow_id=f"{job_id}::stage::{node_id}"',
+        protects="a double-settle on the big-model paid MULTI-STAGE path. Each stage node "
+                 "self-commits its own share (Design A); the ONLY thing that stops a crash-before-"
+                 "discard re-drain from committing the same share TWICE on-chain is sp1436's durable "
+                 "committed-escrow-id dedup, which keys on this share-batch's local_escrow_id. That "
+                 "id MUST be STABLE across re-deliveries of the same (job, stage, node) — a "
+                 "non-deterministic id (e.g. a random/per-delivery value) would get a fresh key each "
+                 "drain, sail past the dedup, and double-settle. Keep it derived from (job, stage, "
+                 "node); deleting/randomizing it re-opens the double-settle sp1436 closed",
+        killed_by="tests/unit/test_sprint_1446_per_stage_double_settle_closed.py",
+        kills_test_id="test_re_commit_of_a_committed_stage_task_does_not_double_settle",
+    ),
 ]
 
 

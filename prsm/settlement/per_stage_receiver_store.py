@@ -361,14 +361,17 @@ async def drain_and_commit_staged(
     commit STAYS staged (retryable next drain). NEVER raises — a per-task failure is isolated in its
     result.
 
-    sp1431 (money-path audit #2) — the discard is the ONLY idempotency for a committed task; the
-    accumulator's ``seen_escrow_ids`` is NOT a durable cross-batch backstop (it resets when the
-    batch pops). So a crash AFTER the on-chain commit lands but BEFORE this discard's atomic persist
-    completes leaves the staged task on disk with no client-side marker, and the next drain
-    re-commits the same receipt as a distinct on-chain batchId → double-settle. The durable fix (a
-    committed-escrow-id ledger, or an idempotency-token check against the client's _tracked before
-    re-committing) is deferred — this path is gated OFF (PRSM_MULTISTAGE_SETTLEMENT + a funded
-    per-stage settler key, both currently unset), so the double-settle is latent, not live."""
+    sp1431 (money-path audit #2) — the discard is NOT the only idempotency for a committed task. A
+    crash AFTER the on-chain commit lands but BEFORE this discard's atomic persist completes leaves
+    the staged task on disk, and the next drain re-attempts it. sp1436 closed the resulting
+    double-settle: BatchSettlementClient carries a DURABLE ``_committed_escrow_ids`` ledger (persisted
+    via its state store — the per-stage client is wired WITH one, resolve_per_stage_settlement_client),
+    and ``accumulate()`` drops a receipt whose ``local_escrow_id`` is already committed. Each
+    share-batch has a STABLE ``local_escrow_id = f"{job}::stage::{node}"``, so the re-delivered share
+    is dropped at accumulate — no second on-chain commit, even across a restart (fresh client
+    rehydrated from the persisted ledger). Proven by test_sprint_1446_per_stage_double_settle_closed
+    (discriminating: neuter the sp1436 dedup and the re-drain double-settles). This path is still
+    gated OFF (PRSM_MULTISTAGE_SETTLEMENT + a funded per-stage settler key, both currently unset)."""
     results: List[StageCommitResult] = []
     for staged in store.all_staged():
         try:
