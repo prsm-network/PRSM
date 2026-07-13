@@ -2469,12 +2469,14 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         # even if broadcast fails (502 + refund), the nonce stays
         # bumped so the captured signature can't be replayed.
         nonce_consumed: Optional[int] = None
-        try:
-            requires_sig = await local_ledger.get_requires_user_signature(
-                wallet_id,
-            )
-        except Exception:  # noqa: BLE001
-            requires_sig = False
+        # sp1454 — FAIL CLOSED: a read error must REQUIRE a signature, never skip the EIP-712 gate
+        # (fail-open here would let an unsigned withdraw proceed against a signature-required wallet).
+        from prsm.economy.withdraw_signature import (
+            resolve_requires_signature_failclosed,
+        )
+        requires_sig = await resolve_requires_signature_failclosed(
+            lambda: local_ledger.get_requires_user_signature(wallet_id),
+        )
         if requires_sig:
             if (
                 body.signature is None

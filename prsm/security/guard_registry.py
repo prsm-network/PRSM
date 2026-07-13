@@ -606,6 +606,21 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1453_kyc_webhook_replay_parser_parity.py",
         kills_test_id="test_replay_token_extraction_agrees_with_the_verifier_on_a_spaced_header",
     ),
+    Guard(
+        id="withdraw-requires-signature-fail-closed",
+        sprint="sp1454",
+        file="prsm/node/api.py",
+        anchor="resolve_requires_signature_failclosed(",
+        protects="an UNSIGNED withdraw proceeding against a signature-required wallet. /wallet/withdraw "
+                 "reads the wallet's requires_user_signature flag to decide whether to enforce the "
+                 "EIP-712 signature gate; the read used to default requires_sig=False on ANY exception "
+                 "(fail-OPEN) → a read error skipped the whole signature check and let an unsigned "
+                 "withdraw drain the wallet. This resolves the flag FAIL-CLOSED (a read error REQUIRES a "
+                 "signature). Revert it to the inline `except: requires_sig = False` and the gate "
+                 "fails open again",
+        killed_by="tests/unit/test_sprint_1454_withdraw_requires_sig_failclosed.py",
+        kills_test_id="test_fails_closed_on_read_error",
+    ),
 ]
 
 

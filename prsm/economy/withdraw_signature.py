@@ -39,7 +39,7 @@ Mismatch on any check → 401 from sprint 556's enforcement.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional, Union
+from typing import Any, Awaitable, Callable, Dict, Optional, Union
 import time
 
 from eth_account import Account
@@ -219,3 +219,20 @@ def is_expired(
     deterministic tests."""
     current = (now or time.time)()
     return int(payload["expiry_unix"]) < int(current)
+
+
+async def resolve_requires_signature_failclosed(
+    read_flag: Callable[[], Awaitable[Any]],
+) -> bool:
+    """sp1454 — resolve a wallet's ``requires_user_signature`` flag, FAILING CLOSED.
+
+    ``read_flag`` is an async callable that reads the flag (e.g. the ledger lookup). If it RAISES we
+    CANNOT prove the wallet is signature-optional, so we REQUIRE a signature (return True) — the safe
+    default for the /wallet/withdraw gate. Fail-OPEN here (defaulting False on a transient read error)
+    would skip the whole EIP-712 signature check and let an UNSIGNED withdraw proceed against a
+    signature-required wallet. The result is coerced to bool so a truthy non-bool still gates as
+    required."""
+    try:
+        return bool(await read_flag())
+    except Exception:  # noqa: BLE001 — a read error must REQUIRE a signature, never skip it
+        return True
