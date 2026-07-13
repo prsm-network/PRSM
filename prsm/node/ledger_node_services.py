@@ -161,6 +161,18 @@ class LedgerNodeServicesMixin:
         )
         await self._db.commit()
 
+    async def gossip_nonce_exists(self, nonce: str) -> bool:
+        """sp1442 (P2P audit, Finding B) — O(1) primary-key seek: has this gossip nonce already
+        been logged? gossip_log.nonce is a PRIMARY KEY, so this is an index lookup, replacing the
+        catch-up dedup's old full-24h-window range scan (which json-parsed every row) — one seek per
+        catch-up entry instead of a scan. Lives on the shared mixin so BOTH LocalLedger and
+        DAGLedger carry it by construction (the sp1425 conformance discipline)."""
+        if not nonce:
+            return False
+        cursor = await self._db.execute(
+            "SELECT 1 FROM gossip_log WHERE nonce = ? LIMIT 1", (nonce,))
+        return (await cursor.fetchone()) is not None
+
     async def get_recent_gossip(
         self,
         since: float,

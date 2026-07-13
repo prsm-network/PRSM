@@ -331,6 +331,41 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_540_bridge_deposit_pattern_a.py",
         kills_test_id="test_link_eth_address_refuses_cross_wallet_relink",
     ),
+    Guard(
+        id="transport-concurrent-connection-cap",
+        sprint="sp1442",
+        file="prsm/node/transport.py",
+        anchor="is_new and len(self.peers) >= self._max_peers",
+        protects="an eclipse + fd/memory DoS of the whole node. node_id = sha256(pubkey)[:32] is "
+                 "free to mint, so without a ceiling one host opens UNLIMITED authenticated "
+                 "WebSocket slots: each is an fd + PeerConnection + read-loop coroutine + rate "
+                 "bucket (exhaustion), and because gossip() fans out by random-sampling self.peers, "
+                 "attacker-dominated slots black-hole honest publishes (eclipse/partition). The "
+                 "sp936 bucket caps messages-per-peer not peer COUNT; sp1414 caps a DIFFERENT dict "
+                 "(discovery.known_peers); sp1326 only collapses duplicate ids — none bounds this. "
+                 "This is the global concurrent-connection ceiling (+ a per-IP cap); deleting it "
+                 "re-opens the Sybil-flood eclipse/DoS",
+        killed_by="tests/unit/test_sprint_1442_p2p_substrate_hardening.py",
+        kills_test_id="test_global_max_peers_rejects_a_new_peer_when_full",
+    ),
+    Guard(
+        id="gossip-digest-response-solicitation-gate",
+        sprint="sp1442",
+        file="prsm/node/gossip.py",
+        anchor='"unsolicited_digest_response"',
+        protects="a ~200x CPU/DB amplifier AND a signed-frame replay-injection. _handle_digest_"
+                 "response processed ANY inbound digest_response with no check we solicited it, and "
+                 "each of up to 200 entries drove a full-window gossip-log scan — one rate-limited "
+                 "frame → ~200 unfiltered ledger scans/writes, past the sp936 per-frame limit; and "
+                 "because the digest path runs BEFORE the sp1008 replay barrier, a validly-signed "
+                 "frame older than the 24h window could be re-injected as authentic. This "
+                 "solicitation gate (keyed on the authenticated peer.peer_id, single-use) drops a "
+                 "response from any peer we never sent a request to — and we only request from "
+                 "OUTBOUND peers we dialed, so an inbound attacker can never trigger it. Deleting it "
+                 "re-opens both the amplifier and the replay-injection",
+        killed_by="tests/unit/test_sprint_1442_p2p_substrate_hardening.py",
+        kills_test_id="test_unsolicited_digest_response_is_dropped_before_processing",
+    ),
 ]
 
 

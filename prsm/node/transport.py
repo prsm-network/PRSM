@@ -219,6 +219,8 @@ class WebSocketTransport:
         jurisdiction_filter: Optional["PeerJurisdictionFilter"] = None,
         peer_msg_rate: float = 100.0,
         peer_msg_burst: float = 200.0,
+        max_peers: int = 256,
+        max_conns_per_ip: int = 16,
     ):
         self.identity = identity
         self.host = host
@@ -266,6 +268,21 @@ class WebSocketTransport:
         self._peer_msg_rate = _env_float("PRSM_PEER_MSG_RATE", peer_msg_rate, minimum=1.0)
         self._peer_msg_burst = _env_float("PRSM_PEER_MSG_BURST", peer_msg_burst, minimum=1.0)
         self._peer_buckets: Dict[str, List[float]] = {}  # peer_id -> [tokens, last_refill]
+
+        # sp1442 (P2P audit, Finding A) — cap CONCURRENT inbound connections. The handshake
+        # authenticates identity but node_id = sha256(pubkey)[:32] is free to mint, so without a
+        # ceiling one host opens unlimited authenticated sockets: each is an fd + PeerConnection +
+        # read-loop coroutine + rate bucket (fd/memory exhaustion), and because gossip() fans out by
+        # random-sampling self.peers, attacker-dominated slots black-hole honest publishes (eclipse).
+        # The sp936 bucket caps messages-per-peer (not peer COUNT), sp1414 caps a DIFFERENT dict
+        # (discovery.known_peers), and sp1326 only collapses duplicate ids — none bounds this. The
+        # bootstrap server already enforces exactly this (bootstrap/server.py); the node just never
+        # wired it in. `_max_peers` is the hard global fd/memory bound; `_max_conns_per_ip` stops a
+        # single source monopolizing the slots (raising the eclipse cost to N distinct IPs).
+        self._max_peers = int(_env_float("PRSM_MAX_PEERS", float(max_peers), minimum=1.0))
+        self._max_conns_per_ip = int(
+            _env_float("PRSM_MAX_CONNS_PER_IP", float(max_conns_per_ip), minimum=1.0))
+        self._ip_conn_counts: Dict[str, int] = {}  # source-IP -> live inbound connection count
 
         # Additive observability counters (must never alter protocol behavior)
         self._telemetry: Dict[str, Any] = {
@@ -520,9 +537,45 @@ class WebSocketTransport:
             if not close_task.done():
                 close_task.cancel()
 
+    async def _try_admit_peer(self, peer_id: str, peer: "PeerConnection", src_ip: str):
+        """sp1442 (P2P audit, Finding A) — atomically enforce the connection ceilings and install.
+
+        Returns ``(old_peer, reject_reason, counted_ip)``. On admission: installs ``peer`` into
+        ``self.peers`` (returning any replaced ``old_peer``), charges the source IP, and returns
+        ``counted_ip=src_ip`` so the caller's ``finally`` can refund exactly one charge. On reject:
+        installs nothing and returns ``reject_reason`` set.
+
+        The caps apply ONLY to a genuinely new ``peer_id``; a reconnect for an already-present id
+        is a REPLACE (sp1326 last-writer-wins, net-zero on ``self.peers``) and is always admitted,
+        so an asymmetric-firewall peer can always re-establish its link. Every accepted connection
+        (new OR replace) charges the IP once and is refunded once on teardown, so the per-IP count
+        stays exact across reconnects. Doing the check + install under the one lock closes the
+        TOCTOU where N concurrent handshakes each pass the check then each install."""
+        async with self._peers_lock:
+            is_new = peer_id not in self.peers
+            if is_new and len(self.peers) >= self._max_peers:
+                return None, "peer limit reached", None
+            if is_new and self._ip_conn_counts.get(src_ip, 0) >= self._max_conns_per_ip:
+                return None, "per-ip connection limit reached", None
+            old_peer = self.peers.get(peer_id)
+            self.peers[peer_id] = peer
+            self._ip_conn_counts[src_ip] = self._ip_conn_counts.get(src_ip, 0) + 1
+            return old_peer, None, src_ip
+
+    async def _release_ip(self, src_ip: str) -> None:
+        """sp1442 — refund one per-IP connection charge on teardown. Pops at 0 so the counter
+        dict stays bounded by the number of concurrently-connected distinct source IPs."""
+        async with self._peers_lock:
+            n = self._ip_conn_counts.get(src_ip, 0) - 1
+            if n > 0:
+                self._ip_conn_counts[src_ip] = n
+            else:
+                self._ip_conn_counts.pop(src_ip, None)
+
     async def _handle_incoming(self, websocket: Any) -> None:
         """Handle a new incoming WebSocket connection."""
         peer = None
+        counted_ip = None   # sp1442 — the source IP this connection charged to _ip_conn_counts
         try:
             # Wait for handshake
             raw = await asyncio.wait_for(websocket.recv(), timeout=self.handshake_timeout)
@@ -567,11 +620,17 @@ class WebSocketTransport:
             # reconnect deadlocks into a connect/reject flap and the peer is unreachable for
             # chain dispatch. The handshake is already validated (pubkey via the anchor), so
             # last-writer-wins is safe: evict + close the old connection, accept the new one.
-            old_peer = None
-            async with self._peers_lock:
-                old_peer = self.peers.get(peer_id)
-                self.peers[peer_id] = peer
-                peer_count = len(self.peers)
+            # sp1442 (Finding A) — enforce the connection ceilings ATOMICALLY with the install
+            # (see _try_admit_peer). The caps apply only to a genuinely NEW peer_id; a reconnect
+            # for an EXISTING id REPLACES it (sp1326 last-writer-wins) and is never rejected.
+            src_ip = websocket.remote_address[0] if getattr(websocket, "remote_address", None) else "?"
+            old_peer, reject_reason, counted_ip = await self._try_admit_peer(peer_id, peer, src_ip)
+            if reject_reason is not None:
+                self._record_handshake_outcome(success=False, reason=reject_reason)
+                await websocket.close(1013, reject_reason)   # 1013 = Try Again Later
+                peer = None   # nothing installed → skip the finally teardown
+                return
+            peer_count = len(self.peers)
             if old_peer is not None and old_peer.websocket is not None:
                 logger.info(
                     "Replacing existing connection for peer %s with a fresh reconnect "
@@ -628,6 +687,10 @@ class WebSocketTransport:
                     if self.peers.get(peer.peer_id) is peer:
                         del self.peers[peer.peer_id]
                         logger.info(f"Peer disconnected: {peer.peer_id[:8]}...")
+                # sp1442 — refund THIS connection's per-IP charge (each accepted connection
+                # incremented exactly once on install; decrement exactly once here).
+                if counted_ip is not None:
+                    await self._release_ip(counted_ip)
                 # Dispatch outside lock to prevent deadlock
                 if peer:
                     await self._dispatch(

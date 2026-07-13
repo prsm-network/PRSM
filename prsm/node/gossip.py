@@ -199,6 +199,16 @@ _DIGEST_REQUEST_MAX_LOOKBACK_SEC = 86400.0  # 24h — the gossip-log retention
 # slack over the legit 100.
 _MAX_DIGEST_RESPONSE_MESSAGES = 200
 
+# sp1442 (P2P audit, Finding B) — how long an outstanding digest REQUEST stays valid. A
+# digest_response is only processed if it answers a request WE sent to that peer (see
+# _pending_digest); the entry is single-use (consumed on the first response) and expires after
+# this window so a never-answered request is cleaned up. Closes the unsolicited-digest-response
+# amplifier (one frame → up to 200 ledger scans) AND the unsolicited signed-frame replay-injection,
+# both of which slipped past the sp936 per-frame rate limit and the sp1008 replay barrier (the
+# digest path returns before the barrier). We only send requests to OUTBOUND peers we dialed, so an
+# inbound attacker can never receive one → their response is always dropped here.
+_DIGEST_REQUEST_TTL_SEC = 300.0
+
 
 # sp1008 — gossip-layer replay barrier. The transport dedups nonces only within
 # its ~300s window, but the gossip log retains messages 1h–24h, so a captured
@@ -335,6 +345,9 @@ class GossipProtocol:
         self._seen_gossip_nonces: "collections.OrderedDict[str, float]" = (
             collections.OrderedDict()
         )
+        # sp1442 (Finding B) — outstanding digest requests we sent (authenticated peer_id -> expiry).
+        # A digest_response is processed only if it answers a live entry here; single-use + TTL.
+        self._pending_digest: Dict[str, float] = {}
 
         # Ledger for gossip persistence (set post-construction by node.py)
         self.ledger: Optional[Any] = None
@@ -623,6 +636,13 @@ class GossipProtocol:
         )
         
         await self.transport.send_to_peer(peer_id, msg)
+        # sp1442 (Finding B) — record the outstanding request so ONLY this peer's answering
+        # digest_response is processed. Prune expired entries first (bounded by our outbound peers).
+        now = time.time()
+        if self._pending_digest:
+            self._pending_digest = {
+                p: exp for p, exp in self._pending_digest.items() if exp > now}
+        self._pending_digest[peer_id] = now + _DIGEST_REQUEST_TTL_SEC
         logger.debug(f"Sent digest request to {peer_id[:8]}... with {len(timestamps)} subtype timestamps")
 
     async def _get_last_seen_timestamps(self) -> Dict[str, float]:
@@ -769,6 +789,20 @@ class GossipProtocol:
         Processes each message as if it were a new gossip message,
         updating local timestamps and storing in local gossip log.
         """
+        # sp1442 (Finding B) — SOLICITATION GATE: only process a digest_response that answers a
+        # request WE sent to this peer. Keyed on the handshake-authenticated peer.peer_id (not the
+        # spoofable msg.sender_id, per sp1182). An unsolicited response is dropped BEFORE the
+        # per-entry auth+dedup loop, closing both the ~200x ledger-scan amplifier and the
+        # signed-frame replay-injection (the digest path runs before the sp1008 replay barrier).
+        # Single-use: consume the pending entry so one request admits exactly one response.
+        auth_peer = getattr(peer, "peer_id", None) or msg.sender_id
+        expiry = self._pending_digest.pop(auth_peer, None)
+        if expiry is None or expiry <= time.time():
+            self._record_drop(GOSSIP_DIGEST_RESPONSE, "unsolicited_digest_response")
+            logger.debug("Dropping unsolicited/expired digest response from %s...",
+                         (auth_peer or "?")[:8])
+            return
+
         data = msg.payload.get("data", {})
         messages = data.get("messages", [])
 
@@ -849,17 +883,22 @@ class GossipProtocol:
         logger.info(f"Processed {processed}/{len(messages)} catch-up messages from {msg.sender_id[:8]}...")
 
     async def _is_duplicate(self, nonce: str) -> bool:
-        """Check if a message with this nonce has already been processed."""
-        # The transport handles nonce dedup for regular messages
-        # For catch-up messages, we check the gossip log
+        """Check if a message with this nonce has already been processed.
+
+        sp1442 (Finding B) — prefer the O(1) primary-key seek (gossip_log.nonce is a PRIMARY KEY)
+        over the old full-24h-window range scan that json-parsed every row. Each catch-up entry
+        calls this, so the scan was a per-entry amplifier (bounded to 200/response by the sp1270
+        cap, and now only reachable via the sp1442 solicitation gate — but the O(1) seek removes the
+        cost entirely). Falls back to the range scan for a ledger (or test mock) without the helper.
+        """
         if not self.ledger:
             return False
-        
+        exists_fn = getattr(self.ledger, "gossip_nonce_exists", None)
         try:
-            # Check if this nonce exists in our log
-            messages = await self.ledger.get_recent_gossip(
-                since=time.time() - 86400,  # Check last 24 hours
-            )
+            if exists_fn is not None:
+                return bool(await exists_fn(nonce))
+            # Backward-compatible fallback: the 24h range scan.
+            messages = await self.ledger.get_recent_gossip(since=time.time() - 86400)
             return any(m.get("nonce") == nonce for m in messages)
         except Exception:
             return False

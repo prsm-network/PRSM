@@ -47,6 +47,9 @@ def mock_ledger():
     ledger = MagicMock()
     ledger.log_gossip = AsyncMock()
     ledger.get_recent_gossip = AsyncMock(return_value=[])
+    # sp1442 — the catch-up dedup now prefers the O(1) gossip_nonce_exists seek; default "not a
+    # duplicate" so a fresh catch-up message is delivered (tests that simulate a dup set it True).
+    ledger.gossip_nonce_exists = AsyncMock(return_value=False)
     ledger.prune_gossip_log = AsyncMock(return_value=0)
     return ledger
 
@@ -325,6 +328,9 @@ class TestDigestResponse:
             },
         )
 
+        # sp1442 — a digest_response is only processed if we solicited it (sent this peer a
+        # digest_request). Simulate that outbound request so the SOLICITED path under test runs.
+        gossip_protocol._pending_digest[mock_peer.peer_id] = time.time() + 3600
         await gossip_protocol._handle_digest_response(msg, mock_peer)
 
         # Verify messages were delivered to subscribers
@@ -358,6 +364,7 @@ class TestDigestResponse:
             },
         )
 
+        gossip_protocol._pending_digest[mock_peer.peer_id] = time.time() + 3600  # sp1442 — solicit
         await gossip_protocol._handle_digest_response(msg, mock_peer)
 
         # Verify message was stored in ledger
@@ -371,10 +378,9 @@ class TestDigestResponse:
         """Test that duplicate messages in digest response are skipped."""
         current_time = time.time()
         
-        # Mock ledger to return existing messages (simulating duplicate)
-        gossip_protocol.ledger.get_recent_gossip = AsyncMock(return_value=[
-            {"nonce": "msg1", "subtype": "job_offer", "received_at": current_time - 100}
-        ])
+        # sp1442 — _is_duplicate now uses the O(1) gossip_nonce_exists seek; simulate the nonce
+        # already being in the log (a duplicate to skip).
+        gossip_protocol.ledger.gossip_nonce_exists = AsyncMock(return_value=True)
 
         # Track subscriber callbacks
         received_messages = []
@@ -405,6 +411,7 @@ class TestDigestResponse:
             },
         )
 
+        gossip_protocol._pending_digest[mock_peer.peer_id] = time.time() + 3600  # sp1442 — solicit
         await gossip_protocol._handle_digest_response(msg, mock_peer)
 
         # Verify duplicate was skipped
@@ -554,6 +561,9 @@ class TestIntegrationScenarios:
             },
         )
 
+        # sp1442 — the late-joiner is OUTBOUND (it dialed the peer and sent the digest request),
+        # so the response is solicited and processed.
+        gossip_protocol._pending_digest[mock_peer.peer_id] = time.time() + 3600
         await gossip_protocol._handle_digest_response(digest_response, mock_peer)
 
         # Verify all messages were received
