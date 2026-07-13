@@ -26,7 +26,24 @@ logger = logging.getLogger(__name__)
 
 
 def _key(nonce: str) -> str:
-    return nonce.lower()
+    """sp1452 (money-audit wuh7kwl7i) — canonicalize the delegation_nonce to its bytes32 form so
+    signature-equivalent spellings collapse to ONE budget bucket.
+
+    The EIP-712 delegation signature binds the nonce via ``_to_bytes32`` (strips a leading '0x',
+    hex-case-insensitive), so '0x<hex>', bare '<hex>' and case variants share ONE digest — i.e. ONE
+    funder signature verifies all of them. Keying the budget on the raw ``.lower()``'d string let a
+    malicious relayer (no funder key) alias one funder-signed delegation into N distinct cap buckets
+    and drain N×C past the signed cumulative cap. This is the SINGLE choke point for
+    consumed/reserve/release on BOTH stores (and the durable on-load re-key), so canonicalizing here
+    makes every signature-equivalent alias map to the same bucket. A malformed nonce — which can never
+    pass the signature gate anyway — falls back to case-folding so it still can't alias on case alone.
+    """
+    s = str(nonce).strip()
+    try:
+        from prsm.settlement.payment_authorization import _to_bytes32
+        return "0x" + _to_bytes32("delegation_nonce", s).hex()
+    except (ValueError, TypeError):
+        return s.lower()
 
 
 class InMemoryDelegationBudgetStore:

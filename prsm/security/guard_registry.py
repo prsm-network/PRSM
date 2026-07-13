@@ -574,6 +574,23 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1451_per_stage_observer_challenge_coverage.py",
         kills_test_id="test_per_stage_client_receives_the_nodes_published_batch_store",
     ),
+    Guard(
+        id="delegation-budget-key-canonical-nonce",
+        sprint="sp1452",
+        file="prsm/settlement/delegation_budget.py",
+        anchor='_to_bytes32("delegation_nonce", s).hex()',
+        protects="a relayer draining a funder's escrow past the signed delegation cap by ALIASING one "
+                 "delegation into N budget buckets. The EIP-712 delegation signature canonicalizes the "
+                 "nonce via _to_bytes32 ('0x<hex>' and bare '<hex>' and case variants share ONE digest "
+                 "→ ONE funder signature verifies all), but the budget cap is enforced OFF-CHAIN keyed "
+                 "by delegation_nonce. Keying on the raw .lower()'d string let a malicious relayer (no "
+                 "funder key) spend cap C, then strip '0x' from the nonce STRING (same signature), land "
+                 "a DISTINCT bucket, and drain another C → N×C. Canonicalizing the budget key the SAME "
+                 "way the signature does collapses every alias to one bucket. Revert it to .lower() and "
+                 "the cumulative cap becomes a per-spelling cap → N×C escrow drain",
+        killed_by="tests/unit/test_sprint_1452_delegation_nonce_alias_cap_multiplication.py",
+        kills_test_id="test_aliased_delegation_nonce_cannot_double_the_cap_end_to_end",
+    ),
 ]
 
 
