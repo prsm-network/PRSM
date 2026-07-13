@@ -55,7 +55,10 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from eth_utils import keccak
 
-from prsm.settlement.payment_client import build_payment_authorization
+from prsm.settlement.payment_client import (
+    build_payment_authorization,
+    build_per_stage_payment_authorization,
+)
 from prsm.settlement.state_store import SettlementStateStore
 
 logger = logging.getLogger(__name__)
@@ -205,6 +208,56 @@ class IssuedAuthorizationStore:
         self._persist()
         return rec
 
+    def record_per_stage(
+        self,
+        payload: Dict[str, Any],
+        payees_wei: Sequence[tuple],
+        linked_job_id: Optional[str] = None,
+    ) -> List[IssuedAuthorization]:
+        """sp1450 — retain a PER-STAGE authorization for NO_ESCROW matching.
+
+        The requester signs ONE per-stage auth over a SET of ``(payee, share_wei)`` (payee_set_hash),
+        and each stage node commits its OWN on-chain batch (``provider == payee``, ``value_ftns ==
+        that payee's share``). The single-payee matcher keys per provider + covers a batch only when
+        a retained auth to that provider has ``max_spend_wei >= value`` and is unexpired — so we
+        record ONE ``IssuedAuthorization`` PER PAYEE (``provider = payee``, ``max_spend_wei = share``)
+        under a per-(job, payee) synthetic nonce. The existing CONSERVATIVE matcher then classifies an
+        HONEST per-stage batch AUTHORIZED (value == its payee's recorded share) and an INFLATED or
+        FOREIGN one UNAUTHORIZED (value > share, or no entry) — closing the requester-side blindness to
+        per-stage batches with NO matcher change. Mirrors ``record``'s keying/eviction/persist."""
+        base_nonce = str(payload["job_nonce"])
+        request_hash = str(payload["request_hash"])
+        expiry = int(payload["expiry_unix"])
+        requester = str(payload["requester"])
+        now = int(self._now())
+        recorded: List[IssuedAuthorization] = []
+        for addr, share in payees_wei:
+            rec = IssuedAuthorization(
+                requester=requester,
+                provider=str(addr),
+                max_spend_wei=int(share),
+                # per-(job, payee) synthetic nonce so the N per-payee entries do not collide on the
+                # store's job_nonce key (the matcher never keys on job_nonce — it uses provider/value).
+                job_nonce=f"{base_nonce}#{str(addr).lower()}",
+                expiry_unix=expiry,
+                request_hash=request_hash,
+                linked_job_id=linked_job_id,
+                issued_at=now,
+            )
+            key = rec.job_nonce
+            if key in self._auths:
+                del self._auths[key]
+            self._auths[key] = rec
+            recorded.append(rec)
+        while len(self._auths) > self._max_entries:
+            evicted_key, _ = self._auths.popitem(last=False)
+            logger.debug(
+                "IssuedAuthorizationStore: evicted oldest auth %s (over max_entries=%d)",
+                evicted_key, self._max_entries,
+            )
+        self._persist()
+        return recorded
+
     def get(self, job_nonce: str) -> Optional[IssuedAuthorization]:
         return self._auths.get(str(job_nonce))
 
@@ -332,6 +385,43 @@ def build_and_record_payment_authorization(
         except Exception as exc:  # noqa: BLE001 — retention must NEVER break the build
             logger.warning(
                 "build_and_record_payment_authorization: issued-auth retention "
+                "failed (non-fatal; auth stands): %s: %s",
+                type(exc).__name__, exc,
+            )
+    return auth
+
+
+def build_and_record_per_stage_payment_authorization(
+    *,
+    store: Optional["IssuedAuthorizationStore"] = None,
+    linked_job_id: Optional[str] = None,
+    payees: Sequence[tuple],
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """sp1450 — build + sign a PER-STAGE PaymentAuthorization (unchanged money-path call) and —
+    ADDITIVELY, when a ``store`` is provided — record it requester-side for NO_ESCROW matching.
+
+    The per-stage sibling of ``build_and_record_payment_authorization``. WITHOUT this, the requester
+    (sdk client ``pay_and_infer_multistage``) signed a per-stage auth via
+    ``build_per_stage_payment_authorization`` but recorded NOTHING — so its ``IssuedAuthorizationStore``
+    stayed EMPTY for per-stage and the NO_ESCROW matcher (``match_unauthorized_batches``) was BLIND to
+    every per-stage batch (the exact bug the single-payee path already fixed — see the sp-history note
+    on the single-payee wrapper). It would then either grief every honest stage node (no matching auth
+    → UNAUTHORIZED → NO_ESCROW challenge) or, if unscanned, miss an unauthorized/inflated per-stage
+    batch that over-draws the requester's (fungible) escrow. Recording the per-stage auth as one entry
+    per payee closes it.
+
+    Default-off + best-effort, exactly like the single-payee sibling: ``store=None`` → pure
+    pass-through (byte-identical auth, nothing recorded); a record failure is logged + swallowed."""
+    auth = build_per_stage_payment_authorization(payees=payees, **kwargs)
+    if store is not None:
+        try:
+            from prsm.settlement.payment_client import per_stage_payees_to_wei
+            store.record_per_stage(
+                auth["payload"], per_stage_payees_to_wei(payees), linked_job_id=linked_job_id)
+        except Exception as exc:  # noqa: BLE001 — retention must NEVER break the build
+            logger.warning(
+                "build_and_record_per_stage_payment_authorization: per-stage issued-auth retention "
                 "failed (non-fatal; auth stands): %s: %s",
                 type(exc).__name__, exc,
             )

@@ -419,8 +419,12 @@ class PRSMClient:
         import time
         from decimal import Decimal
 
-        from prsm.settlement.payment_client import (
-            build_per_stage_payment_authorization,
+        # sp1450 — the RECORDING variant (per-stage sibling of the single-payee sp1421 fix). Identical
+        # auth (byte-for-byte); additionally RETAINS it requester-side so the NO_ESCROW matcher can
+        # recognize each stage node's authorized batch (and flag an inflated/foreign one). Without
+        # this the store stayed EMPTY for per-stage and the matcher was blind to every per-stage batch.
+        from prsm.settlement.issued_authorization_store import (
+            build_and_record_per_stage_payment_authorization,
         )
 
         _max_tokens = int(max_tokens or 0)
@@ -444,7 +448,8 @@ class PRSMClient:
             (addr, Decimal(str(share)) / (Decimal(10) ** 18))
             for addr, share in quote.get("payees", [])
         ]
-        auth = build_per_stage_payment_authorization(
+        auth = build_and_record_per_stage_payment_authorization(
+            store=self._issued_auth_store(),
             requester_key=requester_key, payees=payees_ftns,
             model_id=model_id, prompt=prompt, max_tokens=_max_tokens,
             privacy_tier=privacy_tier, content_tier=content_tier,
@@ -1191,8 +1196,12 @@ class PRSMClient:
         import time
         from decimal import Decimal
 
-        from prsm.settlement.payment_client import (
-            build_per_stage_payment_authorization,
+        # sp1450 — the RECORDING variant (per-stage sibling of the single-payee sp1421 fix). Identical
+        # auth (byte-for-byte); additionally RETAINS it requester-side so the NO_ESCROW matcher can
+        # recognize each stage node's authorized batch (and flag an inflated/foreign one). Without
+        # this the store stayed EMPTY for per-stage and the matcher was blind to every per-stage batch.
+        from prsm.settlement.issued_authorization_store import (
+            build_and_record_per_stage_payment_authorization,
         )
 
         _max_tokens = int(max_tokens or 0)
@@ -1214,7 +1223,8 @@ class PRSMClient:
             (addr, Decimal(str(share)) / (Decimal(10) ** 18))
             for addr, share in quote.get("payees", [])
         ]
-        auth = build_per_stage_payment_authorization(
+        auth = build_and_record_per_stage_payment_authorization(
+            store=self._issued_auth_store(),
             requester_key=requester_key, payees=payees_ftns,
             model_id=model_id, prompt=prompt, max_tokens=_max_tokens,
             privacy_tier=privacy_tier, content_tier=content_tier,

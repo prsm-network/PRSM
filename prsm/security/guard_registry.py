@@ -540,6 +540,23 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1449_per_stage_value_bound_to_authorized_share.py",
         kills_test_id="test_gate_rejects_value_ftns_exceeding_authorized_share",
     ),
+    Guard(
+        id="per-stage-no-escrow-recording",
+        sprint="sp1450",
+        file="prsm/settlement/issued_authorization_store.py",
+        anchor="def record_per_stage(",
+        protects="the requester-side NO_ESCROW defense being BLIND to per-stage batches. commitBatch "
+                 "has NO on-chain requester-auth check, so the PRIMARY boundary against an unauthorized "
+                 "escrow drain is the requester challenging a batch that matches no issued authorization "
+                 "(scan_for_unauthorized_batches → match_unauthorized_batches). The requester signs ONE "
+                 "per-stage auth over a SET of (payee, share) and each stage node commits its own batch; "
+                 "this records ONE entry per payee (provider=payee, max_spend=share) so the matcher "
+                 "classifies an HONEST per-stage batch AUTHORIZED and an INFLATED/FOREIGN one "
+                 "UNAUTHORIZED. Delete it and the store stays EMPTY for per-stage — the matcher either "
+                 "griefs every honest stage node or misses an escrow-draining unauthorized batch",
+        killed_by="tests/unit/test_sprint_1450_per_stage_no_escrow_coverage.py",
+        kills_test_id="test_honest_per_stage_batches_are_authorized",
+    ),
 ]
 
 

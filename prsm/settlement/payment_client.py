@@ -122,6 +122,17 @@ def build_payment_delegation(
     return {"payload": payload, "signature": "0x" + signature.hex()}
 
 
+def per_stage_payees_to_wei(payees) -> list:
+    """sp1450 — convert a per-stage ``(eth_address, share_FTNS)`` payee set to
+    ``(eth_address, share_WEI)``, the canonical form the authorization signs over (payee_set_hash)
+    AND the form each stage node's on-chain batch settles (value_ftns = share_wei). Extracted so the
+    builder and the requester-side NO_ESCROW recorder (record_per_stage) use the IDENTICAL conversion
+    — a drift would make the recorded share disagree with the signed/settled one and mis-classify."""
+    return [
+        (addr, int(Decimal(str(share)) * (Decimal(10) ** 18))) for addr, share in payees
+    ]
+
+
 def build_per_stage_payment_authorization(
     *,
     requester_key: Union[str, bytes],
@@ -160,9 +171,7 @@ def build_per_stage_payment_authorization(
         sign_per_stage_authorization,
     )
     requester = Account.from_key(requester_key).address
-    payees_wei = [
-        (addr, int(Decimal(str(share)) * (Decimal(10) ** 18))) for addr, share in payees
-    ]
+    payees_wei = per_stage_payees_to_wei(payees)
     payee_set_hash = compute_payee_set_hash(payees_wei)   # validates the set; raises on bad
     total_wei = (
         sum(s for _, s in payees_wei) if total_max_spend_ftns is None
