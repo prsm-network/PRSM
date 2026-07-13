@@ -46,3 +46,4 @@ echidna-reports/
 *.tmp
 *.temp
 .tmp
+ops-runbooks/
