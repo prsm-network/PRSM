@@ -104,7 +104,13 @@ async def _deliver_catchup(gp, message_data, sender_id="relayer_node"):
                  "data": {"messages": [message_data], "total_count": 1}},
         ttl=1,
     )
-    await gp._handle_digest_response(msg, MagicMock())
+    # sp1442 — a digest_response is only processed if we SOLICITED it from this peer (keyed on the
+    # authenticated peer.peer_id). Simulate the outbound digest request so the catch-up path runs.
+    import time as _time
+    peer = MagicMock()
+    peer.peer_id = sender_id
+    gp._pending_digest[sender_id] = _time.time() + 3600
+    await gp._handle_digest_response(msg, peer)
     return seen
 
 

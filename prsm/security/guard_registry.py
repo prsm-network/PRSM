@@ -431,6 +431,22 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1444_api_authz_denylist_gaps.py",
         kills_test_id="test_sensitive_route_is_now_protected",
     ),
+    Guard(
+        id="authz-default-deny",
+        sprint="sp1445",
+        file="prsm/api/auth_middleware.py",
+        anchor="return True  # default-deny: every unenumerated path requires the operator key",
+        protects="the WHOLE node API from the recurring deny-list-gap class. NodeAuthMiddleware was "
+                 "inverted from a deny-list (protect only enumerated prefixes; everything else OPEN "
+                 "even on a keyed node — which leaked a new gap every time a sensitive route shipped, "
+                 "sp138/183/1012/1103/1444) to DEFAULT-DENY: a path is protected unless on the explicit "
+                 "PUBLIC allowlist, so a NEW route is fail-closed the moment it is added. This final "
+                 "`return True` IS the inversion. Flip it to `return False` (or remove it) and every "
+                 "unenumerated path — including any future operator/money route — is served "
+                 "unauthenticated again",
+        killed_by="tests/unit/test_sprint_1445_authz_default_deny.py",
+        kills_test_id="test_a_new_unlisted_route_is_protected_by_default",
+    ),
 ]
 
 

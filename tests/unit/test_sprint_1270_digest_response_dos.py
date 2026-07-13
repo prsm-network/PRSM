@@ -34,6 +34,16 @@ def _msg(n):
     return m
 
 
+def _peer(gp, sender_id="peerabcd1234"):
+    """sp1442 — a digest_response is only processed if we solicited it from this peer. Register the
+    outstanding request + return a peer whose authenticated id matches, so the DoS-cap path runs."""
+    import time as _time
+    gp._pending_digest[sender_id] = _time.time() + 3600
+    p = MagicMock()
+    p.peer_id = sender_id
+    return p
+
+
 @pytest.mark.asyncio
 async def test_oversized_response_truncated_to_cap(monkeypatch):
     gp = _gp()
@@ -44,7 +54,7 @@ async def test_oversized_response_truncated_to_cap(monkeypatch):
         return True  # treat all as duplicate → fast skip after the dedup call
 
     monkeypatch.setattr(gp, "_is_duplicate", _dup)
-    await gp._handle_digest_response(_msg(5000), MagicMock())
+    await gp._handle_digest_response(_msg(5000), _peer(gp))
     # the per-message ledger scan ran AT MOST the cap many times, not 5000
     assert calls["n"] == _MAX_DIGEST_RESPONSE_MESSAGES
 
@@ -59,7 +69,7 @@ async def test_under_cap_all_processed(monkeypatch):
         return True
 
     monkeypatch.setattr(gp, "_is_duplicate", _dup)
-    await gp._handle_digest_response(_msg(10), MagicMock())
+    await gp._handle_digest_response(_msg(10), _peer(gp))
     assert calls["n"] == 10  # honest small responses are fully processed
 
 
@@ -76,7 +86,7 @@ async def test_non_list_messages_ignored(monkeypatch):
     m = MagicMock()
     m.payload = {"data": {"messages": {"not": "a list"}}}
     m.sender_id = "peerabcd1234"
-    await gp._handle_digest_response(m, MagicMock())
+    await gp._handle_digest_response(m, _peer(gp))
     assert calls["n"] == 0  # malformed → ignored, no scans
 
 

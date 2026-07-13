@@ -150,14 +150,76 @@ PROTECTED_PATH_PATTERNS = [
 ]
 
 
+# Sprint 1445 — DEFAULT-DENY inversion. NodeAuthMiddleware was a deny-list (protect only the
+# enumerated PROTECTED_PREFIXES/PATTERNS above; everything else OPEN even on a keyed node), which
+# leaked a new gap every time a sensitive route shipped (sp138/183/1012/1103/1444 — the last one an
+# unkeyed operator-FTNS drain). The model is inverted below: a path is PROTECTED by default and open
+# ONLY if it is on this explicit PUBLIC allowlist. A NEW route is therefore protected the moment it
+# is added, until someone deliberately allowlists it — fail-closed instead of fail-open.
+#
+# The allowlist is BEHAVIOR-PRESERVING: it is exactly the set of routes that were reachable-without-
+# key before this change (enumerated from the live @app / dashboard @self.app decorators) AND are
+# genuinely public reads (the free Tier-A content commons, health/status/discovery, dashboard read
+# views) or SELF-AUTHENTICATING (the payer-signed + on-chain-verified paid-key serve, the vendor-HMAC
+# KYC webhook, the JWT dashboard login). No route's current reachability changes; only the DEFAULT for
+# unenumerated/future paths flips to protected. (PROTECTED_PREFIXES/PATTERNS above are retained as
+# documentation of the known-sensitive routes + for back-compat; the decision no longer needs them.)
+
+# Exact public paths (any method) — no protected sibling shares these exact paths.
+PUBLIC_ALLOWLIST_EXACT: Set[str] = {
+    # root / health / status / discovery / info
+    "/", "/health", "/health/detailed", "/health/ready", "/readyz", "/status", "/metrics",
+    "/info", "/api-info", "/node/info", "/node/identity/pubkey", "/peers", "/bootstrap/status",
+    "/rings/status", "/privacy/budget", "/auth/verify", "/dashboard", "/agents",
+    "/docs", "/openapi.json", "/redoc",
+    # audit summaries (public, aggregate)
+    "/audit/recent", "/audit/summary",
+    # free Tier-A content commons (static reads)
+    "/content/search", "/content/search/semantic", "/content/index/stats", "/content/provider-stats",
+    # storage / marketplace aggregate reads
+    "/storage/stats", "/storage/pinned-stats", "/storage/provider-reputations",
+    "/marketplace/reputation",
+    # dashboard sub-app public reads + login (a blanket /api/ would break /api/auth/login)
+    "/api/auth/login", "/api/auth/logout", "/api/auth/me", "/api/status", "/api/node",
+    "/api/health", "/api/peers", "/api/agents", "/api/content/search", "/api/distillation",
+    "/api/jobs", "/api/teacher/list",
+}
+
+# Public param routes (regex). Reserved-word exclusions keep the single-segment PROTECTED routes
+# (POST /content/upload, GET /content/mine, POST /api/jobs/submit, /api/distillation/submit,
+# /api/teacher/create) OUT of the public {param} match — those fall through to default-deny.
+PUBLIC_ALLOWLIST_PATTERNS = [
+    re.compile(r"^/content/(?!upload$|mine$)[^/]+$"),   # GET /content/{cid} (free commons)
+    re.compile(r"^/content/retrieve/[^/]+$"),           # GET /content/retrieve/{cid}
+    re.compile(r"^/content/recipient-manifest/[^/]+$"), # GET /content/recipient-manifest/{cid}
+    re.compile(r"^/content/paid-key/[^/]+$"),           # GET /content/paid-key/{hash} (SELF_AUTH)
+    re.compile(r"^/api/agents/[^/]+$"),                 # dashboard read
+    re.compile(r"^/api/jobs/(?!submit$)[^/]+$"),        # dashboard job read (not /submit)
+    re.compile(r"^/api/distillation/(?!submit$)[^/]+$"),# dashboard read (not /submit)
+    re.compile(r"^/api/teacher/(?!create$)[^/]+$"),     # dashboard read (not /create)
+]
+
+
 def is_protected_path(path: str) -> bool:
-    """sp1012 — single-sourced protection decision for NodeAuthMiddleware: True
-    when ``path`` matches a PROTECTED_PREFIXES prefix OR a PROTECTED_PATH_PATTERNS
-    template. Public-endpoint + signature-authenticated carve-outs are handled
-    separately (earlier) in dispatch."""
-    if any(path.startswith(prefix) for prefix in PROTECTED_PREFIXES):
+    """sp1445 — DEFAULT-DENY. Returns True (=> require the operator node key when auth is enabled)
+    for EVERYTHING except the explicit PUBLIC allowlist. Fails closed on path-normalization tricks."""
+    # Decide on the same normalized path the router will dispatch on; anything that could route to a
+    # handler while dodging the allowlist (encoded slash/dot, //, dot-segments, backslash) is protected.
+    p = path.split("?", 1)[0].split("#", 1)[0]
+    low = p.lower()
+    if "%2f" in low or "%2e" in low or "//" in p or "/../" in p or "/./" in p or "\\" in p:
         return True
-    return any(pat.match(path) for pat in PROTECTED_PATH_PATTERNS)
+    if p != "/" and p.endswith("/"):
+        p = p[:-1]
+
+    # Self-authenticating vendor webhooks (verify their own HMAC) — exempt from the node key.
+    if any(p.startswith(prefix) for prefix in SIGNATURE_AUTHENTICATED_PREFIXES):
+        return False
+    if p in PUBLIC_ENDPOINTS or p in PUBLIC_ALLOWLIST_EXACT:
+        return False
+    if any(rx.match(p) for rx in PUBLIC_ALLOWLIST_PATTERNS):
+        return False
+    return True  # default-deny: every unenumerated path requires the operator key
 
 
 def generate_api_key() -> str:

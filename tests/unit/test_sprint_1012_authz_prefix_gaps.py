@@ -54,8 +54,9 @@ def test_public_content_read_not_protected():
 
 
 def test_other_content_subpath_not_protected():
-    # Only the /pin action is gated, not arbitrary /content/{cid}/... paths.
-    assert is_protected_path("/content/QmAbc/info") is False
+    # sp1445 default-deny: /content/{cid}/pin is the only /content/{cid}/... route (POST, gated);
+    # any OTHER /content/{cid}/subpath is not a real public route and is now protected by default.
+    assert is_protected_path("/content/QmAbc/info") is True
 
 
 def test_existing_protected_prefixes_still_protected():
@@ -66,8 +67,12 @@ def test_existing_protected_prefixes_still_protected():
 
 
 def test_unrelated_public_path_not_protected():
+    # An explicitly-allowlisted public read stays open.
     assert is_protected_path("/health") is False
-    assert is_protected_path("/marketplace/search") is False
+    # sp1445 — the model is now DEFAULT-DENY: an unlisted path (/marketplace/search is not a real
+    # route and not on the public allowlist) is PROTECTED, not open. This inverts the old deny-list
+    # assumption that "unrelated" paths were open — that fail-open default was the recurring gap.
+    assert is_protected_path("/marketplace/search") is True
 
 
 def test_dispatch_uses_the_helper():
