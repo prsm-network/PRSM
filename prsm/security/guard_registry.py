@@ -463,6 +463,66 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1446_per_stage_double_settle_closed.py",
         kills_test_id="test_re_commit_of_a_committed_stage_task_does_not_double_settle",
     ),
+    Guard(
+        id="per-stage-arm-dedup-before-broadcast",
+        sprint="sp1448",
+        file="prsm/settlement/client.py",
+        anchor="self._arm_committing_escrow_ids(ready)",
+        protects="a DOUBLE escrow release on the big-model per-stage path. sp1436's dedup ledger was "
+                 "armed ONLY on the clean-commit success tail, so a commit that BROADCAST but did not "
+                 "cleanly confirm — OnChainPendingError (receipt-wait timed out) or BroadcastFailedError "
+                 "(send threw) yet actually mined — left the escrow id UNARMED. The receiver store then "
+                 "re-injected the still-staged share and committed a SECOND on-chain batch for it → the "
+                 "requester is charged twice / the payee paid twice. Arming the id BEFORE the "
+                 "irreversible broadcast closes the quarantine/broadcast-failed/crash-in-window gaps. "
+                 "Delete this and every uncertain-fate per-stage commit that lands double-settles",
+        killed_by="tests/unit/test_sprint_1448_per_stage_commit_failure_double_settle.py",
+        kills_test_id="test_onchain_pending_commit_does_not_double_settle_on_redrain",
+    ),
+    Guard(
+        id="per-stage-revert-unarms-escrow-id",
+        sprint="sp1448",
+        file="prsm/settlement/client.py",
+        anchor="self._discard_committed_escrow_id(br.local_escrow_id)",
+        protects="STRANDED escrow on the per-stage path. sp1448 arms the dedup ledger BEFORE broadcast; "
+                 "a commit that MINES-AND-REVERTS (OnChainRevertedError) landed nothing, so its share "
+                 "MUST stay re-committable. This unarm (revert branch only — pending/broadcast-failed "
+                 "keep the arm because they MAY have landed) is the ONLY thing that lets a reverted "
+                 "share retry; delete it and the pre-broadcast arming permanently blocks the share from "
+                 "ever committing → funds locked, work never paid",
+        killed_by="tests/unit/test_sprint_1448_per_stage_commit_failure_double_settle.py",
+        kills_test_id="test_reverted_commit_is_retryable_not_stranded",
+    ),
+    Guard(
+        id="per-stage-discard-owned-share",
+        sprint="sp1448",
+        file="prsm/settlement/per_stage_receiver_store.py",
+        anchor="client.has_committed_escrow_id(staged.local_escrow_id)",
+        protects="a DOUBLE escrow release via receiver-store re-injection. Once a per-stage commit has "
+                 "broadcast (armed in the client's durable ledger), the client's WAL/quarantine + the "
+                 "recover/reconcile phases own settling it. If the staged task is NOT discarded it "
+                 "re-injects the same share every drain cycle → a second on-chain batch (and an "
+                 "unbounded stuck-task leak). This discard-on-ownership stops the re-injection; delete "
+                 "it and a broadcast-but-unconfirmed share is re-committed on the next drain",
+        killed_by="tests/unit/test_sprint_1448_per_stage_commit_failure_double_settle.py",
+        kills_test_id="test_owned_share_task_is_discarded_not_re_injected",
+    ),
+    Guard(
+        id="per-stage-recover-adoption-phases",
+        sprint="sp1448",
+        file="prsm/settlement/client_wiring.py",
+        anchor="for status_key, method_name in _PER_STAGE_RECOVER_PHASES:",
+        protects="STRANDED escrow on the per-stage path. The per-stage cycle omitted the pending-commit "
+                 "recovery/adoption phases the single-stage poll loop runs (_POLL_PHASES). A per-stage "
+                 "commit that broadcast-but-unconfirmed and then LANDED is parked in _pending_commits / "
+                 "_committing and is NEVER adopted into _tracked, so run_per_stage_finalize_cycle can't "
+                 "finalize it → the escrow it locked on-chain is never released to the payee. This loop "
+                 "runs recover_committing_intents + reconcile_pending_commits on the per-stage client so "
+                 "landed batches are adopted + finalizable; delete it and landed-but-unconfirmed shares "
+                 "strand forever",
+        killed_by="tests/unit/test_sprint_1448_per_stage_commit_failure_double_settle.py",
+        kills_test_id="test_per_stage_commit_cycle_runs_recovery_phases",
+    ),
 ]
 
 

@@ -384,7 +384,21 @@ async def drain_and_commit_staged(
             continue
         res = await commit_staged_task(
             staged, client=client, chain_id=chain_id, now_unix=now_unix)
-        if res.committed and discard_committed:
+        discard = res.committed
+        # sp1448 (money-audit w754cz4mr) — ALSO discard when the client has taken DURABLE OWNERSHIP of
+        # this escrow id even though THIS pass did not cleanly commit. A broadcast-but-unconfirmed
+        # (OnChainPendingError) / broadcast-failed / crash-in-window commit ARMS the id in the client's
+        # durable ledger (BatchSettlementClient.commit_ready_batches), and the client's WAL/quarantine +
+        # the recover/reconcile adoption phases now own settling it. Leaving the task staged would let
+        # the store re-inject the SAME share every cycle → a second on-chain batch → double-settle (and
+        # an unbounded stuck-task leak). A genuinely-reverted commit is NOT owned (the revert branch
+        # unarms the id), so it correctly stays staged for retry.
+        if not discard:
+            try:
+                discard = bool(client.has_committed_escrow_id(staged.local_escrow_id))
+            except Exception:  # noqa: BLE001 — a client without the predicate keeps prior behavior
+                discard = False
+        if discard and discard_committed:
             store.discard(res.local_escrow_id)
         results.append(res)
     return results

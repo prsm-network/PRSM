@@ -880,6 +880,16 @@ def deliver_for_settled_receipt(
     return results
 
 
+# sp1448 — the pending-commit recovery/adoption phases, mirroring the FIRST two single-stage
+# _POLL_PHASES. Run on the per-stage client BEFORE draining so a broadcast-but-unconfirmed commit that
+# actually landed is adopted into _tracked (→ finalizable by run_per_stage_finalize_cycle) instead of
+# being stranded. Same order/semantics as the single-stage poll loop.
+_PER_STAGE_RECOVER_PHASES = (
+    ("recover", "recover_committing_intents"),
+    ("reconcile_pending", "reconcile_pending_commits"),
+)
+
+
 async def run_per_stage_commit_cycle(node: Any, environ=os.environ) -> dict:
     """sp1322 (S3b-3b) — drive ONE per-stage commit cycle on this node: drain the receiver store
     + commit each staged (authorized) share-batch on the node's OWN settlement client
@@ -905,18 +915,39 @@ async def run_per_stage_commit_cycle(node: Any, environ=os.environ) -> dict:
     client = resolve_per_stage_settlement_client(node, environ)
     if client is None:
         return {"per_stage_commit": "skipped:no-client"}
+    result: dict = {}
+    # sp1448 (money-audit w754cz4mr #3) — FIRST run the pending-commit recovery/adoption phases on the
+    # per-stage client, exactly as the single-stage poll loop does (_POLL_PHASES). A per-stage commit
+    # that broadcast but whose receipt-wait timed out (OnChainPendingError → _pending_commits) or whose
+    # send threw yet landed (BroadcastFailedError → _committing) is otherwise NEVER adopted into
+    # _tracked, so run_per_stage_finalize_cycle can't finalize it → escrow stranded on-chain forever.
+    # recover adopts landed intents; reconcile_pending resolves quarantined-but-landed txs. Runs even
+    # when nothing is staged (an orphaned commit must be adopted regardless). Fail-soft: never raises.
+    for status_key, method_name in _PER_STAGE_RECOVER_PHASES:
+        try:
+            method = getattr(client, method_name, None)
+            if method is None:
+                result[f"per_stage_{status_key}"] = "skip:absent"
+                continue
+            res = await method()
+            result[f"per_stage_{status_key}"] = "ok" if res is None else str(res)
+        except Exception as exc:  # noqa: BLE001 — phase isolation; never break the cycle
+            result[f"per_stage_{status_key}"] = f"error:{type(exc).__name__}"
     staged = store.all_staged()
     if not staged:
-        return {"per_stage_commit": "ok:nothing-staged"}
+        result["per_stage_commit"] = "ok:nothing-staged"
+        return result
     try:
         from prsm.settlement.per_stage_receiver_store import drain_and_commit_staged
         # In Design A this node commits ONLY its own staged shares → its single client.
         results = await drain_and_commit_staged(
             store, client_for_node=lambda _node_id: client)
     except Exception as exc:  # noqa: BLE001 — the cycle never raises (loop isolation)
-        return {"per_stage_commit": f"error:{type(exc).__name__}"}
+        result["per_stage_commit"] = f"error:{type(exc).__name__}"
+        return result
     committed = sum(1 for r in results if r.committed)
-    return {"per_stage_commit": f"committed {committed}/{len(results)}"}
+    result["per_stage_commit"] = f"committed {committed}/{len(results)}"
+    return result
 
 
 # sp1447 — the FINALIZE half of the per-stage lifecycle. run_per_stage_commit_cycle (sp1322)

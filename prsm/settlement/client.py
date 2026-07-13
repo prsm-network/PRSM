@@ -363,6 +363,9 @@ class BatchSettlementClient:
             # sp1040 — WAL: record the intent durably BEFORE the irreversible
             # broadcast so a crash in the commit→persist window is recoverable.
             self._committing[intent_key] = self._build_intent(ready, leaf_hashes, root)
+            # sp1448 (money-audit w754cz4mr #1/#2/#4) — ARM the durable dedup ledger with this batch's
+            # escrow ids on the SAME write as the WAL intent, i.e. BEFORE the irreversible broadcast.
+            self._arm_committing_escrow_ids(ready)
             self._persist()
             try:
                 record = await self._commit_one(ready, leaf_hashes, root)
@@ -407,6 +410,13 @@ class BatchSettlementClient:
                     # so NOTHING was committed → safe to retry: drop the intent,
                     # receipts stay in the accumulator for the next poll.
                     self._committing.pop(intent_key, None)
+                    # sp1448 — UNARM the escrow ids we armed pre-broadcast: the commit definitively did
+                    # NOT land, so the share must stay re-committable. Without this the pre-broadcast
+                    # arming would permanently block accumulate() from re-adding it (and the receiver
+                    # store's discard-on-ownership would drop the staged task) → the share is STRANDED.
+                    # Only the revert branch unarms; pending/broadcast-failed KEEP the arming (may land).
+                    for br in ready.batch.receipts:
+                        self._discard_committed_escrow_id(br.local_escrow_id)
                     self._persist()
                     logger.warning(
                         f"batch commit reverted for key {ready.key}: "
@@ -422,9 +432,10 @@ class BatchSettlementClient:
             self._accumulator.pop_batch(ready.key)
             self._tracked[record.batch_id] = record
             self._committing.pop(intent_key, None)
-            # sp1436 — record this batch's escrow ids in the durable ledger BEFORE the persist, so
-            # the "already committed" set and the tracked batch land in the SAME state write. A
-            # re-delivery after this point is dropped by accumulate().
+            # sp1436/sp1448 — re-assert this batch's escrow ids in the durable ledger (idempotent
+            # move-to-newest: sp1448 already armed them pre-broadcast above). Kept as a defensive
+            # reassertion so the "already committed" set and the tracked batch land in the SAME state
+            # write on the success path. A re-delivery after this point is dropped by accumulate().
             for br in ready.batch.receipts:
                 self._record_committed_escrow_id(br.local_escrow_id)
             self._persist()
@@ -799,6 +810,37 @@ class BatchSettlementClient:
             self._committed_escrow_ids[escrow_id] = None
         while len(self._committed_escrow_ids) > _MAX_COMMITTED_ESCROW_IDS:
             self._committed_escrow_ids.popitem(last=False)  # evict oldest
+
+    def _arm_committing_escrow_ids(self, ready) -> None:
+        """sp1448 — arm the durable dedup ledger with a ready batch's escrow ids BEFORE its irreversible
+        on-chain broadcast (called from commit_ready_batches on the same write as the sp1040 WAL intent).
+
+        Previously the ledger was armed ONLY on the clean-commit success tail (post-_commit_one), leaving
+        three windows unarmed: OnChainPendingError (quarantined to _pending_commits), BroadcastFailedError
+        (intent kept), and a crash between the on-chain commit and the tail persist. In the per-stage path
+        the receiver store re-injects the staged task every cycle until it commits, so an unarmed
+        uncertain-fate commit that ACTUALLY LANDED gets re-committed as a SECOND on-chain batch (the
+        registry has no content dedup) → double escrow release. Arming here (accumulate() drops any
+        re-delivery whose id is armed) closes all three windows. It does NOT strand a genuinely-reverted
+        commit: the OnChainRevertedError branch UNARMS these ids (nothing landed → safe to retry), and
+        commit_ready_batches commits accumulator-resident receipts WITHOUT consulting this ledger — the
+        ledger gates only the re-injection path (accumulate())."""
+        for br in ready.batch.receipts:
+            self._record_committed_escrow_id(br.local_escrow_id)
+
+    def _discard_committed_escrow_id(self, escrow_id: Optional[str]) -> None:
+        """sp1448 — remove an escrow id from the durable dedup ledger. Used ONLY on a confirmed atomic
+        revert (OnChainRevertedError), where the commit definitively did not land, so the share must
+        remain re-committable rather than be blocked by the pre-broadcast arming."""
+        if escrow_id:
+            self._committed_escrow_ids.pop(escrow_id, None)
+
+    def has_committed_escrow_id(self, escrow_id: Optional[str]) -> bool:
+        """sp1448 — True once this client has DURABLY armed ``escrow_id`` in its committed-ledger, i.e.
+        a commit for that share has been broadcast (its fate now owned by this client's WAL/quarantine
+        + the recovery/adoption phases). The per-stage receiver store consults this to stop re-injecting
+        a share the client already owns — closing the broadcast-but-unconfirmed re-drain double-settle."""
+        return bool(escrow_id) and escrow_id in self._committed_escrow_ids
 
     def _persist(self) -> None:
         """Atomically persist the three post-commit state dicts. No-op when no
