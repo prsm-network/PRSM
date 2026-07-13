@@ -284,6 +284,36 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1438_paid_decrypt_fund_loss.py",
         kills_test_id="test_key_is_retained_before_a_failing_deposit_so_it_is_not_stranded",
     ),
+    Guard(
+        id="withdraw-refund-exactly-once-credit",
+        sprint="sp1439",
+        file="prsm/node/pending_withdraw_reconciler.py",
+        anchor='idempotency_key=f"withdraw-refund:{intent.job_id}"',
+        protects="a reverted/dropped withdraw NEVER being refunded (permanent lost-debit). The old "
+                 "_refund claimed a separate record_nonce marker in its OWN durable commit BEFORE "
+                 "crediting; a crash in the gap burned the claim while no credit landed, and on "
+                 "restart the burned claim made _refund return without ever crediting. Folding "
+                 "idempotency into the credit itself (deterministic tx_id → PRIMARY-KEY dedup) makes "
+                 "the refund exactly-once and crash-safe: a crash before the commit just re-runs the "
+                 "same idempotent credit. Reverting to claim-before-credit re-opens the lost refund",
+        killed_by="tests/unit/test_sprint_1439_withdraw_reconciler_lost_debit.py",
+        kills_test_id="test_refund_credits_despite_a_burned_claim_from_a_crashed_prior_run",
+    ),
+    Guard(
+        id="withdraw-dropped-tx-nonce-advance-gate",
+        sprint="sp1439",
+        file="prsm/node/pending_withdraw_reconciler.py",
+        anchor="int(confirmed_nonce) > int(intent.nonce)",
+        protects="TWO opposite fund-loss failures. (a) A dropped/evicted withdraw tx never produces "
+                 "a receipt, so without this the reconciler polls 'pending' forever and the "
+                 "off-chain debit is stranded (lost-debit). (b) This STRICT-greater gate is also the "
+                 "double-pay guard: a tx is refunded ONLY once the escrow's CONFIRMED nonce has "
+                 "advanced strictly PAST this tx's nonce (a different tx took the slot → this "
+                 "tx_hash can never mine). Weakening `>` to `>=`, or refunding on age/absence alone, "
+                 "would refund a tx that could still confirm → double-pay",
+        killed_by="tests/unit/test_sprint_1439_withdraw_reconciler_lost_debit.py",
+        kills_test_id="test_is_dropped_true_only_when_confirmed_nonce_advanced_past_tx_nonce",
+    ),
 ]
 
 

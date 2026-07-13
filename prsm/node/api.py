@@ -2675,6 +2675,10 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                         amount=float(body.amount_ftns),
                         to_addr=to_addr,
                         tx_hash=getattr(tx_record, "tx_hash", "") or "",
+                        # sp1439 — carry the tx nonce so the reconciler can prove a
+                        # dropped/never-mined tx is dead (confirmed nonce advanced past it)
+                        # and refund the stranded debit instead of polling forever.
+                        nonce=getattr(tx_record, "nonce", None),
                     )
                 except Exception as _exc:  # noqa: BLE001
                     logger.warning(

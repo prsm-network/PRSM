@@ -9,18 +9,23 @@ debit → the user permanently loses the FTNS. The only prior reconciliation
 (``OnChainFTNSLedger._reconcile_pending_transactions``) runs at startup and only
 updates tx *status*; it takes no corrective action.
 
-This module records each pending withdraw (``job_id → wallet_id, amount,
-tx_hash``) in a small bounded, persisted store, and a background reconciler
-polls the receipt:
+This module records each pending withdraw (``job_id → wallet_id, amount, tx_hash,
+nonce``) in a small bounded, persisted store, and a background reconciler polls the
+receipt:
 
   * confirmed → resolve, no refund (the on-chain transfer succeeded);
   * reverted  → refund the off-chain debit, then resolve;
-  * unconfirmed → leave for the next tick.
+  * dropped   → (sp1439) the tx was evicted/dropped and can NEVER mine — proven when the
+                escrow's CONFIRMED nonce has advanced strictly past this tx's nonce — so
+                it never produces a receipt and would otherwise strand the debit forever;
+                refund and resolve;
+  * unconfirmed but still live → leave for the next tick.
 
-The refund is IDEMPOTENT: it atomically claims ``withdraw-refund:{job_id}`` via
-the local ledger's ``record_nonce`` (the sp898/sp911 primitive) BEFORE crediting,
-so a reconciler restart / double-run — or a store that lost its resolved mark in
-a crash — credits the wallet at most once.
+The refund is EXACTLY-ONCE: it credits with ``idempotency_key="withdraw-refund:{job_id}"``,
+so a reconciler restart / double-run credits the wallet exactly once (the credit's
+deterministic ``tx_id`` collides on the transactions PRIMARY KEY on replay). sp1439 replaced
+the earlier record_nonce-claim-before-credit design, whose two separate durable commits left
+a crash-in-the-gap window that could burn the claim without ever crediting.
 """
 from __future__ import annotations
 
@@ -50,7 +55,11 @@ class WithdrawIntent:
     tx_hash: str
     recorded_at: float = field(default_factory=time.time)
     resolved: bool = False
-    outcome: Optional[str] = None   # "confirmed" | "refunded"
+    outcome: Optional[str] = None   # "confirmed" | "refunded" | "refunded_dropped"
+    # sp1439 — the on-chain nonce this withdraw tx was signed at. Optional so intents
+    # persisted before sp1439 still load (nonce=None → the reconciler can't prove the tx
+    # is dropped and leaves it pending, exactly the pre-sp1439 behavior — no regression).
+    nonce: Optional[int] = None
 
 
 class PendingWithdrawStore:
@@ -114,12 +123,13 @@ class PendingWithdrawStore:
 
     # ── api ──────────────────────────────────────────────────────
     def record(self, *, job_id: str, wallet_id: str, amount: float,
-               to_addr: str, tx_hash: str) -> None:
+               to_addr: str, tx_hash: str, nonce: Optional[int] = None) -> None:
         if job_id in self._intents:
             return   # idempotent — a withdraw records its intent once
         self._intents[job_id] = WithdrawIntent(
             job_id=job_id, wallet_id=wallet_id, amount=float(amount),
             to_addr=to_addr, tx_hash=tx_hash,
+            nonce=(int(nonce) if nonce is not None else None),
         )
         self._prune()
         self._save()
@@ -145,14 +155,20 @@ async def reconcile_pending_withdraws(
     *,
     get_receipt_status: Callable[[str], Awaitable[str]],
     refund: Callable[[WithdrawIntent], Awaitable[bool]],
+    is_dropped: Optional[Callable[[WithdrawIntent], Awaitable[bool]]] = None,
 ) -> Dict[str, int]:
     """Resolve every unresolved withdraw intent.
 
     ``get_receipt_status(tx_hash)`` → "confirmed" | "reverted" | "pending"
     (anything else is treated as still-pending — leave for the next tick).
     ``refund(intent)`` performs the idempotent off-chain refund.
+    ``is_dropped(intent)`` (sp1439, optional) → True iff a still-"pending" tx is PROVABLY
+    dead (dropped/evicted and can never mine). Such a tx never produces a receipt, so the
+    confirmed/reverted branches can't fire and the off-chain debit would otherwise be
+    stranded forever; when it returns True we refund via the same idempotent path. Omitted
+    (None) → the pre-sp1439 behavior (a stuck-pending tx stays pending).
     """
-    confirmed = refunded = still_pending = 0
+    confirmed = refunded = still_pending = dropped = 0
     for intent in list(store.unresolved()):
         try:
             status = await get_receipt_status(intent.tx_hash)
@@ -175,14 +191,37 @@ async def reconcile_pending_withdraws(
             store.mark_resolved(intent.job_id, "refunded")
             refunded += 1
         else:
-            still_pending += 1
-    if confirmed or refunded:
+            # sp1439 — still "pending": refund ONLY if it is provably dead (a dropped tx
+            # that can never mine). A tx that could still land is left pending so we never
+            # refund a debit whose transfer subsequently confirms (double-pay).
+            dead = False
+            if is_dropped is not None:
+                try:
+                    dead = bool(await is_dropped(intent))
+                except Exception as exc:  # noqa: BLE001 — be conservative, retry next tick
+                    logger.debug("reconcile: dropped-check for %s failed: %s",
+                                 intent.job_id, exc)
+                    dead = False
+            if dead:
+                try:
+                    intent.outcome = "dropped"   # for the refund description
+                    await refund(intent)
+                except Exception as exc:  # noqa: BLE001 — leave unresolved, retry
+                    logger.error("reconcile: dropped-refund for %s FAILED (will retry): %s",
+                                 intent.job_id, exc)
+                    still_pending += 1
+                    continue
+                store.mark_resolved(intent.job_id, "refunded_dropped")
+                dropped += 1
+            else:
+                still_pending += 1
+    if confirmed or refunded or dropped:
         logger.info(
-            "pending-withdraw reconcile: %d confirmed, %d refunded, %d still pending",
-            confirmed, refunded, still_pending,
+            "pending-withdraw reconcile: %d confirmed, %d refunded, %d dropped-refunded, "
+            "%d still pending", confirmed, refunded, dropped, still_pending,
         )
     return {"confirmed": confirmed, "refunded": refunded,
-            "still_pending": still_pending}
+            "dropped_refunded": dropped, "still_pending": still_pending}
 
 
 def resolve_pending_withdraw_reconciler_config_from_env() -> tuple[bool, float]:
@@ -251,40 +290,67 @@ class PendingWithdrawReconciler:
         return "confirmed" if receipt.get("status") == 1 else "reverted"
 
     async def _refund(self, intent: WithdrawIntent) -> bool:
-        """Refund the off-chain debit, gated by an atomic per-job nonce claim
-        so it credits at most once across restarts / double-runs. Returns True
-        if it credited, False if the refund was already claimed."""
-        nonce = f"withdraw-refund:{intent.job_id}"
-        won = await self._local_ledger.record_nonce(nonce, "reconciler")
-        if not won:
-            logger.info("reconcile: refund for %s already claimed — skipping",
-                        intent.job_id)
-            return False
-        # Resolve the tx_type enum lazily to avoid import-cycle surprises.
+        """Refund the off-chain debit EXACTLY ONCE across restarts / double-runs.
+
+        sp1439 (audit) — idempotency is the CREDIT itself (``idempotency_key`` makes
+        ``tx_id`` deterministic, so a replay collides on the transactions PRIMARY KEY and
+        is a no-op). The old design claimed a separate ``record_nonce`` BEFORE crediting;
+        a crash in the gap between the two durable commits burned the claim while no credit
+        landed, and on restart the burned claim made ``_refund`` return without ever
+        crediting — a permanent lost refund. Folding idempotency into the credit removes
+        that window: a crash before the credit commits simply re-runs the same idempotent
+        credit on the next tick and the wallet is made whole exactly once."""
         from prsm.node.local_ledger import TransactionType
         await self._local_ledger.credit(
             wallet_id=intent.wallet_id,
             amount=intent.amount,
             tx_type=TransactionType.BRIDGE_WITHDRAW,
+            idempotency_key=f"withdraw-refund:{intent.job_id}",
             description=(
-                f"bridge withdraw REFUND (reconciler: on-chain tx reverted) "
+                f"bridge withdraw REFUND (reconciler: on-chain tx {intent.outcome or 'reverted'}) "
                 f"job={intent.job_id} tx={intent.tx_hash}"
             ),
         )
         logger.warning(
-            "reconcile: REFUNDED %s FTNS to %s — withdraw %s reverted on-chain",
+            "reconcile: REFUNDED %s FTNS to %s — withdraw %s did not deliver on-chain",
             intent.amount, intent.wallet_id, intent.job_id,
         )
         return True
+
+    async def _is_dropped(self, intent: WithdrawIntent) -> bool:
+        """sp1439 — is this pending tx PROVABLY dead (dropped/evicted and can never mine)?
+
+        Deterministic + double-pay-safe: a tx can only be refunded once it is IMPOSSIBLE
+        for it to still land. That is precisely when the escrow's CONFIRMED nonce has
+        advanced STRICTLY past this tx's nonce — a different tx took the slot, so this
+        tx_hash is permanently 'nonce too low'. If our tx had itself confirmed, the
+        confirmed-status branch would have caught it before this check. A legacy intent
+        with no recorded nonce can't be proven dead, so it stays pending (no regression)."""
+        if intent.nonce is None:
+            return False
+        w3 = getattr(self._ftns_ledger, "w3", None)
+        sender = getattr(self._ftns_ledger, "_connected_address", None)
+        if w3 is None or not sender:
+            return False
+        loop = asyncio.get_running_loop()
+        try:
+            confirmed_nonce = await loop.run_in_executor(
+                None, lambda: w3.eth.get_transaction_count(sender, "latest"))
+        except Exception as exc:  # noqa: BLE001 — transient RPC; retry next tick
+            logger.debug("reconcile: confirmed-nonce poll for %s failed: %s",
+                         intent.job_id, exc)
+            return False
+        return int(confirmed_nonce) > int(intent.nonce)
 
     async def reconcile_once(self) -> Dict[str, int]:
         out = await reconcile_pending_withdraws(
             self._store,
             get_receipt_status=self._get_receipt_status,
             refund=self._refund,
+            is_dropped=self._is_dropped,   # sp1439 — refund provably-dead dropped txs
         )
         self.confirmed_total += out["confirmed"]
-        self.refunded_total += out["refunded"]
+        self.refunded_total += out["refunded"] + out.get("dropped_refunded", 0)
         return out
 
     async def run_forever(self) -> None:

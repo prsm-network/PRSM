@@ -156,25 +156,29 @@ async def test_second_pass_does_not_double_refund():
     refund.assert_awaited_once()   # resolved after pass 1 → not refunded twice
 
 
-# ── PendingWithdrawReconciler.refund idempotency (record_nonce gate) ──────
+# ── PendingWithdrawReconciler.refund idempotency (sp1439: idempotency_key on credit) ──
 
 
 @pytest.mark.asyncio
-async def test_refund_is_nonce_gated_against_double_credit():
-    # The refund closure must claim a per-job nonce BEFORE crediting, so two
-    # invocations (e.g. across a reconciler restart that lost the resolved
-    # mark) credit the wallet only ONCE.
+async def test_refund_is_idempotency_key_gated_against_double_credit():
+    # sp1439 — idempotency moved from a record_nonce PRE-CLAIM (crash-unsafe: a crash
+    # between the claim commit and the credit commit burned the claim and lost the refund
+    # forever) INTO the credit itself via idempotency_key="withdraw-refund:{job_id}". Two
+    # invocations (e.g. across a reconciler restart that lost the resolved mark) must credit
+    # the wallet EXACTLY once — the real ledger dedups on the deterministic tx_id.
     local_ledger = MagicMock()
-    nonce_claimed = set()
+    credited = []          # (wallet, amount) actually applied
+    seen_keys = set()
 
-    async def record_nonce(nonce, origin):
-        if nonce in nonce_claimed:
-            return False
-        nonce_claimed.add(nonce)
-        return True
+    async def credit(*, wallet_id, amount, tx_type, idempotency_key=None, description=""):
+        if idempotency_key is not None and idempotency_key in seen_keys:
+            return None    # exactly-once no-op on replay (mirrors the tx_id PRIMARY-KEY dedup)
+        if idempotency_key is not None:
+            seen_keys.add(idempotency_key)
+        credited.append((wallet_id, float(amount)))
+        return MagicMock()
 
-    local_ledger.record_nonce = AsyncMock(side_effect=record_nonce)
-    local_ledger.credit = AsyncMock()
+    local_ledger.credit = AsyncMock(side_effect=credit)
 
     rec = PendingWithdrawReconciler(
         store=PendingWithdrawStore(persist_dir=None),
@@ -182,11 +186,14 @@ async def test_refund_is_nonce_gated_against_double_credit():
         local_ledger=local_ledger,
     )
     intent = MagicMock(job_id="withdraw-1", wallet_id="alice", amount=10.0,
-                       tx_hash="0xdead")
+                       tx_hash="0xdead", outcome="reverted")
     first = await rec._refund(intent)
     second = await rec._refund(intent)
-    assert first is True and second is False
-    local_ledger.credit.assert_awaited_once()   # credited exactly once
+    # Both succeed (never a stranded refund), and the wallet is credited EXACTLY once.
+    assert first is True and second is True
+    assert credited == [("alice", 10.0)]
+    # Both calls carried the per-job idempotency key that makes the real ledger exactly-once.
+    assert seen_keys == {"withdraw-refund:withdraw-1"}
 
 
 # ── env config ───────────────────────────────────────────────────────────

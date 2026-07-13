@@ -868,6 +868,12 @@ class FTNSTransaction:
     status: str = "pending"  # pending | confirmed | rejected
     created_at: float = field(default_factory=lambda: __import__("time").time())
     block_number: Optional[int] = None
+    # sp1439 (audit) — the on-chain nonce this tx was signed at. The pending-withdraw
+    # reconciler uses it as the DETERMINISTIC "this tx can never mine" signal: once the
+    # escrow's CONFIRMED nonce advances past it (a different tx took the slot), a dropped
+    # tx is provably dead and its off-chain debit can be safely refunded without ever
+    # double-paying a tx that later mines.
+    nonce: Optional[int] = None
 
 
 class OnChainFTNSLedger:
@@ -1301,6 +1307,7 @@ class OnChainFTNSLedger:
 
                 tx_record.tx_hash = tx_hash.hex()
                 tx_record.status = "pending"
+                tx_record.nonce = int(nonce)   # sp1439 — deterministic dropped-tx signal
                 self._transactions.append(tx_record)
                 await self._record_tx(tx_record)
 
