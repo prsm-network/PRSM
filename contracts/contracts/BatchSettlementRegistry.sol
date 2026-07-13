@@ -768,9 +768,16 @@ contract BatchSettlementRegistry is Ownable2Step, Pausable {
         // L2 audit MEDIUM D-03 fix: slash against the per-batch
         // snapshot of stakeBond, not the live mutable pointer.
         address bondAtCommit = b.stakeBondAtCommit;
+        // sp1456 (slashing audit #1, batch-side) — do NOT gate the slash on the CALLER-supplied
+        // `b.tier_slash_rate_bps > 0`. The provider sets that value at commit (validated only <=10000),
+        // so committing the fraudulent batch with tierSlashRateBps=0 previously skipped slash()
+        // entirely even for a properly-bonded provider. The slash AMOUNT is computed from the provider's
+        // ON-CHAIN bonded rate inside StakeBond.slash (now floored per tier by bond()'s
+        // minSlashRateForAmount), so caller input must not decide whether slashing fires. Always attempt
+        // the slash on a proven fault; a genuinely unslashable stake (open-tier 0-rate bond, or already
+        // withdrawn/slashed) is handled by StakeBond reverting into the try/catch below (SlashSwallowed).
         if (
             bondAtCommit != address(0)
-            && b.tier_slash_rate_bps > 0
             && (
                 reason == ReasonCode.DOUBLE_SPEND
                 || reason == ReasonCode.INVALID_SIGNATURE

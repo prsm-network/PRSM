@@ -155,6 +155,16 @@ contract StakeBond is Ownable2Step, ReentrancyGuard, Pausable {
     /// MUST set this to the BatchSettlementRegistry.
     address public immutable slasher;
 
+    /// @dev sp1456 (slashing audit #2) — a SECOND authorized slasher for the STORAGE-fault path
+    /// (StorageSlashing). `slasher` (the BatchSettlementRegistry) is immutable per HIGH-7, so
+    /// StorageSlashing calling slash() as itself reverts CallerNotSlasher — the ENTIRE storage-fault
+    /// slashing class is dead. This is SET ONCE by the owner (from address(0), then never re-pointable),
+    /// which preserves the HIGH-7 anti-repoint intent while allowing post-deploy wiring (StakeBond and
+    /// StorageSlashing reference each other, so one can't be constructor-immutable in the other).
+    address public storageSlasher;
+
+    event StorageSlasherSet(address indexed storageSlasher);
+
     /// @dev Per-provider stake record. Re-bonding after a full withdraw
     /// overwrites the prior record.
     mapping(address provider => Stake) public stakes;
@@ -217,6 +227,10 @@ contract StakeBond is Ownable2Step, ReentrancyGuard, Pausable {
     error NotUnbonding(address provider, StakeStatus status);
     error UnbondDelayNotElapsed(uint64 eligibleAt);
     error InvalidSlashRateBps(uint16 provided);
+    /// @dev sp1456 — bond() rejects a slash rate below the tier-derived floor (see minSlashRateForAmount).
+    error SlashRateBelowTierFloor(uint16 provided, uint16 floor);
+    /// @dev sp1456 — the storage-fault slasher may be wired exactly once (never re-pointable, per HIGH-7).
+    error StorageSlasherAlreadySet(address current);
     error TransferFailed();
     error CallerNotSlasher(address caller, address expectedSlasher);
     error NotSlashable(address provider, StakeStatus status);
@@ -269,6 +283,17 @@ contract StakeBond is Ownable2Step, ReentrancyGuard, Pausable {
     function bond(uint128 amount, uint16 tierSlashRateBps) external nonReentrant whenNotPaused {
         if (amount == 0) revert ZeroAmount();
         if (tierSlashRateBps > 10000) revert InvalidSlashRateBps(tierSlashRateBps);
+        // sp1456 (slashing audit wu7qhwsz3 #1) — bind the slash rate to a tier-derived FLOOR. Without
+        // this a provider bonds a large amount at rate 0 (or a tiny nonzero rate), qualifies for a high
+        // stake TIER (effectiveTier grades on AMOUNT alone), clears the marketplace/orchestrator stake
+        // gates, yet on a proven DOUBLE_SPEND/INVALID_SIGNATURE slash() computes amount*0/10000 = 0 →
+        // NothingToSlash → the whole 50-100% forfeit is nullified. Flooring the rate at the tier's
+        // required exposure makes tier eligibility and slash exposure inseparable. Governance-tunable
+        // policy (see _minSlashRateForAmount).
+        uint16 minRate = _minSlashRateForAmount(amount);
+        if (tierSlashRateBps < minRate) {
+            revert SlashRateBelowTierFloor(tierSlashRateBps, minRate);
+        }
 
         Stake storage s = stakes[msg.sender];
         if (s.status == StakeStatus.BONDED || s.status == StakeStatus.UNBONDING) {
@@ -364,40 +389,39 @@ contract StakeBond is Ownable2Step, ReentrancyGuard, Pausable {
             // later, while a successful challenge in the
             // `pausedSinceCommit`-shaped tail of the effective challenge
             // window would hit WITHDRAWN → SlashSwallowed.
-            try ISlasherWithProviderExpiryAndPause(slasher).lastPendingBatchExpiry(msg.sender) returns (uint64 maxExpiry) {
-                uint256 pauseAdjusted = uint256(maxExpiry);
-                try ISlasherWithProviderExpiryAndPause(slasher).lastPendingBatchPausedAtAccrual(msg.sender) returns (uint64 pausedAtAccrual) {
-                    try ISlasherWithProviderExpiryAndPause(slasher).totalPausedSeconds() returns (uint256 currentPaused) {
-                        if (currentPaused > uint256(pausedAtAccrual)) {
-                            pauseAdjusted += currentPaused - uint256(pausedAtAccrual);
-                        }
-                    } catch {
-                        // slasher exposes lastPendingBatchExpiry +
-                        // lastPendingBatchPausedAtAccrual but not
-                        // totalPausedSeconds — partial-fix BSR build.
-                        // Fall through with un-pause-adjusted expiry; the
-                        // wall-clock floor is still correct for the
-                        // no-pause case.
-                    }
-                } catch {
-                    // slasher exposes lastPendingBatchExpiry but not
-                    // lastPendingBatchPausedAtAccrual — pre-A-06-fix
-                    // BSR build. Fall through with un-pause-adjusted
-                    // expiry. The wall-clock floor remains correct for
-                    // the no-pause case (which is the common case).
-                }
-                if (pauseAdjusted > effectiveEligibleAt) {
-                    effectiveEligibleAt = pauseAdjusted;
-                }
-            } catch {
-                // slasher contract doesn't expose lastPendingBatchExpiry() —
-                // fall back to whatever floor we already have. Operationally
-                // this branch only fires if the slasher is a pre-HIGH-1-fix
-                // BSR build OR a non-BSR contract entirely.
+            // sp1456 — refactored into _pendingExpiryFloor() so withdraw() can re-apply the SAME
+            // pause-adjusted per-provider expiry floor at withdraw time, closing the
+            // commit-after-requestUnbond evasion (a batch committed AFTER this one-shot snapshot).
+            uint256 pendingFloor = _pendingExpiryFloor(msg.sender);
+            if (pendingFloor > effectiveEligibleAt) {
+                effectiveEligibleAt = pendingFloor;
             }
         }
         s.unbond_eligible_at = uint64(effectiveEligibleAt);
         emit UnbondRequested(msg.sender, s.unbond_eligible_at);
+    }
+
+    /// @dev sp1456 — the pause-adjusted MAXIMUM challenge expiry across `provider`'s currently-PENDING
+    /// batches, read LIVE from the slasher. Mirrors BSR `_effectiveElapsed` pause arithmetic
+    /// (A-01/A-06). Returns 0 when the slasher can't be read or exposes no such tracker — a stale/past
+    /// value is naturally dominated by the caller's other floors and never wrongly blocks. Called by
+    /// requestUnbond (to SET unbond_eligible_at) AND withdraw (to RE-CLAMP against batches committed
+    /// after the requestUnbond snapshot).
+    function _pendingExpiryFloor(address provider) internal view returns (uint256) {
+        if (slasher == address(0) || slasher.code.length == 0) return 0;
+        try ISlasherWithProviderExpiryAndPause(slasher).lastPendingBatchExpiry(provider) returns (uint64 maxExpiry) {
+            uint256 pauseAdjusted = uint256(maxExpiry);
+            try ISlasherWithProviderExpiryAndPause(slasher).lastPendingBatchPausedAtAccrual(provider) returns (uint64 pausedAtAccrual) {
+                try ISlasherWithProviderExpiryAndPause(slasher).totalPausedSeconds() returns (uint256 currentPaused) {
+                    if (currentPaused > uint256(pausedAtAccrual)) {
+                        pauseAdjusted += currentPaused - uint256(pausedAtAccrual);
+                    }
+                } catch {}  // partial-fix BSR without totalPausedSeconds — no-pause case still correct
+            } catch {}  // pre-A-06 BSR without lastPendingBatchPausedAtAccrual — no-pause case correct
+            return pauseAdjusted;
+        } catch {
+            return 0;  // slasher exposes no lastPendingBatchExpiry — no per-provider floor available
+        }
     }
 
     /**
@@ -413,6 +437,16 @@ contract StakeBond is Ownable2Step, ReentrancyGuard, Pausable {
         }
         if (block.timestamp < s.unbond_eligible_at) {
             revert UnbondDelayNotElapsed(s.unbond_eligible_at);
+        }
+        // sp1456 (slashing audit #3) — RE-CLAMP against the LIVE per-provider pending-expiry floor.
+        // unbond_eligible_at is a one-shot snapshot taken at requestUnbond; a batch committed AFTER it
+        // (BSR._commitBatch has no BONDED gate) raises the slasher's lastPendingBatchExpiry but never
+        // re-clamps this snapshot. Withdrawing before that later challenge window closes would let the
+        // batch be challenged post-WITHDRAWN and swallow the 50-100% slash. Block withdraw until every
+        // currently-pending batch's (pause-adjusted) window has elapsed.
+        uint256 pendingFloor = _pendingExpiryFloor(msg.sender);
+        if (block.timestamp < pendingFloor) {
+            revert UnbondDelayNotElapsed(uint64(pendingFloor));
         }
 
         uint128 payout = s.amount;
@@ -452,6 +486,22 @@ contract StakeBond is Ownable2Step, ReentrancyGuard, Pausable {
         return "open";
     }
 
+    /// @notice sp1456 — the MINIMUM slash rate (bps) a bond of `amount` must post, mirroring the
+    ///         effectiveTier thresholds so tier eligibility and slash exposure cannot diverge (the
+    ///         rate-0-at-critical-tier evasion). GOVERNANCE-TUNABLE POLICY: >=50k FTNS (critical) must
+    ///         post 100% (10000bps); >=5k (standard/premium) must post >=50% (5000bps); <5k (open tier,
+    ///         which clears no stake gate and earns no tier privileges) has no floor. A future version
+    ///         may make these values a governance-settable table; hard-coded here per the approved policy.
+    function minSlashRateForAmount(uint128 amount) public pure returns (uint16) {
+        return _minSlashRateForAmount(amount);
+    }
+
+    function _minSlashRateForAmount(uint128 amount) internal pure returns (uint16) {
+        if (amount >= 50_000 * 1e18) return 10000;  // critical tier → full 100% forfeit
+        if (amount >= 5_000 * 1e18) return 5000;    // standard/premium → 50% floor
+        return 0;                                   // open tier → untrusted, no tier, no floor
+    }
+
     // ── Governance surface ────────────────────────────────────────
 
     /**
@@ -469,6 +519,20 @@ contract StakeBond is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 old = unbondDelaySeconds;
         unbondDelaySeconds = newDelay;
         emit UnbondDelayUpdated(old, newDelay);
+    }
+
+    /**
+     * @notice sp1456 — wire the storage-fault slasher (StorageSlashing) EXACTLY ONCE. Owner-only, and
+     *         only permitted while `storageSlasher == address(0)`, so it can never be re-pointed to an
+     *         attacker (the same anti-repoint guarantee HIGH-7 gave `slasher` by making it immutable).
+     *         Needed because StakeBond and StorageSlashing reference each other and cannot both be
+     *         constructor-immutable; without it every storage-fault slash reverts CallerNotSlasher.
+     */
+    function setStorageSlasherOnce(address newStorageSlasher) external onlyOwner {
+        if (storageSlasher != address(0)) revert StorageSlasherAlreadySet(storageSlasher);
+        if (newStorageSlasher == address(0)) revert ZeroAddress();
+        storageSlasher = newStorageSlasher;
+        emit StorageSlasherSet(newStorageSlasher);
     }
 
     // L2 audit HIGH-7 (B-CROSS-3) fix: setSlasher was removed. The
@@ -563,7 +627,11 @@ contract StakeBond is Ownable2Step, ReentrancyGuard, Pausable {
         address challenger,
         bytes32 reasonId
     ) external nonReentrant whenNotPaused {
-        if (msg.sender != slasher) {
+        // sp1456 — authorize BOTH the immutable settlement slasher (BSR) AND the set-once storage
+        // slasher (StorageSlashing). storageSlasher==address(0) (unwired) leaves only `slasher`
+        // authorized (a real caller can never be address(0)), so this cannot widen access before it is
+        // deliberately wired once.
+        if (msg.sender != slasher && msg.sender != storageSlasher) {
             revert CallerNotSlasher(msg.sender, slasher);
         }
         Stake storage s = stakes[provider];

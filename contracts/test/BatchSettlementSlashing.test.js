@@ -278,8 +278,13 @@ describe("BatchSettlementRegistry — Phase 7 slashing integration", function ()
       expect(stake.amount).to.equal(PREMIUM_STAKE);
     });
 
-    it("does not revert when tier_slash_rate_bps is 0", async function () {
-      // Provider commits batch at tier_slash_rate_bps = 0 (unstaked tier).
+    it("sp1456: still slashes the provider's BOND when the batch tier_slash_rate_bps is 0", async function () {
+      // A PROPERLY-BONDED provider (PREMIUM_STAKE @ PREMIUM_SLASH_BPS in beforeEach) commits the
+      // fraudulent batch with a self-declared tier_slash_rate_bps = 0. Pre-sp1456 the challengeReceipt
+      // gate `b.tier_slash_rate_bps > 0` skipped the slash ENTIRELY, so a bonded provider could
+      // self-disable slashing by committing at rate 0 — a full slash-evasion. The slash AMOUNT is
+      // computed from the provider's ON-CHAIN bonded rate (not the caller-supplied batch rate), so the
+      // challenge must now slash the bond regardless of the batch's declared rate.
       const sharedLeaf = makeLeaf();
       const root = hashLeaf(sharedLeaf);
 
@@ -297,9 +302,9 @@ describe("BatchSettlementRegistry — Phase 7 slashing integration", function ()
       );
 
       await registry.connect(challenger).challengeReceipt(id2, sharedLeaf, [], 0, aux);
-      // No slash attempted; stake untouched.
+      // sp1456: the bond IS slashed at the BOND's rate (100% for premium) — no longer swallowed.
       const stake = await stakeBond.stakeOf(provider.address);
-      expect(stake.amount).to.equal(PREMIUM_STAKE);
+      expect(stake.amount).to.equal(0);
     });
 
     it("does not revert when provider has no stake", async function () {

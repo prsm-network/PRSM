@@ -5326,9 +5326,11 @@ def _resolve_stake_client(require_ftns: bool = False):
 @node.command("stake-bond")
 @click.argument("amount_ftns", type=float)
 @click.option(
-    "--tier-slash-rate-bps", "tier_slash_rate_bps", type=int, default=0,
-    help="Slash-rate tier this stake commits to, in basis points (0-10000). Higher = higher trust "
-    "tier + higher slash exposure. Default 0.",
+    "--tier-slash-rate-bps", "tier_slash_rate_bps", type=int, default=None,
+    help="Slash-rate this stake commits to, in basis points (0-10000). Higher = higher trust tier + "
+    "higher slash exposure. DEFAULT: the tier floor for the bonded amount (>=50k FTNS => 10000, "
+    ">=5k => 5000, else 0) — matches the StakeBond minimum (sp1456) so a tier-qualifying bond is "
+    "actually slashable. A value below that floor is rejected on-chain.",
 )
 @click.option(
     "--dry-run", "dry_run", is_flag=True, default=False,
@@ -5353,6 +5355,11 @@ def node_stake_bond_cli(
 
     if amount_ftns <= 0:
         raise click.ClickException(f"amount_ftns must be positive (got {amount_ftns})")
+    if tier_slash_rate_bps is None:
+        # sp1456 — default to the StakeBond tier floor for this amount so an honest operator's
+        # tier-qualifying bond is actually slashable (rate 0 = unslashable, the audited evasion).
+        # Mirrors the on-chain StakeBond.minSlashRateForAmount thresholds.
+        tier_slash_rate_bps = 10000 if amount_ftns >= 50_000 else 5000 if amount_ftns >= 5_000 else 0
     client, addrs = _resolve_stake_client(require_ftns=True)
     amount_wei = int(round(amount_ftns * 1e18))
     if dry_run:
