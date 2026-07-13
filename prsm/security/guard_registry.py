@@ -398,6 +398,39 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1443_sandbox_exec_fail_closed.py",
         kills_test_id="test_opt_in_exec_wires_new_session_rlimits_and_drops_host_path",
     ),
+    Guard(
+        id="authz-protect-dashboard-ftns-drain",
+        sprint="sp1444",
+        file="prsm/api/auth_middleware.py",
+        anchor='"/api/ftns/",',
+        protects="an unkeyed DRAIN of the operator's off-chain FTNS. NodeAuthMiddleware is a "
+                 "deny-list (is_protected_path), and the web dashboard sub-app mounted at "
+                 "app.mount(\"\",…) exposes POST /api/ftns/transfer → node.ledger_sync.signed_"
+                 "transfer (debits the operator's own wallet) — the whole dashboard /api/* surface "
+                 "was invisible to the deny-list, so on a KEYED public node an attacker with no API "
+                 "key could transfer the operator's FTNS to themselves (+ read /api/ftns/balance|"
+                 "history PII). This prefix gates the dashboard money subtree; deleting it re-opens "
+                 "the drain (a blanket /api/ is NOT usable — it would gate the dashboard's own "
+                 "/api/auth/login)",
+        killed_by="tests/unit/test_sprint_1444_api_authz_denylist_gaps.py",
+        kills_test_id="test_keyed_node_rejects_unkeyed_ftns_transfer",
+    ),
+    Guard(
+        id="authz-protect-content-paid-publish",
+        sprint="sp1444",
+        file="prsm/api/auth_middleware.py",
+        anchor='"/content/paid/",',
+        protects="an unkeyed spend of the operator's gas + on-chain provenance poisoning. POST "
+                 "/content/paid/publish (sp1367) calls key_client.deposit_key signed by the "
+                 "operator's PRSM_PAID_PUBLISHER_KEY hot wallet (burns gas per call), registers the "
+                 "operator as the on-chain creator, and injects an attacker-chosen wrapped key into "
+                 "the paid-key store — yet the /content/* deny-list prefixes (/content/upload, "
+                 "/content/arbitration/, /content/mine, .../pin) never covered /content/paid/, so it "
+                 "was reachable with no API key on a keyed node. Delete this prefix and the gas "
+                 "drain / provenance-poison returns",
+        killed_by="tests/unit/test_sprint_1444_api_authz_denylist_gaps.py",
+        kills_test_id="test_sensitive_route_is_now_protected",
+    ),
 ]
 
 

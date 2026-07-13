@@ -120,6 +120,25 @@ PROTECTED_PREFIXES = [
     # mode is unaffected — auth_enabled gates the whole check, and a no-key public bind
     # is already refused at startup).
     "/onboarding/",
+    # Sprint 1444 — API-authz re-audit (wtmwud600). Four deny-list gaps on the highest-value
+    # routes, each open unauthenticated on a KEYED public node (operator-key bypass, not IDOR):
+    #  A (CRITICAL) — the mounted dashboard sub-app (app.mount("",…)) exposes /api/ftns/transfer →
+    #    node.ledger_sync.signed_transfer, an unkeyed DRAIN of the operator's off-chain FTNS; plus
+    #    /api/ftns/stake and the money-PII reads /api/ftns/balance + /api/ftns/history. The whole
+    #    dashboard /api/* surface was invisible to this deny-list. (A blanket "/api/" is WRONG — it
+    #    would gate the dashboard's OWN /api/auth/login + public /api/status|health reads; gate the
+    #    sensitive subtrees only.)
+    #  B (HIGH) — POST /content/paid/publish (sp1367) spends the operator's PRSM_PAID_PUBLISHER_KEY
+    #    gas + registers the operator as on-chain creator + injects into the paid-key store; the
+    #    /content/* prefixes never covered /content/paid/.
+    #  D (MEDIUM) — GET /balance leaks the operator's balance + last 20 tx (identical PII shape to
+    #    the sp183-protected /transactions, which the equivalent read route simply never joined).
+    "/api/ftns/",              # A + C — transfer(drain)/stake/balance/history
+    "/api/jobs/submit",        # A — mutating job submit (leaves /api/jobs reads open)
+    "/api/distillation/submit",  # A — mutating distillation submit
+    "/api/teacher/create",     # A — mutating teacher-model create
+    "/content/paid/",          # B — operator gas + on-chain creator identity
+    "/balance",                # D — operator balance + tx-history PII (+ /balance/onchain)
 ]
 
 # Sprint 1012 — protected paths with an EMBEDDED parameter that a startswith
