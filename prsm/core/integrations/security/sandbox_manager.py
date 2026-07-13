@@ -74,6 +74,65 @@ class SandboxResult:
     status: str = "completed"
 
 
+# ── sp1443 (compute-sandbox audit, Findings 1+2) — untrusted-execution safety ──
+# execute_safely's subprocess backend runs the guest as a PLAIN child of the daemon user: no
+# network namespace, no seccomp, no user namespace, no chroot. It provides NO confidentiality or
+# network isolation (the block_network / allowed_domains flags are advisory JSON this code never
+# reads). Executing untrusted downloaded content there is host-secret exfiltration + SSRF + RCE, so
+# execution is FAIL-CLOSED: it runs ONLY when the operator explicitly opts in, and even then it is
+# resource-bounded (rlimits + its own session so a runaway process GROUP can be reaped).
+
+def _unisolated_exec_enabled() -> bool:
+    """Opt-in gate for running untrusted content in the (un-isolated) subprocess backend. OFF by
+    default — an operator must set PRSM_SANDBOX_ALLOW_UNISOLATED_EXEC only when this process is
+    itself wrapped in REAL external isolation (a --net=none container / nsjail), since this backend
+    gives no network or filesystem isolation on its own."""
+    return (os.environ.get("PRSM_SANDBOX_ALLOW_UNISOLATED_EXEC", "") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _sandbox_mem_limit_bytes() -> int:
+    # RLIMIT_AS caps VIRTUAL address space; a modern interpreter maps several GB of virtual space at
+    # startup (especially on macOS), so the cap must be generous enough to START yet still bound a
+    # runaway allocation. 2 GiB default, env-tunable, floored at 512 MiB.
+    try:
+        return max(512, int(os.environ.get("PRSM_SANDBOX_MEM_LIMIT_MB", "2048"))) * 1024 * 1024
+    except (ValueError, TypeError):
+        return 2048 * 1024 * 1024
+
+
+def _sandbox_preexec(cpu_seconds: int, mem_bytes: int):
+    """Build a POSIX preexec_fn: start a NEW SESSION so os.killpg can reap the whole process GROUP on
+    timeout — a forked grandchild otherwise survives as a runaway (Finding 2) — and clamp the
+    PER-PROCESS rlimits (CPU time, address space) so a runaway CPU loop / alloc bomb is bounded.
+
+    Deliberately does NOT set RLIMIT_NPROC / RLIMIT_NOFILE: those are per-USER / inherited limits, so
+    an absolute low value breaks whenever the host already runs many of the user's processes or holds
+    many fds (it capped the child before it could exec). The session + killpg-on-timeout is the real
+    runaway defense; a fork bomb is bounded by the timeout reaping the whole group. (A hard pids cap
+    belongs in the external container/cgroup this opt-in path must run behind anyway.)"""
+    def _pre():  # runs in the forked child, before exec
+        try:
+            os.setsid()
+        except OSError:
+            pass
+        try:
+            import resource as _resource
+        except ImportError:
+            return
+        for name, limit in (
+            ("RLIMIT_CPU", (int(cpu_seconds) + 1, int(cpu_seconds) + 1)),
+            ("RLIMIT_AS", (int(mem_bytes), int(mem_bytes))),
+        ):
+            r = getattr(_resource, name, None)
+            if r is not None:
+                try:
+                    _resource.setrlimit(r, limit)
+                except (ValueError, OSError):
+                    pass
+    return _pre
+
+
 # ===== MCP Tool Execution Sandbox Classes =====
 
 class ToolSandboxType(str, Enum):
@@ -647,12 +706,8 @@ class SandboxManager:
                     status="error"
                 )
 
-            # Determine execution command based on file type
-            if content_path.endswith('.py'):
-                import sys
-                cmd = [sys.executable, content_path]
-            else:
-                # For non-Python files, just validate they can be read
+            # Non-Python files are only validated (never executed).
+            if not content_path.endswith('.py'):
                 return SandboxResult(
                     success=True,
                     output="Content validated (non-executable)",
@@ -661,38 +716,68 @@ class SandboxManager:
                     status="completed"
                 )
 
-            # Execute with timeout and resource limits
+            # sp1443 (Finding 1, CRITICAL) — FAIL CLOSED. This backend has NO OS isolation, so
+            # running untrusted content here is host-secret exfiltration / SSRF / RCE. Skip execution
+            # unless the operator explicitly opts in (behind real external isolation). Static scans
+            # still gate the import; we simply refuse to RUN attacker-controlled code by default.
+            if not _unisolated_exec_enabled():
+                logger.warning(
+                    "sandbox: refusing to EXECUTE untrusted content (no OS isolation on this "
+                    "backend). Static analysis only. Set PRSM_SANDBOX_ALLOW_UNISOLATED_EXEC=1 to "
+                    "enable — ONLY behind a real --net=none container / nsjail.",
+                    content_path=content_path,
+                )
+                return SandboxResult(
+                    success=True,
+                    output="",
+                    error_output="execution skipped: no OS isolation on this sandbox backend",
+                    exit_code=0,
+                    status="skipped_no_isolation",
+                )
+
+            import sys
+            import signal
+            cmd = [sys.executable, content_path]
             timeout = min(metadata.get("timeout", 30), self.scan_timeout)
 
+            # sp1443 (Finding 2, HIGH) — run in a NEW SESSION with rlimits so a forked grandchild
+            # can't survive the timeout as a runaway (killpg reaps the whole group) and a fork/alloc
+            # bomb is bounded. Drop the host PATH/PYTHONPATH. NB: this still gives no network/fs
+            # isolation — that is why the whole path is opt-in behind external containment above.
+            proc = sp.Popen(
+                cmd,
+                stdout=sp.PIPE,
+                stderr=sp.PIPE,
+                text=True,
+                cwd=self.sandbox_dir,
+                env={"PATH": "", "HOME": self.sandbox_dir, "PYTHONPATH": ""},
+                preexec_fn=_sandbox_preexec(timeout, _sandbox_mem_limit_bytes()),
+            )
             try:
-                result = sp.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    cwd=self.sandbox_dir,
-                    env={
-                        "PATH": os.environ.get("PATH", ""),
-                        "HOME": self.sandbox_dir,
-                        "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
-                    }
-                )
-
+                out, err = proc.communicate(timeout=timeout)
                 return SandboxResult(
-                    success=result.returncode == 0,
-                    output=result.stdout[:10000],
-                    error_output=result.stderr[:10000],
-                    exit_code=result.returncode,
-                    status="completed"
+                    success=proc.returncode == 0,
+                    output=(out or "")[:10000],
+                    error_output=(err or "")[:10000],
+                    exit_code=proc.returncode if proc.returncode is not None else -1,
+                    status="completed",
                 )
-
             except sp.TimeoutExpired:
+                # Reap the ENTIRE process group, not just the tracked child.
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+                try:
+                    proc.communicate(timeout=5)
+                except Exception:  # noqa: BLE001 — best-effort reap after the kill
+                    pass
                 return SandboxResult(
                     success=False,
                     output="",
                     error_output=f"Execution timed out after {timeout} seconds",
                     exit_code=-1,
-                    status="timeout"
+                    status="timeout",
                 )
 
         except Exception as e:

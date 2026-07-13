@@ -366,6 +366,38 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1442_p2p_substrate_hardening.py",
         kills_test_id="test_unsolicited_digest_response_is_dropped_before_processing",
     ),
+    Guard(
+        id="sandbox-exec-fail-closed",
+        sprint="sp1443",
+        file="prsm/core/integrations/security/sandbox_manager.py",
+        anchor="if not _unisolated_exec_enabled():",
+        protects="arbitrary code execution / host-secret exfiltration / SSRF on the node. "
+                 "SandboxManager.execute_safely runs untrusted .py as a PLAIN child of the daemon "
+                 "user — no netns/seccomp/userns/chroot, full host filesystem read + unrestricted "
+                 "network (the block_network/allowed_domains flags are advisory JSON no execution "
+                 "code reads). Reachable by design from the authenticated /integrations/import + "
+                 "/integrations/security/scan flows (enable_sandbox defaults True, _should_run_"
+                 "sandbox auto-runs any payload that evades the regex vuln scan). This gate FAILS "
+                 "CLOSED: it refuses to EXECUTE untrusted content unless the operator explicitly "
+                 "opts in (behind real external isolation). Delete it and downloaded code auto-runs "
+                 "as the daemon user again",
+        killed_by="tests/unit/test_sprint_1443_sandbox_exec_fail_closed.py",
+        kills_test_id="test_execute_safely_does_not_run_untrusted_code_by_default",
+    ),
+    Guard(
+        id="sandbox-exec-process-group-reap",
+        sprint="sp1443",
+        file="prsm/core/integrations/security/sandbox_manager.py",
+        anchor="preexec_fn=_sandbox_preexec(timeout, _sandbox_mem_limit_bytes())",
+        protects="an unbounded runaway-process DoS on the (opt-in) subprocess exec path. sp.run(..., "
+                 "timeout) SIGKILLs only the direct child, so a forked grandchild (double-fork / "
+                 "os.fork) survives the timeout and spins a core / grows memory forever — bounded "
+                 "requester effort, unbounded host CPU/memory. _sandbox_preexec starts a NEW SESSION "
+                 "(so the timeout handler's os.killpg reaps the whole process GROUP) and clamps "
+                 "per-process CPU/address-space rlimits. Delete it and a timed-out job leaks runaways",
+        killed_by="tests/unit/test_sprint_1443_sandbox_exec_fail_closed.py",
+        kills_test_id="test_opt_in_exec_wires_new_session_rlimits_and_drops_host_path",
+    ),
 ]
 
 
