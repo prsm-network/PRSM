@@ -67,6 +67,50 @@ def fetch_and_verify_wrapped_key(fetch_fn: Any, content_hash: bytes, commitment:
     return wrapped
 
 
+# RPCs (Base, most L2s) cap eth_getLogs at a ~10k-block range and REJECT a wider query outright
+# (Base mainnet: error -32614 "eth_getLogs is limited to a 10,000 range"). A one-shot
+# get_key_released_events(0, latest) therefore HARD-FAILS on mainnet — the scan must walk the range
+# in windows. Newest-first: a key released by the release() we just sent (or a recent prior release)
+# lands in the first window, so the common path costs one RPC; an older release costs one extra RPC
+# per ~chunk blocks scanned back. Kept just under the cap for headroom.
+_LOG_RANGE_CHUNK = 9000
+
+
+def _get_released_window(client: Any, content_hash: bytes, from_block: int, to_block: int) -> Any:
+    """One windowed get_key_released_events call, RPC-side filtered by contentHash when the client
+    supports argument_filters (bytes32 — no address-checksum footgun). A client/stub predating that
+    kwarg falls back to callback-side filtering; recipient is always filtered by _matching_key."""
+    try:
+        return client.get_key_released_events(
+            from_block, to_block, argument_filters={"contentHash": bytes(content_hash)})
+    except TypeError:  # older client/stub without the argument_filters kwarg
+        return client.get_key_released_events(from_block, to_block)
+
+
+def _scan_released_key(
+    client: Any, content_hash: bytes, recipient: str,
+    from_block: int, to_block: int, chunk_size: int,
+) -> Optional[bytes]:
+    """Newest-first, chunked scan of [from_block, to_block] for the KeyReleased event matching
+    (content_hash, recipient). Stays under the RPC eth_getLogs range cap and short-circuits on the
+    first (newest) match. Returns the wrapped key or None."""
+    if to_block < from_block:
+        return None
+    if chunk_size is None or chunk_size <= 0:
+        chunk_size = to_block - from_block + 1  # single window (small chains / tests)
+    hi = to_block
+    while hi >= from_block:
+        lo = max(from_block, hi - chunk_size + 1)
+        key = _matching_key(
+            _get_released_window(client, content_hash, lo, hi), content_hash, recipient)
+        if key is not None:
+            return key
+        if lo == from_block:
+            break
+        hi = lo - 1
+    return None
+
+
 def _matching_key(events: Any, content_hash: bytes, recipient: str) -> Optional[bytes]:
     ch = bytes(content_hash)
     rl = str(recipient).lower()
@@ -87,6 +131,7 @@ def acquire_released_key(
     from_block: int = 0,
     to_block: Optional[int] = None,
     trigger_release: bool = True,
+    log_range_chunk: int = _LOG_RANGE_CHUNK,
 ) -> bytes:
     """Acquire the released ``encrypted_key`` for ``(content_hash, recipient)`` from the
     KeyDistribution contract via ``client`` (a KeyDistributionClient or compatible).
@@ -104,7 +149,7 @@ def acquire_released_key(
     from prsm.economy.web3.provenance_registry import OnChainRevertedError
 
     top = to_block if to_block is not None else client.latest_block()
-    key = _matching_key(client.get_key_released_events(from_block, top), content_hash, recipient)
+    key = _scan_released_key(client, content_hash, recipient, from_block, top, log_range_chunk)
     if key is not None:
         return key  # already released — no re-trigger (idempotent)
 
@@ -128,8 +173,8 @@ def acquire_released_key(
             f"release reverted — most likely the release fee is unpaid, or the key was "
             f"deauthorized: {exc}") from exc
 
-    top = client.latest_block()
-    key = _matching_key(client.get_key_released_events(from_block, top), content_hash, recipient)
+    top = to_block if to_block is not None else client.latest_block()
+    key = _scan_released_key(client, content_hash, recipient, from_block, top, log_range_chunk)
     if key is None:
         raise KeyNotReleasedError(
             "release tx was sent but no matching KeyReleased event was found (RPC lag or a "

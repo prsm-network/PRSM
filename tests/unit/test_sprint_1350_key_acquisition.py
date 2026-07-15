@@ -124,5 +124,87 @@ def test_acquired_key_reconstructs_plaintext_end_to_end():
     assert reconstruct_paid_content(released_key, buyer_priv, content) == plaintext   # B1
 
 
+# ── sp1457: the on-chain KeyReleased scan must stay under the RPC eth_getLogs range cap ──
+# A one-shot get_key_released_events(0, latest) HARD-FAILS on Base mainnet, whose RPC rejects any
+# eth_getLogs wider than 10k blocks (error -32614 "eth_getLogs is limited to a 10,000 range"). The
+# acquire path must walk the range in windows; these tests use a stub that enforces the same cap.
+
+_RPC_RANGE_CAP = 10_000
+
+
+class _RangeCappedClient:
+    """A KeyDistribution client stub that rejects an eth_getLogs query wider than the RPC cap
+    (mimicking Base mainnet's -32614), and range-filters returned events by block — so a scan
+    only succeeds if it chunks under the cap AND queries the window holding the event."""
+
+    def __init__(self, *, released_at=None, emit_on_release=None, emit_block=None, latest=30_000_000):
+        # released_at: list of (block_number, _Ev); emit_on_release/_block: event to add on release()
+        self._events = list(released_at or [])
+        self._emit = emit_on_release
+        self._emit_block = emit_block
+        self._latest = int(latest)
+        self.release_calls = []
+        self.window_queries = []
+
+    def latest_block(self):
+        return self._latest
+
+    def get_key_released_events(self, from_block, to_block, *, argument_filters=None):
+        span = int(to_block) - int(from_block) + 1
+        if span > _RPC_RANGE_CAP:
+            raise ValueError(
+                f"eth_getLogs is limited to a {_RPC_RANGE_CAP} range (-32614): got {span} blocks "
+                f"[{from_block}, {to_block}]")
+        self.window_queries.append((int(from_block), int(to_block)))
+        return [ev for (blk, ev) in self._events if from_block <= blk <= to_block]
+
+    def release(self, content_hash, recipient):
+        self.release_calls.append((content_hash, recipient))
+        if self._emit is not None:
+            self._events.append((self._emit_block, self._emit))
+        return ("0xtx", None)
+
+
+def test_range_capped_stub_rejects_oversized_query_sanity():
+    # Discriminating: prove the stub actually enforces the cap, so the tests below are meaningful.
+    client = _RangeCappedClient()
+    with pytest.raises(ValueError, match="10000 range"):
+        client.get_key_released_events(0, 30_000_000)
+
+
+def test_recent_release_found_under_range_cap():
+    # Event near the chain tip; a one-shot [0, latest] scan would exceed the cap and raise.
+    client = _RangeCappedClient(released_at=[(29_999_000, _Ev(_CH, _BUYER, b"wrapped-recent"))])
+    assert acquire_released_key(client, _CH, _BUYER) == b"wrapped-recent"
+    assert client.release_calls == []                                  # idempotent — already released
+    assert all(hi - lo + 1 <= _RPC_RANGE_CAP for (lo, hi) in client.window_queries)
+
+
+def test_release_then_read_stays_under_range_cap():
+    # Not-yet-released → trigger release() → the re-read must ALSO chunk (line-132 scan).
+    client = _RangeCappedClient(emit_on_release=_Ev(_CH, _BUYER, b"wrapped-fresh"),
+                                emit_block=29_999_500)
+    assert acquire_released_key(client, _CH, _BUYER) == b"wrapped-fresh"
+    assert client.release_calls == [(_CH, _BUYER)]
+    assert all(hi - lo + 1 <= _RPC_RANGE_CAP for (lo, hi) in client.window_queries)
+
+
+def test_older_release_found_several_chunks_back():
+    # Event ~20k blocks below the tip → the newest-first walk must continue past the first window.
+    client = _RangeCappedClient(released_at=[(29_980_000, _Ev(_CH, _BUYER, b"wrapped-older"))])
+    assert acquire_released_key(client, _CH, _BUYER) == b"wrapped-older"
+    assert len(client.window_queries) >= 2                             # took more than one window
+    assert all(hi - lo + 1 <= _RPC_RANGE_CAP for (lo, hi) in client.window_queries)
+
+
+def test_chunked_scan_still_ignores_other_recipient():
+    # A different recipient's release in the same window must not be mistaken for ours.
+    client = _RangeCappedClient(
+        released_at=[(29_999_000, _Ev(_CH, "0x" + "99" * 20, b"not-mine"))],
+        emit_on_release=_Ev(_CH, _BUYER, b"mine"), emit_block=29_999_900)
+    assert acquire_released_key(client, _CH, _BUYER) == b"mine"
+    assert client.release_calls == [(_CH, _BUYER)]                     # had to trigger for us
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
