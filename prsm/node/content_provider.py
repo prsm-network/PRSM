@@ -1733,6 +1733,23 @@ class ContentProvider:
             # Supported-algo canonical CID: verify strictly here. IO error → None → reject.
             return file_digest is not None and file_digest == parsed.digest.hex()
 
+        # (a2) BitTorrent v1 infohash CID (40-hex) → stream-derive the file's infohash and
+        # require an exact match. Closes the sp1290 "documented follow-on": before sp1457 an
+        # infohash CID had NO streaming anchor on this path and fell through to the weaker
+        # gossip check. The infohash IS the content-derived identity (more authoritative than
+        # the gossip hash), so a mismatch REJECTS; an unreadable/underivable file fails closed.
+        low = cid.lower() if isinstance(cid, str) else ""
+        if len(low) == 40 and all(c in "0123456789abcdef" for c in low):
+            def _derive_infohash():
+                from prsm.core.torrent_infohash import (
+                    compute_v1_infohash_single_file_from_path)
+                return compute_v1_infohash_single_file_from_path(path)
+            try:
+                derived = await loop.run_in_executor(None, _derive_infohash)
+            except Exception:  # noqa: BLE001 — can't verify the chosen anchor → fail closed
+                return False
+            return derived == low
+
         # (b) gossip-supplied expected hash (sha256), when known.
         if expected_hash:
             file_sha256 = await loop.run_in_executor(

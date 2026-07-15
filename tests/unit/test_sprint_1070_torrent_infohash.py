@@ -91,3 +91,50 @@ def test_matches_libtorrent_v1(label, size):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ── sp1457: streaming-from-path infohash is byte-identical to the in-memory version ──
+
+import hashlib as _hashlib
+
+from prsm.core.torrent_infohash import (
+    compute_v1_infohash_single_file_from_path,
+    DEFAULT_PIECE_LENGTH,
+)
+
+
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize("size", [
+    0,                              # empty
+    1,                              # tiny
+    DEFAULT_PIECE_LENGTH - 1,       # just under one piece
+    DEFAULT_PIECE_LENGTH,           # exactly one piece
+    DEFAULT_PIECE_LENGTH + 1,       # just over → 2 pieces
+    DEFAULT_PIECE_LENGTH * 3 + 7,   # several pieces, non-aligned tail
+])
+def test_streaming_infohash_matches_in_memory(tmp_path, size):
+    data = bytes((i * 31 + 7) % 256 for i in range(size))
+    f = tmp_path / "blob.bin"
+    f.write_bytes(data)
+    # Default name = sha256(bytes).hex() — the PRSM canonical single-file name, matching
+    # content_provider._infohash_anchor_rejects.
+    name = _hashlib.sha256(data).hexdigest()
+    expected = compute_v1_infohash_single_file(data, name)
+    assert compute_v1_infohash_single_file_from_path(f) == expected
+
+
+def test_streaming_infohash_honors_explicit_name(tmp_path):
+    data = b"named-torrent-content" * 1000
+    f = tmp_path / "blob.bin"
+    f.write_bytes(data)
+    assert (compute_v1_infohash_single_file_from_path(f, name="dataset.parquet")
+            == compute_v1_infohash_single_file(data, "dataset.parquet"))
+
+
+def test_streaming_infohash_rejects_bad_piece_length(tmp_path):
+    f = tmp_path / "blob.bin"
+    f.write_bytes(b"x")
+    with _pytest.raises(ValueError):
+        compute_v1_infohash_single_file_from_path(f, piece_length=0)

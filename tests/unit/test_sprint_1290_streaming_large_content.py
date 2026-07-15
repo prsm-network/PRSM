@@ -358,3 +358,25 @@ async def test_verify_file_cid_anchors_on_the_cids_own_algorithm_sha3(tmp_path):
     bad.write_bytes(b"different bytes " * 500)
     assert await provider._verify_file_cid(cid, good, True) is True
     assert await provider._verify_file_cid(cid, bad, True) is False
+
+
+@pytest.mark.asyncio
+async def test_verify_file_cid_anchors_bittorrent_infohash_cid(tmp_path):
+    # sp1457 — a 40-hex BitTorrent-infohash CID is now anchored on the streaming path by
+    # re-deriving the file's infohash (previously a "documented follow-on" → fell through to
+    # the weaker gossip check, so substituted bytes with a matching gossip hash were accepted).
+    from prsm.core.torrent_infohash import compute_v1_infohash_single_file_from_path
+    provider = _make_provider("node_v")
+    real = b"tier-a public dataset bytes " * 500
+    good = tmp_path / "good.bin"
+    good.write_bytes(real)
+    cid = compute_v1_infohash_single_file_from_path(good)     # 40-hex infohash CID
+    assert len(cid) == 40 and all(c in "0123456789abcdef" for c in cid)
+    assert await provider._verify_file_cid(cid, good, True) is True    # matching bytes accepted
+
+    evil = b"attacker-substituted bytes!! " * 500
+    bad = tmp_path / "bad.bin"
+    bad.write_bytes(evil)
+    evil_gossip = hashlib.sha256(evil).hexdigest()
+    # Substituted file REJECTED even though the gossip hash matches the evil bytes.
+    assert await provider._verify_file_cid(cid, bad, True, expected_hash=evil_gossip) is False

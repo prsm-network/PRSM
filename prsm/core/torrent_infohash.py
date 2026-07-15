@@ -64,3 +64,36 @@ def compute_v1_infohash_single_file(
     (sp1070 golden-verified). This is the PRSM CID a non-libtorrent publisher uses."""
     info = build_single_file_info_dict(data, name, piece_length)
     return hashlib.sha1(bencodepy.encode(info)).hexdigest()
+
+
+def compute_v1_infohash_single_file_from_path(
+    path, name: "str | None" = None, piece_length: int = DEFAULT_PIECE_LENGTH,
+) -> str:
+    """sp1457 — the STREAMING equivalent of ``compute_v1_infohash_single_file``: compute the
+    canonical v1 infohash of a file WITHOUT loading it into memory, reading it in
+    ``piece_length`` blocks. Byte-identical to the in-memory function for the same bytes
+    (single-pass: each block feeds both the BEP-3 per-piece SHA-1 and, when ``name`` is not
+    given, the SHA-256 the PRSM anchor derives the torrent ``name`` from — matching
+    ``_infohash_anchor_rejects``' ``name = sha256(bytes).hexdigest()``). Lets a multi-GiB
+    file's CID be verified/derived with a bounded memory footprint.
+
+    ``name`` defaults to ``sha256(file).hexdigest()`` (the PRSM canonical single-file name).
+    Raises ``ValueError`` on a non-positive ``piece_length``; propagates OS errors on read."""
+    if piece_length <= 0:
+        raise ValueError(f"piece_length must be positive (got {piece_length})")
+    sha256 = hashlib.sha256()
+    pieces = bytearray()
+    length = 0
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(piece_length), b""):
+            length += len(block)
+            sha256.update(block)
+            pieces += hashlib.sha1(block).digest()
+    resolved_name = name if name is not None else sha256.hexdigest()
+    info = {
+        b"length": length,
+        b"name": resolved_name.encode("utf-8"),
+        b"piece length": int(piece_length),
+        b"pieces": bytes(pieces),
+    }
+    return hashlib.sha1(bencodepy.encode(info)).hexdigest()
