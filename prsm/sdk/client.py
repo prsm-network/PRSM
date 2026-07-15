@@ -305,6 +305,36 @@ class PRSMClient:
             )
         return await client.deposit(amount_wei)
 
+    @staticmethod
+    def _attach_receipt_verified(result: Dict[str, Any], prompt: str,
+                                 verify_pubkey_b64: str) -> Dict[str, Any]:
+        """Sprint 1457 — run the FULL caller-side receipt check (InferenceReceipt docstring
+        steps 2-4), not just the settler signature. The receipt must (2) verify against the
+        settler key, (3) commit to THIS prompt (sp1099 prompt_hash, when present), and (4)
+        commit to the OUTPUT we received (output_hash). Setting receipt_verified from the
+        signature ALONE overclaims: 'the settler signed a receipt' is not 'for MY prompt and
+        the output I got' — a head node could return a canned answer for a different prompt and
+        the signature would still verify. Sets result['receipt_verified']; never raises."""
+        try:
+            import hashlib as _hashlib
+            from prsm.compute.inference.models import InferenceReceipt
+            from prsm.compute.inference.receipt import verify_receipt
+            receipt = InferenceReceipt.from_dict(result.get("receipt") or {})
+            ok = bool(verify_receipt(receipt, public_key_b64=verify_pubkey_b64))
+            # (3) bind the receipt to MY prompt — when it commits to one (sp1099).
+            if ok and getattr(receipt, "prompt_hash", None) is not None:
+                ok = (receipt.prompt_hash
+                      == _hashlib.sha256((prompt or "").encode("utf-8")).digest())
+            # (4) confirm output_hash matches the output actually received.
+            if ok:
+                served = result.get("output")
+                ok = (isinstance(served, str) and receipt.output_hash
+                      == _hashlib.sha256(served.encode("utf-8")).digest())
+            result["receipt_verified"] = ok
+        except Exception:
+            result["receipt_verified"] = False
+        return result
+
     async def pay_and_infer(
         self,
         prompt: str,
@@ -376,14 +406,7 @@ class PRSMClient:
         }
         result = await self._post("/compute/inference", body)
         if verify_pubkey_b64:
-            try:
-                from prsm.compute.inference.models import InferenceReceipt
-                from prsm.compute.inference.receipt import verify_receipt
-                receipt = InferenceReceipt.from_dict(result.get("receipt") or {})
-                result["receipt_verified"] = bool(
-                    verify_receipt(receipt, public_key_b64=verify_pubkey_b64))
-            except Exception:
-                result["receipt_verified"] = False
+            self._attach_receipt_verified(result, prompt, verify_pubkey_b64)
         return result
 
     async def pay_and_infer_multistage(
@@ -467,14 +490,7 @@ class PRSMClient:
             "payee_set_hash": quote.get("payee_set_hash"),
         }
         if verify_pubkey_b64:
-            try:
-                from prsm.compute.inference.models import InferenceReceipt
-                from prsm.compute.inference.receipt import verify_receipt
-                receipt = InferenceReceipt.from_dict(result.get("receipt") or {})
-                result["receipt_verified"] = bool(
-                    verify_receipt(receipt, public_key_b64=verify_pubkey_b64))
-            except Exception:
-                result["receipt_verified"] = False
+            self._attach_receipt_verified(result, prompt, verify_pubkey_b64)
         return result
 
     async def relayed_infer(
