@@ -366,3 +366,43 @@ def test_forged_binding_is_not_honored():
         directory=_StubDirectory([forged]), reputation=ReputationTracker(),
         stake_reader=lambda a: 25000, require_stake_binding=True)
     assert strict() == ()                                 # and excluded under enforcement
+
+
+# ── sp1457: make_ftns_stake_reader (wei → whole FTNS adapter over OnChainStakeReader) ──
+
+from prsm.compute.query_orchestrator.marketplace_candidate_pool_provider import (
+    make_ftns_stake_reader,
+)
+
+
+class _FakeOnChainReader:
+    def __init__(self, wei_by_addr):
+        self._m = wei_by_addr
+
+    def stake_amount_for(self, address):
+        if address == "__boom__":
+            raise RuntimeError("rpc down")
+        return self._m.get(address, 0)
+
+
+def test_make_ftns_stake_reader_converts_wei_to_whole_ftns():
+    reader = make_ftns_stake_reader(_FakeOnChainReader({"0xabc": 5000 * 10**18}))
+    assert reader("0xabc") == 5000        # wei → whole FTNS (matches tier scale)
+    assert reader("0xunknown") == 0       # unstaked → 0 (verified-but-no-stake → 0 weight)
+
+
+def test_make_ftns_stake_reader_returns_none_on_error():
+    reader = make_ftns_stake_reader(_FakeOnChainReader({}))
+    assert reader("__boom__") is None     # RPC error → None → fall back / exclude, never over-weight
+
+
+def test_make_ftns_stake_reader_wires_into_pool_end_to_end():
+    # A verified-bound listing claiming T4 (tier 25000) but only 300 FTNS on-chain → weight 300.
+    pid = "a" * 32
+    listing, addr = _bound_listing(pid, stake_tier="T4")
+    reader = make_ftns_stake_reader(_FakeOnChainReader({addr: 300 * 10**18}))
+    pool = MarketplaceCandidatePoolProvider(
+        directory=_StubDirectory([listing]), reputation=ReputationTracker(),
+        stake_reader=reader)
+    (node,) = pool()
+    assert node.stake_amount_ftns == 300

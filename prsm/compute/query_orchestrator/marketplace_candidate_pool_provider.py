@@ -53,6 +53,22 @@ DEFAULT_STAKE_PER_TIER: Mapping[str, int] = {
 # Tiers eligible for aggregator selection per Vision §6 (T2+).
 ELIGIBLE_TIERS = frozenset({"T2", "T3", "T4"})
 
+_WEI_PER_FTNS = 10 ** 18
+
+
+def make_ftns_stake_reader(onchain_reader: Any) -> Callable[[str], Optional[int]]:
+    """sp1457 — adapt an ``OnChainStakeReader`` (``stake_amount_for(address) -> wei``, cached +
+    error-degrading) into the candidate pool's ``stake_reader`` (``address -> whole FTNS``, to
+    match the tier-amount scale). Returns None on any error/negative so the pool falls back to the
+    tier label (default mode) or excludes the provider (strict mode) rather than over-weighting."""
+    def _read(address: str) -> Optional[int]:
+        try:
+            wei = int(onchain_reader.stake_amount_for(address))
+        except Exception:  # noqa: BLE001 — a reader/RPC error must not crash pool assembly
+            return None
+        return wei // _WEI_PER_FTNS if wei >= 0 else None
+    return _read
+
 
 @dataclass
 class MarketplaceCandidatePoolProvider:

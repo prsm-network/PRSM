@@ -6356,9 +6356,26 @@ class PRSMNode:
                     endpoint_resolver=_endpoint_resolver,
                 ),
             )
+            # sp1457 — weight aggregator selection by REAL on-chain stake when a listing carries a
+            # verified stake binding (else the self-declared stake_tier, or exclusion under
+            # enforcement). Reuses the node's cached OnChainStakeReader. require_stake_binding gates
+            # exclusion of unverifiable-stake providers (opt-in via PRSM_REQUIRE_STAKE_BINDING) so
+            # operators enable it once their providers advertise bindings.
+            from prsm.compute.query_orchestrator.marketplace_candidate_pool_provider import (
+                make_ftns_stake_reader as _make_ftns_stake_reader,
+            )
+            _onchain_reader = getattr(self, "_compute_stake_reader", None)
+            _pool_stake_reader = (
+                _make_ftns_stake_reader(_onchain_reader)
+                if _onchain_reader is not None else None
+            )
+            _require_binding = os.environ.get(
+                "PRSM_REQUIRE_STAKE_BINDING", "").strip().lower() in ("1", "true", "yes")
             candidate_pool_provider = MarketplaceCandidatePoolProvider(
                 directory=marketplace_directory,
                 reputation=reputation_tracker,
+                stake_reader=_pool_stake_reader,
+                require_stake_binding=_require_binding,
             )
 
             orchestrator = build_query_orchestrator_for_node(
