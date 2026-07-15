@@ -56,6 +56,14 @@ async function main() {
     const ssBond = await ss.stakeBond();
     console.log(`  StorageSlashing.stakeBond = ${ssBond}`);
     console.log(`  == live settlement StakeBond ${A("OLD_STAKE_BOND")}?  ${eq(ssBond, A("OLD_STAKE_BOND")) ? "yes" : "NO → storage slashing already mis-wired/DEAD on mainnet"}`);
+    // sp1456 open-Q#5 — the redeploy's StorageSlashing MUST preserve these live params (the off-chain
+    // storage prover keys off authorizedVerifier; grace/owner must not silently change). Read-only.
+    for (const [label, fn] of [["authorizedVerifier (storage prover addr)", "authorizedVerifier"],
+                               ["heartbeatGraceSeconds", "heartbeatGraceSeconds"],
+                               ["owner", "owner"]]) {
+      try { console.log(`  StorageSlashing.${label} = ${await ss[fn]()}`); }
+      catch (e2) { console.log(`  StorageSlashing.${fn}() read failed: ${e2.message.slice(0, 60)}`); }
+    }
   } catch (e) { console.log(`  StorageSlashing read failed: ${e.message.slice(0, 80)}`); }
 
   console.log(`\n[sp1456 build check] Is the live StakeBond pre-sp1456 (expected)?`);
