@@ -695,6 +695,47 @@ class PRSMClient:
         ) as resp:
             return await resp.json()
 
+    async def fetch_content_to_file(
+        self,
+        cid: str,
+        dest_path,
+        *,
+        timeout: float = 30.0,
+        verify_hash: bool = True,
+        chunk_size: int = 262_144,
+    ) -> str:
+        """Sprint 1457 — GET /content/retrieve-stream/{cid}, streaming the body straight to
+        ``dest_path`` with NO full-content buffering. The SDK companion to ``fetch_content``
+        for LARGE content (above the in-memory retrieve ceiling), mirroring
+        ``prsm content fetch --stream``. The server fetches to a temp file (CID re-verified by
+        a streaming read) and streams it back; here it is written chunk-by-chunk to disk, so a
+        multi-GiB dataset never materializes in memory on either side.
+
+        Returns the destination path (str) on success. Raises ``ValueError`` on a non-200
+        response (404 not found, 451 blocked, 503 no provider, 504 timeout) with the server
+        detail, matching the SDK's error convention."""
+        await self._ensure_session()
+        import aiohttp as _aiohttp
+
+        params: Dict[str, Any] = {
+            "timeout": timeout,
+            "verify_hash": "true" if verify_hash else "false",
+        }
+        async with self._session.get(
+            f"{self.base_url}/content/retrieve-stream/{cid}",
+            headers=self._headers(),
+            timeout=_aiohttp.ClientTimeout(total=timeout + 5.0),
+            params=params,
+        ) as resp:
+            if resp.status != 200:
+                detail = (await resp.text())[:300]
+                raise ValueError(
+                    f"stream fetch of {cid} failed ({resp.status}): {detail}")
+            with open(dest_path, "wb") as fh:
+                async for chunk in resp.content.iter_chunked(chunk_size):
+                    fh.write(chunk)
+        return str(dest_path)
+
     async def find_and_fetch(
         self,
         query: str,

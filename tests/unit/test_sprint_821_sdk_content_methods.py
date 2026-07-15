@@ -298,3 +298,77 @@ async def test_round_trip_publish_then_fetch():
     assert fetch_result["status"] == "success"
     # CID appears in the GET URL
     assert new_cid in captured_url["v"]
+
+
+# ---- sp1457: fetch_content_to_file (streaming large content to disk) --------
+
+async def test_fetch_content_to_file_streams_to_disk(tmp_path):
+    from prsm.sdk.client import PRSMClient
+    payload = b"large-streamed-sdk-body-" * 50_000
+    chunks = [payload[i:i + 65536] for i in range(0, len(payload), 65536)]
+
+    class _Content:
+        async def iter_chunked(self, n):
+            for c in chunks:
+                yield c
+
+    class _FakeResp:
+        status = 200
+        content = _Content()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def text(self):
+            return ""
+
+    captured = {}
+
+    class _FakeSession:
+        def get(self, url, **kwargs):
+            captured["url"] = url
+            captured["params"] = kwargs.get("params")
+            return _FakeResp()
+
+        async def close(self):
+            pass
+
+    client = PRSMClient("http://node:8000")
+    client._session = _FakeSession()
+    dest = tmp_path / "big.bin"
+    result = await client.fetch_content_to_file("QmBig", dest)
+    assert "/content/retrieve-stream/QmBig" in captured["url"]
+    assert dest.read_bytes() == payload           # byte-exact, streamed
+    assert result == str(dest)
+
+
+async def test_fetch_content_to_file_raises_on_non_200(tmp_path):
+    import pytest
+    from prsm.sdk.client import PRSMClient
+
+    class _FakeResp:
+        status = 404
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def text(self):
+            return "not found on any provider"
+
+    class _FakeSession:
+        def get(self, url, **kwargs):
+            return _FakeResp()
+
+        async def close(self):
+            pass
+
+    client = PRSMClient("http://node:8000")
+    client._session = _FakeSession()
+    with pytest.raises(ValueError, match="404"):
+        await client.fetch_content_to_file("QmMissing", tmp_path / "x.bin")
