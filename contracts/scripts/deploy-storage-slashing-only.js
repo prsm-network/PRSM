@@ -9,10 +9,15 @@
  *
  * Required env vars:
  *   STAKE_BOND_ADDRESS   - the NEW sp1456 StakeBond (from the audit-bundle redeploy manifest)
- *   AUTHORIZED_VERIFIER  - the storage proof verifier (see runbook open-question #5; the F manifest
- *                          used the Foundation Safe — confirm the intended prover before mainnet)
+ *   AUTHORIZED_VERIFIER  - the storage proof verifier. RESOLVED (read-only preflight 2026-07-14): the
+ *                          LIVE StorageSlashing.authorizedVerifier is the Foundation Safe
+ *                          0x91b0e6F85A371D82De94eD13A3812d9f5A4E5791 itself. Because defect-#2's fix
+ *                          REVIVES storage slashing (currently dead — its stakeBond drifted off the
+ *                          live StakeBond), a 2-of-3 Safe is impractical for frequent proof/heartbeat
+ *                          submission: the user must choose here — keep the Safe or provision a
+ *                          dedicated prover EOA (setAuthorizedVerifier is owner-only ⇒ rotatable later).
  * Optional:
- *   HEARTBEAT_GRACE_SECONDS - default 86400 (1 day); preserve the live value if it was retuned
+ *   HEARTBEAT_GRACE_SECONDS - default 86400 (1 day) = the LIVE value (preflight-confirmed); preserve it
  *
  * Usage:
  *   STAKE_BOND_ADDRESS=0x<newStakeBond> AUTHORIZED_VERIFIER=0x<prover> \
