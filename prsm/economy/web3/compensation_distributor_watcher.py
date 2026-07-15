@@ -29,6 +29,13 @@ from prsm.economy.web3.compensation_distributor import DistributedEvent
 
 logger = logging.getLogger(__name__)
 
+# sp1457 — Base public RPC rejects any eth_getLogs range wider than ~10k blocks (-32614). A node that
+# restarts >10k blocks behind its persisted baseline must not poll [persisted+1, latest] in ONE call
+# (it would hard-fail, get swallowed, and wedge the watcher forever). Cap each poll to a <=9k window
+# so a far-behind watcher advances one bounded window per tick and catches up across ticks. Mirrors
+# batch_settlement_contract_client / stake_manager _SCAN_MAX_WINDOW.
+_SCAN_MAX_WINDOW = 9_000
+
 
 DistributedCallback = Callable[
     [DistributedEvent], Union[None, Awaitable[None]],
@@ -158,7 +165,7 @@ class CompensationDistributorWatcher:
             return
 
         from_block = self.last_processed_block + 1
-        to_block = latest
+        to_block = min(latest, from_block + _SCAN_MAX_WINDOW - 1)
 
         try:
             events = self._client.get_distributed_events(from_block, to_block)

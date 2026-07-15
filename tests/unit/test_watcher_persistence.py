@@ -38,11 +38,25 @@ from prsm.economy.web3.storage_slashing_watcher import (
 # ──────────────────────────────────────────────────────────────────────
 
 
+# sp1457: Base mainnet rejects any eth_getLogs range wider than 10k blocks (-32614). A watcher that
+# restarts with a persisted baseline >10k blocks behind must NOT issue one oversized poll and wedge;
+# `range_cap` on these fakes reproduces that RPC limit so the tests are discriminating.
+_RPC_RANGE_CAP = 10_000
+
+
+def _enforce_range_cap(cap, from_block, to_block):
+    if cap is not None and (int(to_block) - int(from_block) + 1) > cap:
+        raise ValueError(
+            f"eth_getLogs is limited to a {cap} range (-32614): got "
+            f"{int(to_block) - int(from_block) + 1} blocks [{from_block}, {to_block}]")
+
+
 class _FakeKeyDistributionClient:
-    def __init__(self, *, latest_block: int = 100):
+    def __init__(self, *, latest_block: int = 100, range_cap=None):
         self._latest_block = latest_block
         self._released: List = []
         self.released_calls = []
+        self._range_cap = range_cap
 
     def latest_block(self):
         return self._latest_block
@@ -54,6 +68,7 @@ class _FakeKeyDistributionClient:
         self._released.append(ev)
 
     def get_key_released_events(self, from_block, to_block):
+        _enforce_range_cap(self._range_cap, from_block, to_block)
         self.released_calls.append((from_block, to_block))
         events = self._released
         self._released = []
@@ -67,10 +82,11 @@ class _FakeKeyDistributionClient:
 
 
 class _FakeStorageSlashingClient:
-    def __init__(self, *, latest_block: int = 100):
+    def __init__(self, *, latest_block: int = 100, range_cap=None):
         self._latest_block = latest_block
         self._missing: List = []
         self.missing_calls = []
+        self._range_cap = range_cap
 
     def latest_block(self):
         return self._latest_block
@@ -82,6 +98,7 @@ class _FakeStorageSlashingClient:
         self._missing.append(ev)
 
     def get_heartbeat_missing_slashed_events(self, from_block, to_block):
+        _enforce_range_cap(self._range_cap, from_block, to_block)
         self.missing_calls.append((from_block, to_block))
         events = self._missing
         self._missing = []
@@ -95,10 +112,11 @@ class _FakeStorageSlashingClient:
 
 
 class _FakeCompensationDistributorClient:
-    def __init__(self, *, latest_block: int = 100):
+    def __init__(self, *, latest_block: int = 100, range_cap=None):
         self._latest_block = latest_block
         self._distributed: List = []
         self.distributed_calls = []
+        self._range_cap = range_cap
 
     def latest_block(self):
         return self._latest_block
@@ -110,6 +128,7 @@ class _FakeCompensationDistributorClient:
         self._distributed.append(ev)
 
     def get_distributed_events(self, from_block, to_block):
+        _enforce_range_cap(self._range_cap, from_block, to_block)
         self.distributed_calls.append((from_block, to_block))
         events = self._distributed
         self._distributed = []
@@ -408,3 +427,81 @@ class TestCrossWatcherKeyIsolation:
         assert store.load("key_distribution") == 100
         assert store.load("storage_slashing") == 200
         assert store.load("compensation_distributor") == 300
+
+
+# ──────────────────────────────────────────────────────────────────────
+# sp1457: restart-after-long-downtime must not wedge on the RPC getLogs cap
+# ──────────────────────────────────────────────────────────────────────
+#
+# A node down > ~10k blocks (~5.5h on Base) restarts with a persisted baseline that far behind.
+# The old tick polled [persisted+1, latest] in ONE call; on Base that exceeds the 10k eth_getLogs
+# range cap (-32614), the watcher swallows the error and never advances → it wedges SILENTLY forever
+# (every tick retries the same oversized range). The fix caps each poll to a <=9k-block window so a
+# far-behind watcher advances one bounded window per tick and catches up across successive ticks.
+
+
+class TestWatcherDowntimeBackfillStaysUnderRpcCap:
+    @pytest.mark.asyncio
+    async def test_key_distribution_far_behind_does_not_wedge(self):
+        store = InMemoryLastProcessedBlockStore()
+        store.save("key_distribution", 1_000)                 # restart baseline, far behind
+        client = _FakeKeyDistributionClient(latest_block=40_000, range_cap=_RPC_RANGE_CAP)
+
+        async def cb(ev):
+            pass
+
+        watcher = KeyDistributionWatcher(
+            client=client, on_key_released=cb, state_store=store)
+
+        await watcher.tick()
+        # Progress made (not wedged at 1000) and the oversized [1001, 40000] call was never issued.
+        assert watcher.last_processed_block > 1_000
+        assert all(hi - lo + 1 <= _RPC_RANGE_CAP for (lo, hi) in client.released_calls)
+
+        # Successive ticks catch all the way up, every call staying under the cap.
+        for _ in range(10):
+            await watcher.tick()
+        assert watcher.last_processed_block == 40_000
+        assert all(hi - lo + 1 <= _RPC_RANGE_CAP for (lo, hi) in client.released_calls)
+
+    @pytest.mark.asyncio
+    async def test_storage_slashing_far_behind_does_not_wedge(self):
+        store = InMemoryLastProcessedBlockStore()
+        store.save("storage_slashing", 500)
+        client = _FakeStorageSlashingClient(latest_block=30_000, range_cap=_RPC_RANGE_CAP)
+
+        async def cb(ev):
+            pass
+
+        watcher = StorageSlashingWatcher(
+            client=client, on_heartbeat_missing_slashed=cb, state_store=store)
+
+        await watcher.tick()
+        assert watcher.last_processed_block > 500
+        assert all(hi - lo + 1 <= _RPC_RANGE_CAP for (lo, hi) in client.missing_calls)
+
+        for _ in range(10):
+            await watcher.tick()
+        assert watcher.last_processed_block == 30_000
+        assert all(hi - lo + 1 <= _RPC_RANGE_CAP for (lo, hi) in client.missing_calls)
+
+    @pytest.mark.asyncio
+    async def test_compensation_distributor_far_behind_does_not_wedge(self):
+        store = InMemoryLastProcessedBlockStore()
+        store.save("compensation_distributor", 2_000)
+        client = _FakeCompensationDistributorClient(latest_block=25_000, range_cap=_RPC_RANGE_CAP)
+
+        async def cb(ev):
+            pass
+
+        watcher = CompensationDistributorWatcher(
+            client=client, on_distributed=cb, state_store=store)
+
+        await watcher.tick()
+        assert watcher.last_processed_block > 2_000
+        assert all(hi - lo + 1 <= _RPC_RANGE_CAP for (lo, hi) in client.distributed_calls)
+
+        for _ in range(10):
+            await watcher.tick()
+        assert watcher.last_processed_block == 25_000
+        assert all(hi - lo + 1 <= _RPC_RANGE_CAP for (lo, hi) in client.distributed_calls)
