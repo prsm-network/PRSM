@@ -92,6 +92,40 @@ def _derive_node_id_from_pubkey_b64(pubkey_b64: str) -> Optional[str]:
     return hashlib.sha256(pub_bytes).hexdigest()[:32]
 
 
+def build_stake_binding_message(provider_id: str, stake_eth_address: str) -> str:
+    """sp1457 — the EIP-191 message the provider's STAKE-HOLDING eth key signs to prove it
+    authorized ``provider_id`` to advertise ``stake_eth_address``'s on-chain stake.
+
+    Closes the self-declared-stake-tier selection-weight exploit: aggregator selection weights a
+    provider by stake, but the stake_tier was self-asserted (a zero-stake node could claim T4 and
+    win ~25x more paid work, unslashable). Requiring this proof means the selector can read the
+    REAL on-chain ``stake_of(stake_eth_address)`` and trust the address belongs to this provider.
+    A relay cannot forge the eth signature, and the message binds a SPECIFIC provider_id so the
+    proof can never be reused for a different node identity."""
+    return f"PRSM-stake-binding:v1:{str(provider_id)}:{str(stake_eth_address).lower()}"
+
+
+def verify_stake_binding(
+    provider_id: str, stake_eth_address: str, stake_binding_sig: str,
+) -> bool:
+    """True iff ``stake_binding_sig`` is a valid EIP-191 signature over
+    ``build_stake_binding_message(provider_id, stake_eth_address)`` by the key controlling
+    ``stake_eth_address`` — i.e. the on-chain stake holder authorized THIS provider_id. Never
+    raises; returns False on any missing/malformed input, recovery failure, or address mismatch."""
+    if not (provider_id and stake_eth_address and stake_binding_sig):
+        return False
+    try:
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+        from eth_utils import to_checksum_address
+        msg = encode_defunct(
+            text=build_stake_binding_message(provider_id, stake_eth_address))
+        recovered = Account.recover_message(msg, signature=stake_binding_sig)
+        return to_checksum_address(recovered) == to_checksum_address(stake_eth_address)
+    except Exception:  # noqa: BLE001 — malformed sig/address → not verified
+        return False
+
+
 @dataclass(frozen=True)
 class ProviderListing:
     """Signed advertisement of a provider's capacity + price.
@@ -110,9 +144,23 @@ class ProviderListing:
     advertised_at_unix: int
     ttl_seconds: int
     signature: str
+    # sp1457 — OPTIONAL authenticated on-chain-stake binding. When present, stake_binding_sig is
+    # an EIP-191 signature by the key controlling stake_eth_address over
+    # build_stake_binding_message(provider_id, stake_eth_address), proving the on-chain stake
+    # holder authorized this provider_id. The selector then weights by the REAL stake_of(address)
+    # instead of the self-asserted stake_tier. Absent (None) → unverified stake (legacy behavior).
+    stake_eth_address: Optional[str] = None
+    stake_binding_sig: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    def has_verified_stake_binding(self) -> bool:
+        """True iff this listing carries a stake binding that cryptographically verifies (the
+        stake_eth_address key authorized this provider_id). Selection uses the REAL on-chain
+        stake only when this holds."""
+        return bool(self.stake_eth_address) and verify_stake_binding(
+            self.provider_id, self.stake_eth_address or "", self.stake_binding_sig or "")
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ProviderListing":
@@ -129,6 +177,8 @@ class ProviderListing:
             advertised_at_unix=data["advertised_at_unix"],
             ttl_seconds=data["ttl_seconds"],
             signature=data["signature"],
+            stake_eth_address=data.get("stake_eth_address"),
+            stake_binding_sig=data.get("stake_binding_sig"),
         )
 
     def is_expired(self, at_unix: Optional[int] = None) -> bool:
@@ -149,6 +199,8 @@ def sign_listing(
     ttl_seconds: int = 300,
     listing_id: Optional[str] = None,
     advertised_at_unix: Optional[int] = None,
+    stake_eth_address: Optional[str] = None,
+    stake_binding_sig: Optional[str] = None,
 ) -> ProviderListing:
     """Construct + sign a ProviderListing using a NodeIdentity.
 
@@ -156,7 +208,11 @@ def sign_listing(
     from the identity directly — callers cannot inject a mismatched
     claim here. (They CAN construct a ProviderListing manually via
     __init__; verify_listing then rejects the mismatch.)
-    """
+
+    sp1457 — pass ``stake_eth_address`` + ``stake_binding_sig`` (an EIP-191 signature by the
+    stake-holding eth key over ``build_stake_binding_message(provider_id, stake_eth_address)``)
+    to authenticate the provider's on-chain stake for weight-verified selection. The eth-key
+    signature is produced by the operator OUT OF BAND (this node holds only the Ed25519 identity)."""
     lid = listing_id or f"listing-{uuid.uuid4().hex[:16]}"
     when = advertised_at_unix if advertised_at_unix is not None else int(time.time())
     payload = build_listing_signing_payload(
@@ -184,6 +240,8 @@ def sign_listing(
         advertised_at_unix=when,
         ttl_seconds=ttl_seconds,
         signature=sig,
+        stake_eth_address=stake_eth_address,
+        stake_binding_sig=stake_binding_sig,
     )
 
 
