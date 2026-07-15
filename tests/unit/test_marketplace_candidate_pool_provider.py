@@ -276,3 +276,93 @@ class TestCallableContract:
         )
         result = provider()
         assert isinstance(result, tuple)
+
+
+# ── sp1457: verified on-chain-stake binding weighting (closes the self-declared-tier exploit) ──
+
+from eth_account import Account as _Account
+from eth_account.messages import encode_defunct as _encode_defunct
+
+from prsm.marketplace.listing import build_stake_binding_message as _bind_msg
+
+_ETHK = "0x" + "3c" * 32
+
+
+def _bound_listing(provider_id, *, stake_tier="T4", eth_key=_ETHK):
+    acct = _Account.from_key(eth_key)
+    sig = acct.sign_message(
+        _encode_defunct(text=_bind_msg(provider_id, acct.address))).signature.hex()
+    base = _make_listing(provider_id=provider_id, stake_tier=stake_tier)
+    listing = ProviderListing(**{**base.to_dict(),
+                                 "stake_eth_address": acct.address,
+                                 "stake_binding_sig": sig})
+    return listing, acct.address
+
+
+def test_verified_binding_uses_real_onchain_stake_not_tier_label():
+    # ★ THE FIX: a listing claims T4 (tier label 25000) but its verified on-chain stake is only 100.
+    pid = "a" * 32
+    listing, addr = _bound_listing(pid, stake_tier="T4")
+    pool = MarketplaceCandidatePoolProvider(
+        directory=_StubDirectory([listing]), reputation=ReputationTracker(),
+        stake_reader=lambda a: 100 if a == addr else None)
+    (node,) = pool()
+    assert node.stake_amount_ftns == 100                 # REAL stake, not 25000 → exploit closed
+
+
+def test_legacy_listing_without_reader_keeps_tier_label():
+    pid = "b" * 32
+    pool = MarketplaceCandidatePoolProvider(
+        directory=_StubDirectory([_make_listing(provider_id=pid, stake_tier="T4")]),
+        reputation=ReputationTracker())
+    (node,) = pool()
+    assert node.stake_amount_ftns == DEFAULT_STAKE_PER_TIER["T4"]   # backward-compat
+
+
+def test_unbound_listing_with_reader_falls_back_to_tier_in_default_mode():
+    pid = "c" * 32
+    pool = MarketplaceCandidatePoolProvider(
+        directory=_StubDirectory([_make_listing(provider_id=pid, stake_tier="T3")]),
+        reputation=ReputationTracker(), stake_reader=lambda a: 999)
+    (node,) = pool()
+    assert node.stake_amount_ftns == DEFAULT_STAKE_PER_TIER["T3"]   # no binding → tier label
+
+
+def test_require_binding_excludes_unbound_listings():
+    pid = "d" * 32
+    pool = MarketplaceCandidatePoolProvider(
+        directory=_StubDirectory([_make_listing(provider_id=pid, stake_tier="T4")]),
+        reputation=ReputationTracker(), stake_reader=lambda a: 100,
+        require_stake_binding=True)
+    assert pool() == ()                                   # unverifiable stake → excluded
+
+
+def test_require_binding_includes_bound_listing_with_real_stake():
+    pid = "e" * 32
+    listing, addr = _bound_listing(pid, stake_tier="T4")
+    pool = MarketplaceCandidatePoolProvider(
+        directory=_StubDirectory([listing]), reputation=ReputationTracker(),
+        stake_reader=lambda a: 50000 if a == addr else None, require_stake_binding=True)
+    (node,) = pool()
+    assert node.stake_amount_ftns == 50000
+
+
+def test_forged_binding_is_not_honored():
+    # Listing claims a binding to an address it cannot sign for → not verified.
+    pid = "f" * 32
+    base = _make_listing(provider_id=pid, stake_tier="T4")
+    wrong_addr = _Account.from_key("0x" + "99" * 32).address
+    real_sig = _Account.from_key(_ETHK).sign_message(
+        _encode_defunct(text=_bind_msg(pid, _Account.from_key(_ETHK).address))).signature.hex()
+    forged = ProviderListing(**{**base.to_dict(),
+                                "stake_eth_address": wrong_addr,   # not the signer of real_sig
+                                "stake_binding_sig": real_sig})
+    pool = MarketplaceCandidatePoolProvider(
+        directory=_StubDirectory([forged]), reputation=ReputationTracker(),
+        stake_reader=lambda a: 25000)
+    (node,) = pool()
+    assert node.stake_amount_ftns == DEFAULT_STAKE_PER_TIER["T4"]   # forged binding ignored
+    strict = MarketplaceCandidatePoolProvider(
+        directory=_StubDirectory([forged]), reputation=ReputationTracker(),
+        stake_reader=lambda a: 25000, require_stake_binding=True)
+    assert strict() == ()                                 # and excluded under enforcement

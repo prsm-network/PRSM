@@ -31,7 +31,7 @@ import base64
 import hashlib
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Tuple
+from typing import Any, Callable, Mapping, Optional, Tuple
 
 from prsm.compute.query_orchestrator.aggregator_selector import StakedNode
 from prsm.marketplace.reputation import ReputationTracker
@@ -70,6 +70,16 @@ class MarketplaceCandidatePoolProvider:
     stake_amount_per_tier: Mapping[str, int] = field(
         default_factory=lambda: dict(DEFAULT_STAKE_PER_TIER),
     )
+    # sp1457 — closes the self-declared-stake-tier selection-weight exploit. When ``stake_reader``
+    # is wired (verified stake_eth_address → real on-chain bonded FTNS), a listing carrying a
+    # cryptographically-verified stake binding is weighted by its REAL stake, not the self-asserted
+    # tier — so a zero-stake node claiming T4 gets its true (low) stake, not 25000. Legacy listings
+    # (no verified binding) keep the tier-label weight UNLESS ``require_stake_binding`` is set, in
+    # which case they are excluded from the paid pool entirely (only verifiable-stake providers are
+    # selectable). Both default to the pre-sp1457 behavior; operators enable enforcement once their
+    # providers advertise bindings (node.py wires the real StakeBond reader).
+    stake_reader: Optional[Callable[[str], Optional[int]]] = None
+    require_stake_binding: bool = False
 
     def __call__(self) -> Tuple[StakedNode, ...]:
         """Return current T2+ pool snapshot.
@@ -77,6 +87,8 @@ class MarketplaceCandidatePoolProvider:
         Filters silently:
           - Tier not in `ELIGIBLE_TIERS` (T1 and unknown tiers dropped)
           - Malformed pubkey_b64 (logged at debug; listing dropped)
+          - sp1457: in ``require_stake_binding`` mode, listings without a verified on-chain-stake
+            binding are dropped (unverifiable-stake providers can't win paid work).
 
         Empty directory or fully-filtered result → empty tuple.
         Caller (orchestrator) handles the empty case via
@@ -93,9 +105,16 @@ class MarketplaceCandidatePoolProvider:
             )
             if pubkey_hash is None:
                 continue
-            stake_amount = self.stake_amount_per_tier.get(
-                listing.stake_tier, 0,
-            )
+            verified_stake = self._verified_stake_of(listing)
+            if verified_stake is None:
+                if self.require_stake_binding:
+                    logger.debug(
+                        "candidate-pool: dropped provider_id=%r — no verified stake binding "
+                        "(require_stake_binding)", listing.provider_id)
+                    continue
+                stake_amount = self.stake_amount_per_tier.get(listing.stake_tier, 0)
+            else:
+                stake_amount = verified_stake  # REAL on-chain bonded stake (authoritative)
             out.append(StakedNode(
                 node_id=listing.provider_id,
                 pubkey_hash=pubkey_hash,
@@ -111,6 +130,30 @@ class MarketplaceCandidatePoolProvider:
                 ),
             ))
         return tuple(out)
+
+    def _verified_stake_of(self, listing: Any) -> Optional[int]:
+        """sp1457 — the REAL on-chain bonded FTNS for ``listing`` when it carries a
+        cryptographically-verified stake binding AND a ``stake_reader`` is wired; else None.
+
+        Returns None (→ caller falls back to the tier label, or drops in strict mode) when: no
+        reader is configured, the listing has no verified binding, the address is absent, or the
+        reader can't return a non-negative amount. Never raises."""
+        if self.stake_reader is None:
+            return None
+        try:
+            has_binding = getattr(listing, "has_verified_stake_binding", None)
+            if not (callable(has_binding) and has_binding()):
+                return None
+            addr = getattr(listing, "stake_eth_address", None)
+            if not addr:
+                return None
+            real = self.stake_reader(addr)
+            if real is None:
+                return None
+            real = int(real)
+            return real if real >= 0 else None
+        except Exception:  # noqa: BLE001 — a reader/RPC error must not crash pool assembly
+            return None
 
     @staticmethod
     def _compute_pubkey_hash(
