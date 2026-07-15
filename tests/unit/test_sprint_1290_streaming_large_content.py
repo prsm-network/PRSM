@@ -309,3 +309,52 @@ async def test_request_content_to_file_rejects_corrupted_stream(tmp_path, monkey
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ── sp1457: _verify_file_cid must anchor a canonical ContentHash CID (regression) ──
+# The streaming receive path's CID anchor read a dead attribute (`algorithm` vs the real
+# `algorithm_id`), so the branch was inert: substituted bytes fell through to the weaker
+# gossip `expected_hash` check (which a malicious provider also controls) or to accept-all.
+# These exercise the ContentHash-CID branch the Qm…-CID tests above never reach.
+
+@pytest.mark.asyncio
+async def test_verify_file_cid_rejects_substituted_bytes_for_contenthash_cid(tmp_path):
+    from prsm.storage import ContentHash
+    provider = _make_provider("node_v")
+    real = b"the genuine paid dataset bytes " * 200
+    cid = ContentHash.from_data(real).hex()          # canonical sha256 ContentHash CID
+    evil = b"attacker-substituted content!! " * 200
+    got = tmp_path / "got.bin"
+    got.write_bytes(evil)
+    # The attacker also advertises a gossip hash matching the evil bytes.
+    evil_gossip = hashlib.sha256(evil).hexdigest()
+    ok = await provider._verify_file_cid(cid, got, True, expected_hash=evil_gossip)
+    assert ok is False                               # RED before the fix (accepted via gossip)
+
+
+@pytest.mark.asyncio
+async def test_verify_file_cid_accepts_matching_bytes_for_contenthash_cid(tmp_path):
+    from prsm.storage import ContentHash
+    provider = _make_provider("node_v")
+    body = b"genuine addressed content " * 500
+    cid = ContentHash.from_data(body).hex()
+    got = tmp_path / "got.bin"
+    got.write_bytes(body)
+    assert await provider._verify_file_cid(cid, got, True) is True
+
+
+@pytest.mark.asyncio
+async def test_verify_file_cid_anchors_on_the_cids_own_algorithm_sha3(tmp_path):
+    # The anchor must hash with the CID's OWN algorithm — a SHA3_256 CID anchors on sha3_256,
+    # not sha256 (the old code only ever computed sha256, so a SHA3 CID could never anchor).
+    from prsm.storage import ContentHash
+    from prsm.storage.models import AlgorithmID
+    provider = _make_provider("node_v")
+    body = b"sha3-256 addressed content " * 500
+    cid = ContentHash.from_data(body, AlgorithmID.SHA3_256).hex()
+    good = tmp_path / "good.bin"
+    good.write_bytes(body)
+    bad = tmp_path / "bad.bin"
+    bad.write_bytes(b"different bytes " * 500)
+    assert await provider._verify_file_cid(cid, good, True) is True
+    assert await provider._verify_file_cid(cid, bad, True) is False

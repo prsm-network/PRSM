@@ -1692,10 +1692,19 @@ class ContentProvider:
         if not verify_hash:
             return True
         loop = asyncio.get_event_loop()
+        from prsm.storage.models import AlgorithmID
 
-        def _sha256() -> Optional[str]:
-            try:
+        def _stream_digest(algo_id) -> Optional[str]:
+            """Hash the file with the algorithm the CID declares, streaming in 1 MiB
+            blocks so a multi-GiB file never materializes. None on IO error / unsupported
+            algorithm."""
+            if algo_id == AlgorithmID.SHA256:
                 h = hashlib.sha256()
+            elif algo_id == AlgorithmID.SHA3_256:
+                h = hashlib.sha3_256()
+            else:
+                return None
+            try:
                 with open(path, "rb") as fh:
                     for block in iter(lambda: fh.read(1024 * 1024), b""):
                         h.update(block)
@@ -1703,25 +1712,32 @@ class ContentProvider:
             except OSError:
                 return None
 
-        digest = await loop.run_in_executor(None, _sha256)
-        if digest is None:
-            return False
-
-        # (a) canonical sha256-family ContentHash CID → the file's sha256 must equal
-        # the CID's embedded digest (the sp1003 anchor, streaming-friendly).
+        # (a) canonical ContentHash CID → the file, hashed with the CID's OWN algorithm,
+        # MUST equal the CID's embedded digest. This is the strongest anchor (the requester
+        # chose the CID); a mismatch REJECTS and must NEVER fall through to the weaker gossip
+        # check. (sp1457: was `getattr(parsed, "algorithm", ...)` — a dead attribute name, so
+        # the whole anchor was inert and substituted bytes were accepted via the gossip path.)
+        parsed = None
         try:
             from prsm.storage import ContentHash
-            parsed = ContentHash.from_hex(cid)
-            if parsed.hex() == cid:
-                algo = getattr(parsed, "algorithm", "") or ""
-                if "sha256" in str(algo).lower() or parsed.digest.hex() == digest:
-                    return parsed.digest.hex() == digest
-        except Exception:  # noqa: BLE001 — not a ContentHash CID, fall through
-            pass
+            p = ContentHash.from_hex(cid)
+            expected_len = len(ContentHash.from_data(b"", p.algorithm_id).digest)
+            if p.hex() == cid and len(p.digest) == expected_len:
+                parsed = p
+        except (ValueError, TypeError):
+            parsed = None  # not a canonical ContentHash CID — fall through
+        if parsed is not None and parsed.algorithm_id in (
+                AlgorithmID.SHA256, AlgorithmID.SHA3_256):
+            file_digest = await loop.run_in_executor(
+                None, lambda: _stream_digest(parsed.algorithm_id))
+            # Supported-algo canonical CID: verify strictly here. IO error → None → reject.
+            return file_digest is not None and file_digest == parsed.digest.hex()
 
-        # (b) gossip-supplied expected hash, when known.
+        # (b) gossip-supplied expected hash (sha256), when known.
         if expected_hash:
-            return digest == expected_hash
+            file_sha256 = await loop.run_in_executor(
+                None, lambda: _stream_digest(AlgorithmID.SHA256))
+            return file_sha256 is not None and file_sha256 == expected_hash
         return True
 
     # ── Gossip Handlers ─────────────────────────────────────────────────
