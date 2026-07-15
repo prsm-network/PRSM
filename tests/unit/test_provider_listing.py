@@ -250,3 +250,15 @@ def test_listing_dict_roundtrip_preserves_binding():
     back = ProviderListing.from_dict(listing.to_dict())
     assert back.stake_eth_address == _ETH.address
     assert back.has_verified_stake_binding() is True
+
+
+def test_sign_stake_binding_roundtrips_with_verify():
+    # PROVIDER side: sign with the stake eth key → the verifier accepts it.
+    from prsm.marketplace.listing import sign_stake_binding
+    pid = "e" * 32
+    eth_key = "0x" + "7f" * 32
+    address, sig = sign_stake_binding(pid, eth_key)
+    assert sig.startswith("0x")
+    assert verify_stake_binding(pid, address, sig) is True
+    # and it's bound to THIS provider_id only
+    assert verify_stake_binding("0" * 32, address, sig) is False

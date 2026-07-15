@@ -105,6 +105,21 @@ def build_stake_binding_message(provider_id: str, stake_eth_address: str) -> str
     return f"PRSM-stake-binding:v1:{str(provider_id)}:{str(stake_eth_address).lower()}"
 
 
+def sign_stake_binding(provider_id: str, eth_private_key: str) -> "tuple[str, str]":
+    """sp1457 — PROVIDER side: sign the provider_id↔stake_address binding with the STAKE-HOLDING
+    eth key, so the operator can advertise a listing whose stake is on-chain-verifiable. Returns
+    ``(stake_eth_address, stake_binding_sig)`` to pass to ``sign_listing`` / MarketplaceAdvertiser.
+    The eth key must be the one controlling the operator's bonded StakeBond stake."""
+    from eth_account import Account
+    from eth_account.messages import encode_defunct
+    acct = Account.from_key(eth_private_key)
+    msg = encode_defunct(text=build_stake_binding_message(provider_id, acct.address))
+    sig = acct.sign_message(msg).signature.hex()
+    if not sig.startswith("0x"):
+        sig = "0x" + sig
+    return acct.address, sig
+
+
 def verify_stake_binding(
     provider_id: str, stake_eth_address: str, stake_binding_sig: str,
 ) -> bool:

@@ -57,6 +57,8 @@ class MarketplaceAdvertiser:
         stake_tier: str = "open",
         rebroadcast_interval_sec: float = 90.0,
         ttl_seconds: int = 300,
+        stake_eth_address: Optional[str] = None,
+        stake_binding_sig: Optional[str] = None,
     ):
         self.identity = identity
         self.gossip = gossip
@@ -69,6 +71,10 @@ class MarketplaceAdvertiser:
         self.stake_tier = stake_tier
         self.rebroadcast_interval_sec = rebroadcast_interval_sec
         self.ttl_seconds = ttl_seconds
+        # sp1457 — the operator's on-chain-stake binding (produced once via sign_stake_binding with
+        # the stake eth key), attached to every re-broadcast so the selector can weight by real stake.
+        self.stake_eth_address = stake_eth_address
+        self.stake_binding_sig = stake_binding_sig
 
         self._task: Optional[asyncio.Task] = None
         self._stopping = asyncio.Event()
@@ -101,6 +107,8 @@ class MarketplaceAdvertiser:
             tee_capable=self.tee_capable,
             stake_tier=self.stake_tier,
             ttl_seconds=self.ttl_seconds,
+            stake_eth_address=self.stake_eth_address,
+            stake_binding_sig=self.stake_binding_sig,
         )
 
     async def _broadcast_once(self) -> ProviderListing:

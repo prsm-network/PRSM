@@ -196,3 +196,28 @@ def test_advertiser_start_is_idempotent():
 def test_advertiser_current_price_matches_configured():
     advertiser, _, _, _ = _make_advertiser(price_per_shard_ftns=0.07)
     assert advertiser.current_price_ftns() == 0.07
+
+
+def test_advertiser_attaches_verifiable_stake_binding():
+    # sp1457 — a provider that supplies its stake binding broadcasts listings whose stake is
+    # on-chain-verifiable (has_verified_stake_binding == True), so the selector weights by real stake.
+    from prsm.node.identity import generate_node_identity
+    from prsm.marketplace.listing import sign_stake_binding, verify_listing
+    identity = generate_node_identity(display_name="bound-provider")
+    address, sig = sign_stake_binding(identity.node_id, "0x" + "5d" * 32)
+    advertiser, _gossip, _id, _cp = _make_advertiser(
+        identity=identity, stake_tier="T4",
+        stake_eth_address=address, stake_binding_sig=sig)
+    listing = _run(advertiser._broadcast_once())
+    assert verify_listing(listing) is True
+    assert listing.stake_eth_address == address
+    assert listing.has_verified_stake_binding() is True
+
+
+def test_advertiser_without_binding_is_unverified_but_valid():
+    # Backward-compat: a provider that doesn't supply a binding still advertises a valid listing.
+    from prsm.marketplace.listing import verify_listing
+    advertiser, _gossip, _id, _cp = _make_advertiser(stake_tier="T2")
+    listing = _run(advertiser._broadcast_once())
+    assert verify_listing(listing) is True
+    assert listing.has_verified_stake_binding() is False
