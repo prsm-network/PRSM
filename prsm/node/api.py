@@ -10901,6 +10901,97 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 error=str(e),
             )
 
+    @app.get("/content/retrieve-stream/{cid}")
+    async def retrieve_content_stream(
+        cid: str, timeout: float = 30.0, verify_hash: bool = True,
+    ):
+        """sp1457 — stream LARGE content (above the in-memory retrieve ceiling) to the caller.
+
+        The JSON ``/content/retrieve/{cid}`` buffers the whole body in memory, so content in
+        the sp1290 streaming band (>64 MiB, up to the 2 GiB streaming ceiling) can be SERVED by
+        a provider (``_send_chunked_from_path``) but never FETCHED — ``request_content`` rejects
+        a response above the in-memory chunked ceiling. This route fetches to a temp file via
+        ``request_content_to_file`` (bounded by the streaming ceiling, CID-re-verified by a
+        streaming read) and returns it as a streamed ``FileResponse``, closing the sp1290
+        receive-side wiring gap. Works for content of ANY size — small content just streams a
+        small file. The temp file is removed after the response is sent (or on any error)."""
+        import math as _math
+        import tempfile
+        from pathlib import Path as _Path
+        from fastapi.responses import FileResponse
+        from starlette.background import BackgroundTask
+
+        # timeout cap — identical bound to /content/retrieve (slow-loris guard).
+        _to_cap_raw = os.environ.get("PRSM_MAX_RETRIEVE_TIMEOUT_SEC", "").strip()
+        try:
+            _to_cap = float(_to_cap_raw) if _to_cap_raw else 300.0
+            if _to_cap <= 0:
+                raise ValueError("non-positive")
+        except (ValueError, TypeError):
+            _to_cap = 300.0
+        if not _math.isfinite(timeout):
+            raise HTTPException(
+                status_code=422,
+                detail=f"timeout must be a finite positive number; got {timeout!r}.")
+        if timeout < 0.1 or timeout > _to_cap:
+            raise HTTPException(
+                status_code=422,
+                detail=f"timeout must be in [0.1, {_to_cap}] seconds; got {timeout}.")
+
+        if not node.content_provider:
+            raise HTTPException(status_code=503, detail="Content provider not initialized")
+
+        # Operator content-filter gate (parity with /content/retrieve) — refuse BEFORE fetch.
+        _filter_store = getattr(node, "_content_filter_store", None)
+        if _filter_store is not None and _filter_store.is_cid_blocked(cid):
+            logger.info("content-filter: refused cid=%s (operator blocklist)", cid[:14])
+            raise HTTPException(
+                status_code=451,
+                detail=f"content cid={cid!r} is blocked by this operator's content filter")
+
+        fd, tmp_name = tempfile.mkstemp(prefix="prsm-retrieve-", suffix=".bin")
+        os.close(fd)
+        tmp_path = _Path(tmp_name)
+
+        def _cleanup() -> None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        try:
+            result = await node.content_provider.request_content_to_file(
+                cid=cid, dest_path=tmp_path, timeout=timeout, verify_hash=verify_hash)
+        except asyncio.TimeoutError:
+            _cleanup()
+            raise HTTPException(
+                status_code=504, detail=f"Content retrieval timed out after {timeout} seconds")
+        except HTTPException:
+            _cleanup()
+            raise
+        except Exception as e:  # noqa: BLE001
+            _cleanup()
+            logger.error(f"Error streaming content {cid}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+        if result is None:
+            _cleanup()
+            raise HTTPException(
+                status_code=404, detail="Content not found on any available provider")
+
+        download_name = None
+        if node.content_index:
+            rec = node.content_index.lookup(cid)
+            if rec and getattr(rec, "filename", None):
+                download_name = rec.filename
+
+        return FileResponse(
+            path=str(tmp_path),
+            media_type="application/octet-stream",
+            filename=download_name or f"{cid}.bin",
+            background=BackgroundTask(_cleanup),  # remove the temp file after streaming
+        )
+
     @app.get("/transactions")
     async def get_transactions(limit: int = 50) -> Dict[str, Any]:
         """Get transaction history."""
