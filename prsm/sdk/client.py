@@ -736,6 +736,48 @@ class PRSMClient:
                     fh.write(chunk)
         return str(dest_path)
 
+    async def publish_content_from_file(
+        self,
+        src_path,
+        *,
+        filename: Optional[str] = None,
+        chunk_size: int = 262_144,
+    ) -> Dict[str, Any]:
+        """Sprint 1457 — stream a LARGE Tier-A file to POST /content/upload-stream with NO
+        in-memory buffering (the SDK companion to ``prsm content publish --stream``). Reads
+        ``src_path`` in chunks and returns the server payload
+        ``{cid, content_hash, size_bytes, status}``. Raises ``ValueError`` on a non-200
+        response (501 no streaming publisher, 413 over cap, 451 blocked, 500)."""
+        await self._ensure_session()
+        import aiohttp as _aiohttp
+        from pathlib import Path as _Path
+
+        src = _Path(src_path)
+        params: Dict[str, Any] = {"filename": filename or src.name}
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        async def _body():
+            with open(src, "rb") as fh:
+                while True:
+                    block = fh.read(chunk_size)
+                    if not block:
+                        break
+                    yield block
+
+        async with self._session.post(
+            f"{self.base_url}/content/upload-stream",
+            headers=headers,
+            params=params,
+            data=_body(),
+        ) as resp:
+            if resp.status != 200:
+                detail = (await resp.text())[:300]
+                raise ValueError(
+                    f"stream publish of {src} failed ({resp.status}): {detail}")
+            return await resp.json()
+
     async def find_and_fetch(
         self,
         query: str,

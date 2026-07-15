@@ -242,3 +242,38 @@ def test_unreachable_exits_2(tmp_path: Path):
         result = _invoke([str(f), "--format", "text"])
     assert result.exit_code == 2
     assert "unreachable" in result.output.lower()
+
+
+# ---- sp1457: --stream (large/binary file → /content/upload-stream) ---------
+
+def test_publish_stream_hits_upload_stream_endpoint(tmp_path):
+    f = tmp_path / "big.bin"
+    f.write_bytes(b"large binary dataset " * 100_000)
+    r = MagicMock()
+    r.status_code = 200
+    r.json.return_value = {"cid": "QmBig", "content_hash": "abc",
+                           "size_bytes": f.stat().st_size, "status": "published"}
+    with patch("httpx.post", return_value=r) as mp:
+        result = _invoke([str(f), "--stream"])
+    assert result.exit_code == 0, result.output
+    assert mp.call_args.args[0].endswith("/content/upload-stream")
+
+
+def test_publish_stream_server_error_exit_1(tmp_path):
+    f = tmp_path / "x.bin"
+    f.write_bytes(b"data")
+    r = MagicMock()
+    r.status_code = 500
+    r.text = "boom"
+    with patch("httpx.post", return_value=r):
+        result = _invoke([str(f), "--stream"])
+    assert result.exit_code == 1
+
+
+def test_publish_stream_unreachable_exit_2(tmp_path):
+    import httpx as _hx
+    f = tmp_path / "x.bin"
+    f.write_bytes(b"data")
+    with patch("httpx.post", side_effect=_hx.ConnectError("refused")):
+        result = _invoke([str(f), "--stream"])
+    assert result.exit_code == 2

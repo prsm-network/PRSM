@@ -1523,6 +1523,10 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
     _UPLOAD_ROUTE_CAP_ENV = {
         "/content/upload": ("PRSM_MAX_UPLOAD_BYTES", 10 * 1024 * 1024),
         "/content/upload/shard": ("PRSM_MAX_SHARD_UPLOAD_BYTES", 100 * 1024 * 1024),
+        # sp1457 — the streaming large-content publish route governs its OWN size via the
+        # handler's streaming cap; exempt it from the generic 1 MiB guard so a large body
+        # reaches the handler (which never buffers it in memory).
+        "/content/upload-stream": ("PRSM_MAX_STREAMING_UPLOAD_BYTES", 2 * 1024 * 1024 * 1024),
     }
 
     def _positive_int_env(_os, name, default):
@@ -10991,6 +10995,100 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             filename=download_name or f"{cid}.bin",
             background=BackgroundTask(_cleanup),  # remove the temp file after streaming
         )
+
+    @app.post("/content/upload-stream")
+    async def upload_content_stream(
+        request: Request, filename: str = "", provenance_id: str = "",
+    ) -> Dict[str, Any]:
+        """sp1457 — stream a LARGE Tier-A binary file into the node WITHOUT buffering it in
+        memory, closing the publish half of the large-content gap (the JSON /content/upload
+        caps at ~10 MiB and materializes the body). Reads the request body straight to a temp
+        file (bounded), stages it via the streaming publish_from_path (byte-identical CID to an
+        in-memory publish), registers it with the ContentProvider so the sp1290 streaming-send
+        path serves it, and returns the CID. The temp file is removed after staging (or on any
+        error). Tier A (public) only; encrypted large-file publish is a follow-on.
+
+        Requires the libtorrent-free LocalContentPublisher (publish_from_path); returns 501
+        otherwise."""
+        import tempfile
+        from pathlib import Path as _Path
+
+        if not node.content_provider:
+            raise HTTPException(status_code=503, detail="Content provider not initialized")
+        publisher = (getattr(node.content_provider, "content_publisher", None)
+                     or getattr(getattr(node, "content_uploader", None),
+                                "content_publisher", None))
+        if publisher is None or not hasattr(publisher, "publish_from_path"):
+            raise HTTPException(
+                status_code=501,
+                detail="streaming publish requires the libtorrent-free LocalContentPublisher "
+                       "(publish_from_path); this node's publisher does not support it.")
+
+        # Size cap (slow-loris / disk-fill guard). Default = the streaming transfer ceiling.
+        _cap_raw = os.environ.get("PRSM_MAX_STREAMING_UPLOAD_BYTES", "").strip()
+        try:
+            cap = int(_cap_raw) if _cap_raw else 2 * 1024 * 1024 * 1024
+            if cap <= 0:
+                raise ValueError("non-positive")
+        except (ValueError, TypeError):
+            cap = 2 * 1024 * 1024 * 1024
+
+        fd, tmp_name = tempfile.mkstemp(prefix="prsm-upload-", suffix=".bin")
+        os.close(fd)
+        tmp_path = _Path(tmp_name)
+
+        def _cleanup() -> None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        written = 0
+        try:
+            with open(tmp_path, "wb") as fh:
+                async for chunk in request.stream():
+                    written += len(chunk)
+                    if written > cap:
+                        _cleanup()
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"upload exceeds PRSM_MAX_STREAMING_UPLOAD_BYTES cap of {cap}")
+                    fh.write(chunk)
+            if written == 0:
+                _cleanup()
+                raise HTTPException(status_code=422, detail="empty upload body")
+            result = await publisher.publish_from_path(
+                tmp_path, provenance_id=provenance_id, name=(filename or None))
+        except HTTPException:
+            _cleanup()
+            raise
+        except Exception as e:  # noqa: BLE001
+            _cleanup()
+            logger.error("streaming publish failed: %s", e)
+            raise HTTPException(status_code=500, detail=f"streaming publish failed: {e}")
+        _cleanup()  # temp removed — publish_from_path copied it into content-addressed staging
+
+        cid = result.torrent_infohash
+        content_hash = result.staged_path.name  # content-addressed sha256 hex
+        # Operator content-filter: refuse to register/serve a blocked CID (parity w/ retrieve).
+        _filter_store = getattr(node, "_content_filter_store", None)
+        if _filter_store is not None and _filter_store.is_cid_blocked(cid):
+            raise HTTPException(
+                status_code=451,
+                detail=f"published content cid={cid!r} is blocked by this operator's filter")
+        node.content_provider.register_local_content(
+            cid=cid,
+            size_bytes=result.manifest.total_size,
+            content_hash=content_hash,
+            filename=(filename or None),
+            metadata={"provenance_hash": (provenance_id or None), "tier": "A"},
+        )
+        return {
+            "cid": cid,
+            "content_hash": content_hash,
+            "size_bytes": result.manifest.total_size,
+            "status": "published",
+        }
 
     @app.get("/transactions")
     async def get_transactions(limit: int = 50) -> Dict[str, Any]:

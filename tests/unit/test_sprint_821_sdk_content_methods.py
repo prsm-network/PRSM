@@ -372,3 +372,75 @@ async def test_fetch_content_to_file_raises_on_non_200(tmp_path):
     client._session = _FakeSession()
     with pytest.raises(ValueError, match="404"):
         await client.fetch_content_to_file("QmMissing", tmp_path / "x.bin")
+
+
+# ---- sp1457: publish_content_from_file (streaming large publish) ------------
+
+async def test_publish_content_from_file_streams(tmp_path):
+    from prsm.sdk.client import PRSMClient
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"binary dataset " * 50_000)
+
+    class _FakeResp:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def json(self):
+            return {"cid": "QmBig", "size_bytes": src.stat().st_size, "status": "published"}
+
+        async def text(self):
+            return ""
+
+    captured = {}
+
+    class _FakeSession:
+        def post(self, url, **kwargs):
+            captured["url"] = url
+            captured["params"] = kwargs.get("params")
+            return _FakeResp()
+
+        async def close(self):
+            pass
+
+    client = PRSMClient("http://node:8000")
+    client._session = _FakeSession()
+    result = await client.publish_content_from_file(src, filename="ds.bin")
+    assert "/content/upload-stream" in captured["url"]
+    assert result["cid"] == "QmBig"
+    assert captured["params"]["filename"] == "ds.bin"
+
+
+async def test_publish_content_from_file_raises_non_200(tmp_path):
+    import pytest
+    from prsm.sdk.client import PRSMClient
+    src = tmp_path / "x.bin"
+    src.write_bytes(b"d")
+
+    class _FakeResp:
+        status = 501
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def text(self):
+            return "no streaming publisher"
+
+    class _FakeSession:
+        def post(self, url, **kwargs):
+            return _FakeResp()
+
+        async def close(self):
+            pass
+
+    client = PRSMClient("http://node:8000")
+    client._session = _FakeSession()
+    with pytest.raises(ValueError, match="501"):
+        await client.publish_content_from_file(src)

@@ -12659,6 +12659,11 @@ def content_publish_shard_cli(
     help="Override daemon URL",
 )
 @click.option(
+    "--stream", "stream_large", is_flag=True, default=False,
+    help="Stream a LARGE/binary file to /content/upload-stream (Tier A public), never "
+    "buffering it in memory. Use for datasets above the in-memory upload cap.",
+)
+@click.option(
     "--format", "output_format",
     type=click.Choice(["text", "json"]), default="text",
     help="Output format",
@@ -12668,13 +12673,13 @@ def content_publish_cli(
     replicas: int, royalty_rate: Optional[float],
     parent_cids: tuple, title: Optional[str], description: Optional[str],
     tags: tuple, api_url_override: Optional[str],
-    output_format: str,
+    stream_large: bool, output_format: str,
 ) -> None:
     """Sprint 806 — upload a text file to the P2P content store.
 
-    Reads FILE as UTF-8, POSTs to /content/upload, returns the
-    CID. For binary content use /content/upload/shard (CLI
-    wrapper TBD).
+    Reads FILE as UTF-8, POSTs to /content/upload, returns the CID. With --stream (sp1457),
+    streams a LARGE/binary FILE to /content/upload-stream (Tier A public) chunk-by-chunk with
+    no in-memory buffering — for datasets above the in-memory upload cap.
 
     Exit codes:
       0 — uploaded
@@ -12693,6 +12698,40 @@ def content_publish_cli(
         else:
             console.print(f"[red]{msg}[/red]")
         raise SystemExit(1)
+
+    if stream_large:
+        url = _api_url_from_creds(api_url_override)
+        endpoint = f"{url}/content/upload-stream"
+        params: Dict[str, Any] = {"filename": filename_override or path.name}
+
+        def _body_chunks():
+            with open(path, "rb") as fh:
+                for block in iter(lambda: fh.read(1024 * 1024), b""):
+                    yield block
+        try:
+            resp = _httpx.post(endpoint, params=params, content=_body_chunks(), timeout=None)
+        except Exception as exc:
+            if output_format == "json":
+                click.echo(_json.dumps({"ok": False, "error": f"daemon unreachable: {exc}"}))
+            else:
+                console.print(f"[red]Daemon unreachable at {endpoint}[/red] — {exc}")
+            raise SystemExit(2)
+        if resp.status_code != 200:
+            if output_format == "json":
+                click.echo(_json.dumps({
+                    "ok": False, "status": resp.status_code, "detail": resp.text[:300]}))
+            else:
+                console.print(f"[red]Stream publish failed ({resp.status_code}):[/red] "
+                              f"{resp.text[:300]}")
+            raise SystemExit(1)
+        data = resp.json()
+        if output_format == "json":
+            click.echo(_json.dumps(data, indent=2))
+        else:
+            console.print(
+                f"[green]Published (streamed)[/green] cid=[cyan]{data.get('cid')}[/cyan]  "
+                f"size_bytes=[bold]{data.get('size_bytes')}[/bold]")
+        return
 
     try:
         text = path.read_text(encoding="utf-8")
