@@ -38,7 +38,7 @@ pragma solidity ^0.8.22;
 ///   StorageSlashing.setSlashGraceMultiplier →
 ///     contracts/contracts/StorageSlashing.sol:272-286
 ///   StakeBond.setUnbondDelay →
-///     contracts/contracts/StakeBond.sol:464-470
+///     contracts/contracts/StakeBond.sol:514-520
 
 contract StorageSlashingBounded {
     uint256 public constant MIN_HEARTBEAT_GRACE = 1 hours;

@@ -23,7 +23,7 @@ pragma solidity ^0.8.22;
 ///      all guards hold + the majority leaf is proven, it does accept.
 ///
 /// @dev STRUCTURAL EQUIVALENCE (audit-visible; line range pinned):
-///     _handleConsensusMismatch → contracts/contracts/BatchSettlementRegistry.sol:997-1043
+///     _handleConsensusMismatch → contracts/contracts/BatchSettlementRegistry.sol:1004-1050
 ///   Simplifications (orthogonal to the false-slash guards):
 ///     - The Merkle proof of the majority leaf is substituted with a boolean
 ///       `majorityProofValid` (proving membership is MerkleProof.verify's job,
