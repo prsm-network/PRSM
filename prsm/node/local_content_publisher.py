@@ -20,6 +20,7 @@ BitTorrent/ContentStore path and raises a clear error here.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from pathlib import Path
@@ -28,7 +29,8 @@ from typing import Dict, Optional
 from prsm.compute.inference.models import ContentTier
 from prsm.core.bittorrent_manifest import FileEntry, PieceInfo, TorrentManifest
 from prsm.core.torrent_infohash import (
-    DEFAULT_PIECE_LENGTH, compute_v1_infohash_single_file)
+    DEFAULT_PIECE_LENGTH, compute_v1_infohash_single_file,
+    compute_v1_infohash_single_file_from_path)
 from prsm.node.artifact_bundle import bundle_artifacts, unbundle_artifacts
 from prsm.node.content_publisher import (
     PublishedContent, _deserialize_key_shares, _serialize_key_shares)
@@ -117,6 +119,85 @@ class LocalContentPublisher:
             provenance_id)
         return PublishedContent(
             torrent_infohash=infohash, staged_path=staged_path, manifest=manifest)
+
+    async def publish_from_path(
+        self,
+        src_path,
+        *,
+        provenance_id: str,
+        tier: ContentTier = ContentTier.A,
+        name: Optional[str] = None,
+    ) -> PublishedContent:
+        """sp1457 — STREAMING Tier-A publish of a file too large to hold in memory.
+
+        The in-memory ``publish(data: bytes)`` materializes the whole blob (sha256 for the
+        content-addressed staged name, the v1 infohash, and every manifest piece all iterate
+        ``data``), so a >100 MiB dataset can't be published through it. This stages ``src_path``
+        content-addressed by a STREAMING sha256 (block-copied, never fully read into memory) and
+        computes the SAME canonical v1 infohash via the streaming primitive — byte-identical to
+        ``publish(bytes)`` for the same content, with a bounded memory footprint. The staged file
+        is registered so the ContentProvider streaming-send path (sp1290) serves it.
+
+        Tier A (public single-file) only — Tier B/C encrypt-from-file is a follow-on (raises).
+        Raises ``FileNotFoundError`` if ``src_path`` isn't a file."""
+        if tier is not ContentTier.A:
+            raise NotImplementedError(
+                "publish_from_path supports Tier A only; Tier B/C large-file encrypt-from-path "
+                "is a follow-on. Use publish(data) for encrypted content that fits in memory.")
+        src = Path(src_path).expanduser()
+        if not src.is_file():
+            raise FileNotFoundError(f"publish_from_path: {src} is not a file")
+        loop = asyncio.get_event_loop()
+
+        def _stage() -> "tuple[str, Path]":
+            # content-addressed name = streaming sha256 (matches publish(bytes)).
+            h = hashlib.sha256()
+            with open(src, "rb") as fh:
+                for block in iter(lambda: fh.read(1024 * 1024), b""):
+                    h.update(block)
+            staged_filename = h.hexdigest()
+            staged_path = self.staging_dir / staged_filename
+            if not staged_path.exists():
+                tmp_path = staged_path.with_suffix(".tmp")
+                with open(src, "rb") as fin, open(tmp_path, "wb") as fout:
+                    for block in iter(lambda: fin.read(1024 * 1024), b""):
+                        fout.write(block)
+                tmp_path.replace(staged_path)   # atomic — a reader never sees a partial file
+            return staged_filename, staged_path
+
+        staged_filename, staged_path = await loop.run_in_executor(None, _stage)
+        infohash = await loop.run_in_executor(
+            None, lambda: compute_v1_infohash_single_file_from_path(
+                staged_path, staged_filename, self._piece_length))
+        manifest = await loop.run_in_executor(
+            None, lambda: self._build_manifest_from_path(
+                staged_path, staged_filename, infohash, provenance_id))
+        self._published_paths[infohash] = staged_path
+        logger.info(
+            "Content published (tier=A, streaming, no libtorrent): infohash=%s name=%s "
+            "size=%d provenance_id=%s", infohash, staged_filename,
+            manifest.total_size, provenance_id)
+        return PublishedContent(
+            torrent_infohash=infohash, staged_path=staged_path, manifest=manifest)
+
+    def _build_manifest_from_path(self, path, name: str, infohash: str,
+                                  provenance_id: str) -> TorrentManifest:
+        """Streaming equivalent of ``_build_manifest`` — reads ``path`` in piece_length blocks
+        so a multi-GiB file's manifest is built without materializing it."""
+        pl = self._piece_length
+        pieces = []
+        total = 0
+        with open(path, "rb") as fh:
+            index = 0
+            for chunk in iter(lambda: fh.read(pl), b""):
+                pieces.append(PieceInfo(
+                    index=index, hash=hashlib.sha1(chunk).hexdigest(), size=len(chunk)))
+                total += len(chunk)
+                index += 1
+        return TorrentManifest(
+            infohash=infohash, name=name, total_size=total, piece_length=pl, pieces=pieces,
+            files=[FileEntry(path=name, size_bytes=total)],
+            created_by_node_id=self._node_id, provenance_id=provenance_id or None)
 
     async def _encrypt_and_bundle(self, data: bytes, replication_factor: int) -> bytes:
         """Tier B/C: encrypt+shard via the ContentStore and bundle the artifacts into

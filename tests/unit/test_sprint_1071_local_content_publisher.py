@@ -146,3 +146,42 @@ def test_no_libtorrent_import():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ── sp1457: publish_from_path (streaming Tier-A publish, byte-identical to publish(bytes)) ──
+
+def test_publish_from_path_matches_in_memory_publish(tmp_path):
+    data = b"large tier-a dataset content " * 100_000  # ~2.9 MB → many pieces
+    pub_mem = LocalContentPublisher(tmp_path / "stage_a", node_id="n1")
+    res_mem = _run(pub_mem.publish(data, provenance_id="prov-1"))
+
+    src = tmp_path / "input.bin"
+    src.write_bytes(data)
+    pub_path = LocalContentPublisher(tmp_path / "stage_b", node_id="n1")
+    res_path = _run(pub_path.publish_from_path(src, provenance_id="prov-1"))
+
+    # Same canonical v1 infohash (CID) as the in-memory publish of identical bytes.
+    assert res_path.torrent_infohash == res_mem.torrent_infohash
+    # Staged content is byte-identical to the source.
+    assert res_path.staged_path.read_bytes() == data
+    # Manifest equivalence (size, piece length, per-piece hashes).
+    assert res_path.manifest.total_size == res_mem.manifest.total_size == len(data)
+    assert res_path.manifest.piece_length == res_mem.manifest.piece_length
+    assert ([p.hash for p in res_path.manifest.pieces]
+            == [p.hash for p in res_mem.manifest.pieces])
+    # Registered for the ContentProvider streaming-send local shortcut (sp1290).
+    assert pub_path.local_publish_path(res_path.torrent_infohash) == res_path.staged_path
+
+
+def test_publish_from_path_tier_bc_raises(tmp_path):
+    src = tmp_path / "x.bin"
+    src.write_bytes(b"data")
+    pub = LocalContentPublisher(tmp_path / "stage", node_id="n1")
+    with pytest.raises(NotImplementedError):
+        _run(pub.publish_from_path(src, provenance_id="p", tier=ContentTier.B))
+
+
+def test_publish_from_path_missing_file_raises(tmp_path):
+    pub = LocalContentPublisher(tmp_path / "stage", node_id="n1")
+    with pytest.raises(FileNotFoundError):
+        _run(pub.publish_from_path(tmp_path / "nope.bin", provenance_id="p"))
