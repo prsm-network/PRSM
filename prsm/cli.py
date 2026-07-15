@@ -12812,16 +12812,26 @@ def content_publish_cli(
     type=click.Choice(["text", "json"]), default="text",
     help="Output format",
 )
+@click.option(
+    "--stream", "stream_to_file", is_flag=True, default=False,
+    help="Stream LARGE content (>64 MiB) straight to --output via "
+    "GET /content/retrieve-stream/{cid}, never buffering the whole "
+    "body in memory. Requires --output.",
+)
 def content_fetch_cli(
     cid: str, output_path: Optional[str], timeout_s: float,
     no_verify_hash: bool, api_url_override: Optional[str],
-    output_format: str,
+    output_format: str, stream_to_file: bool,
 ) -> None:
     """Sprint 805 — retrieve content from the P2P network by CID.
 
     Wraps GET /content/retrieve/{cid}. base64-decodes the data
     and writes to --output when set. Exit 0 on success, 1 on
     not_found / server-side error, 2 on daemon unreachable.
+
+    With --stream (sp1457), fetches LARGE content (above the in-memory
+    retrieve ceiling) to --output via GET /content/retrieve-stream/{cid},
+    writing the body chunk-by-chunk with no full-content buffering.
     """
     import base64 as _b64
     import json as _json
@@ -12831,6 +12841,49 @@ def content_fetch_cli(
     params: Dict[str, Any] = {"timeout": timeout_s}
     if no_verify_hash:
         params["verify_hash"] = False
+
+    if stream_to_file:
+        if not output_path:
+            console.print("[red]--stream requires --output PATH to write to[/red]")
+            raise SystemExit(1)
+        stream_endpoint = f"{url}/content/retrieve-stream/{cid}"
+        try:
+            with _httpx.stream(
+                "GET", stream_endpoint, params=params, timeout=timeout_s + 5.0,
+            ) as sr:
+                if sr.status_code != 200:
+                    detail = sr.read().decode("utf-8", "replace")[:300]
+                    if output_format == "json":
+                        click.echo(_json.dumps({
+                            "ok": False, "status": sr.status_code, "detail": detail}))
+                    else:
+                        console.print(
+                            f"[red]Stream failed ({sr.status_code}):[/red] {detail}")
+                    raise SystemExit(1)
+                written = 0
+                from pathlib import Path as _Path
+                with open(_Path(output_path), "wb") as _fh:
+                    for chunk in sr.iter_bytes():
+                        _fh.write(chunk)
+                        written += len(chunk)
+        except _httpx.RequestError as exc:
+            if output_format == "json":
+                click.echo(_json.dumps({
+                    "ok": False, "error": f"daemon unreachable: {exc}"}))
+            else:
+                console.print(
+                    f"[red]Daemon unreachable at {stream_endpoint}[/red] — {exc}")
+            raise SystemExit(2)
+        if output_format == "json":
+            click.echo(_json.dumps({
+                "ok": True, "cid": cid, "bytes_written": written,
+                "output": output_path}))
+        else:
+            console.print(
+                f"[green]Streamed[/green] cid=[cyan]{cid}[/cyan] → "
+                f"[bold]{output_path}[/bold] ([bold]{written}[/bold] bytes)")
+        return
+
     try:
         resp = _httpx.get(endpoint, params=params, timeout=timeout_s + 5.0)
     except Exception as exc:

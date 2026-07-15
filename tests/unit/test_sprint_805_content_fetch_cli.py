@@ -227,3 +227,61 @@ def test_no_verify_hash_flag_threaded():
     assert params.get("verify_hash") in (
         False, "false", "False", "0", 0,
     )
+
+
+# ---- sp1457: --stream (large-content streaming to file) ---------------------
+
+class _FakeStream:
+    """A context-manager mock mirroring httpx.Client.stream()'s response object."""
+    def __init__(self, status_code=200, chunks=(b"",), body=b""):
+        self.status_code = status_code
+        self._chunks = list(chunks)
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def iter_bytes(self):
+        for c in self._chunks:
+            yield c
+
+    def read(self):
+        return self._body
+
+
+def test_stream_writes_large_body_to_output(tmp_path: Path):
+    payload = b"streamed-large-content-" * 100_000  # ~2.3 MB, chunked
+    chunks = [payload[i:i + 65536] for i in range(0, len(payload), 65536)]
+    target = tmp_path / "big.bin"
+    with patch("httpx.stream", return_value=_FakeStream(200, chunks=chunks)) as ms:
+        result = _invoke(["QmBig", "--stream", "--output", str(target)])
+    assert result.exit_code == 0, result.output
+    assert target.read_bytes() == payload
+    # hit the STREAMING endpoint, not the JSON one.
+    assert ms.call_args.args[1].endswith("/content/retrieve-stream/QmBig")
+
+
+def test_stream_requires_output():
+    with patch("httpx.stream") as ms:
+        result = _invoke(["QmBig", "--stream"])
+    assert result.exit_code == 1
+    ms.assert_not_called()  # rejected before any request
+
+
+def test_stream_not_found_exit_1(tmp_path: Path):
+    target = tmp_path / "x.bin"
+    with patch("httpx.stream",
+               return_value=_FakeStream(404, body=b'{"detail":"not found"}')):
+        result = _invoke(["QmMissing", "--stream", "--output", str(target)])
+    assert result.exit_code == 1
+
+
+def test_stream_daemon_unreachable_exit_2(tmp_path: Path):
+    import httpx as _hx
+    target = tmp_path / "x.bin"
+    with patch("httpx.stream", side_effect=_hx.ConnectError("refused")):
+        result = _invoke(["QmX", "--stream", "--output", str(target)])
+    assert result.exit_code == 2
