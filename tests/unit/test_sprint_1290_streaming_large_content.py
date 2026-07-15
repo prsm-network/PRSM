@@ -380,3 +380,44 @@ async def test_verify_file_cid_anchors_bittorrent_infohash_cid(tmp_path):
     evil_gossip = hashlib.sha256(evil).hexdigest()
     # Substituted file REJECTED even though the gossip hash matches the evil bytes.
     assert await provider._verify_file_cid(cid, bad, True, expected_hash=evil_gossip) is False
+
+
+@pytest.mark.asyncio
+async def test_publish_from_path_then_fetch_roundtrip_end_to_end(tmp_path, monkeypatch):
+    """★ sp1457 CAPSTONE — the full large-content pipeline composes end to end: publish a large
+    file via LocalContentPublisher.publish_from_path on A → fetch it on B via
+    request_content_to_file by the REAL infohash CID, byte-identical and CID-verified (this
+    exercises the sp1457 streaming infohash anchor on a LIVE fetch, not just in isolation).
+    Proves the seam between publish_from_path's staging and the provider serve/fetch path."""
+    monkeypatch.setenv("PRSM_MAX_CHUNKED_TRANSFER_BYTES", str(GATEWAY_FETCH_CHUNK_BYTES))
+    from prsm.node.local_content_publisher import LocalContentPublisher
+
+    body = os.urandom(MAX_INLINE_SIZE + 500_000)   # > inline, forces CHUNKED streaming
+    src = tmp_path / "dataset.bin"
+    src.write_bytes(body)
+
+    a, b = _make_provider("node_a"), _make_provider("node_b")
+    publisher = LocalContentPublisher(tmp_path / "stage_a", node_id="node_a")
+    a.content_publisher = publisher
+    published = await publisher.publish_from_path(src, provenance_id="prov-1")
+    cid = published.torrent_infohash                # the REAL v1 infohash CID
+    assert len(cid) == 40 and all(c in "0123456789abcdef" for c in cid)
+
+    a.register_local_content(
+        cid=cid, size_bytes=published.manifest.total_size,
+        content_hash=published.staged_path.name, filename="dataset.bin")
+
+    link = _InProcessLink(a, b)
+    b.content_discovery.announce_content(
+        cid, "node_a",
+        ContentAnnouncement(cid=cid, size=len(body), content_type="application/octet-stream",
+                            content_hash=published.staged_path.name, provider_id="node_a",
+                            filename="dataset.bin"))
+    assert not b.has_local_content(cid)
+
+    dest = tmp_path / "b_received.bin"
+    result = await b.request_content_to_file(cid, dest, timeout=10, verify_hash=True)
+
+    assert result is not None, "B must receive + CID-verify the streamed file"
+    assert dest.read_bytes() == body, "round-tripped file must be byte-identical"
+    assert all(f.transfer_mode == TransferMode.CHUNKED for f in link.frames_from_a)
