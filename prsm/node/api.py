@@ -3301,24 +3301,59 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         # only at CONFIRMED (the on-chain sweep, minutes-to-hours later), so
         # repeated /onramp/execute calls all saw a stale total → tier bypass.
         # total_usd_for_user dedups by intent_id, so this PENDING + the later
-        # CONFIRMED settle (same intent_id) count once. Fail-soft: a ring error
-        # must not break the session response.
+        # CONFIRMED settle (same intent_id) count once.
+        #
+        # sp1464 — this reservation is now an ATOMIC check-and-reserve. The _tier_check above is a
+        # READ and this was a separate WRITE, so in shared_redis (multi-replica) mode N concurrent
+        # onramps could each pass the READ and all record → structuring PAST the tier limit. try_reserve
+        # does the windowed-total read + limit compare + record in ONE WATCH/MULTI transaction on the
+        # shared store, so a concurrent reserver aborts+retries against the fresh total. On BREACH we
+        # reject here — the onramp session URL minted just above is simply never returned to the caller
+        # (a signed Coinbase pay-URL that charges nothing until used, so it harmlessly expires). On a
+        # shared-store ERROR we FAIL CLOSED (503), consistent with the _tier_check fail-closed posture
+        # (deny rather than under-enforce). process_local mode is unchanged (records + True; the
+        # pre-mint _tier_check gates the single-replica case).
         _cring = getattr(node, "_fiat_compliance_ring", None)
         if _cring is not None and body.destination_user_id:
             try:
-                _cring.record(
-                    kind="onramp_execute",
+                _reserved = _cring.try_reserve(
                     user_id=body.destination_user_id,
+                    dedup_key=intent.intent_id,
                     usd_amount=float(body.usd_amount),
-                    ftns_amount=0.0,
-                    status="PENDING",
+                    limit_usd=float(_tier["tier_limit_usd"]),
                     address=destination_address,
-                    metadata={"intent_id": intent.intent_id},
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 — a shared-store error must FAIL CLOSED
                 logger.warning(
-                    "sp968: onramp reservation record failed for intent %s: %s",
+                    "sp1464: atomic AML reserve failed for intent %s (failing closed): %s",
                     intent.intent_id, exc,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": "tier_limit_enforcement_unavailable",
+                        "message": (
+                            "The AML tier limit could not be enforced with "
+                            "global consistency right now; fiat onramp is "
+                            "temporarily unavailable. Please retry shortly."
+                        ),
+                    },
+                )
+            if not _reserved:
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "error": "tier_limit_exceeded",
+                        "tier_level": _tier.get("tier_level"),
+                        "tier_limit_usd": _tier.get("tier_limit_usd"),
+                        "requested_usd": float(body.usd_amount),
+                        "message": (
+                            f"This onramp would exceed your tier limit of "
+                            f"${_tier['tier_limit_usd']:.2f} once concurrent "
+                            f"in-flight onramps are counted. Contact support to "
+                            f"raise your limit."
+                        ),
+                    },
                 )
 
         return {

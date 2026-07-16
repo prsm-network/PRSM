@@ -10,6 +10,7 @@ pytest-mock>=3.12.0
 pytest-cov>=4.1.0
 pytest-timeout>=2.2.0
 pytest-xdist>=3.5.0
+fakeredis>=2.20.0  # sp1464 — WATCH/MULTI-capable fake for the atomic AML-reserve concurrency tests
 
 # Testing Utilities
 factory-boy>=3.3.0

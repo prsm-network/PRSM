@@ -157,6 +157,26 @@ class RedisRollingTotal:
                 user_id, exc,
             )
 
+    @classmethod
+    def _latest_amount_by_dedup(cls, rows: Any) -> Dict[str, float]:
+        """From ``(member, score)`` rows → {dedup_key: latest-score amount}. The intent-dedup: for
+        each dedup_key keep the amount of its highest-scored (newest) member, so a PENDING→CONFIRMED
+        pair for one intent counts once. Malformed members are skipped."""
+        latest: Dict[str, tuple] = {}  # dedup_key -> (score, amount)
+        for member, score in rows:
+            parts = str(member).split(cls._SEP)
+            if len(parts) != 3:
+                continue
+            dk, _entry, amount_str = parts
+            try:
+                amount = float(amount_str)
+            except (ValueError, TypeError):
+                continue
+            prev = latest.get(dk)
+            if prev is None or score >= prev[0]:
+                latest[dk] = (score, amount)
+        return {dk: amt for dk, (_s, amt) in latest.items()}
+
     def total_usd_for_user(
         self, user_id: str, *, window_sec: int, now: float,
     ) -> float:
@@ -175,20 +195,73 @@ class RedisRollingTotal:
         rows = self._redis.zrangebyscore(
             key, cutoff, "+inf", withscores=True,
         )
-        latest_by_dedup: Dict[str, Any] = {}  # dedup_key -> (score, amt)
-        for member, score in rows:
-            parts = str(member).split(self._SEP)
-            if len(parts) != 3:
-                continue
-            dk, _entry, amount_str = parts
-            try:
-                amount = float(amount_str)
-            except (ValueError, TypeError):
-                continue
-            prev = latest_by_dedup.get(dk)
-            if prev is None or score >= prev[0]:
-                latest_by_dedup[dk] = (score, amount)
-        return sum(amt for _s, amt in latest_by_dedup.values())
+        return sum(self._latest_amount_by_dedup(rows).values())
+
+    def try_reserve(
+        self,
+        *,
+        user_id: str,
+        dedup_key: str,
+        entry_id: str,
+        usd_amount: float,
+        timestamp: float,
+        limit_usd: float,
+        window_sec: int,
+        now: float,
+        max_retries: int = 8,
+    ) -> bool:
+        """sp1464 — ATOMIC check-and-reserve. Returns True iff the windowed, intent-deduped total for
+        ``user_id`` PLUS ``usd_amount`` stays within ``limit_usd`` — and, when True, atomically records
+        the reservation so a concurrent reserver (another replica) immediately sees it. Returns False
+        WITHOUT recording when it would breach. RAISES on a Redis error (caller must fail closed).
+
+        Closes the check→record race: ``total_usd_for_user`` (read) and ``record`` (zadd) were two
+        separate round-trips, so N concurrent onramps across replicas all read the same under-limit
+        total and all recorded → structuring past the AML limit. Here the read+compare+zadd run under
+        a WATCH on the user's key; any concurrent modification aborts the EXEC → retry with the fresh
+        total. Dedup-aware: re-reserving the SAME dedup_key replaces its contribution (idempotent),
+        so it can't inflate the total — for a fresh intent_id (the onramp case) that contribution is 0
+        so prospective = current + amount."""
+        if not user_id:
+            return True
+        from redis.exceptions import WatchError  # redis is present whenever a shared total exists
+
+        key = self._key(user_id)
+        member = (
+            f"{dedup_key}{self._SEP}{entry_id}{self._SEP}"
+            f"{repr(float(usd_amount))}"
+        )
+        cutoff = now - window_sec
+        for _ in range(max(1, int(max_retries))):
+            with self._redis.pipeline() as pipe:
+                try:
+                    pipe.watch(key)
+                    # After watch() the pipe runs commands IMMEDIATELY until multi().
+                    pipe.zremrangebyscore(key, "-inf", f"({cutoff}")
+                    rows = pipe.zrangebyscore(key, cutoff, "+inf", withscores=True)
+                    latest = self._latest_amount_by_dedup(rows)
+                    # Replace this dedup_key's current contribution with the new amount (fresh key → 0).
+                    prospective = (
+                        sum(latest.values())
+                        - latest.get(str(dedup_key), 0.0)
+                        + float(usd_amount)
+                    )
+                    if prospective > limit_usd:
+                        pipe.unwatch()
+                        return False
+                    pipe.multi()
+                    pipe.zadd(key, {member: float(timestamp)})
+                    pipe.expire(key, self._window_sec * 2 + 3600)
+                    pipe.execute()
+                    return True
+                except WatchError:
+                    continue  # the key changed under us → retry with the fresh total
+        # Exhausted retries under sustained contention: fail closed (caller denies) rather than
+        # record without a fresh consistency check.
+        raise RuntimeError(
+            "sp1464: try_reserve exhausted retries under contention for "
+            f"user {user_id}"
+        )
 
 
 class FiatComplianceRing:
@@ -304,53 +377,11 @@ class FiatComplianceRing:
         metadata: Optional[Dict[str, Any]] = None,
         timestamp: Optional[float] = None,
     ) -> FiatComplianceEntry:
-        if kind not in _VALID_KINDS:
-            raise ValueError(
-                f"kind must be one of {sorted(_VALID_KINDS)}, "
-                f"got {kind!r}"
-            )
-        # Sp889 — reject non-finite amounts FIRST. `NaN < 0` and
-        # `inf < 0` are both False, so the negative-guard below
-        # would let them through — and a single NaN poisons
-        # total_usd_for_user (sum → NaN), making the sp884 tier
-        # check `(NaN + requested) > limit` always False and thus
-        # permanently disabling tier enforcement for that user.
-        if not math.isfinite(usd_amount):
-            raise ValueError(
-                f"usd_amount must be finite, got {usd_amount}"
-            )
-        if not math.isfinite(ftns_amount):
-            raise ValueError(
-                f"ftns_amount must be finite, got {ftns_amount}"
-            )
-        if usd_amount < 0:
-            raise ValueError(
-                f"usd_amount must be >= 0, got {usd_amount}"
-            )
-        if ftns_amount < 0:
-            raise ValueError(
-                f"ftns_amount must be >= 0, got {ftns_amount}"
-            )
-        entry = FiatComplianceEntry(
-            entry_id=str(uuid.uuid4()),
-            timestamp=(
-                timestamp if timestamp is not None else time.time()
-            ),
-            kind=kind,
-            user_id=user_id or "",
-            usd_amount=float(usd_amount),
-            ftns_amount=float(ftns_amount),
-            status=status,
-            kyc_status=kyc_status,
-            tx_hash=tx_hash,
-            vendor_ref=vendor_ref,
-            address=address,
-            jurisdiction=(
-                jurisdiction
-                if jurisdiction is not None
-                else self._default_jurisdiction
-            ),
-            metadata=metadata or {},
+        entry = self._build_entry(
+            kind=kind, user_id=user_id, usd_amount=usd_amount,
+            ftns_amount=ftns_amount, status=status, kyc_status=kyc_status,
+            tx_hash=tx_hash, vendor_ref=vendor_ref, address=address,
+            jurisdiction=jurisdiction, metadata=metadata, timestamp=timestamp,
         )
         with self._lock:
             self._entries.append(entry)
@@ -381,6 +412,135 @@ class FiatComplianceRing:
                 timestamp=entry.timestamp,
             )
         return entry
+
+    def _build_entry(
+        self,
+        *,
+        kind: str,
+        user_id: str,
+        usd_amount: float,
+        ftns_amount: float,
+        status: str,
+        kyc_status: Optional[str] = None,
+        tx_hash: Optional[str] = None,
+        vendor_ref: Optional[str] = None,
+        address: Optional[str] = None,
+        jurisdiction: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        timestamp: Optional[float] = None,
+    ) -> FiatComplianceEntry:
+        """Validate + construct a FiatComplianceEntry (no side effects). Shared by record() and
+        try_reserve() so both apply the identical kind/amount guards."""
+        if kind not in _VALID_KINDS:
+            raise ValueError(
+                f"kind must be one of {sorted(_VALID_KINDS)}, "
+                f"got {kind!r}"
+            )
+        # Sp889 — reject non-finite amounts FIRST. `NaN < 0` and
+        # `inf < 0` are both False, so the negative-guard below
+        # would let them through — and a single NaN poisons
+        # total_usd_for_user (sum → NaN), making the sp884 tier
+        # check `(NaN + requested) > limit` always False and thus
+        # permanently disabling tier enforcement for that user.
+        if not math.isfinite(usd_amount):
+            raise ValueError(
+                f"usd_amount must be finite, got {usd_amount}"
+            )
+        if not math.isfinite(ftns_amount):
+            raise ValueError(
+                f"ftns_amount must be finite, got {ftns_amount}"
+            )
+        if usd_amount < 0:
+            raise ValueError(
+                f"usd_amount must be >= 0, got {usd_amount}"
+            )
+        if ftns_amount < 0:
+            raise ValueError(
+                f"ftns_amount must be >= 0, got {ftns_amount}"
+            )
+        return FiatComplianceEntry(
+            entry_id=str(uuid.uuid4()),
+            timestamp=(
+                timestamp if timestamp is not None else time.time()
+            ),
+            kind=kind,
+            user_id=user_id or "",
+            usd_amount=float(usd_amount),
+            ftns_amount=float(ftns_amount),
+            status=status,
+            kyc_status=kyc_status,
+            tx_hash=tx_hash,
+            vendor_ref=vendor_ref,
+            address=address,
+            jurisdiction=(
+                jurisdiction
+                if jurisdiction is not None
+                else self._default_jurisdiction
+            ),
+            metadata=metadata or {},
+        )
+
+    def try_reserve(
+        self,
+        *,
+        user_id: str,
+        dedup_key: str,
+        usd_amount: float,
+        limit_usd: float,
+        window_sec: int = 86400,
+        timestamp: Optional[float] = None,
+        address: Optional[str] = None,
+        kyc_status: Optional[str] = None,
+        jurisdiction: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """sp1464 — atomic check-and-reserve backing the AML tier limit on onramp/execute. Returns
+        True (reservation recorded) iff the user's windowed, intent-deduped total + ``usd_amount`` <=
+        ``limit_usd``; False (nothing recorded) on breach. RAISES on a shared-Redis error so the
+        caller FAILS CLOSED. ``dedup_key`` is the intent_id (dedups this PENDING with the later
+        CONFIRMED settle, matching total_usd_for_user).
+
+        shared_redis mode: the check+reserve is ATOMIC on the shared store (WATCH/MULTI), closing the
+        cross-replica structuring race that a separate read-then-record left open. process_local mode
+        has no cross-replica store, so this preserves the existing behavior (record + True; the API's
+        pre-mint tier check gates that mode) rather than changing single-replica semantics."""
+        ts = timestamp if timestamp is not None else time.time()
+        md = dict(metadata or {})
+        md.setdefault("intent_id", str(dedup_key))
+        if self._shared_total is None:
+            # process_local — unchanged behavior: record the PENDING reservation, report success.
+            self.record(
+                kind="onramp_execute", user_id=user_id, usd_amount=usd_amount,
+                ftns_amount=0.0, status="PENDING", address=address,
+                kyc_status=kyc_status, jurisdiction=jurisdiction, metadata=md,
+                timestamp=ts,
+            )
+            return True
+        # shared_redis — ATOMIC check-and-reserve on the authoritative shared store.
+        entry = self._build_entry(
+            kind="onramp_execute", user_id=user_id, usd_amount=usd_amount,
+            ftns_amount=0.0, status="PENDING", address=address,
+            kyc_status=kyc_status, jurisdiction=jurisdiction, metadata=md,
+            timestamp=ts,
+        )
+        reserved = self._shared_total.try_reserve(
+            user_id=entry.user_id,
+            dedup_key=str(dedup_key),
+            entry_id=entry.entry_id,
+            usd_amount=entry.usd_amount,
+            timestamp=entry.timestamp,
+            limit_usd=float(limit_usd),
+            window_sec=window_sec,
+            now=entry.timestamp,
+        )
+        if reserved:
+            # Mirror to the local deque for audit/export ONLY (the shared zadd already happened
+            # atomically above — going through record() would double-write to the shared store).
+            with self._lock:
+                self._entries.append(entry)
+                self._by_id[entry.entry_id] = entry
+            self._write_to_disk(entry)
+        return reserved
 
     def get(
         self, entry_id: str,
