@@ -1527,6 +1527,8 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         # handler's streaming cap; exempt it from the generic 1 MiB guard so a large body
         # reaches the handler (which never buffers it in memory).
         "/content/upload-stream": ("PRSM_MAX_STREAMING_UPLOAD_BYTES", 2 * 1024 * 1024 * 1024),
+        # sp1458 — the streaming PAID publish route, same rationale.
+        "/content/paid/publish-stream": ("PRSM_MAX_STREAMING_UPLOAD_BYTES", 2 * 1024 * 1024 * 1024),
     }
 
     def _positive_int_env(_os, name, default):
@@ -17554,6 +17556,143 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             "verifier": cav,
             "deposit_tx": tx,
             "fee_wei": fee_wei,
+            "num_recipients": len(recipients),
+        }
+
+    @app.post("/content/paid/publish-stream")
+    async def content_paid_publish_stream(
+        request: Request, filename: str = "", fee_wei: int = 0,
+        buyer_x25519_pubkeys: str = "",
+    ) -> Dict[str, Any]:
+        """Sprint 1458 — publish a LARGE Tier B/C paid dataset by STREAMING the plaintext body, with a
+        bounded memory footprint (the JSON /content/paid/publish materializes the whole plaintext +
+        base64 ciphertext). Query params: fee_wei (release fee), buyer_x25519_pubkeys (comma-separated
+        X25519 pubkeys), filename. The request BODY is the raw plaintext bytes.
+
+        Streams the body to a temp file → stream-encrypts to a ciphertext file (AES-256-GCM) →
+        serves it under content_hash via the large-content path → registers the creator on-chain
+        with the PAID-PUBLISHER key (so creator == the commitment depositor: the sp1365 anti-squat
+        invariant, else a buyer's fee doesn't credit the publisher) → deposits the sha256 commitment
+        naming the CAV + retains the wrapped key. Order preserves serve-before-deposit (F5) and
+        retain-before-deposit (sp1438). FAIL CLOSED (503) unless every publisher primitive is wired,
+        INCLUDING the dedicated paid-publisher provenance client (creator==depositor can't be
+        guaranteed without it — the node's default provenance client signs with a different key)."""
+        import asyncio as _asyncio
+        import os as _os
+        import tempfile
+        from pathlib import Path as _Path
+
+        from prsm.economy.paid_content import (
+            build_paid_content_from_path,
+            deposit_commitment_and_retain,
+        )
+        from prsm.enterprise.recipient_encryption import EnterpriseRecipient
+
+        if (_os.environ.get("PRSM_PAID_KEY_SERVE") or "").strip().lower() not in (
+                "1", "true", "yes", "on"):
+            raise HTTPException(status_code=503, detail="paid-content publish disabled "
+                                "(set PRSM_PAID_KEY_SERVE=1)")
+        store = getattr(node, "_paid_key_store", None)
+        key_client = getattr(node, "_paid_publish_key_client", None)
+        prov_client = getattr(node, "_paid_publish_provenance_client", None)
+        provider = getattr(node, "content_provider", None)
+        publisher = getattr(provider, "content_publisher", None) if provider else None
+        if (store is None or key_client is None or prov_client is None or provider is None
+                or publisher is None or not hasattr(publisher, "publish_from_path")):
+            raise HTTPException(
+                status_code=503,
+                detail="streaming paid publish not initialized — needs PRSM_PAID_KEY_SERVE, "
+                       "PRSM_PAID_PUBLISHER_KEY, a V2 ProvenanceRegistry signed with that key "
+                       "(creator==depositor), and the libtorrent-free content publisher")
+
+        from prsm.config.networks import resolve_endpoints
+        cav = resolve_endpoints(None).content_access_verifier
+        if not cav:
+            raise HTTPException(status_code=503, detail="no ContentAccessVerifier for this network")
+
+        pubkeys = [k.strip() for k in buyer_x25519_pubkeys.split(",") if k.strip()]
+        if not pubkeys:
+            raise HTTPException(status_code=422,
+                                detail="buyer_x25519_pubkeys must be a non-empty comma-separated list")
+        if int(fee_wei) <= 0:
+            raise HTTPException(status_code=422, detail="fee_wei must be > 0")
+        recipients = [EnterpriseRecipient(identifier=f"buyer-{i}", x25519_pubkey_b64=k)
+                      for i, k in enumerate(pubkeys)]
+
+        cap = _os.environ.get("PRSM_MAX_STREAMING_UPLOAD_BYTES", "").strip()
+        try:
+            cap = int(cap) if cap else 2 * 1024 * 1024 * 1024
+            if cap <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            cap = 2 * 1024 * 1024 * 1024
+
+        fd, plain_name = tempfile.mkstemp(prefix="prsm-paidpub-plain-", suffix=".bin")
+        _os.close(fd)
+        fd, ct_name = tempfile.mkstemp(prefix="prsm-paidpub-ct-", suffix=".bin")
+        _os.close(fd)
+        plain_path, ct_path = _Path(plain_name), _Path(ct_name)
+
+        def _cleanup() -> None:
+            for p in (plain_path, ct_path):
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        try:
+            written = 0
+            with open(plain_path, "wb") as fh:
+                async for chunk in request.stream():
+                    written += len(chunk)
+                    if written > cap:
+                        raise HTTPException(status_code=413,
+                                            detail=f"upload exceeds cap {cap}")
+                    fh.write(chunk)
+            if written == 0:
+                raise HTTPException(status_code=422, detail="empty upload body")
+
+            # 1. stream-encrypt + wrap the key (bounded memory). content_hash = sha256(ciphertext file).
+            built = await _asyncio.to_thread(
+                build_paid_content_from_path, plain_path, ct_path, recipients)
+            content_hash = built["content_hash"]
+
+            # 2. SERVE the ciphertext file under its CID (large-content path) — BEFORE deposit (F5).
+            pub = await publisher.publish_from_path(
+                ct_path, provenance_id="0x" + content_hash.hex(), name=(filename or None))
+            cid = pub.torrent_infohash
+            provider.register_local_content(
+                cid=cid, size_bytes=pub.manifest.total_size,
+                content_hash=content_hash.hex(), filename=(filename or None),
+                metadata={"paid": True, "provenance_hash": "0x" + content_hash.hex()})
+
+            # 3. Register the creator on-chain with the PAID-PUBLISHER key → creator == depositor.
+            reg_tx, _rs = await _asyncio.to_thread(
+                prov_client.register_content, content_hash, 0, f"prsm://{cid}")
+
+            # 4. Retain the wrapped key BEFORE depositing the commitment (sp1438), naming the CAV.
+            dep_tx, _ds = await _asyncio.to_thread(
+                deposit_commitment_and_retain,
+                key_client=key_client, paid_key_store=store, content_hash=content_hash,
+                commitment=built["commitment"], wrapped_key=built["wrapped_key"],
+                fee_wei=int(fee_wei), verifier_address=cav)
+        except HTTPException:
+            _cleanup()
+            raise
+        except Exception as exc:  # noqa: BLE001 — surface publish/deposit failures to the operator
+            _cleanup()
+            logger.error("streaming paid publish failed: %s", exc)
+            raise HTTPException(status_code=409, detail=f"streaming paid publish failed: {exc}")
+        _cleanup()  # temps removed — publish_from_path copied the ciphertext into content-addressed staging
+
+        return {
+            "content_hash": "0x" + content_hash.hex(),
+            "cid": cid,
+            "commitment": "0x" + built["commitment"].hex(),
+            "verifier": cav,
+            "register_tx": reg_tx,
+            "deposit_tx": dep_tx,
+            "fee_wei": int(fee_wei),
             "num_recipients": len(recipients),
         }
 

@@ -4612,6 +4612,7 @@ class PRSMNode:
             self._paid_key_store = None
             self._paid_key_verify_payment = None
             self._paid_publish_key_client = None      # sp1367 — publisher deposit client
+            self._paid_publish_provenance_client = None  # sp1458 — publisher-key-signed registry client
             if (os.environ.get("PRSM_PAID_KEY_SERVE") or "").strip().lower() in (
                     "1", "true", "yes", "on"):
                 try:
@@ -4648,11 +4649,28 @@ class PRSMNode:
                         from prsm.economy.web3.key_distribution import KeyDistributionClient
                         self._paid_publish_key_client = KeyDistributionClient(
                             _ep.rpc_url, _ep.key_distribution, private_key=_pubkey)
+                        # sp1458 — a ProvenanceRegistry client signed with the SAME paid-publisher key,
+                        # so a STREAMING large-paid-content publish registers creator == depositor
+                        # on-chain (the sp1365 anti-squat invariant — else the buyer's fee doesn't
+                        # credit the publisher). The node's default _provenance_client signs with a
+                        # DIFFERENT key (FTNS_WALLET_PRIVATE_KEY), so it can't be reused here. Only when
+                        # the V2 ProvenanceRegistry is configured; the streaming route fails closed
+                        # (503) without it.
+                        _prov_addr = (
+                            (os.environ.get("PRSM_PROVENANCE_REGISTRY_ADDRESS") or "").strip()
+                            or getattr(_ep, "provenance_registry", None))
+                        if _prov_addr:
+                            from prsm.economy.web3.provenance_registry_v2 import (
+                                ProvenanceRegistryV2Client)
+                            self._paid_publish_provenance_client = ProvenanceRegistryV2Client(
+                                rpc_url=_ep.rpc_url, contract_address=_prov_addr,
+                                private_key=_pubkey)
                 except Exception as _exc:  # noqa: BLE001
                     logger.warning("paid-key serve wiring failed (disabled): %s", _exc)
                     self._paid_key_store = None
                     self._paid_key_verify_payment = None
                     self._paid_publish_key_client = None
+                    self._paid_publish_provenance_client = None
 
             self._onchain_settlement_client = (
                 build_onchain_settlement_client_or_none(
