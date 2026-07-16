@@ -31,7 +31,7 @@ import base64
 import hashlib
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from prsm.compute.query_orchestrator.aggregator_selector import StakedNode
 from prsm.marketplace.reputation import ReputationTracker
@@ -111,7 +111,15 @@ class MarketplaceCandidatePoolProvider:
         `InsufficientCandidatesError` from `select_aggregator`.
         """
         listings = self.directory.list_active_providers()
-        out: list[StakedNode] = []
+
+        # First pass: keep eligible listings + their verified stake, and count how many verified
+        # listings share each stake_eth_address. sp1463 — the binding proves an address authorized a
+        # provider_id but does NOT enforce one-provider-per-address, so a single bonded address could
+        # back N distinct identities, each weighted at the FULL stake_of(address) → N× selection mass
+        # for one stake deposit (a shared-stake Sybil). Counting here lets the second pass SPLIT the
+        # address's real stake across its bound identities, so collective weight ∝ stake, counted once.
+        prepared: list[tuple[Any, bytes, Optional[int]]] = []
+        verified_count_by_addr: Dict[str, int] = {}
         for listing in listings:
             if listing.stake_tier not in ELIGIBLE_TIERS:
                 continue
@@ -122,6 +130,13 @@ class MarketplaceCandidatePoolProvider:
             if pubkey_hash is None:
                 continue
             verified_stake = self._verified_stake_of(listing)
+            if verified_stake is not None:
+                addr_key = str(getattr(listing, "stake_eth_address", "") or "").lower()
+                verified_count_by_addr[addr_key] = verified_count_by_addr.get(addr_key, 0) + 1
+            prepared.append((listing, pubkey_hash, verified_stake))
+
+        out: list[StakedNode] = []
+        for listing, pubkey_hash, verified_stake in prepared:
             if verified_stake is None:
                 if self.require_stake_binding:
                     logger.debug(
@@ -130,7 +145,11 @@ class MarketplaceCandidatePoolProvider:
                     continue
                 stake_amount = self.stake_amount_per_tier.get(listing.stake_tier, 0)
             else:
-                stake_amount = verified_stake  # REAL on-chain bonded stake (authoritative)
+                # REAL on-chain bonded stake (authoritative), SPLIT across all verified identities
+                # bound to the same address so a shared stake can't be counted more than once.
+                addr_key = str(getattr(listing, "stake_eth_address", "") or "").lower()
+                shared = verified_count_by_addr.get(addr_key, 1) or 1
+                stake_amount = verified_stake // shared
             out.append(StakedNode(
                 node_id=listing.provider_id,
                 pubkey_hash=pubkey_hash,

@@ -406,3 +406,56 @@ def test_make_ftns_stake_reader_wires_into_pool_end_to_end():
         stake_reader=reader)
     (node,) = pool()
     assert node.stake_amount_ftns == 300
+
+
+# ── sp1463 (capstone audit F2): shared-stake Sybil amplification ──
+# The binding proves an eth address authorized a provider_id, but nothing enforced one-provider-per-
+# address. A single bonded address R could back N distinct identities, each weighted at the FULL
+# stake_of(R) → N·S selection mass for S stake (decisive in require_stake_binding mode). Fix: SPLIT
+# R's real stake across the identities bound to it, so collective weight ∝ stake, counted once.
+
+def test_shared_stake_address_splits_weight_across_clones():
+    l1, addr = _bound_listing("clone-1", stake_tier="T4")
+    l2, addr2 = _bound_listing("clone-2", stake_tier="T4")
+    l3, addr3 = _bound_listing("clone-3", stake_tier="T4")   # same default eth key → same address
+    assert addr == addr2 == addr3
+    pool = MarketplaceCandidatePoolProvider(
+        directory=_StubDirectory([l1, l2, l3]), reputation=ReputationTracker(),
+        stake_reader=lambda a: 900 if a == addr else None)
+    nodes = pool()
+    assert len(nodes) == 3
+    for n in nodes:
+        assert n.stake_amount_ftns == 300                    # 900 // 3, NOT 900 → amplification closed
+    assert sum(n.stake_amount_ftns for n in nodes) == 900    # collective == the real stake, once
+
+
+def test_single_bound_provider_keeps_full_stake():
+    listing, addr = _bound_listing("solo", stake_tier="T4")
+    pool = MarketplaceCandidatePoolProvider(
+        directory=_StubDirectory([listing]), reputation=ReputationTracker(),
+        stake_reader=lambda a: 900 if a == addr else None)
+    (node,) = pool()
+    assert node.stake_amount_ftns == 900                     # N=1 → unaffected by the split
+
+
+def test_distinct_stake_addresses_are_not_split_together():
+    l1, a1 = _bound_listing("p1", stake_tier="T4", eth_key="0x" + "11" * 32)
+    l2, a2 = _bound_listing("p2", stake_tier="T4", eth_key="0x" + "22" * 32)
+    assert a1 != a2
+    reader = lambda a: {a1: 900, a2: 500}.get(a)
+    pool = MarketplaceCandidatePoolProvider(
+        directory=_StubDirectory([l1, l2]), reputation=ReputationTracker(), stake_reader=reader)
+    per = {n.node_id: n.stake_amount_ftns for n in pool()}
+    assert per["p1"] == 900 and per["p2"] == 500             # different addresses → each full
+
+
+def test_shared_stake_split_applies_under_require_binding():
+    # Strict mode is where the amplification was decisive — confirm the split applies there too.
+    l1, addr = _bound_listing("c1", stake_tier="T4")
+    l2, _a2 = _bound_listing("c2", stake_tier="T4")
+    pool = MarketplaceCandidatePoolProvider(
+        directory=_StubDirectory([l1, l2]), reputation=ReputationTracker(),
+        stake_reader=lambda a: 1000 if a == addr else None, require_stake_binding=True)
+    nodes = pool()
+    assert len(nodes) == 2
+    assert all(n.stake_amount_ftns == 500 for n in nodes)    # 1000 // 2
