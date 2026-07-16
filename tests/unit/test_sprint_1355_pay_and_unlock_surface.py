@@ -184,3 +184,89 @@ def test_cli_unlock_requires_verifier(monkeypatch):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ── sp1458: pay_and_unlock_content(dest_path=...) — streaming large-file unlock ──
+
+def test_sdk_pay_and_unlock_content_to_file_streams(tmp_path):
+    from prsm.economy.paid_content import build_paid_content_from_path
+    from prsm.economy.web3.key_distribution import KeyDeposit
+
+    plaintext = (b"paywalled large dataset via the SDK " * 100_000) + b"tail"
+    src = tmp_path / "plain.bin"
+    src.write_bytes(plaintext)
+    ct = tmp_path / "cipher.bin"
+    buyer_priv, buyer_pub = generate_recipient_keypair()
+    built = build_paid_content_from_path(
+        src, ct, [EnterpriseRecipient(identifier="b", x25519_pubkey_b64=buyer_pub)])
+
+    order = []
+    paid = {"ok": False}
+    vc = MagicMock()
+    vc.address = _BUYER_ETH
+    vc.verify_payment.return_value = False
+    vc.pay_for_access.side_effect = lambda *a: (order.append("pay"), paid.__setitem__("ok", True))
+
+    def fetch(ch):
+        order.append("fetch")
+        return built["wrapped_key"] if paid["ok"] else None
+
+    kc = MagicMock()
+    kc.get_deposit.return_value = KeyDeposit(
+        publisher="0xpub", royalty="0xroy", release_fee_ftns_wei=_FEE, active=True)
+
+    async def _go():
+        client = PRSMClient()
+        try:
+            return await client.pay_and_unlock_content(
+                built["content_hash"], requester_key="0x" + "01" * 32,
+                x25519_privkey_b64=buyer_priv, fee_wei=_FEE,
+                verifier_address="0x" + "ab" * 20, commitment=built["commitment"],
+                dest_path=str(tmp_path / "out.bin"),
+                _verifier_client=vc, _content=str(ct), _fetch_wrapped_key=fetch, _key_client=kc)
+        finally:
+            await client.close()
+
+    out = asyncio.run(_go())
+    assert out == str(tmp_path / "out.bin")
+    assert order == ["pay", "fetch"]                        # paid, THEN the gated key fetch
+    assert (tmp_path / "out.bin").read_bytes() == plaintext  # streamed decrypt, byte-identical
+
+
+def test_cli_unlock_stream_requires_output(monkeypatch):
+    from click.testing import CliRunner
+    from prsm.cli import main
+    monkeypatch.setenv("PRSM_REQUESTER_KEY", "0x" + "01" * 32)
+    monkeypatch.setenv("PRSM_X25519_PRIVKEY", "k")
+    r = CliRunner().invoke(main, [
+        "content", "unlock", "0x" + _CH.hex(), "--fee", "1", "--commitment", _COMMIT,
+        "--verifier-address", "0x" + "ab" * 20, "--stream"])
+    assert r.exit_code == 1
+    assert "--stream requires --output" in r.output
+
+
+def test_cli_unlock_stream_passes_dest_path(monkeypatch, tmp_path):
+    from unittest.mock import AsyncMock, patch
+    from pathlib import Path
+    from click.testing import CliRunner
+    from prsm.cli import main
+    monkeypatch.setenv("PRSM_REQUESTER_KEY", "0x" + "01" * 32)
+    monkeypatch.setenv("PRSM_X25519_PRIVKEY", "k")
+    out = tmp_path / "big.bin"
+    captured = {}
+
+    async def _fake_unlock(content_hash, **kw):
+        captured.update(kw)
+        Path(kw["dest_path"]).write_bytes(b"streamed plaintext")
+        return kw["dest_path"]
+
+    with patch("prsm.sdk.client.PRSMClient.pay_and_unlock_content",
+               new=AsyncMock(side_effect=_fake_unlock)), \
+         patch("prsm.sdk.client.PRSMClient.close", new=AsyncMock()):
+        r = CliRunner().invoke(main, [
+            "content", "unlock", "0x" + _CH.hex(), "--fee", "1", "--commitment", _COMMIT,
+            "--verifier-address", "0x" + "ab" * 20, "--stream", "--output", str(out)])
+    assert r.exit_code == 0, r.output
+    assert "Unlocked (streamed)" in r.output
+    assert captured["dest_path"] == str(out)              # --stream threads dest_path
+    assert out.read_bytes() == b"streamed plaintext"

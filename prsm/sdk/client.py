@@ -953,6 +953,7 @@ class PRSMClient:
         fee_wei: int,
         verifier_address: str,
         commitment=None,
+        dest_path: Optional[Any] = None,
         cid: Optional[str] = None,
         network: Optional[str] = None,
         rpc_url: Optional[str] = None,
@@ -1061,17 +1062,6 @@ class PRSMClient:
             def fetch_commitment(_kc=key_client, _c=ch, _p=_payer):
                 return bytes(acquire_released_key(_kc, _c, _p))
 
-        # The freely-served ciphertext (fetched async, then decrypted in the worker thread).
-        content = _content
-        if content is None:
-            row = await self.fetch_content(cid or ("0x" + ch.hex()))
-            data_b64 = (row or {}).get("data")
-            if not data_b64:
-                from prsm.storage.paid_unlock import PaidUnlockError
-                raise PaidUnlockError(
-                    f"ciphertext for content {ch.hex()[:12]}… is not retrievable")
-            content = deserialize_encrypted_content(base64.b64decode(data_b64))
-
         # The wrapped-key fetch is a SYNC blocking call run inside the worker thread AFTER settle_fee
         # (the endpoint gates on payment), so the pay→fetch ordering holds.
         base_url = self.base_url
@@ -1081,6 +1071,45 @@ class PRSMClient:
                 return _fetch_paid_key_sync(_u, _c, _k)
 
         settle_fee = build_content_access_settle_fee(verifier_client, ch, int(fee_wei))
+
+        if dest_path is not None:
+            # sp1458 — STREAMING large-file unlock: fetch the ciphertext to a FILE (bounded memory) and
+            # stream-decrypt to dest_path. The IDENTICAL money flow (pay → fetch+verify key) runs via
+            # pay_and_unlock_to_file. The ciphertext is freely served, so pre-fetching it before settle
+            # is fine; the pay→key ordering holds inside pay_and_unlock_to_file. Returns dest_path.
+            import os as _os
+            import tempfile
+            from pathlib import Path as _P
+
+            from prsm.economy.paid_content import pay_and_unlock_to_file
+            if _content is not None:
+                _ct_path, _own = _P(str(_content)), False   # test-inject: a ciphertext FILE path
+            else:
+                _fd, _ctn = tempfile.mkstemp(prefix="prsm-unlock-ct-", suffix=".bin")
+                _os.close(_fd)
+                _ct_path, _own = _P(_ctn), True
+                await self.fetch_content_to_file(cid or ("0x" + ch.hex()), _ct_path)
+            try:
+                return await asyncio.to_thread(
+                    pay_and_unlock_to_file,
+                    content_hash=ch, recipient_privkey_b64=x25519_privkey_b64, commitment=commit,
+                    fetch_commitment=fetch_commitment, fetch_wrapped_key=fetch_wrapped_key,
+                    retrieve_content_to_file=(lambda _c, _p=_ct_path: str(_p)),
+                    dest_path=str(dest_path), settle_fee=settle_fee)
+            finally:
+                if _own:
+                    _ct_path.unlink(missing_ok=True)
+
+        # In-memory path: fetch the freely-served ciphertext + reconstruct.
+        content = _content
+        if content is None:
+            row = await self.fetch_content(cid or ("0x" + ch.hex()))
+            data_b64 = (row or {}).get("data")
+            if not data_b64:
+                from prsm.storage.paid_unlock import PaidUnlockError
+                raise PaidUnlockError(
+                    f"ciphertext for content {ch.hex()[:12]}… is not retrievable")
+            content = deserialize_encrypted_content(base64.b64decode(data_b64))
 
         return await asyncio.to_thread(
             pay_and_unlock,

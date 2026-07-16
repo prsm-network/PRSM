@@ -13168,6 +13168,11 @@ def content_get_cli(
     help="Write the decrypted plaintext to PATH.",
 )
 @click.option(
+    "--stream", "stream_large", is_flag=True, default=False,
+    help="Unlock LARGE content: fetch the ciphertext + decrypt it to --output with NO in-memory "
+    "buffering (bounded footprint). Requires --output.",
+)
+@click.option(
     "--cid", default=None, help="Retrieval id for the ciphertext (default: 0x<content_hash>).",
 )
 @click.option("--network", default=None, help="Network (else PRSM_NETWORK).")
@@ -13178,8 +13183,8 @@ def content_get_cli(
 )
 def content_unlock_cli(
     content_hash: str, fee_ftns: float, commitment: str, verifier_address: str,
-    output_path: Optional[str], cid: Optional[str], network: Optional[str], rpc_url: Optional[str],
-    api_url_override: Optional[str], output_format: str,
+    output_path: Optional[str], stream_large: bool, cid: Optional[str], network: Optional[str],
+    rpc_url: Optional[str], api_url_override: Optional[str], output_format: str,
 ) -> None:
     """Sprint 1355 — buy + decrypt a Tier B/C paid dataset: pay the release fee, get the key
     released on-chain, fetch the ciphertext, and decrypt it. Prints/writes the plaintext.
@@ -13204,6 +13209,9 @@ def content_unlock_cli(
         console.print(
             "[red]Missing --verifier-address[/red] (or PRSM_CONTENT_ACCESS_VERIFIER).")
         raise SystemExit(1)
+    if stream_large and not output_path:
+        console.print("[red]--stream requires --output PATH to write the plaintext to[/red]")
+        raise SystemExit(1)
 
     fee_wei = int(round(fee_ftns * (10 ** 18)))
     url = _api_url_from_creds(api_url_override)
@@ -13215,12 +13223,13 @@ def content_unlock_cli(
             return await client.pay_and_unlock_content(
                 content_hash, requester_key=requester_key, x25519_privkey_b64=x25519_privkey,
                 fee_wei=fee_wei, verifier_address=verifier_address, commitment=commitment,
+                dest_path=(output_path if stream_large else None),
                 cid=cid, network=network, rpc_url=rpc_url)
         finally:
             await client.close()
 
     try:
-        plaintext = _run_async(_go())
+        result = _run_async(_go())
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
         if any(s in msg.lower() for s in ("connect", "refused", "unreachable", "timeout")):
@@ -13229,6 +13238,15 @@ def content_unlock_cli(
         console.print(f"[red]unlock failed:[/red] {exc}")
         raise SystemExit(1)
 
+    if stream_large:
+        # `result` is the dest path; the streaming decrypt already wrote the plaintext (bounded memory).
+        if output_format == "json":
+            click.echo(_json.dumps({"ok": True, "output": str(result), "streamed": True}))
+            raise SystemExit(0)
+        console.print(f"[green]Unlocked (streamed)[/green] → [bold]{result}[/bold]")
+        raise SystemExit(0)
+
+    plaintext = result
     if output_path:
         from pathlib import Path as _Path
         _Path(output_path).write_bytes(plaintext)
