@@ -414,9 +414,11 @@ To offer a compute node as marketplace supply, set on the provider node:
 **Stake binding (sp1457, optional but needed for real-stake weighting).** Attach the provider↔stake
 binding one of two ways:
 
-- **Pre-produced (recommended — the stake key never touches the node):** produce the pair out of band
-  with `sign_stake_binding(provider_id, stake_eth_private_key)` (provider_id = the node's `node_id`),
-  then set `PRSM_STAKE_ETH_ADDRESS` + `PRSM_STAKE_BINDING_SIG`.
+- **Pre-produced (recommended — the stake key never touches the advertising node):** run
+  `PRSM_STAKE_ETH_KEY=0x… prsm marketplace sign-stake-binding` (sp1465) on a machine that holds the
+  stake key; it prints the `export PRSM_STAKE_ETH_ADDRESS=…` + `export PRSM_STAKE_BINDING_SIG=…` lines
+  to set on the advertising node. (The key is read from the environment, never from argv; the emitted
+  address + signature are public.) Equivalent to calling `sign_stake_binding(provider_id, key)` by hand.
 - **Derive at startup:** set `PRSM_STAKE_ETH_KEY` to the stake-holding eth private key and the node
   signs the binding on boot. Convenient, but places the stake key in the node's environment.
 

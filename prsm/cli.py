@@ -12340,6 +12340,78 @@ def _wallet_read_inbound_count(
 
 
 @main.group()
+def marketplace():
+    """Marketplace provider tools — produce the stake binding for real-stake selection weighting."""
+    pass
+
+
+@marketplace.command("sign-stake-binding")
+@click.option(
+    "--format", "output_format",
+    type=click.Choice(["env", "json"]), default="env",
+    help="Emit shell env exports (default) or a JSON object.",
+)
+def marketplace_sign_stake_binding_cli(output_format: str) -> None:
+    """sp1465 — produce THIS node's on-chain-stake binding (sp1457) for marketplace advertising.
+
+    An opted-in advertiser (PRSM_MARKETPLACE_ADVERTISE=1) is weighted by its REAL bonded stake — not
+    its self-declared tier label — only when it advertises a binding proving it controls the stake
+    address. This command derives the node's provider_id from its identity and signs
+    build_stake_binding_message(provider_id, address) with the stake-holding eth key, then prints the
+    PRSM_STAKE_ETH_ADDRESS + PRSM_STAKE_BINDING_SIG to set on the advertising node (design doc §14).
+
+    The eth private key is read from the PRSM_STAKE_ETH_KEY environment variable and is NEVER accepted
+    on the command line — keys must not appear in argv or shell history. The emitted address +
+    signature are PUBLIC; the key never leaves this process.
+    """
+    import os as _os
+
+    key = (_os.environ.get("PRSM_STAKE_ETH_KEY") or "").strip()
+    if not key:
+        console.print(
+            "Missing PRSM_STAKE_ETH_KEY. Export your stake-holding eth private key in the "
+            "environment (never pass it on the command line), then re-run:\n"
+            "  export PRSM_STAKE_ETH_KEY=0x...\n  prsm marketplace sign-stake-binding",
+            style="red",
+        )
+        raise SystemExit(1)
+
+    from prsm.node.config import NodeConfig
+    from prsm.node.identity import load_node_identity
+
+    config = NodeConfig.load()
+    identity = load_node_identity(config.identity_path)
+    if not identity:
+        console.print(
+            "No node identity found. Run 'prsm setup' first.", style="yellow")
+        raise SystemExit(1)
+
+    from prsm.marketplace.listing import sign_stake_binding
+
+    try:
+        address, sig = sign_stake_binding(identity.node_id, key)
+    except Exception as exc:  # noqa: BLE001 — a bad key surfaces as a clean CLI error
+        console.print(f"Could not sign the stake binding: {exc}", style="red")
+        raise SystemExit(1)
+
+    # Machine-readable output uses click.echo (NOT rich console.print, which wraps long lines at the
+    # terminal width — truncating the signature — and injects styling).
+    if output_format == "json":
+        import json as _json
+        click.echo(_json.dumps({
+            "provider_id": identity.node_id,
+            "stake_eth_address": address,
+            "stake_binding_sig": sig,
+        }))
+        return
+
+    click.echo(f"# marketplace stake binding for provider_id={identity.node_id}")
+    click.echo("# Set these on the advertising node (alongside PRSM_MARKETPLACE_ADVERTISE=1):")
+    click.echo(f"export PRSM_STAKE_ETH_ADDRESS={address}")
+    click.echo(f"export PRSM_STAKE_BINDING_SIG={sig}")
+
+
+@main.group()
 def content():
     """Content publishing — view uploads, royalties accrued."""
     pass
