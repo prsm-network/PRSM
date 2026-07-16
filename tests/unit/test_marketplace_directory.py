@@ -270,16 +270,18 @@ def test_directory_cap_still_allows_updates_to_existing_provider(monkeypatch):
     gossip = _make_gossip()
     directory = MarketplaceDirectory(gossip=gossip)
     ids = [generate_node_identity(display_name=f"p{i}") for i in range(3)]
-    # Future advertised_at so the listings are unexpired at real time.time().
+    # Near-now advertised_at (+ default ttl 300) so the listings are unexpired but NOT future-dated
+    # beyond the sp1462 clock-skew bound.
+    base = int(time.time())
     for idn in ids:
-        _run(_fire(gossip, _make_listing(idn, advertised_at_unix=2_000_000_000).to_dict()))
+        _run(_fire(gossip, _make_listing(idn, advertised_at_unix=base).to_dict()))
     assert directory.size() == 3
     # A NEWER listing for an ALREADY-PRESENT provider must still replace (the cap gates only NEW
     # provider_ids, so an honest provider's refresh is never starved by a full directory).
-    newer = _make_listing(ids[0], advertised_at_unix=2_000_000_001, price_per_shard_ftns=0.99)
+    newer = _make_listing(ids[0], advertised_at_unix=base + 1, price_per_shard_ftns=0.99)
     _run(_fire(gossip, newer.to_dict()))
     assert directory.size() == 3
-    assert directory.get_listing(ids[0].node_id).advertised_at_unix == 2_000_000_001
+    assert directory.get_listing(ids[0].node_id).advertised_at_unix == base + 1
 
 
 def test_directory_cap_evicts_expired_before_rejecting(monkeypatch):

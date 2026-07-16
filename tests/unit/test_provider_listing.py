@@ -354,3 +354,39 @@ def test_binding_listing_still_round_trips_and_verifies():
     rt = ProviderListing.from_dict(listing.to_dict())
     assert verify_listing(rt) is True
     assert rt.has_verified_stake_binding() is True
+
+
+# ── sp1462 (capstone audit F1): bound advertised_at_unix in the FUTURE ──
+# verify_listing bounded ttl (0..86400) but NEVER bounded advertised_at_unix upward. A far-future
+# timestamp makes is_expired() = (advertised_at + ttl) < now FALSE FOREVER, so the directory's lazy
+# expiry-eviction can never reclaim it → an attacker floods ~cap distinct immortal listings ONCE and
+# permanently locks out honest late-joiners (the sp1460 ttl cap is defeated because the expiry ANCHOR
+# is attacker-controlled). Reject a timestamp more than a small clock-skew ahead of now.
+
+def test_listing_rejects_far_future_advertised_at():
+    import time as _t
+    from prsm.marketplace.listing import verify_listing
+    identity = _fresh()
+    listing = _make_valid_listing(
+        identity, advertised_at_unix=int(_t.time()) + 10 ** 9, ttl_seconds=300)
+    assert verify_listing(listing) is False
+
+
+def test_listing_accepts_advertised_at_within_skew():
+    import time as _t
+    from prsm.marketplace.listing import verify_listing
+    identity = _fresh()
+    # A few seconds in the future (benign clock skew) is fine.
+    listing = _make_valid_listing(
+        identity, advertised_at_unix=int(_t.time()) + 5, ttl_seconds=300)
+    assert verify_listing(listing) is True
+
+
+def test_listing_future_skew_is_env_tunable(monkeypatch):
+    import time as _t
+    from prsm.marketplace.listing import verify_listing
+    monkeypatch.setenv("PRSM_MAX_LISTING_FUTURE_SKEW_SEC", "10")
+    identity = _fresh()
+    now = int(_t.time())
+    assert verify_listing(_make_valid_listing(identity, advertised_at_unix=now + 8)) is True
+    assert verify_listing(_make_valid_listing(identity, advertised_at_unix=now + 60)) is False

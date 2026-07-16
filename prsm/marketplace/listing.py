@@ -72,6 +72,27 @@ def _max_listing_ttl() -> int:
         return _DEFAULT_MAX_LISTING_TTL_SECONDS
 
 
+# sp1462 — allowance for benign clock skew between nodes on advertised_at_unix. A listing timestamped
+# further than this into the future is rejected: is_expired() is (advertised_at + ttl) < now, so an
+# UNBOUNDED future advertised_at makes a listing never expire, defeating the sp1460 ttl cap (the
+# expiry anchor would be attacker-controlled) → immortal listings that permanently occupy the
+# size-capped directory. Env-tunable: PRSM_MAX_LISTING_FUTURE_SKEW_SEC.
+_DEFAULT_MAX_LISTING_FUTURE_SKEW_SEC = 300
+
+
+def _max_listing_future_skew() -> int:
+    try:
+        return max(
+            0,
+            int(os.environ.get(
+                "PRSM_MAX_LISTING_FUTURE_SKEW_SEC",
+                _DEFAULT_MAX_LISTING_FUTURE_SKEW_SEC,
+            )),
+        )
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_LISTING_FUTURE_SKEW_SEC
+
+
 def build_listing_signing_payload(
     listing_id: str,
     provider_id: str,
@@ -322,6 +343,19 @@ def verify_listing(listing: ProviderListing) -> bool:
         logger.warning(
             f"listing {listing.listing_id!r} rejected: ttl {listing.ttl_seconds} "
             f"exceeds max {ttl_max}"
+        )
+        return False
+
+    # sp1462 — reject a listing dated too far in the FUTURE. Without this an attacker sets
+    # advertised_at_unix decades ahead so (advertised_at + ttl) never elapses → the listing never
+    # expires and the sp1460 ttl cap is meaningless (the expiry anchor is attacker-controlled),
+    # letting a one-shot flood permanently occupy the size-capped directory and lock out honest
+    # providers. A small skew allowance tolerates benign NTP drift between nodes.
+    skew = _max_listing_future_skew()
+    if listing.advertised_at_unix > int(time.time()) + skew:
+        logger.warning(
+            f"listing {listing.listing_id!r} rejected: advertised_at_unix "
+            f"{listing.advertised_at_unix} is more than {skew}s in the future"
         )
         return False
 
