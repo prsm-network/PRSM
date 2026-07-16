@@ -73,3 +73,48 @@ def test_cli_publish_paid_requires_buyer_pubkey():
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
+
+
+# ── sp1458: --stream (large paid file → /content/paid/publish-stream) ─────────
+
+def test_cli_publish_paid_stream_hits_stream_endpoint(tmp_path):
+    from unittest.mock import MagicMock, patch
+    f = tmp_path / "big.bin"
+    f.write_bytes(b"large paid dataset " * 100_000)
+    r = MagicMock()
+    r.status_code = 200
+    r.json.return_value = {"content_hash": "0x" + "ab" * 32, "commitment": "0x" + "cd" * 32,
+                           "cid": "QmX", "deposit_tx": "0xdep", "num_recipients": 1}
+    with patch("httpx.post", return_value=r) as mp:
+        result = CliRunner().invoke(main, [
+            "content", "publish-paid", str(f), "--buyer-pubkey", "bkey1",
+            "--buyer-pubkey", "bkey2", "--fee", "1", "--stream"])
+    assert result.exit_code == 0, result.output
+    assert mp.call_args.args[0].endswith("/content/paid/publish-stream")
+    params = mp.call_args.kwargs["params"]
+    assert params["fee_wei"] == 10 ** 18
+    assert params["buyer_x25519_pubkeys"] == "bkey1,bkey2"   # comma-joined
+
+
+def test_cli_publish_paid_stream_server_error_exit_1(tmp_path):
+    from unittest.mock import MagicMock, patch
+    f = tmp_path / "x.bin"
+    f.write_bytes(b"data")
+    r = MagicMock()
+    r.status_code = 503
+    r.text = "not wired"
+    with patch("httpx.post", return_value=r):
+        result = CliRunner().invoke(main, [
+            "content", "publish-paid", str(f), "--buyer-pubkey", "b", "--fee", "1", "--stream"])
+    assert result.exit_code == 1
+
+
+def test_cli_publish_paid_stream_unreachable_exit_2(tmp_path):
+    import httpx
+    from unittest.mock import patch
+    f = tmp_path / "x.bin"
+    f.write_bytes(b"data")
+    with patch("httpx.post", side_effect=httpx.ConnectError("refused")):
+        result = CliRunner().invoke(main, [
+            "content", "publish-paid", str(f), "--buyer-pubkey", "b", "--fee", "1", "--stream"])
+    assert result.exit_code == 2

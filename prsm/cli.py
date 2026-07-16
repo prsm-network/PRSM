@@ -13280,13 +13280,18 @@ def content_unlock_cli(
 )
 @click.option("--fee", "fee_ftns", type=float, required=True, help="Release fee in FTNS.")
 @click.option("--filename", default=None, help="Served filename (default: the file's name).")
+@click.option(
+    "--stream", "stream_large", is_flag=True, default=False,
+    help="Publish a LARGE dataset: stream the file to /content/paid/publish-stream with NO in-memory "
+    "buffering (bounded footprint). Use for datasets above the in-memory publish cap.",
+)
 @click.option("--api-url", "api_url_override", default=None, help="Override daemon URL")
 @click.option(
     "--format", "output_format", type=click.Choice(["text", "json"]), default="text",
 )
 def content_publish_paid_cli(
     file_path: str, buyer_pubkeys, fee_ftns: float, filename: Optional[str],
-    api_url_override: Optional[str], output_format: str,
+    stream_large: bool, api_url_override: Optional[str], output_format: str,
 ) -> None:
     """Sprint 1367 — publish a Tier B/C PAID dataset from your operator node: encrypt + wrap the
     content to the buyer(s), serve the ciphertext, deposit the sha256 commitment on-chain (naming
@@ -13302,16 +13307,53 @@ def content_publish_paid_cli(
 
     import httpx
 
-    data = _Path(file_path).read_bytes()
     url = _api_url_from_creds(api_url_override)
+    key = (os.environ.get("PRSM_NODE_API_KEY") or "").strip()
+    headers = {"Authorization": f"Bearer {key}"} if key else None
+
+    if stream_large:
+        endpoint = f"{url}/content/paid/publish-stream"
+        params = {
+            "fee_wei": int(round(fee_ftns * (10 ** 18))),
+            "buyer_x25519_pubkeys": ",".join(buyer_pubkeys),
+            "filename": filename or _Path(file_path).name,
+        }
+
+        def _body_chunks():
+            with open(file_path, "rb") as fh:
+                for block in iter(lambda: fh.read(1024 * 1024), b""):
+                    yield block
+        try:
+            resp = httpx.post(endpoint, params=params, content=_body_chunks(),
+                              timeout=None, headers=headers)
+        except httpx.RequestError as exc:
+            console.print(f"[red]Daemon unreachable at {endpoint}[/red] — {exc}")
+            raise SystemExit(2)
+        if resp.status_code != 200:
+            console.print(
+                f"[red]stream publish-paid failed ({resp.status_code}):[/red] {resp.text[:300]}")
+            raise SystemExit(1)
+        out = resp.json()
+        if output_format == "json":
+            click.echo(_json.dumps(out, indent=2))
+            raise SystemExit(0)
+        console.print("[green]Published paid dataset (streamed)[/green]")
+        console.print(f"  content_hash: [cyan]{out['content_hash']}[/cyan]")
+        console.print(f"  commitment:   [dim]{out['commitment']}[/dim]")
+        console.print(f"  cid:          [dim]{out.get('cid')}[/dim]")
+        console.print(f"  deposit_tx:   [dim]{out.get('deposit_tx')}[/dim]")
+        console.print(
+            f"\n  Buyers unlock with: [bold]prsm content unlock {out['content_hash']} "
+            f"--fee {fee_ftns} --commitment {out['commitment']} --stream --output <path>[/bold]")
+        raise SystemExit(0)
+
+    data = _Path(file_path).read_bytes()
     body = {
         "plaintext_b64": _b64.b64encode(data).decode(),
         "buyer_x25519_pubkeys": list(buyer_pubkeys),
         "fee_wei": int(round(fee_ftns * (10 ** 18))),
         "filename": filename or _Path(file_path).name,
     }
-    key = (os.environ.get("PRSM_NODE_API_KEY") or "").strip()
-    headers = {"Authorization": f"Bearer {key}"} if key else None
     try:
         with httpx.Client(timeout=120.0) as c:
             resp = c.post(f"{url}/content/paid/publish", json=body, headers=headers)

@@ -444,3 +444,79 @@ async def test_publish_content_from_file_raises_non_200(tmp_path):
     client._session = _FakeSession()
     with pytest.raises(ValueError, match="501"):
         await client.publish_content_from_file(src)
+
+
+# ── sp1458: publish_paid_content_from_file (streaming large paid publish) ─────
+
+async def test_publish_paid_content_from_file_streams(tmp_path):
+    from prsm.sdk.client import PRSMClient
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"paid dataset " * 50_000)
+
+    class _FakeResp:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def json(self):
+            return {"content_hash": "0xab", "cid": "QmX", "commitment": "0xcd",
+                    "deposit_tx": "0xdep"}
+
+        async def text(self):
+            return ""
+
+    captured = {}
+
+    class _FakeSession:
+        def post(self, url, **kwargs):
+            captured["url"] = url
+            captured["params"] = kwargs.get("params")
+            return _FakeResp()
+
+        async def close(self):
+            pass
+
+    client = PRSMClient("http://node:8000")
+    client._session = _FakeSession()
+    result = await client.publish_paid_content_from_file(
+        src, buyer_x25519_pubkeys=["k1", "k2"], fee_wei=10 ** 18, filename="ds.bin")
+    assert "/content/paid/publish-stream" in captured["url"]
+    assert result["content_hash"] == "0xab"
+    assert captured["params"]["buyer_x25519_pubkeys"] == "k1,k2"
+    assert captured["params"]["fee_wei"] == 10 ** 18
+
+
+async def test_publish_paid_content_from_file_raises_non_200(tmp_path):
+    import pytest
+    from prsm.sdk.client import PRSMClient
+    src = tmp_path / "x.bin"
+    src.write_bytes(b"d")
+
+    class _FakeResp:
+        status = 503
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def text(self):
+            return "not wired"
+
+    class _FakeSession:
+        def post(self, url, **kwargs):
+            return _FakeResp()
+
+        async def close(self):
+            pass
+
+    client = PRSMClient("http://node:8000")
+    client._session = _FakeSession()
+    with pytest.raises(ValueError, match="503"):
+        await client.publish_paid_content_from_file(
+            src, buyer_x25519_pubkeys=["k"], fee_wei=10 ** 18)

@@ -794,6 +794,56 @@ class PRSMClient:
                     f"stream publish of {src} failed ({resp.status}): {detail}")
             return await resp.json()
 
+    async def publish_paid_content_from_file(
+        self,
+        src_path,
+        *,
+        buyer_x25519_pubkeys,
+        fee_wei: int,
+        filename: Optional[str] = None,
+        chunk_size: int = 262_144,
+    ) -> Dict[str, Any]:
+        """Sprint 1458 — publish a LARGE Tier B/C PAID dataset by streaming the file to
+        POST /content/paid/publish-stream with NO in-memory buffering. The node encrypts + wraps the
+        content key to ``buyer_x25519_pubkeys`` (base64), serves the ciphertext, registers the creator
+        on-chain, and deposits the commitment. Returns the server payload
+        ``{content_hash, cid, commitment, deposit_tx, ...}``; buyers unlock with
+        ``pay_and_unlock_content(dest_path=…)``. Raises ``ValueError`` on a non-200 (503 not wired /
+        422 bad request / 409 deposit failure). The node must run with PRSM_PAID_KEY_SERVE=1 +
+        PRSM_PAID_PUBLISHER_KEY."""
+        await self._ensure_session()
+        from pathlib import Path as _Path
+
+        src = _Path(src_path)
+        params: Dict[str, Any] = {
+            "fee_wei": int(fee_wei),
+            "buyer_x25519_pubkeys": ",".join(buyer_x25519_pubkeys),
+            "filename": filename or src.name,
+        }
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        async def _body():
+            with open(src, "rb") as fh:
+                while True:
+                    block = fh.read(chunk_size)
+                    if not block:
+                        break
+                    yield block
+
+        async with self._session.post(
+            f"{self.base_url}/content/paid/publish-stream",
+            headers=headers,
+            params=params,
+            data=_body(),
+        ) as resp:
+            if resp.status != 200:
+                detail = (await resp.text())[:300]
+                raise ValueError(
+                    f"paid stream publish of {src} failed ({resp.status}): {detail}")
+            return await resp.json()
+
     async def find_and_fetch(
         self,
         query: str,
