@@ -52,6 +52,26 @@ def _max_listing_capacity() -> float:
         return _DEFAULT_MAX_LISTING_CAPACITY
 
 
+# sp1460 — upper bound on ttl_seconds. Generous (1 day) — the point is to reject the ABSURD, not to
+# bound a legitimate operator. Without it a listing with a decades-long ttl never expires, defeating
+# the directory's lazy expiry-eviction so a flood of long-ttl valid listings grows a listening node's
+# directory permanently (memory DoS). Env-tunable: PRSM_MAX_LISTING_TTL_SECONDS.
+_DEFAULT_MAX_LISTING_TTL_SECONDS = 86_400
+
+
+def _max_listing_ttl() -> int:
+    try:
+        return max(
+            1,
+            int(os.environ.get(
+                "PRSM_MAX_LISTING_TTL_SECONDS",
+                _DEFAULT_MAX_LISTING_TTL_SECONDS,
+            )),
+        )
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_LISTING_TTL_SECONDS
+
+
 def build_listing_signing_payload(
     listing_id: str,
     provider_id: str,
@@ -275,6 +295,16 @@ def verify_listing(listing: ProviderListing) -> bool:
     if listing.ttl_seconds < 0 or listing.price_per_shard_ftns < 0:
         logger.warning(
             f"listing {listing.listing_id!r} rejected: negative ttl or price"
+        )
+        return False
+
+    # sp1460 — reject an absurdly-long ttl so every accepted listing expires within a bounded window
+    # (else lazy expiry-eviction can never reclaim a flood of "immortal" listings → memory DoS).
+    ttl_max = _max_listing_ttl()
+    if listing.ttl_seconds > ttl_max:
+        logger.warning(
+            f"listing {listing.listing_id!r} rejected: ttl {listing.ttl_seconds} "
+            f"exceeds max {ttl_max}"
         )
         return False
 

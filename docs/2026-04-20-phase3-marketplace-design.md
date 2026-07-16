@@ -422,3 +422,11 @@ binding one of two ways:
 
 Without a binding the node still advertises a valid listing; it is simply weighted at the tier label
 (and excluded from the aggregator pool if selectors run with `PRSM_REQUIRE_STAKE_BINDING=1`).
+
+**Ingestion safety bounds (sp1460).** Every node's `MarketplaceDirectory` defends against a listing
+flood (cheap keypairs → many distinct valid listings → unbounded memory): it holds at most
+`PRSM_MARKETPLACE_DIRECTORY_MAX` (default 10 000) distinct provider listings — when full it reclaims
+expired entries first, then drops new ones (updates to an already-present provider are never dropped)
+— and `verify_listing` rejects any `ttl_seconds` above `PRSM_MAX_LISTING_TTL_SECONDS` (default 86 400)
+so no listing is "immortal" against expiry-eviction. Operators running a very large marketplace can
+raise these; the defaults reject only the absurd.

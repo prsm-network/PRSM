@@ -20,10 +20,25 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
+import os
+
 from prsm.marketplace.listing import ProviderListing, verify_listing
 from prsm.node.gossip import GOSSIP_MARKETPLACE_LISTING
 
 logger = logging.getLogger(__name__)
+
+# sp1460 — hard cap on distinct provider listings held in memory. verify_listing requires
+# provider_id == sha256(pubkey) + a valid sig, but keypairs are cheap, so a flood of DISTINCT valid
+# listings would otherwise grow this dict without bound → OOM on every listening node. Generous
+# default; env-tunable via PRSM_MARKETPLACE_DIRECTORY_MAX.
+_DEFAULT_DIRECTORY_MAX = 10_000
+
+
+def _max_directory_size() -> int:
+    try:
+        return max(1, int(os.environ.get("PRSM_MARKETPLACE_DIRECTORY_MAX", _DEFAULT_DIRECTORY_MAX)))
+    except (TypeError, ValueError):
+        return _DEFAULT_DIRECTORY_MAX
 
 
 class MarketplaceDirectory:
@@ -64,6 +79,26 @@ class MarketplaceDirectory:
             if existing.advertised_at_unix >= listing.advertised_at_unix:
                 # Old or equal — ignore. Prevents replay of stale listings
                 # with attacker-favorable terms (e.g., lower price).
+                return
+            # A newer listing for an ALREADY-PRESENT provider: replace in place. The size cap gates
+            # only NEW provider_ids, so an honest provider's periodic refresh is never starved by a
+            # full directory.
+            self._listings[listing.provider_id] = listing
+            return
+
+        # sp1460 — a NEW provider_id: enforce the size cap so a flood of distinct valid listings
+        # cannot exhaust memory. Reclaim expired entries first; if still full, drop the new listing
+        # (availability over completeness — the node stays up with a bounded, if flood-contended,
+        # directory rather than OOMing). Logged, never silent.
+        cap = _max_directory_size()
+        if len(self._listings) >= cap:
+            self._evict_expired(int(time.time()))
+            if len(self._listings) >= cap:
+                logger.warning(
+                    "marketplace directory at capacity (%d) — dropping new listing from "
+                    "provider %s… (possible listing flood)",
+                    cap, str(listing.provider_id)[:12],
+                )
                 return
 
         self._listings[listing.provider_id] = listing

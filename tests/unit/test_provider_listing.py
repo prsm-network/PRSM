@@ -262,3 +262,32 @@ def test_sign_stake_binding_roundtrips_with_verify():
     assert verify_stake_binding(pid, address, sig) is True
     # and it's bound to THIS provider_id only
     assert verify_stake_binding("0" * 32, address, sig) is False
+
+
+# ── sp1460: TTL upper bound at ingestion (DoS hardening) ──
+# verify_listing bounded ttl >= 0 but had NO upper bound. A listing with ttl_seconds = decades never
+# expires, so the directory's lazy expiry-eviction can never reclaim it → a flood of long-TTL valid
+# listings grows a listening node's directory permanently. Cap ttl at ingestion so every accepted
+# listing expires within a bounded window (mirrors the sp926 capacity bound).
+
+def test_listing_rejects_absurd_ttl():
+    from prsm.marketplace.listing import verify_listing
+    identity = _fresh()
+    # A ~317-year TTL — an "immortal" listing crafted to defeat expiry-based eviction.
+    listing = _make_valid_listing(identity, ttl_seconds=10_000_000_000)
+    assert verify_listing(listing) is False
+
+
+def test_listing_accepts_ttl_within_bound():
+    from prsm.marketplace.listing import verify_listing
+    identity = _fresh()
+    listing = _make_valid_listing(identity, ttl_seconds=300)
+    assert verify_listing(listing) is True
+
+
+def test_listing_ttl_bound_is_env_tunable(monkeypatch):
+    from prsm.marketplace.listing import verify_listing
+    identity = _fresh()
+    monkeypatch.setenv("PRSM_MAX_LISTING_TTL_SECONDS", "600")
+    assert verify_listing(_make_valid_listing(identity, ttl_seconds=600)) is True
+    assert verify_listing(_make_valid_listing(identity, ttl_seconds=601)) is False

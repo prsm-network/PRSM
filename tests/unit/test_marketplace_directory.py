@@ -241,3 +241,57 @@ def test_directory_multiple_providers():
     active = directory.list_active_providers()
     prices = sorted(l.price_per_shard_ftns for l in active)
     assert prices == [0.01, 0.02, 0.03]
+
+
+# ── sp1460: bounded directory (memory-DoS backstop) ──
+# _listings had no size cap. verify_listing requires provider_id==sha256(pubkey)+sig, but keypairs
+# are cheap, so a flood of DISTINCT valid listings grows the dict without bound → OOM on every
+# listening node. Cap the directory: evict-expired-first, then REJECT new distinct providers when
+# full (updates to an already-present provider are never blocked). Availability preserved under flood.
+
+def test_directory_caps_distinct_providers(monkeypatch):
+    monkeypatch.setenv("PRSM_MARKETPLACE_DIRECTORY_MAX", "5")
+    gossip = _make_gossip()
+    directory = MarketplaceDirectory(gossip=gossip)
+    # Fill to the cap with 5 distinct valid providers.
+    for i in range(5):
+        idn = generate_node_identity(display_name=f"p{i}")
+        _run(_fire(gossip, _make_listing(idn).to_dict()))
+    assert directory.size() == 5
+    # A 6th DISTINCT valid provider is REJECTED — the directory does not grow past the cap.
+    overflow = generate_node_identity(display_name="overflow")
+    _run(_fire(gossip, _make_listing(overflow).to_dict()))
+    assert directory.size() == 5
+    assert directory.get_listing(overflow.node_id) is None
+
+
+def test_directory_cap_still_allows_updates_to_existing_provider(monkeypatch):
+    monkeypatch.setenv("PRSM_MARKETPLACE_DIRECTORY_MAX", "3")
+    gossip = _make_gossip()
+    directory = MarketplaceDirectory(gossip=gossip)
+    ids = [generate_node_identity(display_name=f"p{i}") for i in range(3)]
+    # Future advertised_at so the listings are unexpired at real time.time().
+    for idn in ids:
+        _run(_fire(gossip, _make_listing(idn, advertised_at_unix=2_000_000_000).to_dict()))
+    assert directory.size() == 3
+    # A NEWER listing for an ALREADY-PRESENT provider must still replace (the cap gates only NEW
+    # provider_ids, so an honest provider's refresh is never starved by a full directory).
+    newer = _make_listing(ids[0], advertised_at_unix=2_000_000_001, price_per_shard_ftns=0.99)
+    _run(_fire(gossip, newer.to_dict()))
+    assert directory.size() == 3
+    assert directory.get_listing(ids[0].node_id).advertised_at_unix == 2_000_000_001
+
+
+def test_directory_cap_evicts_expired_before_rejecting(monkeypatch):
+    # When full, expired entries are reclaimed FIRST — so a new provider is admitted if room frees up.
+    monkeypatch.setenv("PRSM_MARKETPLACE_DIRECTORY_MAX", "2")
+    gossip = _make_gossip()
+    directory = MarketplaceDirectory(gossip=gossip)
+    # Two short-TTL listings advertised in the distant past → already expired.
+    for i in range(2):
+        idn = generate_node_identity(display_name=f"old{i}")
+        _run(_fire(gossip, _make_listing(idn, advertised_at_unix=1, ttl_seconds=10).to_dict()))
+    # A fresh listing arrives; the two stale entries are evicted to make room → admitted.
+    fresh = generate_node_identity(display_name="fresh")
+    _run(_fire(gossip, _make_listing(fresh).to_dict()))
+    assert directory.get_listing(fresh.node_id) is not None
