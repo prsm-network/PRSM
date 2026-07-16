@@ -350,30 +350,86 @@ def pay_and_unlock(
     Raises KeyNotReleasedError / KeyCommitmentMismatchError (unpaid / wrong served key) or
     PaidUnlockError (retrieval miss / wrong X25519 key / tampered ciphertext).
     """
-    from prsm.economy.web3.key_acquisition import fetch_and_verify_wrapped_key
     from prsm.storage.paid_unlock import PaidUnlockError, reconstruct_paid_content
 
-    # 1. Pay the release fee first (so the endpoint's on-chain verifyPayment gate passes).
-    if settle_fee is not None:
-        settle_fee()
+    wrapped_key = _settle_and_fetch_key(
+        content_hash=content_hash, fetch_wrapped_key=fetch_wrapped_key,
+        commitment=commitment, fetch_commitment=fetch_commitment, settle_fee=settle_fee)
 
-    # 2. Resolve the commitment from an AUTHORITATIVE source (on-chain) if not supplied directly.
-    resolved_commitment = commitment
-    if resolved_commitment is None:
-        if fetch_commitment is None:
-            raise PaidUnlockError("commitment or fetch_commitment is required")
-        resolved_commitment = fetch_commitment()
-
-    # 3. Fetch the wrapped key off-chain + verify it against the commitment (B2 redesign).
-    wrapped_key = fetch_and_verify_wrapped_key(
-        fetch_wrapped_key, content_hash, resolved_commitment)
-
-    # 3. Retrieve the freely-served ciphertext.
+    # Retrieve the freely-served ciphertext (in memory).
     content = retrieve_content(content_hash)
     if content is None:
         raise PaidUnlockError(
             f"paid + fetched the key, but the ciphertext for content "
             f"{bytes(content_hash).hex()[:12]}… is not retrievable (no provider has it?).")
 
-    # 4. Reconstruct the plaintext (B1 — unwrap key with the buyer's X25519 key + decrypt).
+    # Reconstruct the plaintext (B1 — unwrap key with the buyer's X25519 key + decrypt).
     return reconstruct_paid_content(wrapped_key, recipient_privkey_b64, content)
+
+
+def _settle_and_fetch_key(
+    *,
+    content_hash: bytes,
+    fetch_wrapped_key: Callable[[bytes], Any],
+    commitment: Optional[bytes],
+    fetch_commitment: Optional[Callable[[], Any]],
+    settle_fee: Optional[Callable[[], Any]],
+) -> bytes:
+    """sp1458 — the money-critical PREFIX of the consumer unlock, shared by pay_and_unlock (in-memory)
+    and pay_and_unlock_to_file (streaming) so the twice-audited settle → resolve-commitment →
+    fetch+verify-key flow lives in ONE place (B5/B6): (1) pay the release fee first so the serve
+    endpoint's on-chain verifyPayment gate passes; (2) resolve the commitment from an AUTHORITATIVE
+    on-chain source when not supplied directly (never a publisher/MITM value); (3) fetch the wrapped
+    key off-chain and VERIFY it against the commitment. Returns the verified wrapped_key bytes."""
+    from prsm.economy.web3.key_acquisition import fetch_and_verify_wrapped_key
+    from prsm.storage.paid_unlock import PaidUnlockError
+
+    if settle_fee is not None:
+        settle_fee()
+    resolved_commitment = commitment
+    if resolved_commitment is None:
+        if fetch_commitment is None:
+            raise PaidUnlockError("commitment or fetch_commitment is required")
+        resolved_commitment = fetch_commitment()
+    return fetch_and_verify_wrapped_key(
+        fetch_wrapped_key, content_hash, resolved_commitment)
+
+
+def pay_and_unlock_to_file(
+    *,
+    content_hash: bytes,
+    recipient_privkey_b64: str,
+    fetch_wrapped_key: Callable[[bytes], Any],
+    retrieve_content_to_file: Callable[[bytes], Any],
+    dest_path: Any,
+    commitment: Optional[bytes] = None,
+    fetch_commitment: Optional[Callable[[], Any]] = None,
+    settle_fee: Optional[Callable[[], Any]] = None,
+) -> Any:
+    """sp1458 — the STREAMING, large-file consumer unlock. Runs the IDENTICAL money flow as
+    pay_and_unlock (pay → fetch+verify the wrapped key, via the shared _settle_and_fetch_key), but
+    the ciphertext is retrieved TO A FILE and stream-decrypted, so a multi-GiB paid dataset unlocks
+    with a bounded memory footprint.
+
+    ``retrieve_content_to_file``: ``content_hash -> ciphertext_file_path`` — fetches the served
+    streaming ciphertext to a local file (e.g. GET /content/retrieve-stream). ``dest_path``: where the
+    decrypted plaintext is written. Returns ``dest_path``. FAIL-LOUD (PaidUnlockError) on a wrong key /
+    tampered ciphertext, leaving no plaintext file."""
+    from prsm.storage.paid_unlock import (
+        PaidUnlockError,
+        reconstruct_paid_content_from_file,
+    )
+
+    wrapped_key = _settle_and_fetch_key(
+        content_hash=content_hash, fetch_wrapped_key=fetch_wrapped_key,
+        commitment=commitment, fetch_commitment=fetch_commitment, settle_fee=settle_fee)
+
+    ciphertext_path = retrieve_content_to_file(content_hash)
+    if not ciphertext_path:
+        raise PaidUnlockError(
+            f"paid + fetched the key, but the ciphertext for content "
+            f"{bytes(content_hash).hex()[:12]}… is not retrievable (no provider has it?).")
+
+    reconstruct_paid_content_from_file(
+        wrapped_key, recipient_privkey_b64, ciphertext_path, dest_path)
+    return dest_path

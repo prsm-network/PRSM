@@ -114,3 +114,68 @@ def test_wrong_buyer_key_raises():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ── sp1458: pay_and_unlock_to_file (streaming large-file consumer) ─────────────
+
+def test_pay_and_unlock_to_file_streams_end_to_end(tmp_path):
+    from prsm.economy.paid_content import (
+        build_paid_content_from_path, pay_and_unlock_to_file)
+    plaintext = (b"paywalled large dataset row; " * 100_000) + b"tail"
+    src = tmp_path / "plain.bin"
+    src.write_bytes(plaintext)
+    ct = tmp_path / "cipher.bin"
+    buyer_priv, buyer_pub = generate_recipient_keypair()
+    built = build_paid_content_from_path(
+        src, ct, [EnterpriseRecipient(identifier="b", x25519_pubkey_b64=buyer_pub)])
+
+    order = []
+    out = pay_and_unlock_to_file(
+        content_hash=built["content_hash"], recipient_privkey_b64=buyer_priv,
+        commitment=built["commitment"],
+        fetch_wrapped_key=lambda ch: (order.append("fetch"), built["wrapped_key"])[1],
+        retrieve_content_to_file=lambda ch: (order.append("retrieve"), str(ct))[1],
+        dest_path=tmp_path / "out.bin",
+        settle_fee=lambda: order.append("pay"))
+    # money flow preserved: pay BEFORE fetching the key BEFORE retrieving the ciphertext
+    assert order == ["pay", "fetch", "retrieve"]
+    assert out == tmp_path / "out.bin"
+    assert (tmp_path / "out.bin").read_bytes() == plaintext   # streamed decrypt, byte-identical
+
+
+def test_pay_and_unlock_to_file_wrong_buyer_key_fails_loud(tmp_path):
+    from prsm.economy.paid_content import (
+        build_paid_content_from_path, pay_and_unlock_to_file)
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"secret dataset " * 50_000)
+    _buyer_priv, buyer_pub = generate_recipient_keypair()
+    other_priv, _other_pub = generate_recipient_keypair()
+    ct = tmp_path / "cipher.bin"
+    built = build_paid_content_from_path(
+        src, ct, [EnterpriseRecipient(identifier="b", x25519_pubkey_b64=buyer_pub)])
+    with pytest.raises(PaidUnlockError):
+        pay_and_unlock_to_file(
+            content_hash=built["content_hash"], recipient_privkey_b64=other_priv,
+            commitment=built["commitment"],
+            fetch_wrapped_key=lambda ch: built["wrapped_key"],
+            retrieve_content_to_file=lambda ch: str(ct),
+            dest_path=tmp_path / "out.bin", settle_fee=lambda: None)
+    assert not (tmp_path / "out.bin").exists()
+
+
+def test_pay_and_unlock_to_file_unretrievable_ciphertext_fails_loud(tmp_path):
+    from prsm.economy.paid_content import (
+        build_paid_content_from_path, pay_and_unlock_to_file)
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"data " * 20_000)
+    buyer_priv, buyer_pub = generate_recipient_keypair()
+    ct = tmp_path / "cipher.bin"
+    built = build_paid_content_from_path(
+        src, ct, [EnterpriseRecipient(identifier="b", x25519_pubkey_b64=buyer_pub)])
+    with pytest.raises(PaidUnlockError, match="not retrievable"):
+        pay_and_unlock_to_file(
+            content_hash=built["content_hash"], recipient_privkey_b64=buyer_priv,
+            commitment=built["commitment"],
+            fetch_wrapped_key=lambda ch: built["wrapped_key"],
+            retrieve_content_to_file=lambda ch: None,   # no provider has it
+            dest_path=tmp_path / "out.bin", settle_fee=lambda: None)
