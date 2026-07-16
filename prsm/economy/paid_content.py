@@ -130,6 +130,40 @@ def build_paid_content(plaintext: bytes, recipients: List[Any]) -> Dict[str, Any
     return {"ciphertext": ciphertext, "wrapped_key": wrapped, "commitment": key_commitment(wrapped)}
 
 
+def build_paid_content_from_path(
+    src_path: Any, dest_ciphertext_path: Any, recipients: List[Any],
+) -> Dict[str, Any]:
+    """sp1458 — the STREAMING equivalent of build_paid_content for a LARGE plaintext file: stream-
+    encrypt ``src_path`` to ``dest_ciphertext_path`` (AES-256-GCM, bounded memory) and wrap the fresh
+    content key to the buyer(s). Returns ``{ciphertext_path, wrapped_key, commitment, content_hash}``
+    where ``content_hash`` = sha256 of the STREAMING ciphertext file (the authoritative deposit +
+    fetch key), computed by a streaming read. The ASYNC caller then serves the ciphertext file (e.g.
+    POST /content/upload-stream) and deposits the commitment under that content_hash via
+    ``deposit_commitment_and_retain``. Nothing is materialized in memory."""
+    import hashlib
+    from prsm.storage.encryption import generate_key
+    from prsm.storage.paid_unlock import (
+        encrypt_content_to_file,
+        key_commitment,
+        wrap_content_key_for_deposit,
+    )
+    if not recipients:
+        raise ValueError("at least one recipient (buyer X25519 pubkey) is required")
+    content_key = generate_key()
+    encrypt_content_to_file(src_path, dest_ciphertext_path, content_key)
+    wrapped = wrap_content_key_for_deposit(content_key, list(recipients))
+    h = hashlib.sha256()
+    with open(dest_ciphertext_path, "rb") as fh:
+        for block in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(block)
+    return {
+        "ciphertext_path": str(dest_ciphertext_path),
+        "wrapped_key": wrapped,
+        "commitment": key_commitment(wrapped),
+        "content_hash": h.digest(),
+    }
+
+
 def deposit_commitment_and_retain(
     *,
     key_client: Any,

@@ -131,3 +131,51 @@ def test_bounded_memory_no_full_read(tmp_path, monkeypatch):
     encrypt_content_to_file(src, ct, key)
     decrypt_content_from_file(ct, tmp_path / "out.bin", key)
     assert (tmp_path / "out.bin").read_bytes() == _PLAINTEXT
+
+
+def test_build_paid_content_from_path_round_trips_via_buyer_unwrap(tmp_path):
+    # ★ PRODUCER end-to-end: stream-encrypt a large file + wrap the key → a buyer unwraps the content
+    # key with their X25519 privkey and stream-decrypts the ciphertext file back to the plaintext.
+    import hashlib
+    import json
+
+    from prsm.economy.paid_content import build_paid_content_from_path
+    from prsm.enterprise.recipient_encryption import (
+        EncryptedPayload as _RecipientPayload,
+        EnterpriseRecipient,
+        decrypt_for_recipient,
+        generate_recipient_keypair,
+    )
+    from prsm.storage.encryption import AESKey
+    from prsm.storage.paid_unlock import decrypt_content_from_file
+
+    plaintext = (b"proprietary paid dataset row; " * 100_000) + b"unaligned-tail"
+    src = tmp_path / "plain.bin"
+    src.write_bytes(plaintext)
+    buyer_priv, buyer_pub = generate_recipient_keypair()
+    ct = tmp_path / "cipher.bin"
+
+    result = build_paid_content_from_path(
+        src, ct, [EnterpriseRecipient(identifier="buyer", x25519_pubkey_b64=buyer_pub)])
+
+    # content_hash is sha256 of the ciphertext FILE (the authoritative deposit/fetch key).
+    assert result["content_hash"] == hashlib.sha256(ct.read_bytes()).digest()
+    assert result["commitment"] == hashlib.sha256(result["wrapped_key"]).digest()
+    assert ct.read_bytes()[:16] != plaintext[:16]      # actually encrypted
+
+    # CONSUMER unwrap → content key bytes (key_id NOT recovered — proves the relaxed check) → decrypt.
+    wrapped = _RecipientPayload.from_dict(json.loads(result["wrapped_key"]))
+    content_key_bytes = decrypt_for_recipient(wrapped, buyer_priv)
+    key = AESKey(key_id="placeholder-unknown-to-consumer", key_bytes=content_key_bytes)
+    out = tmp_path / "recovered.bin"
+    decrypt_content_from_file(ct, out, key)
+    assert out.read_bytes() == plaintext
+
+
+def test_build_paid_content_from_path_requires_recipient(tmp_path):
+    import pytest as _pytest
+    from prsm.economy.paid_content import build_paid_content_from_path
+    src = tmp_path / "p.bin"
+    src.write_bytes(b"data")
+    with _pytest.raises(ValueError):
+        build_paid_content_from_path(src, tmp_path / "ct.bin", [])

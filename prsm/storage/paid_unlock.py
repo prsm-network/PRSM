@@ -142,15 +142,15 @@ def decrypt_content_from_file(src_path: Any, dest_path: Any, content_key: Any) -
         if fin.read(len(_STREAM_MAGIC)) != _STREAM_MAGIC:
             raise PaidUnlockError("not a streaming Tier B/C ciphertext (bad magic)")
         kid_len = struct.unpack("B", fin.read(1))[0]
-        key_id = fin.read(kid_len).decode("utf-8", "replace")
+        _ = fin.read(kid_len)  # header key_id — informational only; the GCM tag is the integrity gate
         iv = fin.read(_STREAM_IV_LEN)
         header_len = len(_STREAM_MAGIC) + 1 + kid_len + _STREAM_IV_LEN
         ct_len = total - header_len - _STREAM_TAG_LEN
         if len(iv) != _STREAM_IV_LEN or ct_len < 0:
             raise PaidUnlockError("streaming ciphertext truncated (no room for iv/tag)")
-        if key_id != str(content_key.key_id):
-            raise PaidUnlockError(
-                f"key_id mismatch: file={key_id!r} key={content_key.key_id!r}")
+        # NOTE: the caller's content_key need NOT carry the original key_id — the paid-decrypt
+        # consumer recovers only the raw key BYTES from the wrapped key, not the key_id. Decryption
+        # uses content_key.key_bytes and the file's iv/tag; a wrong key fails the GCM tag at finalize.
         fin.seek(total - _STREAM_TAG_LEN)      # the tag is the trailer; the decryptor needs it up front
         tag = fin.read(_STREAM_TAG_LEN)
         fin.seek(header_len)
