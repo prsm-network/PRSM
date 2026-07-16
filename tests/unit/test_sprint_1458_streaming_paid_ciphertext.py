@@ -179,3 +179,44 @@ def test_build_paid_content_from_path_requires_recipient(tmp_path):
     src.write_bytes(b"data")
     with _pytest.raises(ValueError):
         build_paid_content_from_path(src, tmp_path / "ct.bin", [])
+
+
+def test_reconstruct_paid_content_from_file_full_consumer_round_trip(tmp_path):
+    # ★ CONSUMER end-to-end: producer publishes → consumer unwraps the payment-released key + streams
+    # the ciphertext file back to plaintext, via the packaged reconstruct_paid_content_from_file.
+    from prsm.economy.paid_content import build_paid_content_from_path
+    from prsm.enterprise.recipient_encryption import (
+        EnterpriseRecipient, generate_recipient_keypair)
+    from prsm.storage.paid_unlock import reconstruct_paid_content_from_file
+
+    plaintext = (b"paid dataset " * 90_000) + b"tail!"
+    src = tmp_path / "plain.bin"
+    src.write_bytes(plaintext)
+    buyer_priv, buyer_pub = generate_recipient_keypair()
+    ct = tmp_path / "cipher.bin"
+    result = build_paid_content_from_path(
+        src, ct, [EnterpriseRecipient(identifier="b", x25519_pubkey_b64=buyer_pub)])
+
+    out = tmp_path / "recovered.bin"
+    reconstruct_paid_content_from_file(result["wrapped_key"], buyer_priv, ct, out)
+    assert out.read_bytes() == plaintext
+
+
+def test_reconstruct_from_file_wrong_buyer_key_fails_loud(tmp_path):
+    from prsm.economy.paid_content import build_paid_content_from_path
+    from prsm.enterprise.recipient_encryption import (
+        EnterpriseRecipient, generate_recipient_keypair)
+    from prsm.storage.paid_unlock import reconstruct_paid_content_from_file
+
+    src = tmp_path / "plain.bin"
+    src.write_bytes(b"secret dataset " * 50_000)
+    _buyer_priv, buyer_pub = generate_recipient_keypair()
+    other_priv, _other_pub = generate_recipient_keypair()   # NOT a designated recipient
+    ct = tmp_path / "cipher.bin"
+    result = build_paid_content_from_path(
+        src, ct, [EnterpriseRecipient(identifier="b", x25519_pubkey_b64=buyer_pub)])
+
+    out = tmp_path / "recovered.bin"
+    with pytest.raises(PaidUnlockError):
+        reconstruct_paid_content_from_file(result["wrapped_key"], other_priv, ct, out)
+    assert not out.exists()

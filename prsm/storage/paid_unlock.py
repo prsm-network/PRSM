@@ -173,6 +173,42 @@ def decrypt_content_from_file(src_path: Any, dest_path: Any, content_key: Any) -
         os.replace(tmp, dest)                   # promote ONLY after the tag verifies
 
 
+def reconstruct_paid_content_from_file(
+    released_wrapped_key: bytes,
+    recipient_privkey_b64: str,
+    ciphertext_path: Any,
+    dest_path: Any,
+) -> None:
+    """sp1458 — CONSUMER side, STREAMING: the large-file equivalent of ``reconstruct_paid_content``.
+
+    Unwrap the content key from the payment-released ``released_wrapped_key`` with the buyer's X25519
+    private key, then stream-decrypt the retrieved ciphertext FILE (``encrypt_content_to_file`` format,
+    fetched via /content/retrieve-stream) to ``dest_path`` with a bounded memory footprint. FAIL-LOUD
+    (PaidUnlockError) on a malformed/wrong wrapped key or a tampered ciphertext — no plaintext file is
+    left behind (decrypt_content_from_file promotes only after the GCM tag verifies)."""
+    from prsm.enterprise.recipient_encryption import (
+        EncryptedPayload as _RecipientPayload,
+        decrypt_for_recipient,
+    )
+    from prsm.storage.encryption import AES_KEY_BYTES, AESKey
+    try:
+        wrapped = _RecipientPayload.from_dict(json.loads(released_wrapped_key))
+    except Exception as exc:  # noqa: BLE001
+        raise PaidUnlockError(f"malformed released wrapped key: {exc}") from exc
+    try:
+        content_key_bytes = decrypt_for_recipient(wrapped, recipient_privkey_b64)
+    except Exception as exc:  # noqa: BLE001 — wrong buyer key / not a designated recipient
+        raise PaidUnlockError(
+            f"could not unwrap the content key with this private key "
+            f"(paid for the wrong content, or not a designated buyer?): {exc}") from exc
+    if len(content_key_bytes) != AES_KEY_BYTES:
+        raise PaidUnlockError(
+            f"unwrapped key is {len(content_key_bytes)} bytes, expected {AES_KEY_BYTES} "
+            f"(the deposited key was not a content-encryption key)")
+    key = AESKey(key_id="paid-unlock", key_bytes=content_key_bytes)
+    decrypt_content_from_file(ciphertext_path, dest_path, key)
+
+
 def wrap_content_key_for_deposit(content_key: Any, recipients: List[Any]) -> bytes:
     """PUBLISHER side — wrap the content-encryption key to the buyer(s) as the on-chain
     ``encrypted_key`` for ``KeyDistributionClient.deposit_key``. The wrapped key is released
