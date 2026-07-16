@@ -291,3 +291,66 @@ def test_listing_ttl_bound_is_env_tunable(monkeypatch):
     monkeypatch.setenv("PRSM_MAX_LISTING_TTL_SECONDS", "600")
     assert verify_listing(_make_valid_listing(identity, ttl_seconds=600)) is True
     assert verify_listing(_make_valid_listing(identity, ttl_seconds=601)) is False
+
+
+# ── sp1461: the signed payload must cover ALL selection-relevant fields (relay-tamper defense) ──
+# build_listing_signing_payload originally omitted supported_dtypes and the sp1457 stake binding, so
+# a relay on the gossip path could alter those WITHOUT breaking the Ed25519 signature — tampering
+# eligibility (dtypes) or stripping/swapping the stake binding (downgrading real-stake weighting back
+# to the self-declared tier label). Since advertising went live only at sp1459, there are no deployed
+# listings to break — widen the signed payload now.
+
+def test_relay_cannot_tamper_supported_dtypes():
+    from prsm.marketplace.listing import ProviderListing, verify_listing
+    identity = _fresh()
+    listing = _make_valid_listing(identity, supported_dtypes=["float16"])
+    assert verify_listing(listing) is True
+    # A relay rewrites the dtypes on the wire (the Ed25519 sig is unchanged).
+    d = listing.to_dict()
+    d["supported_dtypes"] = ["float16", "float32", "int8"]
+    tampered = ProviderListing.from_dict(d)
+    assert verify_listing(tampered) is False
+
+
+def _signed_with_binding(identity, stake_key="0x" + "6b" * 32):
+    from prsm.marketplace.listing import sign_listing, sign_stake_binding
+    address, sig = sign_stake_binding(identity.node_id, stake_key)
+    listing = sign_listing(
+        identity=identity, capacity_shards_per_sec=10.0, max_shard_bytes=1024 * 1024,
+        supported_dtypes=["float16"], price_per_shard_ftns=0.05, tee_capable=False,
+        stake_tier="T4", ttl_seconds=300,
+        stake_eth_address=address, stake_binding_sig=sig)
+    return listing, address, sig
+
+
+def test_relay_cannot_strip_stake_binding():
+    from prsm.marketplace.listing import ProviderListing, verify_listing
+    identity = _fresh()
+    listing, _addr, _sig = _signed_with_binding(identity)
+    assert verify_listing(listing) is True
+    # A relay strips the binding to downgrade the provider off real-stake weighting.
+    d = listing.to_dict()
+    d["stake_eth_address"] = None
+    d["stake_binding_sig"] = None
+    stripped = ProviderListing.from_dict(d)
+    assert verify_listing(stripped) is False
+
+
+def test_relay_cannot_swap_stake_binding_address():
+    from prsm.marketplace.listing import ProviderListing, verify_listing
+    identity = _fresh()
+    listing, _addr, _sig = _signed_with_binding(identity)
+    d = listing.to_dict()
+    d["stake_eth_address"] = "0x" + "99" * 20      # a different address (sig no longer matches payload)
+    swapped = ProviderListing.from_dict(d)
+    assert verify_listing(swapped) is False
+
+
+def test_binding_listing_still_round_trips_and_verifies():
+    # The widened payload must not break a legitimately-signed binding listing.
+    from prsm.marketplace.listing import ProviderListing, verify_listing
+    identity = _fresh()
+    listing, _addr, _sig = _signed_with_binding(identity)
+    rt = ProviderListing.from_dict(listing.to_dict())
+    assert verify_listing(rt) is True
+    assert rt.has_verified_stake_binding() is True

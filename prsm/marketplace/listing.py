@@ -82,18 +82,32 @@ def build_listing_signing_payload(
     stake_tier: str,
     advertised_at_unix: int,
     ttl_seconds: int,
+    supported_dtypes: Optional[List[str]] = None,
+    stake_eth_address: Optional[str] = None,
+    stake_binding_sig: Optional[str] = None,
 ) -> bytes:
     """Canonical bytes the provider signs over for a listing.
 
     Format (design §3.1): keccak256 of a pipe-delimited UTF-8 string
-    composed of all price/capacity-relevant fields. Matches the on-
-    chain-compatible hashing scheme used elsewhere in PRSM (Phase 7
-    slashing will verify signatures over the same scheme).
-    """
+    composed of ALL selection-relevant fields. Matches the on-chain-
+    compatible hashing scheme used elsewhere in PRSM (Phase 7 slashing
+    will verify signatures over the same scheme).
+
+    sp1461 — the payload also binds ``supported_dtypes`` (an eligibility
+    input) and the sp1457 stake binding (``stake_eth_address`` +
+    ``stake_binding_sig``). Without them a relay on the gossip path could
+    tamper with dtypes or STRIP/swap the binding while keeping the
+    Ed25519 signature valid — altering who is eligible / how a provider is
+    stake-weighted. Order-preserving join (the provider signs its declared
+    dtype order; verify reproduces from the same list)."""
+    dtypes_canon = ",".join(supported_dtypes or [])
+    addr_canon = str(stake_eth_address or "")
+    bind_canon = str(stake_binding_sig or "")
     raw = (
         f"{listing_id}||{provider_id}||{capacity_shards_per_sec}||"
         f"{max_shard_bytes}||{price_per_shard_ftns}||{tee_capable}||"
-        f"{stake_tier}||{advertised_at_unix}||{ttl_seconds}"
+        f"{stake_tier}||{advertised_at_unix}||{ttl_seconds}||"
+        f"{dtypes_canon}||{addr_canon}||{bind_canon}"
     ).encode("utf-8")
     return keccak(raw)
 
@@ -260,6 +274,9 @@ def sign_listing(
         stake_tier=stake_tier,
         advertised_at_unix=when,
         ttl_seconds=ttl_seconds,
+        supported_dtypes=list(supported_dtypes),
+        stake_eth_address=stake_eth_address,
+        stake_binding_sig=stake_binding_sig,
     )
     sig = identity.sign(payload)
     return ProviderListing(
@@ -344,6 +361,9 @@ def verify_listing(listing: ProviderListing) -> bool:
         stake_tier=listing.stake_tier,
         advertised_at_unix=listing.advertised_at_unix,
         ttl_seconds=listing.ttl_seconds,
+        supported_dtypes=listing.supported_dtypes,
+        stake_eth_address=listing.stake_eth_address,
+        stake_binding_sig=listing.stake_binding_sig,
     )
 
     try:
