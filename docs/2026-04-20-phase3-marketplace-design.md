@@ -406,7 +406,7 @@ To offer a compute node as marketplace supply, set on the provider node:
 | `PRSM_MARKETPLACE_CAPACITY_SHARDS_PER_SEC` | `1.0` | Advertised throughput (auto-drops to 0 when at `max_concurrent_jobs`). |
 | `PRSM_MARKETPLACE_MAX_SHARD_BYTES` | `8388608` | Largest shard this node accepts. |
 | `PRSM_MARKETPLACE_DTYPES` | `float16,float32` | Comma-separated supported dtypes. |
-| `PRSM_MARKETPLACE_STAKE_TIER` | `open` | Claimed tier. Note: an unbound tier claim gains **no** selection weight (sp1457) — bond stake + supply a binding below to be weighted by real stake, and it is required for pool admission under `PRSM_REQUIRE_STAKE_BINDING`. |
+| `PRSM_MARKETPLACE_STAKE_TIER` | `open` | Claimed tier. **The default `open` is NOT aggregator-eligible** — only `T2`/`T3`/`T4` enter the aggregator candidate pool, so a default-configured advertiser offers shard-dispatch supply but is never selected for paid aggregation. To participate in aggregation set an eligible tier AND supply a stake binding (below): an unbound tier claim gains **no** real selection weight (sp1457), and it is excluded from the pool entirely under `PRSM_REQUIRE_STAKE_BINDING`. |
 | `PRSM_MARKETPLACE_TEE_CAPABLE` | *(off)* | Advertise TEE capability. |
 | `PRSM_MARKETPLACE_TTL_SECONDS` | `300` | Listing TTL in the directory (keep > 2× rebroadcast interval). |
 | `PRSM_MARKETPLACE_REBROADCAST_INTERVAL_SEC` | `90` | Re-broadcast cadence (jittered ±25%). |
