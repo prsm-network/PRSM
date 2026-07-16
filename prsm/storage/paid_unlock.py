@@ -82,6 +82,97 @@ def deserialize_encrypted_content(data: bytes) -> Any:
         raise PaidUnlockError(f"malformed encrypted content envelope: {exc}") from exc
 
 
+# ── sp1458: streaming Tier B/C ciphertext codec (LARGE paid content) ──────────────────────────────
+# serialize_encrypted_content (JSON + base64 of the whole ciphertext) is in-memory by nature, so a
+# multi-GiB paid dataset can't be published/consumed through it. This binary format streams a file with
+# a bounded memory footprint, composing the proven StreamingEncryptor/StreamingDecryptor. It is ADDITIVE:
+# a consumer detects the magic (is_streaming_ciphertext_file) and routes here; the JSON envelope path
+# (serve small paid content) is unchanged, so the twice-audited paid-decrypt money gate is untouched.
+#
+# Layout:  _STREAM_MAGIC(8) | u8 key_id_len | key_id | iv(12) | ciphertext… | auth_tag(16 TRAILER)
+# The GCM auth tag is a TRAILER because it is only known at finalize(); a seekable file reads it first.
+_STREAM_MAGIC = b"PRSMSC1\x00"
+_STREAM_CHUNK = 1024 * 1024  # 1 MiB read granularity
+_STREAM_IV_LEN = 12
+_STREAM_TAG_LEN = 16
+
+
+def is_streaming_ciphertext_file(path: Any) -> bool:
+    """True iff ``path`` begins with the streaming-ciphertext magic (cheap header read; never raises)."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(len(_STREAM_MAGIC)) == _STREAM_MAGIC
+    except OSError:
+        return False
+
+
+def encrypt_content_to_file(src_path: Any, dest_path: Any, content_key: Any) -> None:
+    """sp1458 — stream-encrypt the plaintext file at ``src_path`` to ``dest_path`` as a Tier B/C
+    ciphertext (AES-256-GCM under ``content_key``) with NO full-content buffering. Byte-for-byte
+    decryptable by ``decrypt_content_from_file``. Raises PaidUnlockError on an over-long key_id."""
+    import struct
+    from prsm.storage.encryption import StreamingEncryptor
+    enc = StreamingEncryptor(content_key)
+    key_id = str(content_key.key_id).encode("utf-8")
+    if len(key_id) > 255:
+        raise PaidUnlockError("key_id too long for the streaming ciphertext format (>255 bytes)")
+    with open(src_path, "rb") as fin, open(dest_path, "wb") as fout:
+        fout.write(_STREAM_MAGIC)
+        fout.write(struct.pack("B", len(key_id)))
+        fout.write(key_id)
+        fout.write(enc.iv)
+        for block in iter(lambda: fin.read(_STREAM_CHUNK), b""):
+            fout.write(enc.encrypt_chunk(block))
+        fout.write(enc.finalize())  # 16-byte GCM tag trailer
+
+
+def decrypt_content_from_file(src_path: Any, dest_path: Any, content_key: Any) -> None:
+    """sp1458 — inverse of ``encrypt_content_to_file``: stream-decrypt ``src_path`` → ``dest_path``
+    (AES-256-GCM), FAIL-LOUD. Plaintext is written to a TEMP file and promoted to ``dest_path`` ONLY
+    after the GCM tag verifies (GCM chunks are unauthenticated until finalize), so a tampered or
+    wrong-key ciphertext never yields a plaintext file. Raises PaidUnlockError on any failure."""
+    import os
+    import struct
+    from pathlib import Path as _Path
+    from prsm.storage.encryption import StreamingDecryptor
+    src = _Path(src_path)
+    dest = _Path(dest_path)
+    total = src.stat().st_size
+    with open(src, "rb") as fin:
+        if fin.read(len(_STREAM_MAGIC)) != _STREAM_MAGIC:
+            raise PaidUnlockError("not a streaming Tier B/C ciphertext (bad magic)")
+        kid_len = struct.unpack("B", fin.read(1))[0]
+        key_id = fin.read(kid_len).decode("utf-8", "replace")
+        iv = fin.read(_STREAM_IV_LEN)
+        header_len = len(_STREAM_MAGIC) + 1 + kid_len + _STREAM_IV_LEN
+        ct_len = total - header_len - _STREAM_TAG_LEN
+        if len(iv) != _STREAM_IV_LEN or ct_len < 0:
+            raise PaidUnlockError("streaming ciphertext truncated (no room for iv/tag)")
+        if key_id != str(content_key.key_id):
+            raise PaidUnlockError(
+                f"key_id mismatch: file={key_id!r} key={content_key.key_id!r}")
+        fin.seek(total - _STREAM_TAG_LEN)      # the tag is the trailer; the decryptor needs it up front
+        tag = fin.read(_STREAM_TAG_LEN)
+        fin.seek(header_len)
+        dec = StreamingDecryptor(content_key, iv, tag)
+        tmp = _Path(str(dest) + ".dec.tmp")
+        remaining = ct_len
+        try:
+            with open(tmp, "wb") as fout:
+                while remaining > 0:
+                    block = fin.read(min(_STREAM_CHUNK, remaining))
+                    if not block:
+                        break
+                    remaining -= len(block)
+                    fout.write(dec.decrypt_chunk(block))
+            dec.finalize()                      # raises on tamper/wrong-key → temp discarded below
+        except Exception as exc:  # noqa: BLE001 — any auth/IO failure must not leave a plaintext file
+            tmp.unlink(missing_ok=True)
+            raise PaidUnlockError(
+                f"streaming ciphertext failed authentication (tampered or wrong key): {exc}") from exc
+        os.replace(tmp, dest)                   # promote ONLY after the tag verifies
+
+
 def wrap_content_key_for_deposit(content_key: Any, recipients: List[Any]) -> bytes:
     """PUBLISHER side — wrap the content-encryption key to the buyer(s) as the on-chain
     ``encrypted_key`` for ``KeyDistributionClient.deposit_key``. The wrapped key is released
