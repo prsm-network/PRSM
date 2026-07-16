@@ -7,6 +7,7 @@ without every publisher primitive (incl. the dedicated paid-publisher provenance
 """
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
@@ -128,6 +129,38 @@ def test_fail_closed_without_key_client(tmp_path, monkeypatch):
     finally:
         patcher.stop()
     assert resp.status_code == 503
+
+
+def test_base_exception_midstream_cleans_up_temps(tmp_path, monkeypatch):
+    # sp1458 hardening (audit note): a mid-publish BaseException (e.g. asyncio.CancelledError on server
+    # shutdown / client disconnect) must NOT leak the plaintext + ciphertext temp files. The route's
+    # cleanup runs in a `finally`, so it fires even for a BaseException the `except Exception` misses.
+    import glob
+    import os as _os
+    import tempfile
+
+    monkeypatch.setenv("PRSM_PAID_KEY_SERVE", "1")
+    _, buyer_pub = generate_recipient_keypair()
+    node = _node(tmp_path)
+    pat = _os.path.join(tempfile.gettempdir(), "prsm-paidpub-*")
+    before = set(glob.glob(pat))
+
+    def _boom(*a, **k):
+        raise asyncio.CancelledError("shutdown mid-publish")
+
+    client, patcher = _client(node)
+    try:
+        with patch("prsm.economy.paid_content.build_paid_content_from_path", side_effect=_boom):
+            try:
+                client.post("/content/paid/publish-stream", content=_PLAINTEXT,
+                            params={"fee_wei": 10 ** 18, "buyer_x25519_pubkeys": buyer_pub})
+            except BaseException:  # noqa: BLE001 — CancelledError may surface through the test client
+                pass
+    finally:
+        patcher.stop()
+
+    leaked = set(glob.glob(pat)) - before
+    assert not leaked, f"streaming paid-publish temps leaked on BaseException: {leaked}"
 
 
 def test_empty_body_and_missing_buyers_rejected(tmp_path, monkeypatch):

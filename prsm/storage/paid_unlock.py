@@ -133,6 +133,7 @@ def decrypt_content_from_file(src_path: Any, dest_path: Any, content_key: Any) -
     wrong-key ciphertext never yields a plaintext file. Raises PaidUnlockError on any failure."""
     import os
     import struct
+    import tempfile
     from pathlib import Path as _Path
     from prsm.storage.encryption import StreamingDecryptor
     src = _Path(src_path)
@@ -141,9 +142,15 @@ def decrypt_content_from_file(src_path: Any, dest_path: Any, content_key: Any) -
     with open(src, "rb") as fin:
         if fin.read(len(_STREAM_MAGIC)) != _STREAM_MAGIC:
             raise PaidUnlockError("not a streaming Tier B/C ciphertext (bad magic)")
-        kid_len = struct.unpack("B", fin.read(1))[0]
-        _ = fin.read(kid_len)  # header key_id — informational only; the GCM tag is the integrity gate
-        iv = fin.read(_STREAM_IV_LEN)
+        # Parse the fixed header FAIL-CLOSED: a magic-valid but header-truncated file must raise the
+        # documented PaidUnlockError, not a raw struct.error that could slip past a caller catching
+        # only PaidUnlockError. (audit sp1458 LOW-1)
+        try:
+            kid_len = struct.unpack("B", fin.read(1))[0]
+            _ = fin.read(kid_len)  # header key_id — informational only; the GCM tag is the integrity gate
+            iv = fin.read(_STREAM_IV_LEN)
+        except struct.error as exc:
+            raise PaidUnlockError("streaming ciphertext header truncated") from exc
         header_len = len(_STREAM_MAGIC) + 1 + kid_len + _STREAM_IV_LEN
         ct_len = total - header_len - _STREAM_TAG_LEN
         if len(iv) != _STREAM_IV_LEN or ct_len < 0:
@@ -155,10 +162,15 @@ def decrypt_content_from_file(src_path: Any, dest_path: Any, content_key: Any) -
         tag = fin.read(_STREAM_TAG_LEN)
         fin.seek(header_len)
         dec = StreamingDecryptor(content_key, iv, tag)
-        tmp = _Path(str(dest) + ".dec.tmp")
+        # mkstemp in dest's dir: 0600 perms (no umask-leaked plaintext window) + a UNIQUE name (no
+        # predictable-path pre-create and no clobber between concurrent decrypts to one dest), while
+        # staying co-located so the final os.replace is atomic. (audit sp1458 LOW-2)
+        _tmp_fd, _tmp_name = tempfile.mkstemp(
+            dir=str(dest.parent), prefix=".prsm-dec-", suffix=".tmp")
+        tmp = _Path(_tmp_name)
         remaining = ct_len
         try:
-            with open(tmp, "wb") as fout:
+            with os.fdopen(_tmp_fd, "wb") as fout:
                 while remaining > 0:
                     block = fin.read(min(_STREAM_CHUNK, remaining))
                     if not block:

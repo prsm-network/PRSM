@@ -17677,13 +17677,16 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 commitment=built["commitment"], wrapped_key=built["wrapped_key"],
                 fee_wei=int(fee_wei), verifier_address=cav)
         except HTTPException:
-            _cleanup()
             raise
         except Exception as exc:  # noqa: BLE001 — surface publish/deposit failures to the operator
-            _cleanup()
             logger.error("streaming paid publish failed: %s", exc)
             raise HTTPException(status_code=409, detail=f"streaming paid publish failed: {exc}")
-        _cleanup()  # temps removed — publish_from_path copied the ciphertext into content-addressed staging
+        finally:
+            # ALWAYS remove the temps — incl. on a mid-stream BaseException (e.g. asyncio.CancelledError
+            # on server shutdown / client disconnect), which the except Exception above would miss and
+            # leak both temp files. On success publish_from_path has already copied the ciphertext into
+            # content-addressed staging, so removing the temps here is safe.
+            _cleanup()
 
         return {
             "content_hash": "0x" + content_hash.hex(),

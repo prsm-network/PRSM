@@ -69,7 +69,7 @@ def test_tampered_ciphertext_fails_loud_and_leaves_no_plaintext(tmp_path):
     with pytest.raises(PaidUnlockError):
         decrypt_content_from_file(ct, out, key)
     assert not out.exists()                                 # no plaintext promoted on auth failure
-    assert not (tmp_path / "recovered.bin.dec.tmp").exists()  # temp cleaned up
+    assert not list(tmp_path.glob(".prsm-dec-*"))           # decrypt temp cleaned up (no leak)
 
 
 def test_wrong_key_fails_loud(tmp_path):
@@ -81,6 +81,48 @@ def test_wrong_key_fails_loud(tmp_path):
     with pytest.raises(PaidUnlockError):
         decrypt_content_from_file(ct, tmp_path / "out.bin", other)
     assert not (tmp_path / "out.bin").exists()
+
+
+def test_magic_valid_but_truncated_header_raises_paid_unlock_error(tmp_path):
+    # sp1458 hardening (audit LOW-1): a file that carries the magic but is truncated inside the
+    # header (no key_id length byte) must raise the documented PaidUnlockError, NOT a raw struct.error
+    # that would slip past a caller catching only PaidUnlockError. Fail-closed either way, but the
+    # exception contract must hold.
+    from prsm.storage.paid_unlock import _STREAM_MAGIC
+    key = generate_key()
+    truncated = _write(tmp_path / "just-magic.ct", _STREAM_MAGIC)   # 8 bytes: magic, nothing after
+    assert is_streaming_ciphertext_file(truncated)
+    with pytest.raises(PaidUnlockError):
+        decrypt_content_from_file(truncated, tmp_path / "out.bin", key)
+    assert not (tmp_path / "out.bin").exists()
+
+
+def test_decrypt_temp_is_unpredictable_and_colocated(tmp_path, monkeypatch):
+    # sp1458 hardening (audit LOW-2): the decrypt temp must NOT be the predictable "<dest>.dec.tmp"
+    # (a co-located attacker could pre-create/observe it, and concurrent decrypts to one dest would
+    # clobber). It must be an mkstemp file (0600, unique) in the SAME dir as dest (for atomic replace).
+    import os as _os
+    key = generate_key()
+    src = _write(tmp_path / "plain.bin", _PLAINTEXT)
+    ct = tmp_path / "cipher.bin"
+    encrypt_content_to_file(src, ct, key)
+
+    out = tmp_path / "recovered.bin"
+    captured = {}
+    real_replace = _os.replace
+
+    def _cap_replace(a, b):
+        captured["tmp"] = str(a)
+        captured["mode"] = _os.stat(a).st_mode & 0o777
+        return real_replace(a, b)
+
+    monkeypatch.setattr(_os, "replace", _cap_replace)
+    decrypt_content_from_file(ct, out, key)
+    assert out.read_bytes() == _PLAINTEXT
+    tmp = captured["tmp"]
+    assert tmp != str(out) + ".dec.tmp"                     # NOT the predictable name
+    assert _os.path.dirname(tmp) == str(tmp_path)           # co-located → atomic os.replace
+    assert captured["mode"] == 0o600                        # not umask-dependent; plaintext window is private
 
 
 def test_non_streaming_file_rejected(tmp_path):
