@@ -33,6 +33,91 @@ from prsm.node.gossip import GOSSIP_MARKETPLACE_LISTING
 logger = logging.getLogger(__name__)
 
 
+def _truthy(v) -> bool:
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_stake_binding(provider_id, env):
+    """sp1459 — resolve the sp1457 on-chain-stake binding for the advertised listing.
+
+    Prefers a PRE-PRODUCED (PRSM_STAKE_ETH_ADDRESS + PRSM_STAKE_BINDING_SIG) pair (the operator
+    signs it out of band with the stake-holding eth key, so that key need never touch the node).
+    Falls back to deriving it at startup from PRSM_STAKE_ETH_KEY when supplied. Returns (None, None)
+    when no binding is configured — the listing then advertises no binding (weighted at the tier
+    label unless a selector runs in PRSM_REQUIRE_STAKE_BINDING mode)."""
+    addr = str(env.get("PRSM_STAKE_ETH_ADDRESS", "") or "").strip()
+    sig = str(env.get("PRSM_STAKE_BINDING_SIG", "") or "").strip()
+    if addr and sig:
+        return addr, sig
+    key = str(env.get("PRSM_STAKE_ETH_KEY", "") or "").strip()
+    if key:
+        try:
+            from prsm.marketplace.listing import sign_stake_binding
+            return sign_stake_binding(provider_id, key)
+        except Exception as exc:  # noqa: BLE001 — a bad key must not break node startup
+            logger.warning(
+                "marketplace: could not derive the stake binding from PRSM_STAKE_ETH_KEY "
+                "(advertising WITHOUT a verified binding): %s", exc)
+    return None, None
+
+
+def build_marketplace_advertiser_from_env(
+    *, identity, gossip, compute_provider, env=None,
+) -> Optional["MarketplaceAdvertiser"]:
+    """sp1459 — construct a MarketplaceAdvertiser from operator env config, or None.
+
+    OPT-IN + FAIL-SAFE: returns None unless PRSM_MARKETPLACE_ADVERTISE is truthy AND a
+    ComputeProvider exists to advertise. So an existing node's behavior is UNCHANGED by default —
+    the marketplace supply side (directory → candidate pool → stake-weighted aggregator selection,
+    plus the price-quote handler) is only ACTIVATED when an operator explicitly opts in. This closes
+    the long-standing gap where MarketplaceAdvertiser had a full lifecycle but was never constructed
+    in prod (compute_provider._marketplace_advertiser stayed None), so no node ever advertised and
+    the whole selection machinery fired on an empty directory.
+
+    Listing params come from PRSM_MARKETPLACE_* env (sensible defaults). The on-chain stake binding
+    (sp1457) is attached per _resolve_stake_binding."""
+    import os
+    e = env if env is not None else os.environ
+    if not _truthy(e.get("PRSM_MARKETPLACE_ADVERTISE", "")):
+        return None
+    if compute_provider is None or gossip is None or identity is None:
+        return None
+
+    def _f(key, default):
+        try:
+            return float(str(e.get(key, "") or "").strip() or default)
+        except (ValueError, TypeError):
+            return default
+
+    def _i(key, default):
+        try:
+            return int(str(e.get(key, "") or "").strip() or default)
+        except (ValueError, TypeError):
+            return default
+
+    dtypes_raw = str(e.get("PRSM_MARKETPLACE_DTYPES", "") or "").strip()
+    supported_dtypes = [d.strip() for d in dtypes_raw.split(",") if d.strip()] or [
+        "float16", "float32"]
+    stake_tier = str(e.get("PRSM_MARKETPLACE_STAKE_TIER", "") or "open").strip() or "open"
+    stake_eth_address, stake_binding_sig = _resolve_stake_binding(identity.node_id, e)
+
+    return MarketplaceAdvertiser(
+        identity=identity,
+        gossip=gossip,
+        compute_provider=compute_provider,
+        capacity_shards_per_sec=_f("PRSM_MARKETPLACE_CAPACITY_SHARDS_PER_SEC", 1.0),
+        max_shard_bytes=_i("PRSM_MARKETPLACE_MAX_SHARD_BYTES", 8 * 1024 * 1024),
+        supported_dtypes=supported_dtypes,
+        price_per_shard_ftns=_f("PRSM_MARKETPLACE_PRICE_PER_SHARD_FTNS", 1.0),
+        tee_capable=_truthy(e.get("PRSM_MARKETPLACE_TEE_CAPABLE", "")),
+        stake_tier=stake_tier,
+        rebroadcast_interval_sec=_f("PRSM_MARKETPLACE_REBROADCAST_INTERVAL_SEC", 90.0),
+        ttl_seconds=_i("PRSM_MARKETPLACE_TTL_SECONDS", 300),
+        stake_eth_address=stake_eth_address,
+        stake_binding_sig=stake_binding_sig,
+    )
+
+
 class MarketplaceAdvertiser:
     """Periodic broadcaster for a provider's marketplace listing.
 

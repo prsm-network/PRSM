@@ -384,3 +384,41 @@ None P0. P1/P2 to resolve during plan drafting:
 ---
 
 **Design doc authored:** 2026-04-20. Plan doc: see `docs/2026-04-20-phase3-marketplace-plan.md`.
+
+---
+
+## 14. Enabling marketplace advertising (sp1459 — operator config)
+
+`MarketplaceAdvertiser` had a full lifecycle from Phase 3 but was never constructed in prod
+(`compute_provider._marketplace_advertiser` stayed `None`), so no node broadcast a listing and the
+whole selection machinery — directory → candidate pool → stake-weighted aggregator selection (sp1457)
+→ the shard price-quote handler — fired on an empty directory. sp1459 wires the node lifecycle
+(`build_marketplace_advertiser_from_env` → constructed on a FULL/COMPUTE node, started in
+`Node.start()`, stopped in `Node.stop()`). It is **opt-in and fail-safe**: unless the operator sets
+`PRSM_MARKETPLACE_ADVERTISE`, the node is unchanged.
+
+To offer a compute node as marketplace supply, set on the provider node:
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `PRSM_MARKETPLACE_ADVERTISE` | *(off)* | `1`/`true`/`yes`/`on` enables broadcasting. Master switch. |
+| `PRSM_MARKETPLACE_PRICE_PER_SHARD_FTNS` | `1.0` | Advertised price per shard. |
+| `PRSM_MARKETPLACE_CAPACITY_SHARDS_PER_SEC` | `1.0` | Advertised throughput (auto-drops to 0 when at `max_concurrent_jobs`). |
+| `PRSM_MARKETPLACE_MAX_SHARD_BYTES` | `8388608` | Largest shard this node accepts. |
+| `PRSM_MARKETPLACE_DTYPES` | `float16,float32` | Comma-separated supported dtypes. |
+| `PRSM_MARKETPLACE_STAKE_TIER` | `open` | Claimed tier. Note: an unbound tier claim gains **no** selection weight (sp1457) — bond stake + supply a binding below to be weighted by real stake, and it is required for pool admission under `PRSM_REQUIRE_STAKE_BINDING`. |
+| `PRSM_MARKETPLACE_TEE_CAPABLE` | *(off)* | Advertise TEE capability. |
+| `PRSM_MARKETPLACE_TTL_SECONDS` | `300` | Listing TTL in the directory (keep > 2× rebroadcast interval). |
+| `PRSM_MARKETPLACE_REBROADCAST_INTERVAL_SEC` | `90` | Re-broadcast cadence (jittered ±25%). |
+
+**Stake binding (sp1457, optional but needed for real-stake weighting).** Attach the provider↔stake
+binding one of two ways:
+
+- **Pre-produced (recommended — the stake key never touches the node):** produce the pair out of band
+  with `sign_stake_binding(provider_id, stake_eth_private_key)` (provider_id = the node's `node_id`),
+  then set `PRSM_STAKE_ETH_ADDRESS` + `PRSM_STAKE_BINDING_SIG`.
+- **Derive at startup:** set `PRSM_STAKE_ETH_KEY` to the stake-holding eth private key and the node
+  signs the binding on boot. Convenient, but places the stake key in the node's environment.
+
+Without a binding the node still advertises a valid listing; it is simply weighted at the tier label
+(and excluded from the aggregator pool if selectors run with `PRSM_REQUIRE_STAKE_BINDING=1`).

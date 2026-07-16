@@ -2158,6 +2158,7 @@ class PRSMNode:
             logger.info("Using WebSocket transport backend (fallback)")
 
         # ── Compute ──────────────────────────────────────────────
+        self._marketplace_advertiser = None  # sp1459 — set below iff opted-in + a compute provider
         if NodeRole.FULL in self.config.roles or NodeRole.COMPUTE in self.config.roles:
             self.compute_provider = ComputeProvider(
                 identity=self.identity,
@@ -2171,6 +2172,36 @@ class PRSMNode:
                 config=self.config,
             )
             self.compute_provider.allow_self_compute = self.config.allow_self_compute
+
+            # sp1459 — OPT-IN marketplace advertising (default OFF: PRSM_MARKETPLACE_ADVERTISE).
+            # Completes the long-dormant wiring — the advertiser had a full lifecycle but was never
+            # constructed in prod, so no node ever broadcast a listing and the whole selection
+            # machinery (directory → candidate pool → stake-weighted aggregator selection, sp1457
+            # binding, the price-quote handler) fired on an empty directory. When an operator opts
+            # in, this node broadcasts its signed compute listing (+ any stake binding) so it becomes
+            # selectable supply. Fail-safe: None when not opted in / not a compute provider.
+            try:
+                from prsm.marketplace.advertiser import (
+                    build_marketplace_advertiser_from_env,
+                )
+                self._marketplace_advertiser = build_marketplace_advertiser_from_env(
+                    identity=self.identity,
+                    gossip=self.gossip,
+                    compute_provider=self.compute_provider,
+                )
+                if self._marketplace_advertiser is not None:
+                    # The Task-5 price-quote handler reads the live price off this handle.
+                    self.compute_provider._marketplace_advertiser = self._marketplace_advertiser
+                    logger.info(
+                        "marketplace advertising ENABLED (price=%.4f FTNS/shard, tier=%s, "
+                        "verified_stake_binding=%s)",
+                        self._marketplace_advertiser.price_per_shard_ftns,
+                        self._marketplace_advertiser.stake_tier,
+                        self._marketplace_advertiser.stake_eth_address is not None,
+                    )
+            except Exception as exc:  # noqa: BLE001 — advertising must never break node bring-up
+                logger.warning("marketplace advertiser wiring skipped: %s", exc)
+                self._marketplace_advertiser = None
 
         self.compute_requester = ComputeRequester(
             identity=self.identity,
@@ -5049,6 +5080,22 @@ class PRSMNode:
 
         logger.info("Node initialized — all subsystems ready")
 
+    async def _start_marketplace_advertiser_if_present(self) -> None:
+        """sp1459 — begin broadcasting this compute node's marketplace listing.
+
+        No-op when advertising is not opted into (`_marketplace_advertiser is None`, the default),
+        so an existing node is unchanged. When enabled, emits the first signed listing immediately
+        and then re-broadcasts on a jittered loop so the node becomes selectable supply (+ carries
+        its sp1457 stake binding). Fail-soft: a start error is logged but never aborts node bring-up.
+        """
+        if getattr(self, "_marketplace_advertiser", None) is None:
+            return
+        try:
+            await self._marketplace_advertiser.start()
+            logger.info("marketplace advertiser started (broadcasting compute listing)")
+        except Exception as exc:  # noqa: BLE001 — advertising must never break node bring-up
+            logger.warning("marketplace advertiser failed to start: %s", exc)
+
     def _start_dht_components_if_present(self) -> None:
         """T3b — start the DHT components stack on its own loop thread.
 
@@ -5401,6 +5448,7 @@ class PRSMNode:
 
         if self.compute_provider:
             await self.compute_provider.start()
+            await self._start_marketplace_advertiser_if_present()
         await self.compute_requester.start()
 
         if self.storage_provider:
@@ -7016,6 +7064,15 @@ class PRSMNode:
             return
 
         logger.info("Shutting down PRSM node...")
+
+        # sp1459 — stop the marketplace advertiser's re-broadcast loop first so a shutting-down
+        # node stops advertising itself as available supply. Safe when None / never started.
+        if getattr(self, "_marketplace_advertiser", None) is not None:
+            try:
+                await _await_bounded(
+                    self._marketplace_advertiser.stop(), _STOP_TIMEOUT, "marketplace_advertiser")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("marketplace advertiser stop raised: %s", exc)
 
         # Sprint 766 — stop AutoClaimWorker before tearing down the
         # staking_manager it depends on. Safe to call .stop() even

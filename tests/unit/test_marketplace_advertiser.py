@@ -221,3 +221,152 @@ def test_advertiser_without_binding_is_unverified_but_valid():
     listing = _run(advertiser._broadcast_once())
     assert verify_listing(listing) is True
     assert listing.has_verified_stake_binding() is False
+
+
+# ── sp1459: build_marketplace_advertiser_from_env — the node-lifecycle wiring helper ──
+# The advertiser is opt-in (PRSM_MARKETPLACE_ADVERTISE) + fail-safe: an existing node's behavior
+# is unchanged by default (returns None), so the whole marketplace supply side is only ACTIVATED
+# when an operator explicitly turns it on. Listing params come from PRSM_MARKETPLACE_* env; the
+# sp1457 on-chain stake binding is attached from a pre-produced pair OR derived from a stake key.
+
+def _env_gossip_cp(identity=None):
+    from prsm.node.identity import generate_node_identity
+    gossip = MagicMock()
+    gossip.publish = AsyncMock()
+    identity = identity or generate_node_identity(display_name="env-provider")
+    cp = _make_compute_provider()
+    return identity, gossip, cp
+
+
+def test_build_from_env_disabled_by_default_returns_none():
+    from prsm.marketplace.advertiser import build_marketplace_advertiser_from_env
+    identity, gossip, cp = _env_gossip_cp()
+    # No PRSM_MARKETPLACE_ADVERTISE → the node is unchanged (no advertiser).
+    out = build_marketplace_advertiser_from_env(
+        identity=identity, gossip=gossip, compute_provider=cp, env={})
+    assert out is None
+
+
+def test_build_from_env_enabled_without_compute_provider_returns_none():
+    from prsm.marketplace.advertiser import build_marketplace_advertiser_from_env
+    identity, gossip, _ = _env_gossip_cp()
+    # Gate on but nothing to advertise (non-compute node) → still None (fail-safe).
+    out = build_marketplace_advertiser_from_env(
+        identity=identity, gossip=gossip, compute_provider=None,
+        env={"PRSM_MARKETPLACE_ADVERTISE": "1"})
+    assert out is None
+
+
+def test_build_from_env_reads_listing_params():
+    from prsm.marketplace.advertiser import (
+        MarketplaceAdvertiser, build_marketplace_advertiser_from_env)
+    identity, gossip, cp = _env_gossip_cp()
+    out = build_marketplace_advertiser_from_env(
+        identity=identity, gossip=gossip, compute_provider=cp,
+        env={
+            "PRSM_MARKETPLACE_ADVERTISE": "true",
+            "PRSM_MARKETPLACE_PRICE_PER_SHARD_FTNS": "2.5",
+            "PRSM_MARKETPLACE_CAPACITY_SHARDS_PER_SEC": "7",
+            "PRSM_MARKETPLACE_MAX_SHARD_BYTES": "4194304",
+            "PRSM_MARKETPLACE_DTYPES": "float16, bfloat16",
+            "PRSM_MARKETPLACE_STAKE_TIER": "T3",
+            "PRSM_MARKETPLACE_TEE_CAPABLE": "1",
+            "PRSM_MARKETPLACE_TTL_SECONDS": "600",
+            "PRSM_MARKETPLACE_REBROADCAST_INTERVAL_SEC": "120",
+        })
+    assert isinstance(out, MarketplaceAdvertiser)
+    assert out.price_per_shard_ftns == 2.5
+    assert out.base_capacity == 7.0
+    assert out.max_shard_bytes == 4194304
+    assert out.supported_dtypes == ["float16", "bfloat16"]
+    assert out.stake_tier == "T3"
+    assert out.tee_capable is True
+    assert out.ttl_seconds == 600
+    assert out.rebroadcast_interval_sec == 120.0
+    # It binds the SAME compute_provider (so current_price_ftns + auto-downgrade work).
+    assert out.compute_provider is cp
+
+
+def test_build_from_env_defaults_when_params_unset():
+    from prsm.marketplace.advertiser import build_marketplace_advertiser_from_env
+    identity, gossip, cp = _env_gossip_cp()
+    out = build_marketplace_advertiser_from_env(
+        identity=identity, gossip=gossip, compute_provider=cp,
+        env={"PRSM_MARKETPLACE_ADVERTISE": "yes"})
+    assert out is not None
+    assert out.supported_dtypes                       # non-empty default dtype list
+    assert out.price_per_shard_ftns > 0               # a positive default price
+    assert out.stake_tier == "open"                   # honest default: no claimed tier
+    assert out.stake_eth_address is None              # no binding supplied → none advertised
+
+
+def test_build_from_env_attaches_preproduced_binding():
+    from prsm.marketplace.advertiser import build_marketplace_advertiser_from_env
+    from prsm.marketplace.listing import sign_stake_binding, verify_stake_binding
+    from prsm.node.identity import generate_node_identity
+    identity = generate_node_identity(display_name="bound-env-provider")
+    gossip = MagicMock(); gossip.publish = AsyncMock()
+    cp = _make_compute_provider()
+    address, sig = sign_stake_binding(identity.node_id, "0x" + "7c" * 32)
+    out = build_marketplace_advertiser_from_env(
+        identity=identity, gossip=gossip, compute_provider=cp,
+        env={
+            "PRSM_MARKETPLACE_ADVERTISE": "1",
+            "PRSM_STAKE_ETH_ADDRESS": address,
+            "PRSM_STAKE_BINDING_SIG": sig,
+        })
+    assert out.stake_eth_address == address
+    assert out.stake_binding_sig == sig
+    # The advertised binding authenticates for THIS provider_id.
+    assert verify_stake_binding(identity.node_id, address, sig) is True
+
+
+def test_build_from_env_derives_binding_from_stake_key():
+    from prsm.marketplace.advertiser import build_marketplace_advertiser_from_env
+    from prsm.marketplace.listing import verify_stake_binding
+    from prsm.node.identity import generate_node_identity
+    from eth_account import Account
+    identity = generate_node_identity(display_name="key-env-provider")
+    gossip = MagicMock(); gossip.publish = AsyncMock()
+    cp = _make_compute_provider()
+    stake_key = "0x" + "3a" * 32
+    expected_addr = Account.from_key(stake_key).address
+    out = build_marketplace_advertiser_from_env(
+        identity=identity, gossip=gossip, compute_provider=cp,
+        env={"PRSM_MARKETPLACE_ADVERTISE": "1", "PRSM_STAKE_ETH_KEY": stake_key})
+    assert out.stake_eth_address == expected_addr
+    # The startup-derived signature authenticates for THIS provider_id ↔ the key's address.
+    assert verify_stake_binding(identity.node_id, out.stake_eth_address, out.stake_binding_sig) is True
+
+
+# ── sp1459: node-lifecycle glue — _start_marketplace_advertiser_if_present ──
+# The node START/STOP wiring is thin + fail-soft. Verified without booting a heavy node via the
+# established PRSMNode.__new__ surface pattern (mirrors the DHT-components glue tests).
+
+def test_node_start_advertiser_noop_when_none():
+    from prsm.node.node import PRSMNode
+    node = PRSMNode.__new__(PRSMNode)
+    node._marketplace_advertiser = None            # default: advertising not opted in
+    # Must not raise (no advertiser to start).
+    _run(node._start_marketplace_advertiser_if_present())
+
+
+def test_node_start_advertiser_calls_start_when_present():
+    from prsm.node.node import PRSMNode
+    node = PRSMNode.__new__(PRSMNode)
+    adv = MagicMock()
+    adv.start = AsyncMock()
+    node._marketplace_advertiser = adv
+    _run(node._start_marketplace_advertiser_if_present())
+    adv.start.assert_awaited_once()
+
+
+def test_node_start_advertiser_is_fail_soft():
+    # A broadcast/start error must NOT abort node bring-up.
+    from prsm.node.node import PRSMNode
+    node = PRSMNode.__new__(PRSMNode)
+    adv = MagicMock()
+    adv.start = AsyncMock(side_effect=RuntimeError("gossip not ready"))
+    node._marketplace_advertiser = adv
+    _run(node._start_marketplace_advertiser_if_present())   # swallowed, no raise
+    adv.start.assert_awaited_once()
