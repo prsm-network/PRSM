@@ -107,3 +107,48 @@ def test_non_buyer_cannot_decrypt_published_content():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_large_file_streaming_publish_to_unlock_end_to_end(tmp_path):
+    # ★ sp1458 — the full LARGE-FILE paid flow: stream-publish a big dataset from the node → serve the
+    # ciphertext FILE → payment-gated key release → stream-decrypt back to byte-identical plaintext.
+    from pathlib import Path
+    from prsm.node.paid_publish import run_paid_publish_from_path
+    from prsm.storage.paid_unlock import reconstruct_paid_content_from_file
+
+    kd = _kd()
+    store = PaidKeyStore()
+    served = {}   # content_hash -> ciphertext file path
+    buyer_priv, buyer_pub = generate_recipient_keypair()
+    plaintext = (b"large proprietary dataset row; " * 100_000) + b"tail"
+    src = tmp_path / "plain.bin"
+    src.write_bytes(plaintext)
+    ct = tmp_path / "cipher.bin"
+
+    res = run_paid_publish_from_path(
+        plaintext_path=src, ciphertext_path=ct,
+        recipients=[EnterpriseRecipient(identifier="buyer", x25519_pubkey_b64=buyer_pub)],
+        fee_wei=_FEE, verifier_address=_CAV, key_client=kd,
+        serve_ciphertext_from_path=lambda ch, p: served.__setitem__(bytes(ch), str(p)),
+        paid_key_store=store)
+    ch, commitment = res["content_hash"], res["commitment"]
+
+    # commitment (not key) deposited; key retained for the gated serve; ciphertext FILE served.
+    _dch, deposited, verifier, fee = kd.deposit_key.call_args[0]
+    assert deposited == commitment == key_commitment(res["wrapped_key"])
+    assert verifier == _CAV and fee == _FEE
+    assert store.get(bytes(ch))["wrapped_key"] == res["wrapped_key"]
+    assert bytes(ch) in served
+    assert plaintext[:32] not in Path(served[bytes(ch)]).read_bytes()   # served bytes are encrypted
+
+    # consumer pays → gated serve hands over the retained key → verify vs commitment → stream-decrypt.
+    payer_priv = "0x" + "22" * 32
+    payer = Account.from_key(payer_priv).address
+    sig = Account.from_key(payer_priv).sign_message(
+        encode_defunct(text=paid_key_challenge(ch, "n1"))).signature.hex()
+    wrapped = serve_paid_key(ch, "n1", sig, key_store=store,
+                             verify_payment=lambda p, c, f: p == payer and bytes(c) == bytes(ch))
+    verified = fetch_and_verify_wrapped_key(lambda _c: wrapped, ch, commitment)
+    out = tmp_path / "recovered.bin"
+    reconstruct_paid_content_from_file(verified, buyer_priv, served[bytes(ch)], out)
+    assert out.read_bytes() == plaintext

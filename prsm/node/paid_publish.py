@@ -62,3 +62,59 @@ def run_paid_publish(
         retain_wrapped_key=_retain,
         content_hash=content_hash,
     )
+
+
+def run_paid_publish_from_path(
+    *,
+    plaintext_path: Any,
+    ciphertext_path: Any,
+    recipients: List[Any],
+    fee_wei: int,
+    verifier_address: str,
+    key_client: Any,
+    serve_ciphertext_from_path: Callable[[bytes, Any], Any],
+    paid_key_store: Any,
+) -> Dict[str, Any]:
+    """sp1458 — the STREAMING large-file equivalent of ``run_paid_publish``. Publishes a Tier B/C
+    paid dataset too large to hold in memory, with a bounded footprint end to end.
+
+    Steps (preserving the sp1361 F5 + sp1365 anti-squat + sp1438 retain-before-deposit invariants):
+      1. ``build_paid_content_from_path`` stream-encrypts ``plaintext_path`` → ``ciphertext_path``
+         (AES-256-GCM binary streaming format) and wraps the fresh content key to the buyer(s);
+         content_hash = sha256 of the ciphertext FILE.
+      2. ``serve_ciphertext_from_path(content_hash, ciphertext_path)`` serves the ciphertext FILE
+         under content_hash (the SAME large-content upload path — POST /content/upload-stream — that
+         registers the creator on-chain, so the CAV's fee payee resolves to the publisher). Serve is
+         BEFORE deposit so a live payment gate never predates a serveable ciphertext.
+      3. ``deposit_commitment_and_retain`` retains the wrapped key in the PaidKeyStore BEFORE
+         depositing the commitment on-chain (naming the CAV) — the retain-first order that stops a
+         buyer paying into a gate with no retained key.
+
+    Returns ``{content_hash, commitment, wrapped_key, ciphertext_path, deposit_tx, deposit_status,
+    serve_ref}``. The consumer fetches the ciphertext via /content/retrieve-stream and decrypts with
+    ``reconstruct_paid_content_from_file`` after the payment-gated key release."""
+    from prsm.economy.paid_content import (
+        build_paid_content_from_path,
+        deposit_commitment_and_retain,
+    )
+    built = build_paid_content_from_path(plaintext_path, ciphertext_path, list(recipients))
+    content_hash = built["content_hash"]
+    serve_ref = serve_ciphertext_from_path(content_hash, ciphertext_path)
+    tx, status = deposit_commitment_and_retain(
+        key_client=key_client,
+        paid_key_store=paid_key_store,
+        content_hash=content_hash,
+        commitment=built["commitment"],
+        wrapped_key=built["wrapped_key"],
+        fee_wei=int(fee_wei),
+        verifier_address=verifier_address,
+    )
+    return {
+        "content_hash": content_hash,
+        "commitment": built["commitment"],
+        "wrapped_key": built["wrapped_key"],
+        "ciphertext_path": built["ciphertext_path"],
+        "deposit_tx": tx,
+        "deposit_status": status,
+        "serve_ref": serve_ref,
+    }
