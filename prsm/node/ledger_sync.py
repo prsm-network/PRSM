@@ -19,6 +19,7 @@ own balance, and the network verifies consistency via observed transactions.
 import asyncio
 import json
 import logging
+import math
 import uuid
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional
@@ -235,7 +236,17 @@ class LedgerSync:
         tx_id = data.get("tx_id", nonce)
         description = data.get("description", "")
 
-        if amount <= 0:
+        # sp1468 — reject a non-finite (NaN/Infinity) or non-positive amount from a PEER before it
+        # reaches the credit. The old `amount <= 0` guard let NaN/Infinity through (inf<=0 and nan<=0
+        # are both False), letting any unauthenticated peer mint an unbounded balance (inf) or freeze a
+        # targeted wallet (nan). submit_transaction now also fails closed (sp1468), so this is early
+        # defense-in-depth at the P2P ingress.
+        if (
+            not isinstance(amount, (int, float))
+            or isinstance(amount, bool)
+            or not math.isfinite(amount)
+            or amount <= 0
+        ):
             return
 
         # Only apply if this transaction involves us

@@ -1239,6 +1239,18 @@ class DAGLedger(LedgerNodeServicesMixin):
             MissingSignatureError: If signature is required but not provided
             InvalidSignatureError: If signature verification fails
         """
+        # sp1468 — fail closed in the SHARED money primitive (audit wf_6ceaaeff). A non-finite amount
+        # (NaN/Infinity) mints/poisons balances — NaN coerces a wallet_balances cache to NULL and
+        # freezes it, Infinity yields an unbounded restart-surviving spendable balance — and a NEGATIVE
+        # amount is a reverse-transfer (ADDS to the sender, SUBTRACTS from the receiver) that
+        # _check_balance_atomic's `balance >= amount` waves through. Every caller (credit/debit/transfer
+        # AND the P2P gossip credit path) routes here, so this is the last-line defense the audit found
+        # missing at the primitive. (amount == 0 is a harmless no-op — left to outer endpoints.)
+        if not math.isfinite(amount) or amount < 0:
+            raise ValueError(
+                f"transaction amount must be finite and non-negative, got {amount!r}"
+            )
+
         # Track atomic balance check state for cleanup
         balance_version = None
         atomic_check_in_progress = False

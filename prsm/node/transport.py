@@ -142,9 +142,16 @@ class P2PMessage:
         }
         return json.dumps(data, separators=(",", ":"))
 
+    @staticmethod
+    def _reject_non_finite(token: str):
+        # sp1468 — Python's json.loads accepts the non-standard tokens Infinity/-Infinity/NaN and
+        # returns real floats. On the P2P money ingress that let a peer smuggle a non-finite amount
+        # into a gossiped transaction (unbounded-mint / wallet-freeze). Reject them at parse time.
+        raise ValueError(f"non-finite JSON constant {token!r} not allowed in a P2P message")
+
     @classmethod
     def from_json(cls, raw: str) -> "P2PMessage":
-        data = json.loads(raw)
+        data = json.loads(raw, parse_constant=cls._reject_non_finite)
         return cls(
             msg_type=data["msg_type"],
             sender_id=data["sender_id"],
