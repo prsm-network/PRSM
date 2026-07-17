@@ -200,6 +200,10 @@ def scan_inbound_transfers(
         out.append({
             "block_number": getattr(log, "blockNumber", 0),
             "tx_hash": tx_hash,
+            # sp1473 — the log's index within its tx. ONE tx can emit multiple Transfers to the
+            # recipient (multisend/router, or two linked senders in a batched tx); log_index makes
+            # each a distinct deposit so the 2nd+ isn't dropped by the (recipient, tx_hash) dedup.
+            "log_index": getattr(log, "logIndex", 0),
             "from_address": from_addr,
             "to_address": to_addr,
             "amount_ftns": amount_wei / 1e18,
@@ -747,13 +751,20 @@ class InboundMonitor:
         tx_hash = transfer.get("tx_hash") or ""
         if not from_addr or amount <= 0 or not tx_hash:
             return
+        # sp1473 — the dedup identity is (tx_hash, log_index), NOT tx_hash alone. A single tx can
+        # emit multiple Transfers to the recipient; keying the three dedup layers on tx_hash alone
+        # dropped every Transfer after the first (depositor fund-loss). The composite string keeps
+        # 'same tx re-presented' deduped while letting 'distinct log within one tx' credit — and needs
+        # no checkpoint_store schema change (its tx_hash column just holds the composite value).
+        log_index = transfer.get("log_index", 0)
+        dedup_key = f"{tx_hash}:{log_index}"
         # Sprint 544: persistent dedup. In-memory fast-path first
         # (covers retries within a process); SQLite-backed check
         # second (covers restart catch-up scans introduced by
         # sprint 543's checkpoint persistence — without this, a
         # Transfer event already credited in v1 would be re-credited
         # by v2 because the in-memory set is empty on boot).
-        if tx_hash in self._credited_tx_hashes:
+        if dedup_key in self._credited_tx_hashes:
             return
         # Determine the recipient address for the dedup key. Use the
         # ledger's connected address (= the monitor's scan target) so
@@ -767,11 +778,11 @@ class InboundMonitor:
         ):
             try:
                 if self._checkpoint_store.has_credited_tx(
-                    recipient_addr, tx_hash,
+                    recipient_addr, dedup_key,
                 ):
                     # Cache the result in-memory so subsequent ticks
                     # within this process skip the SQLite lookup.
-                    self._credited_tx_hashes.add(tx_hash)
+                    self._credited_tx_hashes.add(dedup_key)
                     return
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
@@ -809,16 +820,16 @@ class InboundMonitor:
                 description=(
                     f"bridge deposit from {from_addr} tx={tx_hash}"
                 ),
-                idempotency_key=f"bridge-deposit:{recipient_addr}:{tx_hash}",
+                idempotency_key=f"bridge-deposit:{recipient_addr}:{dedup_key}",
             )
-            self._credited_tx_hashes.add(tx_hash)
+            self._credited_tx_hashes.add(dedup_key)
             # Sprint 544: persist the dedup record alongside the
             # in-memory cache so the next restart's catch-up scan
             # skips this tx instead of re-crediting.
             if self._checkpoint_store is not None and recipient_addr:
                 try:
                     self._checkpoint_store.mark_credited(
-                        recipient_addr, tx_hash,
+                        recipient_addr, dedup_key,
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
