@@ -115,14 +115,28 @@ class BatchSettlementManager:
         self._last_flush_at: float = 0.0
         self._settlement_history: List[SettlementResult] = []
 
-        # sp917 — in-flight (broadcast-but-unconfirmed) settlement transfers
-        # awaiting receipt reconciliation. Each entry:
-        # {from_addr, to_addr, amount, tx_hash, attempts}. A reverted tx is
-        # re-queued; a confirmed one is dropped; an ambiguous never-confirming
-        # one is dropped after _max_reconcile_attempts WITHOUT auto-requeue.
+        # sp917/sp1475 — in-flight (broadcast-but-unconfirmed) settlement
+        # transfers awaiting receipt reconciliation. Each entry:
+        # {from_addr, to_addr, amount, tx_hash, nonce, first_tracked_at,
+        # attempts}. A reverted tx is re-queued; a confirmed one is dropped; an
+        # ambiguous one is re-queued ONLY once nonce-advance + a receipt re-poll
+        # PROVE it dead (sp1475, mirroring the sp1439/sp1474 withdraw reconciler)
+        # — never silently dropped.
         self._in_flight: List[Dict[str, Any]] = []
-        self._max_reconcile_attempts = 20
+        self._max_reconcile_attempts = 20  # sp1475 — observability only; no longer gates a drop
         self._max_in_flight = 1000
+        # sp1475 — bounded retry for an on-chain REVERT (status==rejected). An
+        # ERC-20 revert is atomic (no tokens moved) so re-queue is safe + recovers
+        # the dominant transient cause (operator hot-wallet low on FTNS, self-heals
+        # on top-up). A recipient that reverts _max_reject_retries times in a row is
+        # dead-lettered (surfaced, not silently dropped, not looped forever).
+        self._reject_retry_counts: Dict[str, int] = {}
+        self._max_reject_retries = 5
+        self._dead_letter: List[Dict[str, Any]] = []
+        # sp1475 — a still-ambiguous in-flight tx (no receipt, nonce not yet
+        # advanced) is kept + loudly surfaced past this wall-clock age, never
+        # dropped (dropping risks losing a payout that later reverts).
+        self._reconcile_stale_seconds = 3600.0
 
         # Background task
         self._flush_task: Optional[asyncio.Task] = None
@@ -310,6 +324,9 @@ class BatchSettlementManager:
             status = getattr(tx_record, "status", None) if tx_record else None
             if tx_record and status == "confirmed":
                 result.tx_hashes.append(tx_record.tx_hash)
+                # sp1475 — a clean settle clears the transient-revert retry count
+                # for this payee (the low-balance dry spell has ended).
+                self._reject_retry_counts.pop(to_addr, None)
                 logger.info(
                     f"BatchSettlement: {net_amount:.6f} FTNS → {to_addr[:12]}… "
                     f"confirmed (tx: {tx_record.tx_hash[:16]}…)"
@@ -322,6 +339,7 @@ class BatchSettlementManager:
                 result.tx_hashes.append(tx_record.tx_hash)
                 self._track_in_flight(
                     from_addr, to_addr, net_amount, tx_record.tx_hash,
+                    nonce=getattr(tx_record, "nonce", None),
                 )
                 result.errors.append(
                     f"Pending (unconfirmed, not re-queued): {net_amount:.6f} → "
@@ -332,9 +350,37 @@ class BatchSettlementManager:
                     f"broadcast but UNCONFIRMED — left for reconciliation, NOT re-queued"
                 )
             elif tx_record and status == "rejected":
-                result.errors.append(
-                    f"Rejected (reverted on-chain): {net_amount:.6f} → {to_addr[:12]}"
-                )
+                # sp1475 — an on-chain ERC-20 revert is ATOMIC (no tokens moved),
+                # so the payout is still owed and re-queuing is safe (cannot
+                # double-pay) — exactly as the reconcile path already does for a
+                # reverted in-flight tx. The dominant cause is a transient operator
+                # hot-wallet FTNS shortfall that self-heals on top-up; the old
+                # "drop + error only" branch stranded EVERY provider in the batch.
+                # Bound the pathological permanently-reverting recipient with a
+                # per-payee retry cap → dead-letter (surfaced, never silent).
+                n = self._reject_retry_counts.get(to_addr, 0) + 1
+                self._reject_retry_counts[to_addr] = n
+                if n <= self._max_reject_retries:
+                    result.errors.append(
+                        f"Rejected (reverted on-chain, re-queued {n}/"
+                        f"{self._max_reject_retries}): {net_amount:.6f} → {to_addr[:12]}"
+                    )
+                    _mark_requeue(from_addr, to_addr, net_amount)
+                else:
+                    self._dead_letter.append({
+                        "to_addr": to_addr, "amount": net_amount,
+                        "reason": "reverted on-chain "
+                                  f"{n} times (exceeds {self._max_reject_retries})",
+                    })
+                    result.errors.append(
+                        f"Rejected (reverted {n}×, DEAD-LETTERED — manual "
+                        f"reconciliation): {net_amount:.6f} → {to_addr[:12]}"
+                    )
+                    logger.error(
+                        "BatchSettlement: %.6f FTNS → %s reverted on-chain %d times "
+                        "— DEAD-LETTERED (not re-queued). Operator must reconcile.",
+                        net_amount, to_addr[:12], n,
+                    )
             else:
                 # tx_record is None → never broadcast → safe to retry.
                 result.errors.append(
@@ -367,20 +413,41 @@ class BatchSettlementManager:
 
     def _track_in_flight(
         self, from_addr: str, to_addr: str, amount: float, tx_hash: str,
+        nonce: Optional[int] = None,
     ) -> None:
         """Record a broadcast-but-unconfirmed settlement transfer so
-        reconcile_in_flight() can re-queue it if it ultimately reverts."""
+        reconcile_in_flight() can re-queue it if it ultimately reverts, or
+        prove it dead via nonce-advance (sp1475). ``nonce`` is the tx's on-chain
+        nonce (from tx_record.nonce) — required for the prove-dead recovery."""
         self._in_flight.append({
             "from_addr": from_addr,
             "to_addr": to_addr,
             "amount": float(amount),
             "tx_hash": tx_hash,
+            "nonce": (int(nonce) if nonce is not None else None),
+            "first_tracked_at": time.time(),
             "attempts": 0,
         })
         if len(self._in_flight) > self._max_in_flight:
             # Bound the tracker (defensive — entries normally drain as they
-            # resolve). Drop the oldest.
+            # resolve). sp1475 — NEVER silently drop an un-reconciled owed
+            # payout: surface the trimmed entries loudly so an operator can
+            # reconcile them manually (mirrors the abandon-path logging).
+            trimmed = self._in_flight[:-self._max_in_flight]
             self._in_flight = self._in_flight[-self._max_in_flight:]
+            for e in trimmed:
+                self._dead_letter.append({
+                    "to_addr": e.get("to_addr"), "amount": e.get("amount"),
+                    "tx_hash": e.get("tx_hash"),
+                    "reason": "in-flight tracker overflow (>%d) — trimmed"
+                              % self._max_in_flight,
+                })
+            logger.error(
+                "BatchSettlement: in-flight tracker overflow — %d owed payout(s) "
+                "trimmed + DEAD-LETTERED (manual reconciliation): %s",
+                len(trimmed),
+                ", ".join(f"{e.get('amount')}→{str(e.get('to_addr'))[:12]}" for e in trimmed),
+            )
 
     async def reconcile_in_flight(self) -> Dict[str, int]:
         """Poll each in-flight settlement tx receipt and resolve it.
@@ -407,7 +474,7 @@ class BatchSettlementManager:
 
         w3 = getattr(self._ftns_ledger, "w3", None)
         loop = asyncio.get_running_loop()
-        confirmed = reverted = still_pending = abandoned = 0
+        confirmed = reverted = still_pending = abandoned = requeued_dead = 0
         survivors: List[Dict[str, Any]] = []
         requeue: List[PendingTransfer] = []
 
@@ -453,19 +520,60 @@ class BatchSettlementManager:
                     ),
                 ))
                 continue
-            # No receipt (still pending or RPC error) → keep + bump attempts.
+            # No receipt (still pending, dropped, or RPC error). sp1475 — NEVER
+            # blindly drop after a fixed attempt budget (the old behavior lost a
+            # genuinely-dead payout, and concurrent flushes inflated the count so
+            # a still-pending tx was ABANDONED prematurely, defeating the sp917
+            # revert recovery). Instead PROVE the tx dead via nonce-advance + a
+            # receipt re-poll (mirrors the sp1439/sp1474 withdraw reconciler): a
+            # DIFFERENT tx took the account's nonce slot AND this tx_hash has no
+            # receipt → it can never mine → re-queue the owed payout (safe: a
+            # never-landed tx moved no tokens). If not provably dead, KEEP it (a
+            # tx that could still confirm must never be re-queued → double-pay).
             entry["attempts"] = entry.get("attempts", 0) + 1
-            if entry["attempts"] >= self._max_reconcile_attempts:
-                abandoned += 1
-                logger.warning(
-                    "BatchSettlement reconcile: tx %s unconfirmed after %d "
-                    "attempts — DROPPING from in-flight tracking (NOT "
-                    "auto-requeued; it may still land — operator must "
-                    "reconcile manually). %.6f FTNS → %s",
-                    tx_hash[:18], entry["attempts"], entry["amount"],
+            sender = self._connected_address or getattr(
+                self._ftns_ledger, "_connected_address", None)
+            entry_nonce = entry.get("nonce")
+            proven_dead = False
+            if w3 is not None and sender and entry_nonce is not None and tx_hash:
+                try:
+                    confirmed_nonce = await loop.run_in_executor(
+                        None, lambda: w3.eth.get_transaction_count(sender, "latest"))
+                except Exception:  # noqa: BLE001 — transient RPC; retry next tick
+                    confirmed_nonce = None
+                if confirmed_nonce is not None and int(confirmed_nonce) > int(entry_nonce):
+                    hh = tx_hash if tx_hash.startswith("0x") else "0x" + tx_hash
+                    try:
+                        rp = await loop.run_in_executor(
+                            None, lambda x=hh: w3.eth.get_transaction_receipt(x))
+                    except Exception:  # noqa: BLE001 — not found → receipt absent
+                        rp = None
+                    if rp is None:
+                        proven_dead = True
+            if proven_dead:
+                requeued_dead += 1
+                requeue.append(PendingTransfer(
+                    tx_id=f"requeue-{uuid.uuid4().hex[:12]}",
+                    from_wallet=entry["from_addr"],
+                    to_wallet=entry["to_addr"],
+                    amount=entry["amount"],
+                    job_id=f"requeue-{uuid.uuid4().hex[:12]}",  # sp930 — collision-free
+                    description=(
+                        "re-queued: settlement tx provably dead "
+                        "(sp1475 nonce-advance + receipt-absent)"
+                    ),
+                ))
+                continue
+            # Not provably dead → keep tracking. Surface loudly if stale; NEVER drop.
+            age = time.time() - entry.get("first_tracked_at", time.time())
+            if age >= self._reconcile_stale_seconds:
+                logger.error(
+                    "BatchSettlement reconcile: tx %s STILL unconfirmed after "
+                    "%.0fs (%d polls) and NOT provably dead — KEEPING for "
+                    "reconciliation (never dropped). %.6f FTNS → %s",
+                    tx_hash[:18], age, entry["attempts"], entry["amount"],
                     entry["to_addr"][:12],
                 )
-                continue
             still_pending += 1
             survivors.append(entry)
 
@@ -481,7 +589,8 @@ class BatchSettlementManager:
                 "transfer(s) for retry", len(requeue),
             )
         return {"confirmed": confirmed, "reverted": reverted,
-                "still_pending": still_pending, "abandoned": abandoned}
+                "still_pending": still_pending, "abandoned": abandoned,
+                "requeued_dead": requeued_dead}
 
     # ── Netting ────────────────────────────────────────────────
 
@@ -556,6 +665,11 @@ class BatchSettlementManager:
             "flush_threshold": self.flush_threshold,
             "total_settled": self._total_settled,
             "gas_txs_saved": self._total_gas_saved,
+            "in_flight": len(self._in_flight),
+            # sp1475 — payouts that could not be settled automatically (reverted
+            # past the retry cap, or trimmed on tracker overflow). Non-zero →
+            # operator must reconcile these manually.
+            "dead_letter_count": len(self._dead_letter),
             "last_flush_at": self._last_flush_at,
             "last_flush_ago": (
                 round(time.time() - self._last_flush_at, 1)

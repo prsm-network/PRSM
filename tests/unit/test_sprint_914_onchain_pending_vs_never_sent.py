@@ -214,10 +214,40 @@ async def test_confirmed_transfer_is_cleared():
 
 
 @pytest.mark.asyncio
-async def test_rejected_transfer_is_not_requeued():
-    # On-chain revert is deterministic — re-queuing would loop forever.
+async def test_rejected_transfer_is_requeued_bounded_then_dead_lettered():
+    # sp1475 — an on-chain ERC-20 revert is ATOMIC (no tokens moved), so the
+    # payout is still owed and re-queuing is SAFE (the dominant cause is a
+    # transient operator FTNS shortfall that self-heals). The old "drop, no
+    # re-queue" behavior stranded every provider in the batch. A permanently-
+    # reverting recipient is bounded: re-queued _max_reject_retries times, then
+    # dead-lettered (surfaced, NOT silently dropped, NOT looped forever).
     fake = _FakeOnChain("rejected")
     mgr = _mgr(fake)
+    for i in range(mgr._max_reject_retries):
+        _queue_one(mgr)
+        await mgr.flush()
+        assert len(mgr._queue) == 1, f"revert {i+1} must re-queue the owed payout"
+        assert mgr._queue[0].to_wallet == _ADDR_TO
+        assert mgr._dead_letter == []
+        mgr._queue.clear()  # simulate the next flush picking it up
+    # One more revert exceeds the cap → dead-lettered, not re-queued.
     _queue_one(mgr)
     await mgr.flush()
     assert mgr._queue == []
+    assert len(mgr._dead_letter) == 1
+    assert mgr._dead_letter[0]["to_addr"] == _ADDR_TO
+
+
+@pytest.mark.asyncio
+async def test_confirmed_transfer_resets_reject_retry_count():
+    # A clean settle clears the transient-revert counter so a later dry spell
+    # gets a fresh full retry budget.
+    mgr = _mgr(_FakeOnChain("rejected"))
+    _queue_one(mgr)
+    await mgr.flush()
+    assert mgr._reject_retry_counts.get(_ADDR_TO) == 1
+    mgr._ftns_ledger = _FakeOnChain("confirmed")
+    mgr._queue.clear()
+    _queue_one(mgr)
+    await mgr.flush()
+    assert _ADDR_TO not in mgr._reject_retry_counts

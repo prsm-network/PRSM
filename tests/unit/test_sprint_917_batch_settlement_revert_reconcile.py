@@ -41,19 +41,27 @@ _TO = "0x" + "b" * 40
 
 
 class _FakeEth:
-    def __init__(self, receipts):
+    def __init__(self, receipts, confirmed_nonce=0):
         self._receipts = receipts   # tx_hash → dict | None | Exception
+        self._confirmed_nonce = confirmed_nonce
 
     def get_transaction_receipt(self, h):
         r = self._receipts.get(h)
         if isinstance(r, Exception):
             raise r
+        if r is None:
+            # web3 raises TransactionNotFound (not None) for an absent receipt.
+            from web3.exceptions import TransactionNotFound
+            raise TransactionNotFound(h)
         return r
 
+    def get_transaction_count(self, addr, block):   # sp1475 prove-dead
+        return self._confirmed_nonce
 
-def _mgr(receipts=None, *, transfer=None):
+
+def _mgr(receipts=None, *, transfer=None, confirmed_nonce=0):
     led = MagicMock()
-    led.w3 = SimpleNamespace(eth=_FakeEth(receipts or {}))
+    led.w3 = SimpleNamespace(eth=_FakeEth(receipts or {}, confirmed_nonce))
     if transfer is not None:
         led.transfer = transfer
     mgr = BatchSettlementManager(
@@ -98,16 +106,43 @@ async def test_still_pending_in_flight_is_kept():
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_dropped_after_max_attempts_without_requeue():
-    # A tx that never gets a receipt is AMBIGUOUS (may still land). After a
-    # bounded number of attempts, stop tracking it but do NOT auto-requeue —
-    # re-queuing a tx that might still confirm would double-pay.
-    mgr = _mgr({"0xstuck": None})
+async def test_ambiguous_never_dropped_without_prove_dead():
+    # sp1475 — a tx that never gets a receipt AND cannot be proven dead (nonce
+    # not advanced / not recorded) is KEPT indefinitely, NEVER silently dropped.
+    # The old behavior dropped it after a fixed attempt budget → a payout that
+    # later reverted was lost (and concurrent flushes inflated the count so a
+    # still-pending tx was abandoned prematurely). It must stay tracked and never
+    # auto-requeue (re-queuing a tx that might still confirm would double-pay).
+    mgr = _mgr({"0xstuck": None})     # tracked WITHOUT a nonce → not provable dead
     mgr._track_in_flight(_FROM, _TO, 5.0, "0xstuck")
-    for _ in range(mgr._max_reconcile_attempts + 2):
+    for _ in range(mgr._max_reconcile_attempts + 5):
         await mgr.reconcile_in_flight()
-    assert mgr._in_flight == []
-    assert mgr._queue == []           # NOT auto-requeued (double-pay safe)
+    assert len(mgr._in_flight) == 1   # ★ kept, never dropped
+    assert mgr._queue == []           # not auto-requeued (double-pay safe)
+
+
+@pytest.mark.asyncio
+async def test_provably_dead_in_flight_is_requeued():
+    # sp1475 — a different tx took the account's nonce slot (confirmed_nonce >
+    # our nonce) AND this tx has no receipt → it can NEVER mine → provably dead →
+    # re-queue the owed payout (safe: a never-landed tx moved no tokens).
+    mgr = _mgr({"0xdead": None}, confirmed_nonce=43)
+    mgr._track_in_flight(_FROM, _TO, 5.0, "0xdead", nonce=42)
+    out = await mgr.reconcile_in_flight()
+    assert out["requeued_dead"] == 1
+    assert any(p.to_wallet == _TO and p.amount == 5.0 for p in mgr._queue)
+    assert mgr._in_flight == []       # dropped from tracking (now re-queued)
+
+
+@pytest.mark.asyncio
+async def test_pending_with_nonce_not_advanced_is_kept():
+    # Nonce slot NOT yet taken → the tx can still land → keep, never re-queue.
+    mgr = _mgr({"0xslow": None}, confirmed_nonce=42)
+    mgr._track_in_flight(_FROM, _TO, 5.0, "0xslow", nonce=42)
+    out = await mgr.reconcile_in_flight()
+    assert out["still_pending"] == 1
+    assert len(mgr._in_flight) == 1
+    assert mgr._queue == []
 
 
 @pytest.mark.asyncio
