@@ -249,13 +249,31 @@ class LedgerSync:
             except ValueError:
                 tx_type = TransactionType.TRANSFER
 
-            await self.ledger.credit(
-                wallet_id=self.identity.node_id,
-                amount=amount,
-                tx_type=tx_type,
-                description=f"[remote] {description}",
-                signature=signature,
-            )
+            try:
+                await self.ledger.credit(
+                    wallet_id=self.identity.node_id,
+                    amount=amount,
+                    tx_type=tx_type,
+                    description=f"[remote] {description}",
+                    signature=signature,
+                )
+            except Exception as exc:  # noqa: BLE001 — a failed credit must not STRAND the payment
+                # Sp1466 — the nonce was CLAIMED + committed above (record_nonce, the sp898
+                # double-credit serialization point) BEFORE this credit. credit() is a single atomic
+                # transaction, so a raise means NO payment was applied (rolled back) — a
+                # definitively-no-payment revert, exactly release_nonce's sanctioned case (sp918).
+                # Without releasing it, the claim strands the payment forever: every re-gossiped copy
+                # is rejected at the has_seen_nonce fast-path (line ~196) BEFORE the has_transaction
+                # retry above can ever fire, so the recipient is never credited. Releasing lets a
+                # re-gossip re-claim + retry. (Preserves sp898: a SUCCESSFUL credit does NOT release,
+                # so a duplicate stays rejected → no double-credit.)
+                await self.ledger.release_nonce(nonce)
+                logger.error(
+                    "sp1466: credit failed for incoming tx %s from %s (nonce RELEASED so gossip "
+                    "can retry — payment not yet applied): %s",
+                    tx_id[:12], (from_wallet[:12] if from_wallet else "system"), exc,
+                )
+                return
             logger.info(
                 f"Received {amount:.6f} FTNS from {from_wallet[:12] if from_wallet else 'system'}... "
                 f"({tx_type_str})"
@@ -325,9 +343,21 @@ class LedgerSync:
     async def _handle_balance_response(self, msg: P2PMessage, peer: PeerConnection) -> None:
         """Compare peer's reported balance against our observed state.
 
-        This is a soft check — discrepancies are logged but not acted on
-        automatically.  At small network scale, discrepancies typically
-        resolve within a gossip round.
+        This is a soft DETECTION check — discrepancies are logged but not acted
+        on automatically (there is no fetch/apply/merge path here).
+
+        Two classes of "not seen locally", only one of which ever resolves:
+          • A tx that INVOLVES us (to_wallet == our node_id) but arrived late:
+            the gossip apply path (_on_ftns_transaction) stores it, so it
+            resolves within a gossip round.
+          • A tx that does NOT involve us (the peer's own escrow-funding debits,
+            its third-party payments, system credits): the apply path refuses to
+            store it (see the `to_wallet == self.identity.node_id` gate above),
+            so it NEVER resolves. The DEFAULT ledger is per-node — each node holds
+            only txs it is a wallet-party to; cross-node value moves through escrow
+            accounts, so two idle peers permanently report each other's ~20 recent
+            own-side txs as "not seen locally". That steady, non-zero count is
+            EXPECTED, not drift. (See sp1466.)
         """
         # sp1428 — DROP unsolicited responses. We only process a balance_response whose request_id
         # matches a balance_request we actually SENT (and consume it, one-shot). Without this, any
