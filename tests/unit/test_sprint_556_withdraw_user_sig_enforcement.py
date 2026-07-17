@@ -85,6 +85,14 @@ class _StubLedger:
         self._next_nonce += 1
         return old
 
+    async def compare_and_bump_withdraw_nonce(self, wallet_id, expected):
+        # sp1474 — atomic check-and-consume mirror of the real ledgers.
+        if self._next_nonce != int(expected):
+            return None
+        old = self._next_nonce
+        self._next_nonce += 1
+        return old
+
     async def get_balance(self, wallet_id):
         return self._balance if wallet_id == self.wallet_id else 0.0
 
@@ -99,11 +107,12 @@ class _StubLedger:
         })
         return rec
 
-    async def credit(self, *, wallet_id, amount, tx_type, description):
+    async def credit(self, *, wallet_id, amount, tx_type, description,
+                     idempotency_key=None):
         self._balance += amount
         self.credits.append({
             "wallet_id": wallet_id, "amount": amount,
-            "description": description,
+            "description": description, "idempotency_key": idempotency_key,
         })
 
     async def transfer(self, *, job_id, to_address, amount_ftns):

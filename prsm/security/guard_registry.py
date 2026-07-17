@@ -308,16 +308,34 @@ GUARDS: List[Guard] = [
         id="withdraw-dropped-tx-nonce-advance-gate",
         sprint="sp1439",
         file="prsm/node/pending_withdraw_reconciler.py",
-        anchor="int(confirmed_nonce) > int(intent.nonce)",
+        anchor="int(confirmed_nonce) <= int(intent.nonce)",
         protects="TWO opposite fund-loss failures. (a) A dropped/evicted withdraw tx never produces "
                  "a receipt, so without this the reconciler polls 'pending' forever and the "
-                 "off-chain debit is stranded (lost-debit). (b) This STRICT-greater gate is also the "
+                 "off-chain debit is stranded (lost-debit). (b) This nonce-advance gate is also the "
                  "double-pay guard: a tx is refunded ONLY once the escrow's CONFIRMED nonce has "
                  "advanced strictly PAST this tx's nonce (a different tx took the slot → this "
-                 "tx_hash can never mine). Weakening `>` to `>=`, or refunding on age/absence alone, "
-                 "would refund a tx that could still confirm → double-pay",
+                 "tx_hash can never mine). Weakening it to refund on age/absence alone, or when the "
+                 "nonce merely EQUALS, would refund a tx that could still confirm → double-pay. "
+                 "sp1474 adds a receipt re-poll AFTER this gate (see withdraw-is-dropped-receipt-"
+                 "repoll) so a tx that CONFIRMED in the read gap is not mis-refunded",
         killed_by="tests/unit/test_sprint_1439_withdraw_reconciler_lost_debit.py",
         kills_test_id="test_is_dropped_true_only_when_confirmed_nonce_advanced_past_tx_nonce",
+    ),
+    Guard(
+        id="withdraw-is-dropped-receipt-repoll",
+        sprint="sp1474",
+        file="prsm/node/pending_withdraw_reconciler.py",
+        anchor="if receipt is not None:",
+        protects="double-pay via a reconciler refund of a CONFIRMED withdraw. _is_dropped's earlier "
+                 "get_receipt_status read and its confirmed-nonce read are two independent RPC calls "
+                 "that can observe different chain heights (a block landing in the gap, or load-"
+                 "balanced/indexer-lagged RPC replicas). A tx that confirmed after the receipt read "
+                 "but whose nonce slot now shows advanced would be mis-classified as dropped and "
+                 "REFUNDED — paying the user on-chain AND off-chain. This re-poll of THIS tx's "
+                 "receipt LAST, returning False (not-dropped) if it now exists, closes the window. "
+                 "Removing it re-opens the double-pay race the sp914/sp1439 arc exists to prevent",
+        killed_by="tests/unit/test_sprint_1474_withdraw_path_hardening.py",
+        kills_test_id="test_is_dropped_false_when_tx_confirmed_in_read_gap",
     ),
     Guard(
         id="deposit-link-no-cross-wallet-steal",

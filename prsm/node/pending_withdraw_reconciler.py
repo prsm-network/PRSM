@@ -60,6 +60,11 @@ class WithdrawIntent:
     # persisted before sp1439 still load (nonce=None → the reconciler can't prove the tx
     # is dropped and leaves it pending, exactly the pre-sp1439 behavior — no regression).
     nonce: Optional[int] = None
+    # sp1474 — the debit was taken but the on-chain transfer definitively did NOT land
+    # (never-broadcast / reverted) AND the endpoint's inline refund credit itself FAILED.
+    # There is no on-chain tx to poll; the reconciler must simply retry the idempotent
+    # refund until it lands, rather than leaving the debit stranded with only a log line.
+    refund_owed: bool = False
 
 
 class PendingWithdrawStore:
@@ -134,6 +139,20 @@ class PendingWithdrawStore:
         self._prune()
         self._save()
 
+    def record_refund_owed(self, *, job_id: str, wallet_id: str,
+                           amount: float, to_addr: str) -> None:
+        """sp1474 — durably record a debit whose broadcast failed AND whose inline
+        refund credit ALSO failed, so the reconciler retries the (idempotent) refund
+        instead of stranding it on a log line. Idempotent per job_id."""
+        if job_id in self._intents:
+            return
+        self._intents[job_id] = WithdrawIntent(
+            job_id=job_id, wallet_id=wallet_id, amount=float(amount),
+            to_addr=to_addr, tx_hash="", refund_owed=True,
+        )
+        self._prune()
+        self._save()
+
     def unresolved(self) -> List[WithdrawIntent]:
         return [i for i in self._intents.values() if not i.resolved]
 
@@ -170,6 +189,20 @@ async def reconcile_pending_withdraws(
     """
     confirmed = refunded = still_pending = dropped = 0
     for intent in list(store.unresolved()):
+        # sp1474 — a refund-owed intent has NO on-chain tx to poll (the transfer
+        # never landed and the inline refund failed). Just retry the idempotent
+        # refund until it lands, then resolve.
+        if getattr(intent, "refund_owed", False):
+            try:
+                await refund(intent)
+            except Exception as exc:  # noqa: BLE001 — leave unresolved, retry next tick
+                logger.error("reconcile: owed-refund for %s FAILED (will retry): %s",
+                             intent.job_id, exc)
+                still_pending += 1
+                continue
+            store.mark_resolved(intent.job_id, "refunded")
+            refunded += 1
+            continue
         try:
             status = await get_receipt_status(intent.tx_hash)
         except Exception as exc:  # noqa: BLE001 — transient RPC; retry next tick
@@ -340,7 +373,26 @@ class PendingWithdrawReconciler:
             logger.debug("reconcile: confirmed-nonce poll for %s failed: %s",
                          intent.job_id, exc)
             return False
-        return int(confirmed_nonce) > int(intent.nonce)
+        if int(confirmed_nonce) <= int(intent.nonce):
+            return False
+        # sp1474 — the nonce slot is taken, but that alone does NOT prove OUR tx
+        # died: the taker could BE our tx, having CONFIRMED in the gap between the
+        # earlier get_receipt_status read (which returned pending) and this nonce
+        # read — or the two reads may hit RPC replicas at different block heights.
+        # Refunding then double-pays a landed withdraw. Re-poll THIS tx's receipt
+        # last: if it now exists, our tx confirmed/reverted → NOT dropped (let the
+        # next tick's confirmed/reverted branch handle it). Only a permanently-null
+        # receipt (a DIFFERENT tx took the slot) is provably dead → refund.
+        h = intent.tx_hash if intent.tx_hash.startswith("0x") else "0x" + intent.tx_hash
+        try:
+            receipt = await loop.run_in_executor(
+                None, lambda: w3.eth.get_transaction_receipt(h))
+        except Exception:  # noqa: BLE001 — receipt not found / transient → treat as absent
+            receipt = None
+        if receipt is not None:
+            # Our tx is in a block after all — do not refund it.
+            return False
+        return True
 
     async def reconcile_once(self) -> Dict[str, int]:
         out = await reconcile_pending_withdraws(

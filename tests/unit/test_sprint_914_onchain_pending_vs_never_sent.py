@@ -47,18 +47,26 @@ _TOKEN = "0x" + "c" * 40
 
 
 class _FakeEth:
-    def __init__(self, *, send_raises=False, receipt=None, receipt_raises=False):
+    def __init__(self, *, send_raises=False, send_exc=None, receipt=None,
+                 receipt_raises=False):
         self._send_raises = send_raises
+        self._send_exc = send_exc
         self._receipt = receipt
         self._receipt_raises = receipt_raises
         self.account = SimpleNamespace(
-            sign_transaction=lambda tx, key: SimpleNamespace(raw_transaction=b"\x01\x02")
+            # sp1474 — a signed tx exposes its deterministic .hash before send.
+            sign_transaction=lambda tx, key: SimpleNamespace(
+                raw_transaction=b"\x01\x02",
+                hash=SimpleNamespace(hex=lambda: "0x" + "d" * 64),
+            )
         )
 
     def get_transaction_count(self, addr, block):
         return 7
 
     def send_raw_transaction(self, raw):
+        if self._send_exc is not None:
+            raise self._send_exc
         if self._send_raises:
             raise RuntimeError("rpc down — tx never broadcast")
         return SimpleNamespace(hex=lambda: "0x" + "d" * 64)
@@ -100,11 +108,28 @@ async def test_receipt_timeout_after_broadcast_returns_pending_not_none(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_never_broadcast_returns_none(monkeypatch):
-    # send_raw_transaction raises → tx never sent → safe to retry/refund.
-    led = _make_ledger(monkeypatch, send_raises=True)
+async def test_explicit_rejection_returns_none(monkeypatch):
+    # sp1474 — an EXPLICIT node rejection (nonce too low) PROVES the tx did not
+    # enter the mempool → safe to return None → refund. Only a provable rejection
+    # takes this path now (see the ambiguous-failure test below).
+    led = _make_ledger(monkeypatch, send_exc=ValueError("nonce too low"))
     rec = await led.transfer(job_id="j", to_address=_ADDR_TO, amount_ftns=1.0)
     assert rec is None
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_send_failure_returns_pending_not_none(monkeypatch):
+    # sp1474 — a GENERIC/transport send failure does NOT prove the tx never
+    # landed (the node may have accepted it and only the response was lost).
+    # Returning None here would refund a debit whose tx later mines → double-pay.
+    # It must surface as "pending" so the reconciler refunds ONLY if it proves
+    # the tx dead. Regression guard for the bridge-withdraw audit (wf_8d70ed5a).
+    led = _make_ledger(monkeypatch, send_raises=True)
+    rec = await led.transfer(job_id="j", to_address=_ADDR_TO, amount_ftns=1.0)
+    assert rec is not None, "ambiguous send failure must NOT be a clean None (double-pay)"
+    assert rec.status == "pending"
+    assert rec.tx_hash and rec.tx_hash.startswith("0x")
+    assert rec.nonce == 7
 
 
 @pytest.mark.asyncio

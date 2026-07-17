@@ -76,6 +76,49 @@ def estimate_gas_price(w3, multiplier: float = 1.2, max_gwei: int = MAX_GAS_GWEI
         return DEFAULT_GAS_GWEI * 1_000_000_000
 
 
+# sp1474 — explicit "this send provably did NOT enter the mempool" markers.
+# A send_raw_transaction that fails with one of these JSON-RPC rejections could
+# not have landed, so the caller may safely refund (return None). ANYTHING ELSE
+# — a transport fault (ConnectionError/timeout), an "already known" reply, or an
+# unrecognised error — MIGHT have landed and must be surfaced as "pending" so the
+# off-chain debit is refunded ONLY if the reconciler later proves the tx dead.
+# Returning None for a tx that actually mined is an irreversible double-pay; a
+# false "pending" is self-correcting (sp1439 refunds once the nonce advances).
+_SEND_TERMINAL_REJECTION_MARKERS = (
+    "nonce too low",
+    "insufficient funds",
+    "intrinsic gas too low",
+    "gas too low",
+    "exceeds block gas limit",
+    "invalid sender",
+    "sender is not eoa",
+)
+
+
+def _send_failure_maybe_landed(exc: Exception) -> bool:
+    """True if a send_raw_transaction failure might still have entered the
+    mempool → treat as pending (never a clean never-broadcast). False only for
+    explicit rejections proving the tx did NOT enter the mempool."""
+    try:
+        import requests  # web3's HTTPProvider transport
+        if isinstance(exc, (requests.exceptions.ConnectionError,
+                            requests.exceptions.Timeout,
+                            requests.exceptions.ChunkedEncodingError)):
+            return True
+    except Exception:  # noqa: BLE001 — requests always present with web3, be safe
+        pass
+    msg = str(exc).lower()
+    # "already known" / "known transaction" / "replacement ... underpriced" all
+    # mean a tx at this nonce IS in the pool → maybe-landed.
+    if "known" in msg or "already" in msg or "replacement transaction" in msg:
+        return True
+    for marker in _SEND_TERMINAL_REJECTION_MARKERS:
+        if marker in msg:
+            return False
+    # Unknown/ambiguous send failure → be safe, treat as maybe-landed.
+    return True
+
+
 # ── Minimal ERC20 ABI ──────────────────────────────────────────────
 _ERC20_ABI = [
     {
@@ -1267,6 +1310,7 @@ class OnChainFTNSLedger:
         )
 
         async with self._lock:
+            sent_ok = False  # sp1474 — True once send_raw_transaction returns
             try:
                 amount_wei = int(amount_ftns * (10 ** self._decimals))
 
@@ -1310,9 +1354,22 @@ class OnChainFTNSLedger:
                     }
 
                     signed = self.w3.eth.account.sign_transaction(tx, self._account.key)
+                    # sp1474 — pin the DETERMINISTIC tx hash + nonce onto the
+                    # record BEFORE broadcasting. The signed tx's hash is fixed
+                    # the instant it is signed; recording it here means a send
+                    # whose HTTP response is LOST (transport fault after the node
+                    # already accepted the tx into the mempool) is no longer
+                    # mis-seen as never-broadcast → refunded → double-paid when
+                    # it mines. The except below uses `sent_ok` + the exception
+                    # class to decide pending-vs-refund instead of tx_hash truthiness.
+                    _signed_hash = getattr(signed, "hash", None)
+                    if _signed_hash is not None:
+                        tx_record.tx_hash = _signed_hash.hex()
+                    tx_record.nonce = int(nonce)   # sp1439 — deterministic dropped-tx signal
                     tx_hash = await loop.run_in_executor(
                         None, self.w3.eth.send_raw_transaction, signed.raw_transaction
                     )
+                    sent_ok = True
                 finally:
                     tx_lock.release()
 
@@ -1346,24 +1403,36 @@ class OnChainFTNSLedger:
                 return tx_record
 
             except Exception as e:
-                # sp914 — distinguish NEVER-BROADCAST (safe to retry/refund)
-                # from BROADCAST-BUT-UNCONFIRMED. If we already have a tx_hash,
-                # `send_raw_transaction` SUCCEEDED and the tx is in the mempool
-                # (this except is almost always `wait_for_transaction_receipt`
-                # timing out on a congested Base). Returning None here made
-                # callers treat an in-flight tx as a clean failure → withdraw
-                # refunded the off-chain debit (DOUBLE-PAY when the tx later
-                # confirmed) and batch-settlement silently DROPPED the owed
-                # payout. Surface it as "pending" instead; only a tx that was
-                # never broadcast (no tx_hash) returns None.
-                if getattr(tx_record, "tx_hash", ""):
+                # sp914/sp1474 — distinguish NEVER-BROADCAST (safe to refund)
+                # from BROADCAST-BUT-UNCONFIRMED (must NOT refund — double-pay).
+                # The decision can no longer key on tx_hash truthiness: sp1474
+                # pins the deterministic hash BEFORE the send, so it is set even
+                # for a never-broadcast tx. Instead:
+                #   • sent_ok is True  → the receipt wait failed AFTER the node
+                #     accepted the tx (congested Base) → pending, never refund.
+                #   • sent_ok is False → the send itself raised. Only an explicit
+                #     JSON-RPC rejection that proves the tx did NOT enter the
+                #     mempool is a clean never-broadcast (→ None → refund); a
+                #     transport fault or an "already known" reply MIGHT have
+                #     landed, so surface it as pending (the sp1439 reconciler
+                #     refunds it exactly once IF the tx is ever proven dead).
+                if sent_ok or _send_failure_maybe_landed(e):
                     tx_record.status = "pending"
                     logger.warning(
                         f"FTNS transfer broadcast but unconfirmed "
-                        f"(receipt wait failed: {e}); tx={tx_record.tx_hash[:16]}… "
+                        f"(sent_ok={sent_ok}, failure={e}); "
+                        f"tx={getattr(tx_record, 'tx_hash', '')[:16]}… "
                         f"is pending — NOT a clean failure"
                     )
-                    await self._update_tx_status(tx_record)
+                    if sent_ok:
+                        # Success path already recorded the row (pre-receipt) —
+                        # just update its status.
+                        await self._update_tx_status(tx_record)
+                    else:
+                        # Send raised before the row was recorded — insert it now
+                        # so the reconciler can find + resolve it.
+                        self._transactions.append(tx_record)
+                        await self._record_tx(tx_record)
                     return tx_record
                 tx_record.status = "rejected"
                 logger.error(f"FTNS transfer failed (never broadcast): {e}")

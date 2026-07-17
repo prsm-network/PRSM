@@ -760,6 +760,44 @@ class DAGLedger(LedgerNodeServicesMixin):
             await self._db.commit()
             return old
 
+    async def compare_and_bump_withdraw_nonce(
+        self, wallet_id: str, expected: int,
+    ) -> Optional[int]:
+        """sp1474 — ATOMIC check-and-consume of a withdraw nonce.
+
+        Restores the sp556 single-use guarantee that the endpoint's
+        separate get_next_withdraw_nonce (read) + bump_withdraw_nonce
+        (write) could not: two concurrent same-nonce withdraws both
+        pass the unlocked equality check, then both bump, so ONE user
+        signature drives N on-chain payouts. Here the re-read + compare
+        + UPDATE happen under a single hold of the connection write
+        lock, so only ONE of two concurrent callers passing `expected`
+        wins; the loser gets None (→ 401) BEFORE any debit/broadcast.
+
+        Returns the consumed nonce (== ``expected``) on success, or
+        None if the wallet's current nonce no longer equals ``expected``
+        (lost the race, or a stale/replayed signature).
+        """
+        async with self._get_write_lock():
+            cursor = await self._db.execute(
+                "SELECT next_withdraw_nonce FROM wallets "
+                "WHERE wallet_id = ?",
+                (wallet_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise KeyError(f"unknown wallet {wallet_id!r}")
+            current = int(row[0])
+            if current != int(expected):
+                return None
+            await self._db.execute(
+                "UPDATE wallets SET next_withdraw_nonce = ? "
+                "WHERE wallet_id = ?",
+                (current + 1, wallet_id),
+            )
+            await self._db.commit()
+            return current
+
     async def get_balance(self, wallet_id: str) -> float:
         """Get the current balance for a wallet (non-atomic read)."""
         cursor = await self._db.execute(

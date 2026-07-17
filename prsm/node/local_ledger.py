@@ -444,6 +444,34 @@ class LocalLedger(LedgerNodeServicesMixin):
         await self._db.commit()
         return old
 
+    async def compare_and_bump_withdraw_nonce(
+        self, wallet_id: str, expected: int,
+    ) -> Optional[int]:
+        """sp1474 — ATOMIC check-and-consume of a withdraw nonce (see
+        the DAGLedger twin for the full rationale). Under self._write_lock
+        the current nonce is re-read, compared to ``expected``, and only
+        bumped if they still match — so two concurrent same-nonce withdraws
+        can no longer both clear the sp556 gate. Returns the consumed nonce
+        on success, None if the wallet nonce no longer equals ``expected``."""
+        async with self._write_lock:
+            cursor = await self._db.execute(
+                "SELECT next_withdraw_nonce FROM wallets WHERE wallet_id = ?",
+                (wallet_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise KeyError(f"unknown wallet {wallet_id!r}")
+            current = int(row[0])
+            if current != int(expected):
+                return None
+            await self._db.execute(
+                "UPDATE wallets SET next_withdraw_nonce = ? "
+                "WHERE wallet_id = ?",
+                (current + 1, wallet_id),
+            )
+            await self._db.commit()
+            return current
+
     # ── Balance ──────────────────────────────────────────────────
 
     async def get_balance(self, wallet_id: str) -> float:

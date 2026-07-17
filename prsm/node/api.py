@@ -2519,9 +2519,16 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 is_expired,
                 InvalidSignatureFormat,
             )
+            # sp1474 — derive the signed-payload wei from the on-chain
+            # ledger's decimals (single source of truth) rather than a
+            # hardcoded 1e18. At the deployed 18-decimal FTNS these are
+            # identical; this keeps the signed amount == the transferred
+            # amount if the token's decimals ever change (avoids a silent
+            # authorized-vs-sent desync).
+            _wei_decimals = int(getattr(ledger, "_decimals", 18) or 18)
             payload = {
                 "wallet_id": wallet_id,
-                "amount_ftns_wei": int(body.amount_ftns * 1e18),
+                "amount_ftns_wei": int(body.amount_ftns * (10 ** _wei_decimals)),
                 "to_eth_address": to_addr,
                 "nonce": int(body.nonce),
                 "expiry_unix": int(body.expiry_unix),
@@ -2573,9 +2580,27 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 )
             # All checks passed — consume the nonce BEFORE broadcast
             # so replay isn't possible even if broadcast fails.
-            nonce_consumed = await local_ledger.bump_withdraw_nonce(
-                wallet_id,
+            # sp1474 — ATOMIC compare-and-consume. The equality check
+            # above reads an UNLOCKED nonce, so two concurrent requests
+            # replaying ONE signature could both pass it and then both
+            # bump (defeating sp556 single-use → one signature drives N
+            # payouts of a wallet's whole balance). compare_and_bump
+            # re-checks + advances the nonce under the ledger write lock,
+            # so only ONE concurrent caller consumes `nonce`; the loser
+            # gets None → 401 BEFORE any debit/broadcast.
+            nonce_consumed = await local_ledger.compare_and_bump_withdraw_nonce(
+                wallet_id, int(body.nonce),
             )
+            if nonce_consumed is None:
+                raise HTTPException(
+                    status_code=401,
+                    detail=(
+                        f"Nonce {int(body.nonce)} already consumed "
+                        "(concurrent or replayed withdraw). Read the "
+                        "current nonce via GET /wallet/deposit/info and "
+                        "re-sign."
+                    ),
+                )
         # Pre-flight balance check
         balance = await local_ledger.get_balance(wallet_id)
         if balance < body.amount_ftns:
@@ -2640,6 +2665,9 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                     wallet_id=wallet_id,
                     amount=body.amount_ftns,
                     tx_type=refund_tt_for_credit,
+                    # sp1474 — share the reconciler's idempotency key so an inline
+                    # refund and a reconciler retry can NEVER double-refund.
+                    idempotency_key=f"withdraw-refund:{job_id}",
                     description=(
                         f"bridge withdraw REFUND "
                         f"(broadcast failed) — original debit "
@@ -2649,12 +2677,27 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             except Exception as refund_exc:  # noqa: BLE001
                 logger.error(
                     "CRITICAL: withdraw refund failed AFTER debit "
-                    "succeeded — manual reconciliation needed. "
+                    "succeeded — recording for reconciler retry. "
                     "wallet=%s amount=%.6f debit_tx=%s "
                     "refund_error=%s",
                     wallet_id, body.amount_ftns,
                     debit_tx.tx_id, refund_exc,
                 )
+                # sp1474 — durably record the owed refund so the pending-withdraw
+                # reconciler retries the (idempotent) credit instead of leaving the
+                # debit stranded on a log line. Best-effort: never mask the 502.
+                _pw_store = getattr(node, "_pending_withdraw_store", None)
+                if _pw_store is not None:
+                    try:
+                        _pw_store.record_refund_owed(
+                            job_id=job_id, wallet_id=wallet_id,
+                            amount=float(body.amount_ftns), to_addr=to_addr,
+                        )
+                    except Exception as _rec_exc:  # noqa: BLE001
+                        logger.error(
+                            "withdraw: failed to record owed refund for "
+                            "job=%s: %s", job_id, _rec_exc,
+                        )
             raise HTTPException(
                 status_code=502,
                 detail=(
