@@ -208,13 +208,18 @@ GUARDS: List[Guard] = [
         id="reconciliation-balance-response-tx-cap",
         sprint="sp1428",
         file="prsm/node/ledger_sync.py",
-        anchor="[:_MAX_RECONCILIATION_TX_IDS]",
+        # sp1467 refined the anchor: the peer-supplied list is now `directed_tx_ids`, and a second
+        # (defensive) `[:_MAX_RECONCILIATION_TX_IDS]` guards our OWN outgoing list in
+        # _handle_balance_request, so this anchor targets the SECURITY-critical response-side cap
+        # specifically (the one bounding a HOSTILE peer's inbound list).
+        anchor="list(directed or [])[:_MAX_RECONCILIATION_TX_IDS]",
         protects="a resource-exhaustion DoS of the money event loop. sp1419 activated "
                  "reconciliation on every default node, turning on _handle_balance_response, which "
-                 "iterated a peer-supplied recent_tx_ids list with up to 2 awaited SQLite lookups "
-                 "per element on the shared ledger connection. Without this cap a hostile peer "
-                 "sends one oversized balance_response (a 256MB frame ~= millions of ids) and "
-                 "monopolizes the ledger connection, starving concurrent transfers/credits",
+                 "iterated a peer-supplied tx-id list (recent_tx_ids; directed_tx_ids since sp1467) "
+                 "with an awaited SQLite lookup per element on the shared ledger connection. Without "
+                 "this cap a hostile peer sends one oversized balance_response (a 256MB frame ~= "
+                 "millions of ids) and monopolizes the ledger connection, starving concurrent "
+                 "transfers/credits",
         killed_by="tests/unit/test_sprint_1428_balance_response_dos.py",
         kills_test_id="test_a_giant_tx_id_list_does_not_produce_unbounded_db_lookups",
     ),

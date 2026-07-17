@@ -88,10 +88,13 @@ class TestReconciliationOnTheDefaultLedger:
         )
         _peer, msg = transport.send_to_peer.await_args.args
         assert msg.payload["subtype"] == "balance_request"
-        assert "recent_tx_ids" in msg.payload, (
-            "balance_request carries no recent_tx_ids — the whole point of the proof"
+        # sp1467 — the request no longer carries a tx list (the old recent_tx_ids was dead data the
+        # responder never read). It carries the sp1428 correlation request_id; the responder replies
+        # with the txs it directed AT us. The load-bearing guarantee is unchanged: reconciliation RUNS
+        # (a request is emitted) on the default DAG ledger — no sp1419 AttributeError.
+        assert msg.payload.get("request_id"), (
+            "balance_request carries no correlation request_id — reconciliation proof is broken"
         )
-        assert isinstance(msg.payload["recent_tx_ids"], list)
 
     async def test_balance_request_from_a_peer_gets_answered_on_the_default_dag_ledger(
         self, dag_ledger,
@@ -109,11 +112,11 @@ class TestReconciliationOnTheDefaultLedger:
         sync = _sync(dag_ledger, identity, transport)
 
         req = MagicMock()
+        req.sender_id = "requester-node"          # sp1467 — responder filters its txs to to_wallet==this
         req.payload = {
             "subtype": "balance_request",
             "request_id": "req-1",
             "requester_balance": 0.0,
-            "recent_tx_ids": [],
         }
         peer = MagicMock()
         peer.peer_id = "peer-abc"
@@ -126,7 +129,9 @@ class TestReconciliationOnTheDefaultLedger:
         _pid, resp = transport.send_to_peer.await_args.args
         assert resp.payload["subtype"] == "balance_response"
         assert resp.payload["request_id"] == "req-1"
-        assert isinstance(resp.payload["recent_tx_ids"], list)
+        # sp1467 — the response carries directed_tx_ids (txs the responder directed AT the requester),
+        # not the responder's whole recent set.
+        assert isinstance(resp.payload["directed_tx_ids"], list)
 
     async def test_recent_tx_ids_actually_reflects_the_dag(self, dag_ledger):
         """Not just "the method exists" — it must return this wallet's real transactions.

@@ -48,7 +48,9 @@ def _response(request_id: str, tx_ids):
         "subtype": "balance_response",
         "request_id": request_id,
         "responder_balance": 1.0,
-        "recent_tx_ids": tx_ids,
+        # sp1467 — the drift-bearing field is now directed_tx_ids (txs the responder directed AT us).
+        # The sp1428 protections (request_id correlation + length cap) apply to it unchanged.
+        "directed_tx_ids": tx_ids,
     }
     return msg
 

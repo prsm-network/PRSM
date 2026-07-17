@@ -297,10 +297,12 @@ class LedgerSync:
 
         self._reconciliations_run += 1
         my_balance = await self.ledger.get_balance(self.identity.node_id)
-        my_recent_txs = await self.ledger.get_recent_tx_ids(self.identity.node_id, limit=20)
 
         for peer_id in list(self.transport.peers.keys()):
             try:
+                # Sp1467 — the request carries no tx list. The responder replies with the txs it
+                # directed AT US (to_wallet == our node_id); a MISSING one is real drift. (The old
+                # request-side recent_tx_ids was dead data — the responder never read it.)
                 msg = P2PMessage(
                     msg_type=MSG_DIRECT,
                     sender_id=self.identity.node_id,
@@ -308,7 +310,6 @@ class LedgerSync:
                         "subtype": "balance_request",
                         "request_id": self._register_outstanding_request(),
                         "requester_balance": my_balance,
-                        "recent_tx_ids": my_recent_txs,
                     },
                 )
                 await self.transport.send_to_peer(peer_id, msg)
@@ -324,9 +325,25 @@ class LedgerSync:
             await self._handle_balance_response(msg, peer)
 
     async def _handle_balance_request(self, msg: P2PMessage, peer: PeerConnection) -> None:
-        """Respond with our balance and recent transaction IDs."""
+        """Respond with our balance and the txs we have that are DIRECTED AT the requester.
+
+        Sp1467 — we send only the tx_ids where ``to_wallet == requester`` (payments WE made TO them).
+        A missing one is real drift on the requester's side — an incoming payment it lost. Sending our
+        whole recent-tx set (the old behavior) made the requester log our own escrow-funding /
+        third-party txs as its "discrepancies": permanent benign noise, since the DEFAULT ledger is
+        per-node and those txs never involve the requester (see sp1466).
+        """
         my_balance = await self.ledger.get_balance(self.identity.node_id)
-        my_recent_txs = await self.ledger.get_recent_tx_ids(self.identity.node_id, limit=20)
+        requester = getattr(msg, "sender_id", None)
+        directed_tx_ids: List[str] = []
+        if requester:
+            history = await self.ledger.get_transaction_history(
+                self.identity.node_id, limit=20,
+            )
+            directed_tx_ids = [
+                tx.tx_id for tx in history
+                if getattr(tx, "to_wallet", None) == requester
+            ][:_MAX_RECONCILIATION_TX_IDS]
 
         response = P2PMessage(
             msg_type=MSG_DIRECT,
@@ -335,29 +352,26 @@ class LedgerSync:
                 "subtype": "balance_response",
                 "request_id": msg.payload.get("request_id", ""),
                 "responder_balance": my_balance,
-                "recent_tx_ids": my_recent_txs,
+                "directed_tx_ids": directed_tx_ids,
             },
         )
         await self.transport.send_to_peer(peer.peer_id, response)
 
     async def _handle_balance_response(self, msg: P2PMessage, peer: PeerConnection) -> None:
-        """Compare peer's reported balance against our observed state.
+        """Detect real reconciliation DRIFT: incoming payments directed at us that we're MISSING.
 
-        This is a soft DETECTION check — discrepancies are logged but not acted
-        on automatically (there is no fetch/apply/merge path here).
+        Sp1467 — the responder sends only ``directed_tx_ids`` (txs it directed AT US, i.e.
+        to_wallet == our node_id). A missing one is genuine drift: a payment we should hold but don't
+        (including an sp1466-class stranding). We alarm ONLY on this class.
 
-        Two classes of "not seen locally", only one of which ever resolves:
-          • A tx that INVOLVES us (to_wallet == our node_id) but arrived late:
-            the gossip apply path (_on_ftns_transaction) stores it, so it
-            resolves within a gossip round.
-          • A tx that does NOT involve us (the peer's own escrow-funding debits,
-            its third-party payments, system credits): the apply path refuses to
-            store it (see the `to_wallet == self.identity.node_id` gate above),
-            so it NEVER resolves. The DEFAULT ledger is per-node — each node holds
-            only txs it is a wallet-party to; cross-node value moves through escrow
-            accounts, so two idle peers permanently report each other's ~20 recent
-            own-side txs as "not seen locally". That steady, non-zero count is
-            EXPECTED, not drift. (See sp1466.)
+        Why this replaced the old count: the DEFAULT ledger is per-node — each node stores only txs it
+        is a wallet-party to, and cross-node value moves through escrow accounts. The old code compared
+        the peer's ENTIRE recent-tx set against our ledger, so a peer's own escrow-funding / third-party
+        txs (which never involve us and we correctly never store) were reported as a permanent, benign
+        ~20/cycle "not seen locally". That made a healthy steady state read as a standing anomaly and
+        drowned any real drift in the noise floor. Now only the convergent class (to_wallet == us) can
+        raise the alarm. Detection-only: logged, not acted on — gossip re-delivers + applies the real
+        payment.
         """
         # sp1428 — DROP unsolicited responses. We only process a balance_response whose request_id
         # matches a balance_request we actually SENT (and consume it, one-shot). Without this, any
@@ -372,25 +386,36 @@ class LedgerSync:
         del self._outstanding_request_ids[request_id]
 
         responder_balance = msg.payload.get("responder_balance", 0)
-        # sp1428 — CAP the id count. A legit response echoes <=20 ids (the request path's limit);
-        # this bound stops a hostile/oversized list from driving an unbounded per-element DB storm
-        # on the shared ledger connection (a money-path DoS).
-        peer_recent_txs = list(msg.payload.get("recent_tx_ids", []) or [])[:_MAX_RECONCILIATION_TX_IDS]
 
-        # Check if we have all of the peer's recent transactions
+        directed = msg.payload.get("directed_tx_ids")
+        if directed is None:
+            # Legacy peer (pre-sp1467) sent only the unfiltered recent_tx_ids — we cannot tell which
+            # of those involve us, so we do NOT alarm on that benign per-node noise.
+            if msg.payload.get("recent_tx_ids"):
+                logger.debug(
+                    "Reconciliation: peer %s... on legacy protocol (no directed_tx_ids); "
+                    "skipping drift check", peer.peer_id[:12],
+                )
+            return
+
+        # sp1428 — CAP the id count so a hostile/oversized list can't drive an unbounded per-element
+        # DB storm on the shared ledger connection (a money-path DoS).
+        directed_tx_ids = list(directed or [])[:_MAX_RECONCILIATION_TX_IDS]
+
+        # Every id is a payment the responder directed AT US (to_wallet == our node_id). A missing one
+        # is real drift. We do NOT suppress on has_seen_nonce here: a seen-but-unstored incoming tx is
+        # EXACTLY the stranding we want surfaced (see sp1466), not noise to hide.
         missing = 0
-        for tx_id in peer_recent_txs:
+        for tx_id in directed_tx_ids:
             if not await self.ledger.has_transaction(tx_id):
-                # Check nonce too — might be a transaction that doesn't involve us
-                if not await self.ledger.has_seen_nonce(tx_id):
-                    missing += 1
+                missing += 1
 
         if missing > 0:
             self._discrepancies_found += 1
-            logger.info(
-                f"Reconciliation with {peer.peer_id[:12]}...: "
-                f"{missing} transaction(s) not seen locally "
-                f"(peer balance: {responder_balance:.6f} FTNS)"
+            logger.warning(
+                "Reconciliation DRIFT with %s...: %d incoming payment(s) directed at us are MISSING "
+                "locally (peer balance: %.6f FTNS) — should self-heal via gossip re-delivery",
+                peer.peer_id[:12], missing, float(responder_balance),
             )
 
     # ── Helpers ───────────────────────────────────────────────────
