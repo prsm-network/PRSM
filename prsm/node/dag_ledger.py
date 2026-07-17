@@ -1221,6 +1221,7 @@ class DAGLedger(LedgerNodeServicesMixin):
         description: str = "",
         signature: Optional[str] = None,
         public_key: Optional[str] = None,
+        _idempotent_tx_id: Optional[str] = None,
     ) -> DAGTransaction:
         """
         Submit a new transaction to the DAG.
@@ -1270,6 +1271,16 @@ class DAGLedger(LedgerNodeServicesMixin):
             raise ValueError(
                 f"transaction amount must be finite and non-negative, got {amount!r}"
             )
+
+        # sp1472 — idempotent credit (bridge-deposit exactly-once). credit(idempotency_key=...) derives
+        # a deterministic tx_id and passes it here. If that tx is already applied — including across a
+        # restart, since get_transaction reads the durable dag_transactions table — this is a replay
+        # (e.g. the InboundMonitor catch-up scan re-presenting the same on-chain Transfer) → return the
+        # existing tx as a NO-OP so it can't double-credit. Matches LocalLedger.credit's sp1101.
+        if _idempotent_tx_id is not None:
+            _existing = await self.get_transaction(_idempotent_tx_id)
+            if _existing is not None:
+                return _existing
 
         # Track atomic balance check state for cleanup
         balance_version = None
@@ -1348,7 +1359,7 @@ class DAGLedger(LedgerNodeServicesMixin):
             parent_ids = self.select_tips_mcmc(num_tips=min(self.max_parents, len(self._state.tips)))
             
             tx = DAGTransaction(
-                tx_id=str(uuid.uuid4()),
+                tx_id=_idempotent_tx_id or str(uuid.uuid4()),
                 tx_type=tx_type,
                 amount=amount,
                 from_wallet=from_wallet,
@@ -1665,12 +1676,24 @@ class DAGLedger(LedgerNodeServicesMixin):
         description: str = "",
         signature: Optional[str] = None,
         public_key: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> DAGTransaction:
         # Sp898 — accept signature/public_key for parity with debit()
         # and LocalLedger.credit(). ledger_sync._on_ftns_transaction
         # calls credit(..., signature=...) when applying an incoming
         # cross-node transfer; without these params the DAG backend
         # raised TypeError on every remote credit.
+        #
+        # sp1472 — accept idempotency_key for parity with LocalLedger.credit (sp1101). The
+        # InboundMonitor bridge-deposit path (ftns_onchain.py) calls credit(..., idempotency_key=...)
+        # and the DEFAULT node ledger is DAGLedger, so without this every bridge deposit raised
+        # TypeError and was stranded. A deterministic tx_id derived from the key makes a re-presented
+        # on-chain Transfer (restart catch-up) an exactly-once no-op.
+        _idem_tx_id = None
+        if idempotency_key:
+            _idem_tx_id = "idem-" + hashlib.sha256(
+                idempotency_key.encode("utf-8")
+            ).hexdigest()[:48]
         return await self.submit_transaction(
             tx_type=tx_type,
             amount=amount,
@@ -1679,6 +1702,7 @@ class DAGLedger(LedgerNodeServicesMixin):
             description=description,
             signature=signature,
             public_key=public_key,
+            _idempotent_tx_id=_idem_tx_id,
         )
     
     async def debit(
