@@ -590,29 +590,45 @@ class DAGLedger(LedgerNodeServicesMixin):
             await self._db.close()
             self._db = None
             
-    async def create_wallet(
-        self, 
-        wallet_id: str, 
+    async def _create_wallet_impl(
+        self,
+        wallet_id: str,
         display_name: str = "",
-        public_key: Optional[str] = None
+        public_key: Optional[str] = None,
     ) -> None:
-        """Create a new wallet with optional public key for signature verification."""
+        """sp1469 — create_wallet body WITHOUT the write lock, for callers that ALREADY hold it
+        (submit_transaction creates the from/to wallets while holding the lock; re-acquiring the
+        non-reentrant lock would deadlock). The public create_wallet wraps this in the lock."""
         await self._db.execute(
             "INSERT OR IGNORE INTO wallets (wallet_id, display_name, public_key, created_at) VALUES (?, ?, ?, ?)",
             (wallet_id, display_name, public_key, time.time()),
         )
         await self._db.commit()
-        
+
         if public_key:
             self._wallet_public_keys[wallet_id] = public_key
-            
+
+    async def create_wallet(
+        self,
+        wallet_id: str,
+        display_name: str = "",
+        public_key: Optional[str] = None
+    ) -> None:
+        """Create a new wallet with optional public key for signature verification."""
+        # sp1469 (audit wf_6ceaaeff) — hold the sp910 connection-wide write lock around the commit: an
+        # UNLOCKED commit here releases a concurrent submit_transaction's connection-global
+        # balance_check SAVEPOINT mid-debit (→ silent withdraw fund loss).
+        async with self._get_write_lock():
+            await self._create_wallet_impl(wallet_id, display_name, public_key)
+
     async def register_wallet_public_key(self, wallet_id: str, public_key: str) -> None:
         """Register or update the public key for an existing wallet."""
-        await self._db.execute(
-            "UPDATE wallets SET public_key = ? WHERE wallet_id = ?",
-            (public_key, wallet_id),
-        )
-        await self._db.commit()
+        async with self._get_write_lock():  # sp1469 — sp910 invariant (see create_wallet)
+            await self._db.execute(
+                "UPDATE wallets SET public_key = ? WHERE wallet_id = ?",
+                (public_key, wallet_id),
+            )
+            await self._db.commit()
         self._wallet_public_keys[wallet_id] = public_key
         
     def get_wallet_public_key(self, wallet_id: str) -> Optional[str]:
@@ -638,24 +654,26 @@ class DAGLedger(LedgerNodeServicesMixin):
                 f"eth_address must be 0x-prefixed; got {eth_address!r}"
             )
         addr_norm = eth_address.lower()
-        # Ensure wallet row exists; DAGLedger doesn't have
-        # _ensure_wallet symmetric to LocalLedger, so use INSERT OR
-        # IGNORE.
-        await self._db.execute(
-            "INSERT OR IGNORE INTO wallets "
-            "(wallet_id, display_name, created_at) "
-            "VALUES (?, '', ?)",
-            (wallet_id, time.time()),
-        )
-        await self._db.execute(
-            "UPDATE wallets SET eth_address = NULL WHERE eth_address = ?",
-            (addr_norm,),
-        )
-        await self._db.execute(
-            "UPDATE wallets SET eth_address = ? WHERE wallet_id = ?",
-            (addr_norm, wallet_id),
-        )
-        await self._db.commit()
+        # sp1469 — sp910 invariant: hold the write lock across these commits (see create_wallet).
+        async with self._get_write_lock():
+            # Ensure wallet row exists; DAGLedger doesn't have
+            # _ensure_wallet symmetric to LocalLedger, so use INSERT OR
+            # IGNORE.
+            await self._db.execute(
+                "INSERT OR IGNORE INTO wallets "
+                "(wallet_id, display_name, created_at) "
+                "VALUES (?, '', ?)",
+                (wallet_id, time.time()),
+            )
+            await self._db.execute(
+                "UPDATE wallets SET eth_address = NULL WHERE eth_address = ?",
+                (addr_norm,),
+            )
+            await self._db.execute(
+                "UPDATE wallets SET eth_address = ? WHERE wallet_id = ?",
+                (addr_norm, wallet_id),
+            )
+            await self._db.commit()
 
     async def wallet_for_eth_address(
         self, eth_address: str,
@@ -697,17 +715,18 @@ class DAGLedger(LedgerNodeServicesMixin):
     async def set_requires_user_signature(
         self, wallet_id: str, enabled: bool,
     ) -> None:
-        cursor = await self._db.execute(
-            "SELECT 1 FROM wallets WHERE wallet_id = ?", (wallet_id,),
-        )
-        if await cursor.fetchone() is None:
-            raise KeyError(f"unknown wallet {wallet_id!r}")
-        await self._db.execute(
-            "UPDATE wallets SET requires_user_signature = ? "
-            "WHERE wallet_id = ?",
-            (1 if enabled else 0, wallet_id),
-        )
-        await self._db.commit()
+        async with self._get_write_lock():  # sp1469 — sp910 invariant (see create_wallet)
+            cursor = await self._db.execute(
+                "SELECT 1 FROM wallets WHERE wallet_id = ?", (wallet_id,),
+            )
+            if await cursor.fetchone() is None:
+                raise KeyError(f"unknown wallet {wallet_id!r}")
+            await self._db.execute(
+                "UPDATE wallets SET requires_user_signature = ? "
+                "WHERE wallet_id = ?",
+                (1 if enabled else 0, wallet_id),
+            )
+            await self._db.commit()
 
     async def get_next_withdraw_nonce(
         self, wallet_id: str,
@@ -723,22 +742,23 @@ class DAGLedger(LedgerNodeServicesMixin):
     async def bump_withdraw_nonce(self, wallet_id: str) -> int:
         """Atomically consume the current nonce + advance. Returns
         the OLD value (the nonce the caller just used)."""
-        cursor = await self._db.execute(
-            "SELECT next_withdraw_nonce FROM wallets "
-            "WHERE wallet_id = ?",
-            (wallet_id,),
-        )
-        row = await cursor.fetchone()
-        if row is None:
-            raise KeyError(f"unknown wallet {wallet_id!r}")
-        old = int(row[0])
-        await self._db.execute(
-            "UPDATE wallets SET next_withdraw_nonce = ? "
-            "WHERE wallet_id = ?",
-            (old + 1, wallet_id),
-        )
-        await self._db.commit()
-        return old
+        async with self._get_write_lock():  # sp1469 — sp910 invariant (see create_wallet)
+            cursor = await self._db.execute(
+                "SELECT next_withdraw_nonce FROM wallets "
+                "WHERE wallet_id = ?",
+                (wallet_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise KeyError(f"unknown wallet {wallet_id!r}")
+            old = int(row[0])
+            await self._db.execute(
+                "UPDATE wallets SET next_withdraw_nonce = ? "
+                "WHERE wallet_id = ?",
+                (old + 1, wallet_id),
+            )
+            await self._db.commit()
+            return old
 
     async def get_balance(self, wallet_id: str) -> float:
         """Get the current balance for a wallet (non-atomic read)."""
@@ -1269,11 +1289,12 @@ class DAGLedger(LedgerNodeServicesMixin):
         await write_lock.acquire()
 
         try:
-            # Create wallets if they don't exist
+            # Create wallets if they don't exist. sp1469 — use the lock-free _impl: we already hold
+            # the write lock here, and create_wallet's public wrapper would deadlock re-acquiring it.
             if from_wallet and not await self.wallet_exists(from_wallet):
-                await self.create_wallet(from_wallet, f"wallet-{from_wallet[:8]}", public_key)
+                await self._create_wallet_impl(from_wallet, f"wallet-{from_wallet[:8]}", public_key)
             if not await self.wallet_exists(to_wallet):
-                await self.create_wallet(to_wallet, f"wallet-{to_wallet[:8]}")
+                await self._create_wallet_impl(to_wallet, f"wallet-{to_wallet[:8]}")
 
             # ATOMIC BALANCE CHECK - TOCTOU Prevention
             # Use atomic balance check with row-level locking for debit transactions

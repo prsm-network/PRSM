@@ -103,8 +103,11 @@ def test_submit_transaction_commits_explicitly():
     ).read_text()
     submit_idx = src.find("async def submit_transaction")
     assert submit_idx >= 0
-    # Find the post-credit commit by its sprint 489 marker.
-    body = src[submit_idx:submit_idx + 12000]
+    # Find the post-credit commit by its sprint 489 marker. Bound the search to the ACTUAL method
+    # (up to the next class-method def) rather than a fixed char window, so unrelated additions to
+    # submit_transaction (e.g. the sp1468 amount guard) don't push the marker out of range.
+    _end = src.find("\n    async def ", submit_idx + len("async def submit_transaction"))
+    body = src[submit_idx:_end if _end != -1 else len(src)]
     assert "Sprint 489 (F27 fix) — durability barrier" in body, (
         "F27 regression: sprint 489 durability-barrier "
         "commit marker missing from submit_transaction"
