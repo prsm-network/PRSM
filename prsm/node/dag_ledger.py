@@ -1502,8 +1502,11 @@ class DAGLedger(LedgerNodeServicesMixin):
             tx = self._state.transactions.get(tx_id)
             if tx:
                 tx.cumulative_weight += 1
-                
-                max_weight = max(t.cumulative_weight for t in self._state.transactions.values()) or 1
+
+                # sp1470 — removed a dead `max_weight = max(... all transactions ...)` scan here: it
+                # was computed but never read (confirmation_level derives from cumulative_weight, not
+                # max_weight), so every weight update did a discarded O(N)-over-all-transactions pass
+                # inside the money write lock (audit wf_6ceaaeff LOW).
                 tx.confirmation_level = min(1.0, tx.cumulative_weight / self.confirmation_threshold)
                 
                 await self._db.execute(
