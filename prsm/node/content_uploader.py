@@ -2502,13 +2502,12 @@ class ContentUploader:
         access_nonce = data.get("access_nonce") or (
             f"{content_id}:{accessor_id}:{data.get('timestamp', '')}"
         )
+        royalty_nonce = f"content_access:{origin}:{access_nonce}"
         try:
             # sp909 — key the claim on (origin, nonce) so a forged origin
             # replaying another node's nonce cannot pre-claim/grief, and
             # each (origin, event) credits at most once.
-            claimed = await self.ledger.record_nonce(
-                f"content_access:{origin}:{access_nonce}", origin,
-            )
+            claimed = await self.ledger.record_nonce(royalty_nonce, origin)
         except Exception:  # noqa: BLE001
             claimed = True
         if not claimed:
@@ -2553,7 +2552,15 @@ class ContentUploader:
                         self.uploaded_content[pcid].total_royalties += per_parent_share[pcid]
                     logger.info(f"Source royalty earned: {source_royalty:.4f} FTNS for derivative {content_id[:12]}...")
                 except Exception as e:
-                    logger.error(f"Source royalty credit failed: {e}")
+                    # sp1471 (sp1466 parity) — the (origin, nonce) claim was committed above, so a
+                    # credit failure would strand this royalty forever: every re-gossiped copy
+                    # short-circuits at `if not claimed: return`. RELEASE the nonce so a later gossip
+                    # copy can re-claim + retry (fail-safe: this credits our own income).
+                    logger.error(f"Source royalty credit failed (releasing nonce for retry): {e}")
+                    try:
+                        await self.ledger.release_nonce(royalty_nonce)
+                    except Exception as rel_exc:  # noqa: BLE001
+                        logger.warning(f"release_nonce after royalty credit failure failed: {rel_exc}")
 
                 # Wire gossip source royalty to platform FTNS
                 await self._platform_royalty_transfer(

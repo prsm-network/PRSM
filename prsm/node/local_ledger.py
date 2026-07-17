@@ -10,6 +10,7 @@ which is reconciled via gossip when connected to the network.
 import asyncio
 import hashlib
 import json
+import math
 import time
 import uuid
 from dataclasses import dataclass
@@ -522,8 +523,13 @@ class LocalLedger(LedgerNodeServicesMixin):
             try:
                 await self._insert_tx(tx)
             except aiosqlite.IntegrityError:
-                # Lost the race to a concurrent identical credit → already applied.
-                return tx
+                # sp1471 — ONLY a same-tx_id PRIMARY-KEY collision is the idempotent case (a concurrent
+                # identical credit already applied). Re-verify the row now exists; if it does NOT, this
+                # was a GENUINE violation (CHECK/FK/NOT NULL) that must surface — masking it as
+                # fake-success would let a caller record the event paid while the payee got nothing.
+                if await self.has_transaction(tx_id):
+                    return tx
+                raise
             return tx
         await self._insert_tx(tx)
         return tx
@@ -791,6 +797,17 @@ class LocalLedger(LedgerNodeServicesMixin):
     # ── Internal ─────────────────────────────────────────────────
 
     async def _insert_tx(self, tx: Transaction) -> None:
+        # sp1471 (audit wf_2bd224fd) — fail closed at the single money choke point that every method
+        # (credit/debit/transfer/agent_debit) inserts through. A non-finite amount slips past SQLite's
+        # CHECK(amount>0) — `inf > 0` is True, so an Infinity credit would be stored and get_balance's
+        # SUM would return inf = an unbounded, restart-surviving mint. Raise a clean ValueError here,
+        # before the INSERT, matching DAGLedger.submit_transaction's primitive guard (sp1468). (The
+        # CHECK also rejects <=0 at the DB, but surfacing it as ValueError beats an IntegrityError the
+        # idempotency branch could mask.)
+        if not math.isfinite(tx.amount) or tx.amount <= 0:
+            raise ValueError(
+                f"transaction amount must be finite and positive, got {tx.amount!r}"
+            )
         await self._db.execute(
             """INSERT INTO transactions
                (tx_id, tx_type, from_wallet, to_wallet, amount, description, timestamp, signature)
