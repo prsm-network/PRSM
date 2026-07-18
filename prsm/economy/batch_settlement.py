@@ -28,13 +28,15 @@ Settlement modes:
 """
 
 import asyncio
+import json
 import logging
 import time
 import uuid
-from collections import defaultdict
-from dataclasses import dataclass, field
+from collections import defaultdict, deque
+from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Tuple
+from pathlib import Path
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +89,7 @@ class BatchSettlementManager:
         flush_interval: float = 600.0,     # 10 minutes
         flush_threshold: float = 1.0,      # 1.0 FTNS
         max_queue_size: int = 1000,
+        persist_dir: Optional[str] = None,
     ):
         self._ftns_ledger = ftns_ledger
         self._node_id = node_id
@@ -95,6 +98,18 @@ class BatchSettlementManager:
         self.flush_interval = flush_interval
         self.flush_threshold = flush_threshold
         self.max_queue_size = max_queue_size
+
+        # sp1476 — durable state. Without this, a process restart (every deploy)
+        # silently dropped the queued + in-flight owed on-chain payouts, voiding
+        # the sp914/sp917/sp1475 re-queue safety net. persist_dir=None → in-memory
+        # only (tests / ephemeral). The flush path persists the queue-CLEAR before
+        # broadcasting so a crash favors a recoverable loss over an irreversible
+        # double-pay; a graceful stop()'s final flush + persist loses nothing.
+        self._persist_path: Optional[Path] = None
+        if persist_dir and persist_dir not in ("", ":memory:"):
+            d = Path(persist_dir)
+            d.mkdir(parents=True, exist_ok=True)
+            self._persist_path = d / "batch_settlement.json"
 
         # Transfer queue
         self._queue: List[PendingTransfer] = []
@@ -106,8 +121,13 @@ class BatchSettlementManager:
         # the next flush broadcasts it twice → double-pay.
         self._reconcile_lock = asyncio.Lock()
 
-        # Deduplication
+        # Deduplication. sp1476 — bounded (was an unbounded set that grew
+        # forever): a companion FIFO deque caps membership + makes it persistable.
+        # It must persist so a restart does not re-enqueue an already-settled
+        # tx_id → re-broadcast → double-pay.
         self._settled_ids: Set[str] = set()
+        self._settled_order: Deque[str] = deque()
+        self._max_settled_ids = 50000
 
         # Stats
         self._total_settled = 0
@@ -141,6 +161,65 @@ class BatchSettlementManager:
         # Background task
         self._flush_task: Optional[asyncio.Task] = None
         self._running = False
+
+        # sp1476 — restore any durably-persisted queue / in-flight / dedup so a
+        # restart resumes owed payouts instead of dropping them. Best-effort.
+        self._load()
+
+    # ── Deduplication (bounded) ────────────────────────────────
+
+    def _mark_settled(self, tx_id: str) -> None:
+        """Record a settled tx_id for dedup, FIFO-bounded (sp1476)."""
+        if not tx_id or tx_id in self._settled_ids:
+            return
+        self._settled_ids.add(tx_id)
+        self._settled_order.append(tx_id)
+        while len(self._settled_order) > self._max_settled_ids:
+            old = self._settled_order.popleft()
+            self._settled_ids.discard(old)
+
+    # ── Durable persistence (sp1476) ───────────────────────────
+
+    def _persist(self) -> None:
+        """Atomically write the queue + in-flight + dedup + dead-letter so a
+        restart can resume. No-op when persist_dir was not configured."""
+        if self._persist_path is None:
+            return
+        try:
+            snapshot = {
+                "queue": [asdict(p) for p in self._queue],
+                "in_flight": self._in_flight,
+                "settled_ids": list(self._settled_order),
+                "dead_letter": self._dead_letter,
+            }
+            tmp = self._persist_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(snapshot))
+            tmp.replace(self._persist_path)   # atomic
+        except (OSError, TypeError) as exc:
+            logger.warning("BatchSettlement: persist failed (%s)", exc)
+
+    def _load(self) -> None:
+        if self._persist_path is None or not self._persist_path.exists():
+            return
+        try:
+            raw = json.loads(self._persist_path.read_text())
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "BatchSettlement: load failed (%s); starting empty", exc)
+            return
+        for d in raw.get("queue", []):
+            try:
+                self._queue.append(PendingTransfer(**d))
+            except (TypeError, KeyError):
+                continue
+        self._in_flight = [e for e in raw.get("in_flight", []) if isinstance(e, dict)]
+        for tx_id in raw.get("settled_ids", []):
+            self._mark_settled(tx_id)
+        self._dead_letter = [e for e in raw.get("dead_letter", []) if isinstance(e, dict)]
+        if self._queue or self._in_flight:
+            logger.info(
+                "BatchSettlement: restored %d queued + %d in-flight owed payout(s) "
+                "from %s", len(self._queue), len(self._in_flight), self._persist_path)
 
     # ── Lifecycle ──────────────────────────────────────────────
 
@@ -219,7 +298,8 @@ class BatchSettlementManager:
 
         async with self._lock:
             self._queue.append(pending)
-            self._settled_ids.add(tx_id)
+            self._mark_settled(tx_id)
+            self._persist()   # sp1476 — durable before we report success
 
         logger.debug(
             f"BatchSettlement: queued {amount:.6f} FTNS → {target_address[:12]}… "
@@ -264,6 +344,12 @@ class BatchSettlementManager:
 
             pending = list(self._queue)
             self._queue.clear()
+            # sp1476 — persist the CLEAR before broadcasting. If we crash mid-
+            # flush, the persisted queue is already empty so these transfers are
+            # NOT re-broadcast (double-pay); a broadcast one is captured in
+            # _in_flight (persisted per-transfer below), a never-broadcast one is
+            # re-queued + persisted at the end. Crash favors recoverable loss.
+            self._persist()
 
         result.settled_count = len(pending)
         result.total_amount = sum(p.amount for p in pending)
@@ -288,21 +374,33 @@ class BatchSettlementManager:
         # NOT be re-queued — it is in the mempool and a retry would DOUBLE-PAY.
         # A reverted ("rejected") transfer is a deterministic on-chain failure;
         # re-queuing would loop, so it is surfaced as an error instead.
-        requeue: List[PendingTransfer] = []
+        requeued = 0
 
-        def _mark_requeue(from_addr: str, to_addr: str, net_amount: float) -> None:
-            requeue.append(PendingTransfer(
-                tx_id=f"requeue-{uuid.uuid4().hex[:12]}",
-                from_wallet=from_addr,
-                to_wallet=to_addr,
-                amount=net_amount,
-                # sp930 — uuid, not int(time.time()): a whole-second job_id
-                # collides for two transfers in the same flush second and the
-                # on-chain audit table (job_id PK, INSERT OR REPLACE) silently
-                # overwrites the first row.
-                job_id=f"requeue-{uuid.uuid4().hex[:12]}",
-                description="re-queued: on-chain transfer never broadcast (sp914)",
-            ))
+        async def _mark_requeue(from_addr: str, to_addr: str, net_amount: float) -> None:
+            # sp1476 — persist each never-broadcast / reverted / raised re-queue
+            # IMMEDIATELY (append to the DURABLE self._queue + persist), not into a
+            # loop-local list flushed only after the whole broadcast loop: a crash
+            # mid-loop would otherwise silently, permanently lose the owed payout
+            # (it would be in neither the restored queue nor in-flight). These
+            # branches moved NO tokens (transfer() returned None, or an atomic
+            # ERC-20 revert), so an incremental durable re-queue carries ZERO
+            # double-pay risk.
+            nonlocal requeued
+            async with self._lock:
+                self._queue.append(PendingTransfer(
+                    tx_id=f"requeue-{uuid.uuid4().hex[:12]}",
+                    from_wallet=from_addr,
+                    to_wallet=to_addr,
+                    amount=net_amount,
+                    # sp930 — uuid, not int(time.time()): a whole-second job_id
+                    # collides for two transfers in the same flush second and the
+                    # on-chain audit table (job_id PK, INSERT OR REPLACE) silently
+                    # overwrites the first row.
+                    job_id=f"requeue-{uuid.uuid4().hex[:12]}",
+                    description="re-queued: on-chain transfer never broadcast (sp914)",
+                ))
+                self._persist()
+            requeued += 1
 
         for (from_addr, to_addr), net_amount in net_amounts.items():
             if net_amount <= 0:
@@ -318,7 +416,7 @@ class BatchSettlementManager:
                 # treat as never-sent and re-queue for a safe retry.
                 result.errors.append(f"{to_addr[:12]}: {e} (re-queued)")
                 logger.error(f"BatchSettlement: transfer to {to_addr[:12]}… raised: {e}")
-                _mark_requeue(from_addr, to_addr, net_amount)
+                await _mark_requeue(from_addr, to_addr, net_amount)
                 continue
 
             status = getattr(tx_record, "status", None) if tx_record else None
@@ -341,6 +439,8 @@ class BatchSettlementManager:
                     from_addr, to_addr, net_amount, tx_record.tx_hash,
                     nonce=getattr(tx_record, "nonce", None),
                 )
+                self._persist()   # sp1476 — durable in-flight (with tx_hash) so a
+                #                    crash does NOT re-broadcast this landed payout
                 result.errors.append(
                     f"Pending (unconfirmed, not re-queued): {net_amount:.6f} → "
                     f"{to_addr[:12]} tx={(tx_record.tx_hash or '')[:16]}"
@@ -365,7 +465,7 @@ class BatchSettlementManager:
                         f"Rejected (reverted on-chain, re-queued {n}/"
                         f"{self._max_reject_retries}): {net_amount:.6f} → {to_addr[:12]}"
                     )
-                    _mark_requeue(from_addr, to_addr, net_amount)
+                    await _mark_requeue(from_addr, to_addr, net_amount)
                 else:
                     self._dead_letter.append({
                         "to_addr": to_addr, "amount": net_amount,
@@ -386,17 +486,19 @@ class BatchSettlementManager:
                 result.errors.append(
                     f"Never broadcast (re-queued): {net_amount:.6f} → {to_addr[:12]}"
                 )
-                _mark_requeue(from_addr, to_addr, net_amount)
+                await _mark_requeue(from_addr, to_addr, net_amount)
 
-        # Re-queue never-broadcast transfers under the lock so the next flush
-        # retries them (the owed payout is preserved, not dropped).
-        if requeue:
-            async with self._lock:
-                self._queue.extend(requeue)
+        # sp1476 — each never-broadcast / reverted re-queue was already appended
+        # to the durable queue + persisted INCREMENTALLY inside the loop (see
+        # _mark_requeue), so a crash mid-loop can no longer lose it. A final
+        # persist captures the remaining state changes (dead-letters, cleared
+        # reject-retry counts, confirmed drops).
+        if requeued:
             logger.warning(
-                f"BatchSettlement: re-queued {len(requeue)} never-broadcast "
+                f"BatchSettlement: re-queued {requeued} never-broadcast "
                 f"transfer(s) for retry"
             )
+        self._persist()
 
         result.duration_seconds = time.time() - start
         self._last_flush_at = time.time()
@@ -584,10 +686,15 @@ class BatchSettlementManager:
         if requeue:
             async with self._lock:
                 self._queue.extend(requeue)
+                self._persist()   # sp1476 — durable requeue + updated in-flight
             logger.warning(
                 "BatchSettlement reconcile: re-queued %d reverted settlement "
                 "transfer(s) for retry", len(requeue),
             )
+        else:
+            # sp1476 — persist the resolved in-flight set (confirmed dropped,
+            # survivors kept) even when nothing was re-queued.
+            self._persist()
         return {"confirmed": confirmed, "reverted": reverted,
                 "still_pending": still_pending, "abandoned": abandoned,
                 "requeued_dead": requeued_dead}

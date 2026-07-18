@@ -4551,6 +4551,15 @@ class PRSMNode:
 
         # ── Batch Settlement (gas-efficient on-chain broadcasting) ──
         from prsm.economy.batch_settlement import BatchSettlementManager, SettlementMode
+        # sp1476 — durable so a restart (every deploy) resumes owed on-chain
+        # payouts instead of dropping the queue + in-flight tracker. Mirrors the
+        # PendingWithdrawStore wiring; override dir via PRSM_BATCH_SETTLEMENT_DIR
+        # ("" / ":memory:" → in-memory only).
+        _bs_dir = os.environ.get("PRSM_BATCH_SETTLEMENT_DIR")
+        if _bs_dir in ("", ":memory:"):
+            _bs_dir = None
+        elif _bs_dir is None:
+            _bs_dir = str(Path.home() / ".prsm")
         self._batch_settlement = BatchSettlementManager(
             ftns_ledger=self.ftns_ledger,
             node_id=self.identity.node_id,
@@ -4562,6 +4571,7 @@ class PRSMNode:
             mode=SettlementMode.PERIODIC,
             flush_interval=600.0,     # 10 minutes
             flush_threshold=1.0,      # or when pending ≥ 1.0 FTNS
+            persist_dir=_bs_dir,
         )
         
         # ── On-chain cross-node settlement client (sprint 1036, opt-in) ──
