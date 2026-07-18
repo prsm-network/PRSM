@@ -863,9 +863,13 @@ class LocalLedger(LedgerNodeServicesMixin):
         if await cursor.fetchone() is not None:
             raise ValueError(f"Wallet {wallet_id} already received a welcome grant")
 
+        # sp1479 — deterministic idempotency key → exactly-once per wallet even
+        # under a concurrent grant or a seed-path re-entry after restart (the
+        # second credit collides on the derived tx_id and no-ops).
         return await self.credit(
             wallet_id=wallet_id,
             amount=amount,
             tx_type=TransactionType.WELCOME_GRANT,
+            idempotency_key=f"welcome-grant:{wallet_id}",
             description=f"Welcome grant of {amount} FTNS for new node",
         )

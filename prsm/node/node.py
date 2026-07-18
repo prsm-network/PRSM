@@ -7308,17 +7308,30 @@ class PRSMNode:
             # ── Step 2: Check balance and grant if needed ──
             balance = await self.ledger.get_balance(self.identity.node_id)
             if balance <= 0:
-                await self.ledger.credit(
-                    wallet_id=self.identity.node_id,
-                    amount=100.0,
-                    tx_type=TransactionType.WELCOME_GRANT,
-                    description="Welcome grant for new node",
-                )
-                # Also prime wallet_balances for the fresh grant
-                if hasattr(self.ledger, "_db"):
-                    # Ensure wallet exists first
-                    if not await self.ledger.wallet_exists(self.identity.node_id):
-                        await self.ledger.create_wallet(self.identity.node_id, "node")
+                # sp1479 — route the grant through issue_welcome_grant's
+                # once-only guard instead of a raw credit. The raw credit here
+                # bypassed the "one welcome grant per wallet, ever" invariant, so
+                # a node that was granted then drained to a <= 0 balance would be
+                # re-granted ANOTHER 100 FTNS on every restart (a self-mint on the
+                # operator's own per-node ledger). issue_welcome_grant refuses
+                # (ValueError) if a grant already exists and is idempotent besides.
+                if hasattr(self.ledger, "_db") and not await self.ledger.wallet_exists(
+                    self.identity.node_id
+                ):
+                    await self.ledger.create_wallet(self.identity.node_id, "node")
+                granted = False
+                try:
+                    await self.ledger.issue_welcome_grant(
+                        self.identity.node_id, 100.0,
+                    )
+                    granted = True
+                except ValueError:
+                    logger.debug(
+                        "welcome grant already issued for %s; not re-granting",
+                        self.identity.node_id[:12],
+                    )
+                # Prime wallet_balances for the fresh grant (only when granted).
+                if granted and hasattr(self.ledger, "_db"):
                     await self.ledger._db.execute(
                         """INSERT INTO wallet_balances (wallet_id, balance, version, last_updated)
                            VALUES (?, ?, 1, ?)
@@ -7328,7 +7341,9 @@ class PRSMNode:
                     await self.ledger._db.commit()
                     if hasattr(self.ledger, "_balance_version_cache"):
                         self.ledger._balance_version_cache[self.identity.node_id] = 1
-                logger.info(f"Seeded welcome grant: 100 FTNS to {self.identity.node_id[:12]}...")
+                    logger.info(
+                        f"Seeded welcome grant: 100 FTNS to {self.identity.node_id[:12]}..."
+                    )
             else:
                 logger.debug(f"Node already has balance: {balance:.6f}")
         except Exception as e:

@@ -1776,10 +1776,16 @@ class DAGLedger(LedgerNodeServicesMixin):
         if await cursor.fetchone() is not None:
             raise ValueError(f"Wallet {wallet_id} already received a welcome grant")
 
+        # sp1479 — a deterministic idempotency key makes the welcome grant
+        # exactly-once per wallet even if the SELECT-then-credit check above
+        # races a concurrent grant, or the seed path re-enters after a restart:
+        # the second credit collides on the derived tx_id and no-ops instead of
+        # minting a second 100 FTNS ("one welcome grant per wallet, ever").
         return await self.credit(
             wallet_id=wallet_id,
             amount=amount,
             tx_type=TransactionType.WELCOME_GRANT,
+            idempotency_key=f"welcome-grant:{wallet_id}",
             description=f"Welcome grant of {amount} FTNS",
         )
     
