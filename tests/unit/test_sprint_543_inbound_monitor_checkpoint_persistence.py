@@ -36,6 +36,13 @@ import pytest
 # ── pin tests ──────────────────────────────────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _legacy_confirmations(monkeypatch):
+    # sp1478 — assert checkpoint mechanics against the chain TIP (legacy
+    # tip-credit mode; the reorg-confirmation gate is covered by test_sprint_1478).
+    monkeypatch.setenv("PRSM_DEPOSIT_CONFIRMATIONS", "0")
+
+
 def test_checkpoint_store_empty_returns_none(tmp_path):
     """Brand-new store: get returns None for any address."""
     from prsm.economy.ftns_onchain import InboundCheckpointStore

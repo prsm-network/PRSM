@@ -31,6 +31,13 @@ suspenders depend on).
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _legacy_confirmations(monkeypatch):
+    # sp1478 — assert checkpoint failure semantics against the chain TIP (legacy
+    # tip-credit mode; the reorg-confirmation gate is covered by test_sprint_1478).
+    monkeypatch.setenv("PRSM_DEPOSIT_CONFIRMATIONS", "0")
+
+
 class _StubW3:
     def __init__(self, block_number):
         self.eth = _StubEth(block_number)

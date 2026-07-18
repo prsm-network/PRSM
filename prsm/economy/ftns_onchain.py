@@ -601,7 +601,8 @@ class InboundMonitor:
                  webhook_url=None, webhook_secret=None,
                  local_ledger=None,
                  checkpoint_store: Optional["InboundCheckpointStore"] = None,
-                 max_catchup_blocks: int = 100_000):
+                 max_catchup_blocks: int = 100_000,
+                 confirmations: Optional[int] = None):
         self.ledger = ledger
         self.interval_seconds = interval_seconds
         self._webhook_deliverer = webhook_deliverer
@@ -626,6 +627,27 @@ class InboundMonitor:
         self._checkpoint_store = checkpoint_store
         self._max_catchup_blocks = max_catchup_blocks
         self._last_scanned_block: Optional[int] = None
+        # sp1478 — confirmation depth before crediting a deposit. The scan used
+        # to credit at the chain TIP (scan_to = current_block); a Transfer in a
+        # block that later reorgs OUT would then leave an UNBACKED off-chain
+        # credit (the mint/counterfeit direction) with no reversal path, and the
+        # checkpoint would have advanced past it so it is never re-examined. Now
+        # only Transfers >= _confirmations blocks deep are credited (scan_to =
+        # current_block - _confirmations); blocks in the confirmation window are
+        # re-scanned next tick (idempotent under the sp1472/1473 dedup), so a
+        # shallow sequencer reorg can no longer produce an unbacked credit. Base
+        # is a single-sequencer OP-stack (reorgs rare + shallow) → a small
+        # default; env-tunable up. 0 preserves the legacy tip-credit behavior.
+        # An explicit ``confirmations`` arg (wins) is used by tests that assert
+        # exact checkpoint mechanics; otherwise resolve from the env.
+        if confirmations is not None:
+            self._confirmations = max(0, int(confirmations))
+        else:
+            try:
+                self._confirmations = max(
+                    0, int(os.environ.get("PRSM_DEPOSIT_CONFIRMATIONS", "5") or 5))
+            except (TypeError, ValueError):
+                self._confirmations = 5
 
     async def _fire_webhook(self, transfer: dict) -> None:
         if (
@@ -696,14 +718,21 @@ class InboundMonitor:
                     addr, current_block,
                 )
             return
-        if current_block <= self._last_scanned_block:
+        # sp1478 — only scan/credit up to the CONFIRMED tip (current_block minus
+        # the confirmation depth), never the raw chain tip, so a Transfer that
+        # later reorgs out cannot leave an unbacked off-chain credit. Blocks in
+        # the confirmation window are picked up on a later tick once they are
+        # deep enough. The checkpoint advances only to what was actually scanned.
+        confirmed_tip = current_block - self._confirmations
+        if confirmed_tip <= self._last_scanned_block:
+            # Nothing sufficiently-confirmed to scan yet.
             return
         # Sprint 543: clamp the catch-up window so a very-stale
         # checkpoint doesn't trigger an unbounded scan on restart.
         # Sprint 542's chunker further splits the (still-large)
         # window into RPC-sized sub-windows.
         scan_from = self._last_scanned_block + 1
-        scan_to = current_block
+        scan_to = confirmed_tip
         if scan_to - scan_from + 1 > self._max_catchup_blocks:
             clamped_from = scan_to - self._max_catchup_blocks + 1
             logger.warning(
@@ -766,7 +795,10 @@ class InboundMonitor:
                     "inbound-monitor webhook prep "
                     "raised (non-fatal): %s", exc,
                 )
-        self._last_scanned_block = current_block
+        # sp1478 — advance only to the CONFIRMED tip we actually scanned, NOT
+        # the raw chain tip: blocks in (scan_to, current_block] are not yet
+        # confirmation-deep and must be re-scanned on a later tick.
+        self._last_scanned_block = scan_to
         # Sprint 543: persist after every tick that scanned anything.
         # If the daemon crashes mid-tick the deposit-side dedup
         # (sprint 540 _credited_tx_hashes + sprint 501 onchain_tx.db
@@ -775,7 +807,7 @@ class InboundMonitor:
         if self._checkpoint_store is not None:
             try:
                 self._checkpoint_store.set_last_scanned_block(
-                    addr, current_block,
+                    addr, scan_to,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(

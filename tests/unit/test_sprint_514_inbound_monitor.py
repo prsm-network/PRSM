@@ -29,6 +29,14 @@ from prsm.economy.ftns_onchain import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _legacy_confirmations(monkeypatch):
+    # sp1478 — these tests assert exact checkpoint mechanics against the chain
+    # TIP; run them in legacy tip-credit mode (confirmation gate disabled). The
+    # reorg-confirmation-depth behavior is covered by test_sprint_1478.
+    monkeypatch.setenv("PRSM_DEPOSIT_CONFIRMATIONS", "0")
+
+
 def _build_ledger():
     led = OnChainFTNSLedger(
         node_id="t", wallet_private_key=None,
