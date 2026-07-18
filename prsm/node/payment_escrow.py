@@ -16,6 +16,7 @@ verified results.
 
 import asyncio
 import logging
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -158,6 +159,30 @@ class PaymentEscrow:
         Returns the escrow entry, or None if insufficient balance.
         """
         requester = requester_id or self.node_id
+        # sp1477 — enforce ONE live escrow per job_id, under the same sp907
+        # per-job lock that release/refund/split hold. create_escrow does not
+        # dedup by job_id, and every release/refund/split locates its escrow by
+        # the FIRST-PENDING match; so a duplicate create (an idempotency retry
+        # whose response was lost) would fund a SECOND escrow-<uuid> wallet that
+        # a later release could pay out separately — a requester-side loss
+        # (conservation holds, but the requester pays twice for one job). The
+        # pre-check + lock make a same-job_id re-create return the existing live
+        # escrow instead of locking a second hold. Held across the balance check
+        # + transfer, so it also serializes concurrent same-job creates.
+        async with self._job_lock(job_id):
+            for e in self._escrows.values():
+                if e.job_id == job_id and e.status == EscrowStatus.PENDING:
+                    logger.warning(
+                        "create_escrow: job %s already has a live PENDING escrow "
+                        "%s; returning it (no second hold locked)",
+                        job_id[:8], e.escrow_id[:8],
+                    )
+                    return e
+            return await self._create_escrow_locked(job_id, amount, requester)
+
+    async def _create_escrow_locked(
+        self, job_id: str, amount: float, requester: str,
+    ) -> Optional[EscrowEntry]:
         balance = await self.ledger.get_balance(requester)
 
         if balance < amount:
@@ -263,6 +288,23 @@ class PaymentEscrow:
           - No escrow at all for this job_id: returns None (preserves legacy
             'not found' behavior for backwards compat with existing callers).
         """
+        # sp1477 — validate partial_amount sign/finiteness (the split path
+        # already does this at _release_escrow_split_locked). Without it a
+        # negative value bypasses the `escrow_balance < amount` guard below
+        # (100 < -X is False) and, on the non-default LocalLedger backend, a
+        # reverse transfer would raise the escrow balance + debit the provider
+        # + over-refund the requester; NaN poisons every comparison. No
+        # production caller passes partial_amount today (DAG default guards it
+        # at the primitive) — this makes the module self-defend regardless of
+        # backend/caller.
+        if partial_amount is not None and (
+            not math.isfinite(partial_amount) or partial_amount <= 0
+        ):
+            raise ValueError(
+                f"partial_amount must be a positive finite number, "
+                f"got {partial_amount!r}"
+            )
+
         escrow_any = None
         escrow = None
         for e in self._escrows.values():
