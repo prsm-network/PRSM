@@ -16704,6 +16704,193 @@ def node_claim_emissions_cli(
           f"{claimable.epoch_id}\n   to : {account}\n   tx : {tx_hash}", 0)
 
 
+@node.command("publish-epoch")
+@click.option("--pool-address", default=None,
+              help="OperatorRewardPool address. Defaults to $PRSM_REWARD_POOL_ADDRESS.")
+@click.option("--registry-address", default=None,
+              help="BatchSettlementRegistry address. Defaults to "
+                   "$PRSM_BATCH_REGISTRY_ADDRESS.")
+@click.option("--watermark", "watermark_path", default=None,
+              help="Durable consumed-batch watermark. Defaults to "
+                   "$PRSM_EPOCH_WATERMARK or ~/.prsm/epoch_watermark.json.")
+@click.option("--manifest-dir", default=None,
+              help="Where epoch manifests are written. Defaults to "
+                   "$PRSM_EPOCH_MANIFEST_DIR or ~/.prsm/epochs.")
+@click.option("--from-block", type=int, default=0,
+              help="First block to scan for BatchFinalized events.")
+@click.option("--confirmations", type=int, default=12,
+              help="Reorg depth. Blocks nearer the head than this are never paid "
+                   "against (default 12).")
+@click.option("--pot", "pot_ftns", type=float, default=None,
+              help="FTNS to distribute. Defaults to the pool's entire UNRESERVED "
+                   "balance.")
+@click.option("--network", default=None, help="Network name (default: resolved).")
+@click.option("--execute", is_flag=True,
+              help="Actually publish. Without this the command only plans "
+                   "(publishing is irreversible).")
+@click.option("--format", "output_format",
+              type=click.Choice(["text", "json"]), default="text")
+def node_publish_epoch_cli(
+    pool_address: Optional[str],
+    registry_address: Optional[str],
+    watermark_path: Optional[str],
+    manifest_dir: Optional[str],
+    from_block: int,
+    confirmations: int,
+    pot_ftns: Optional[float],
+    network: Optional[str],
+    execute: bool,
+    output_format: str,
+) -> None:
+    """Sprint 1487 — publish an emission epoch (operator/foundation side).
+
+    Reads settled work from BatchSettlementRegistry.BatchFinalized, splits the
+    pool's unreserved balance across the providers who earned it, publishes the
+    Merkle root, and writes the manifest earners claim against with
+    `prsm node claim-emissions`.
+
+    Requires the rootPublisher key in FTNS_WALLET_PRIVATE_KEY. That key can publish
+    roots but cannot move funds — the pool separates owner from publisher.
+
+    PLANS BY DEFAULT. An epoch id can never be rewritten once published, so
+    --execute is required to broadcast.
+
+    THE WATERMARK IS THE SAFETY-CRITICAL FILE. It records which batches earlier
+    epochs already paid. Lose it and this command refuses to run rather than
+    re-attribute the entire settled history — back it up alongside the publisher
+    key, and keep both on the same host as this job.
+
+    Exit codes:
+      0 — published (or, without --execute, a valid plan was produced)
+      1 — nothing to pay right now
+      2 — misconfigured
+      3 — REFUSED for a safety reason (lost watermark, unreconciled epoch, pot
+          exceeding the unreserved balance)
+    """
+    import json as _json
+    import os as _os
+    from pathlib import Path as _Path
+
+    def _emit(payload: dict, text: str, code: int) -> None:
+        if output_format == "json":
+            click.echo(_json.dumps(payload, indent=2))
+        else:
+            click.echo(text)
+        raise SystemExit(code)
+
+    pool_address = pool_address or _os.environ.get("PRSM_REWARD_POOL_ADDRESS", "").strip()
+    registry_address = registry_address or _os.environ.get(
+        "PRSM_BATCH_REGISTRY_ADDRESS", "").strip()
+    if not pool_address:
+        _emit({"error": "no_pool_address"},
+              "❌ No OperatorRewardPool address. Pass --pool-address or set "
+              "PRSM_REWARD_POOL_ADDRESS.", 2)
+    if not registry_address:
+        _emit({"error": "no_registry_address"},
+              "❌ No BatchSettlementRegistry address. Pass --registry-address or "
+              "set PRSM_BATCH_REGISTRY_ADDRESS.", 2)
+
+    wm_path = _Path(watermark_path or _os.environ.get("PRSM_EPOCH_WATERMARK")
+                    or (_Path.home() / ".prsm" / "epoch_watermark.json"))
+    man_dir = _Path(manifest_dir or _os.environ.get("PRSM_EPOCH_MANIFEST_DIR")
+                    or (_Path.home() / ".prsm" / "epochs"))
+
+    private_key = (_os.environ.get("FTNS_WALLET_PRIVATE_KEY") or "").strip()
+    if execute and not private_key:
+        _emit({"error": "no_key"},
+              "❌ Publishing needs the rootPublisher key in "
+              "FTNS_WALLET_PRIVATE_KEY (or drop --execute to just plan).", 2)
+
+    try:
+        from prsm.config.networks import resolve_endpoints
+        _ep = resolve_endpoints(network)
+        rpc_url, chain_id = _ep.rpc_url, _ep.chain_id
+    except Exception as exc:  # noqa: BLE001
+        _emit({"error": "network_unresolved", "detail": str(exc)},
+              f"❌ Could not resolve network endpoints: {exc}", 2)
+
+    from prsm.economy.web3.operator_reward_pool_client import OperatorRewardPoolClient
+    from prsm.settlement.epoch_runner import EpochRunAborted, run_epoch
+    from prsm.settlement.epoch_watermark import (
+        EpochWatermarkStore, WatermarkIntegrityError,
+    )
+
+    try:
+        watermark = EpochWatermarkStore(wm_path).load()
+    except WatermarkIntegrityError as exc:
+        _emit({"error": "watermark_unusable", "detail": str(exc)},
+              f"🚨 REFUSING — {exc}", 3)
+
+    try:
+        pool = OperatorRewardPoolClient(
+            rpc_url=rpc_url, pool_address=pool_address,
+            private_key=private_key or None, expected_chain_id=chain_id)
+        from prsm.economy.web3.batch_settlement_contract_client import (
+            Web3SettlementContractClient,
+        )
+        registry = Web3SettlementContractClient(
+            rpc_url=rpc_url, contract_address=registry_address)
+    except Exception as exc:  # noqa: BLE001
+        _emit({"error": "client_init_failed", "detail": str(exc)},
+              f"❌ Could not connect: {exc}", 2)
+
+    try:
+        batches = registry.scan_finalized_batches(
+            from_block=from_block, confirmations=confirmations)
+    except Exception as exc:  # noqa: BLE001
+        _emit({"error": "scan_failed", "detail": str(exc)},
+              f"❌ Could not scan finalized batches: {exc}", 2)
+
+    pot_wei = None if pot_ftns is None else int(pot_ftns * 10**18)
+    try:
+        result = run_epoch(
+            chain=pool, watermark=watermark, batches=batches, pot_wei=pot_wei,
+            manifest_dir=man_dir, dry_run=not execute)
+    except EpochRunAborted as exc:
+        # Safety refusals. Every one of these leaves batches UNCONSUMED, so the
+        # next successful run pays them — late, not lost.
+        _emit({"error": "refused", "detail": str(exc)}, f"🚨 REFUSED — {exc}", 3)
+    except ValueError as exc:
+        _emit({"error": "nothing_to_pay", "detail": str(exc)},
+              f"Nothing to publish: {exc}", 1)
+    except Exception as exc:  # noqa: BLE001
+        _emit({"error": "run_failed", "detail": str(exc)},
+              f"❌ Epoch run failed: {exc}", 2)
+
+    payload = {
+        "epoch_id": result.epoch_id, "published": result.published,
+        "dry_run": result.dry_run, "tx_hash": result.tx_hash,
+        "merkle_root": result.merkle_root,
+        "total_amount_wei": str(result.total_amount_wei),
+        "total_amount_ftns": result.total_amount_wei / 10**18,
+        "recipients": result.recipients,
+        "consumed_batches": result.consumed_batches,
+        "recovered_from_chain": result.recovered_from_chain,
+        "manifest_path": result.manifest_path,
+        "watermark": str(wm_path), "notes": result.notes,
+    }
+    head = ("✅ Published" if result.published else "📋 PLAN (nothing published)")
+    text = (
+        f"{head} — epoch {result.epoch_id}\n"
+        f"   root       : {result.merkle_root}\n"
+        f"   total      : {result.total_amount_wei / 10**18:.6f} FTNS\n"
+        f"   recipients : {result.recipients}\n"
+        f"   batches    : {result.consumed_batches} newly consumed\n"
+        f"   watermark  : {wm_path}\n"
+    )
+    if result.recovered_from_chain:
+        text += "   ⚠️  recovered a previously-published epoch from chain\n"
+    if result.tx_hash:
+        text += f"   tx         : {result.tx_hash}\n"
+    if result.manifest_path:
+        text += (f"   manifest   : {result.manifest_path}\n"
+                 "   Publish this manifest where earners can read it — they claim\n"
+                 "   with `prsm node claim-emissions --manifest <path|url>`.\n")
+    if not result.published:
+        text += "   Re-run with --execute to publish. This cannot be undone.\n"
+    _emit(payload, text, 0)
+
+
 # The /admin/incident/* REST surface (sprint <pre-roadmap>) +
 # `prsm_incident` MCP tool exist; the CLI lane was the gap per
 # PRSM_Testing.md §13 "Operator-trifecta gaps". This block adds
