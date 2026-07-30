@@ -696,6 +696,23 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1487_epoch_runner.py",
         kills_test_id="test_LOST_watermark_is_refused_not_treated_as_a_cold_start",
     ),
+    Guard(
+        id="finalized-batch-scan-confirmation-depth",
+        sprint="sp1487",
+        file="prsm/economy/web3/batch_settlement_contract_client.py",
+        anchor="safe_head = head - int(confirmations)",
+        protects="the emission pot being spent on work a reorg un-finalized. "
+                 "scan_finalized_batches feeds the epoch job, whose output is a published Merkle "
+                 "root that CANNOT be rewritten — so unlike a revocable credit, a payment made "
+                 "against a BatchFinalized log at the chain head is unrecoverable if that log "
+                 "disappears. This clamps to_block to head - confirmations, and clamps it even when "
+                 "a caller passes an explicit to_block, so no caller can opt out of the depth. Same "
+                 "gate and same reasoning as sp1478 on bridge deposit credits: waiting pays LATE, "
+                 "while an unbacked payment is permanent. Remove it (or honour to_block verbatim) "
+                 "and the job pays for batches the chain may still drop",
+        killed_by="tests/unit/test_sprint_1487_finalized_batch_scan.py",
+        kills_test_id="test_scan_STOPS_at_the_confirmation_depth",
+    ),
 ]
 
 

@@ -139,6 +139,19 @@ BATCH_SETTLEMENT_REGISTRY_ABI = [
         ],
     },
     {
+        # sp1487 — BatchFinalized is the emission epoch job's input. finalValueFTNS is
+        # already net of successfully-challenged value, so it is the settled truth of
+        # what the provider actually delivered — the correct weight to pay against.
+        "type": "event", "name": "BatchFinalized", "anonymous": False,
+        "inputs": [
+            {"name": "batchId", "type": "bytes32", "indexed": True},
+            {"name": "provider", "type": "address", "indexed": True},
+            {"name": "finalValueFTNS", "type": "uint256", "indexed": False},
+            {"name": "invalidatedValueFTNS", "type": "uint256", "indexed": False},
+            {"name": "finalizeTimestamp", "type": "uint64", "indexed": False},
+        ],
+    },
+    {
         # sp1381 — ReceiptChallenged: batchId is indexed (NOT provider), so operator visibility
         # cross-references the operator's own BatchCommitted batchIds against these.
         "type": "event", "name": "ReceiptChallenged", "anonymous": False,
@@ -514,6 +527,74 @@ class Web3SettlementContractClient:
                 cid=None,
             ))
         return observed
+
+    def scan_finalized_batches(
+        self,
+        from_block: int,
+        to_block: Optional[int] = None,
+        provider: Optional[str] = None,
+        confirmations: int = 12,
+    ) -> "list":
+        """sp1487 — the emission epoch job's input: settled work, reorg-safe.
+
+        Returns ``FinalizedBatch`` records over [from_block, to_block], scanned in
+        the same bounded windows as the BatchCommitted enumeration so a wide range
+        does not trip an RPC's log limit.
+
+        CONFIRMATION DEPTH IS NOT OPTIONAL HERE. Paying against a BatchFinalized log
+        at the chain head means paying for work that a reorg can un-finalize — and
+        the payment is a published Merkle root that CANNOT be rewritten, so the pot
+        is spent on a batch the chain no longer agrees happened. ``to_block``
+        therefore defaults to ``head - confirmations`` and is clamped to it even
+        when passed explicitly. This is the same gate sp1478 put on bridge deposit
+        credits, for the same reason: an unbacked credit is unrecoverable, while
+        waiting merely pays late.
+
+        Batches whose finalValueFTNS is 0 are still returned; the planner marks them
+        consumed without paying, which is what stops a fully-challenged batch from
+        being re-examined every epoch forever.
+        """
+        from prsm.settlement.emission_epoch import FinalizedBatch
+
+        head = int(self.web3.eth.block_number)
+        safe_head = head - int(confirmations)
+        if safe_head < 0:
+            return []
+        end_bound = safe_head if to_block is None else min(int(to_block), safe_head)
+        start = int(from_block)
+        if start > end_bound:
+            return []
+
+        provider_cs = Web3.to_checksum_address(provider) if provider else None
+        argument_filters = {"provider": provider_cs} if provider_cs else None
+
+        # batchId -> record. A batch finalizes once; dedup defensively, and because
+        # overlapping scan windows must not produce a double-weighted provider.
+        seen: "dict[bytes, FinalizedBatch]" = {}
+        event = self.contract.events.BatchFinalized()
+        while start <= end_bound:
+            end = min(start + _SCAN_MAX_WINDOW - 1, end_bound)
+            flt = event.create_filter(
+                from_block=start, to_block=end, argument_filters=argument_filters)
+            for e in flt.get_all_entries():
+                args = e["args"]
+                bid = bytes(args["batchId"])
+                if bid in seen:
+                    continue
+                seen[bid] = FinalizedBatch(
+                    batch_id="0x" + bid.hex(),
+                    provider=args["provider"],
+                    final_value_wei=int(args["finalValueFTNS"]),
+                    finalize_timestamp=int(args["finalizeTimestamp"]),
+                )
+            if end == end_bound:
+                break
+            start = end + 1
+
+        # Deterministic order so two parties scanning the same range build the same
+        # epoch — the planner sorts its output, but a stable input keeps the
+        # consumed-batch list reproducible for the recovery path.
+        return sorted(seen.values(), key=lambda b: (b.finalize_timestamp, b.batch_id))
 
     def _get_committed_batch_for_tx_sync(self, tx_hash: str) -> Optional[Tuple[bytes, int]]:
         """Recover (batch_id, commit_timestamp) from a commitBatch tx by parsing the
