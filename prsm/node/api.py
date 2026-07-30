@@ -11163,11 +11163,43 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             filename=(filename or None),
             metadata={"provenance_hash": (provenance_id or None), "tier": "A"},
         )
+        # sp1483 — register_local_content alone is an IN-MEMORY dict: pre-fix the
+        # streamed publish was undiscoverable (no GOSSIP_CONTENT_ADVERTISE, so no
+        # peer's ContentIndex ever learned the CID) and non-durable (no provenance
+        # row, so it vanished on restart). Publishing a multi-GB dataset and having
+        # it silently disappear is a work-loss failure even though no FTNS moves.
+        # This brings the streaming path to parity with /content/upload.
+        advertised = False
+        durable = False
+        uploader = getattr(node, "content_uploader", None)
+        if uploader is not None and hasattr(uploader, "register_streamed_publish"):
+            try:
+                await uploader.register_streamed_publish(
+                    content_id=cid,
+                    filename=(filename or cid),
+                    size_bytes=result.manifest.total_size,
+                    content_hash=content_hash,
+                    provenance_hash=(provenance_id or None),
+                    metadata={"tier": "A", "streamed": True},
+                )
+                advertised = True
+                durable = True
+            except Exception as exc:  # noqa: BLE001 — bytes are staged; never fail the publish
+                logger.warning(
+                    "sp1483 streamed-publish registration failed for %s: %s", cid[:12], exc)
+        else:
+            logger.warning(
+                "sp1483 no content_uploader — streamed publish %s is served this "
+                "process only (not advertised, not durable across restart)", cid[:12])
         return {
             "cid": cid,
             "content_hash": content_hash,
             "size_bytes": result.manifest.total_size,
             "status": "published",
+            # Surfaced so a publisher of a multi-GB dataset knows whether it is
+            # actually discoverable + will survive a restart, rather than assuming it.
+            "advertised": advertised,
+            "durable": durable,
         }
 
     @app.get("/transactions")

@@ -1922,6 +1922,88 @@ class ContentUploader:
             "creator_eth_address": u.creator_eth_address,
         }
 
+    async def register_streamed_publish(
+        self,
+        *,
+        content_id: str,
+        filename: str,
+        size_bytes: int,
+        content_hash: str,
+        provenance_hash: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        royalty_rate: float = DEFAULT_ROYALTY_RATE,
+    ) -> "UploadedContent":
+        """sp1483 — make a STREAMED (large-file) publish discoverable + durable.
+
+        The streaming publish path (`/content/upload-stream` → LocalContentPublisher
+        .publish_from_path) staged bytes correctly but only called
+        `ContentProvider.register_local_content`, which is an in-memory dict. So the
+        flagship large-dataset publish was:
+
+          * UNDISCOVERABLE — no GOSSIP_CONTENT_ADVERTISE was ever published, so no
+            other node's ContentIndex learned the CID existed; and
+          * NON-DURABLE — no provenance row was written, so `_hydrate_from_db` had
+            nothing to replay and the registration vanished on restart.
+
+        Publishing a multi-GB dataset and having it silently disappear on the next
+        daemon restart is a work-loss-shaped failure for the user even though
+        no FTNS moves. This brings the streamed path to parity with the JSON upload
+        path by recording it as a first-class locally-hosted item:
+
+          1. an UploadedContent record in `uploaded_content` — which also enrolls it
+             in the sp1343 periodic re-advertise sweep, so late-joining nodes can
+             still discover it after the 24h gossip-retention window;
+          2. a persisted provenance row (best-effort, mirrors the upload path); and
+          3. a GOSSIP_CONTENT_ADVERTISE built by the SAME
+             `_build_content_advertise_payload` the other paths use, so the payload
+             shape cannot drift between publish routes.
+
+        Idempotent: re-registering an existing content_id refreshes the record and
+        re-advertises rather than duplicating. Fail-soft on gossip/DB — the bytes are
+        already staged, so a transient failure must not fail the publish.
+        """
+        existing = self.uploaded_content.get(content_id)
+        uploaded = UploadedContent(
+            content_id=content_id,
+            filename=filename,
+            size_bytes=int(size_bytes),
+            content_hash=content_hash,
+            creator_id=self.identity.node_id,
+            created_at=(existing.created_at if existing else time.time()),
+            royalty_rate=royalty_rate,
+            provenance_hash=provenance_hash,
+            # NOTE: the attribute is `creator_address` (no underscore) — a typo here
+            # would silently drop the royalty destination from every streamed
+            # publish's advertise payload.
+            creator_eth_address=getattr(self, "creator_address", None),
+            metadata=dict(metadata or {}),
+        )
+        self.uploaded_content[content_id] = uploaded
+
+        try:
+            await self._persist_provenance(uploaded)
+        except Exception as exc:  # noqa: BLE001 — bytes are staged; never fail the publish
+            logger.warning(
+                "sp1483 provenance persist failed for %s (content stays served this "
+                "process, but will NOT survive restart): %s", content_id[:12], exc)
+
+        try:
+            if self.gossip is not None:
+                await self.gossip.publish(
+                    GOSSIP_CONTENT_ADVERTISE,
+                    self._build_content_advertise_payload(uploaded),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "sp1483 content advertise failed for %s (peers will not discover it "
+                "until the next re-advertise sweep): %s", content_id[:12], exc)
+
+        logger.info(
+            "sp1483 streamed publish registered: cid=%s size=%.1fMB advertised+persisted",
+            content_id[:12], int(size_bytes) / (1024 * 1024),
+        )
+        return uploaded
+
     async def readvertise_all(self) -> int:
         """sp1343 — re-publish GOSSIP_CONTENT_ADVERTISE for every locally-hosted content so it
         stays fresh in the network gossip log (24h retention) and reaches LATE-JOINING nodes
