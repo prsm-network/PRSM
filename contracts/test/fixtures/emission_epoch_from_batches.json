@@ -1,0 +1,37 @@
+{
+  "epoch_id": 21,
+  "merkle_root": "0xd026dfe56fb6980f953a27d937fe0bf281050adba622c0d2c9c9f05e793c8eec",
+  "total_amount_wei": "1000000000000000000000",
+  "pot_wei": "1000000000000000000000",
+  "contribution_wei": {
+    "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266": "10000000000000000000",
+    "0x70997970C51812dc3A010C7d01b50e0d17dc79C8": "11000000000000000000",
+    "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC": "13000000000000000000"
+  },
+  "entries": [
+    {
+      "account": "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+      "amount_wei": "382352941176470588235",
+      "proof": [
+        "0x4c8b3ff074fd95fa10ba33287bae05fed86fd67a2cd92a014afcb1fd549f37df",
+        "0x764c701492c86381a4c72a2c78d81189f82949b1ae278aa8ae7e370323f2f1a8"
+      ]
+    },
+    {
+      "account": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+      "amount_wei": "323529411764705882353",
+      "proof": [
+        "0xc14ee9a522db7be16ba5d73fe356c631f4998563bf298d3c8964b8b724737592",
+        "0x764c701492c86381a4c72a2c78d81189f82949b1ae278aa8ae7e370323f2f1a8"
+      ]
+    },
+    {
+      "account": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+      "amount_wei": "294117647058823529412",
+      "proof": [
+        "0xb9be062365209543d392c0534e44d47f7e6323e732ebf7aa0a4d01f8e01d7348"
+      ]
+    }
+  ],
+  "_generated_by": "emission_epoch.build_emission_epoch -> plan_to_reward_epoch (sp1481)"
+}

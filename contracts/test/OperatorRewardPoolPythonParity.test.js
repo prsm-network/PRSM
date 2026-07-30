@@ -96,6 +96,37 @@ describe("OperatorRewardPool — Python-built proof parity", function () {
     expect(layer[0]).to.equal(fixture.merkle_root);
   });
 
+  it("★ FULL RAIL: finalized batches -> emission plan -> tree -> published + claimed on chain", async function () {
+    // This fixture came from the complete off-chain pipeline:
+    //   BatchFinalized records -> build_emission_epoch (pro-rata over settled value,
+    //   exactly-once attribution) -> plan_to_reward_epoch (Merkle tree).
+    // Publishing and draining it here proves the links compose: the pot is fully
+    // distributed, every provider's proof verifies, and nothing is left stranded.
+    const railFixture = require("./fixtures/emission_epoch_from_batches.json");
+    const pot = BigInt(railFixture.pot_wei);
+    expect(BigInt(railFixture.total_amount_wei)).to.equal(pot); // leaves sum to the pot
+
+    await ftns.connect(treasury).transfer(await pool.getAddress(), pot);
+    await pool.connect(publisher).publishEpoch(
+      railFixture.epoch_id, railFixture.merkle_root, pot
+    );
+
+    let paid = 0n;
+    for (const e of railFixture.entries) {
+      const amount = BigInt(e.amount_wei);
+      const before = await ftns.balanceOf(e.account);
+      await pool.connect(owner).claim(
+        railFixture.epoch_id, e.account, amount, e.proof);
+      expect(await ftns.balanceOf(e.account)).to.equal(before + amount);
+      paid += amount;
+    }
+    // The emission pot is distributed to the wei — no dust stranded in the pool,
+    // and no earner left unable to claim.
+    expect(paid).to.equal(pot);
+    expect(await pool.totalReserved()).to.equal(0n);
+    expect(await ftns.balanceOf(await pool.getAddress())).to.equal(0n);
+  });
+
   it("a tampered amount from the Python fixture is rejected on chain", async function () {
     const total = BigInt(fixture.total_amount_wei);
     await ftns.connect(treasury).transfer(await pool.getAddress(), total);
