@@ -16669,7 +16669,8 @@ def node_claim_emissions_cli(
     if claimable.already_claimed:
         _emit({"claimable": False, "reason": "already_claimed",
                "epoch_id": claimable.epoch_id, "account": account,
-               "amount_wei": str(claimable.amount_wei)},
+               "amount_wei": str(claimable.amount_wei),
+               "read_at_block": claimable.read_at_block},
               f"Epoch {claimable.epoch_id}: already claimed "
               f"{claimable.amount_ftns:.6f} FTNS.", 1)
 
@@ -16678,11 +16679,14 @@ def node_claim_emissions_cli(
                "account": account, "amount_wei": str(claimable.amount_wei),
                "amount_ftns": claimable.amount_ftns,
                "on_chain_root": "0x" + claimable.on_chain_root.hex(),
-               "verified_against_chain": True},
+               "verified_against_chain": True,
+               "read_at_block": claimable.read_at_block},
               f"✅ Claimable: {claimable.amount_ftns:.6f} FTNS from epoch "
               f"{claimable.epoch_id}\n"
               f"   account : {account}\n"
               f"   root    : 0x{claimable.on_chain_root.hex()} (verified on chain)\n"
+              f"   as of   : block {claimable.read_at_block} — a claim made in the\n"
+              f"             last few blocks may not be reflected yet\n"
               f"   Re-run without --dry-run to claim.", 0)
 
     try:

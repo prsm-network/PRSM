@@ -84,6 +84,7 @@ class ClaimableEpoch:
     proof: List[bytes]
     on_chain_root: bytes
     already_claimed: bool
+    read_at_block: Optional[int] = None   # height this answer reflects (see resolve_claimable)
 
     @property
     def amount_ftns(self) -> float:
@@ -180,9 +181,10 @@ class OperatorRewardPoolClient:
 
     # ── Reads ───────────────────────────────────────────────────────────
 
-    def get_epoch(self, epoch_id: int) -> Dict[str, Any]:
+    def get_epoch(self, epoch_id: int, block_tag: Optional[int] = None) -> Dict[str, Any]:
+        call_kwargs = {"block_identifier": block_tag} if block_tag is not None else {}
         root, total, claimed, published_at, reclaimed = self.pool.functions.epochs(
-            int(epoch_id)).call()
+            int(epoch_id)).call(**call_kwargs)
         return {
             "epoch_id": int(epoch_id),
             "merkle_root": bytes(root),
@@ -193,9 +195,12 @@ class OperatorRewardPoolClient:
             "published": int(published_at) != 0,
         }
 
-    def has_claimed(self, epoch_id: int, account: str) -> bool:
+    def has_claimed(
+        self, epoch_id: int, account: str, block_tag: Optional[int] = None,
+    ) -> bool:
+        call_kwargs = {"block_identifier": block_tag} if block_tag is not None else {}
         return bool(self.pool.functions.hasClaimed(
-            int(epoch_id), Web3.to_checksum_address(account)).call())
+            int(epoch_id), Web3.to_checksum_address(account)).call(**call_kwargs))
 
     def is_claimable(
         self, epoch_id: int, account: str, amount_wei: int, proof: Sequence[bytes],
@@ -227,7 +232,22 @@ class OperatorRewardPoolClient:
         amount_wei = int(entry["amount_wei"])
         proof = [_to_bytes32(p) for p in entry.get("proof", [])]
 
-        chain = self.get_epoch(epoch_id)
+        # sp1481 — pin BOTH chain reads to a SINGLE height. Read separately at
+        # "latest" they can be served by load-balanced replicas at DIFFERENT
+        # heights, so the epoch record and the claimed-flag may disagree — the
+        # same mixed-height class as the sp1474 reconciler bug. Found live on Base
+        # Sepolia: re-running immediately after a successful claim reported
+        # "claimable" because hasClaimed was still false on a lagging replica,
+        # which would send the operator into a tx that reverts AlreadyClaimed.
+        # Pinning makes the answer self-consistent; `read_at_block` makes any
+        # remaining staleness visible instead of silent. (A lagging endpoint
+        # cannot be made fresh — but it can be made honest.)
+        try:
+            block_tag = int(self.web3.eth.block_number)
+        except Exception:  # noqa: BLE001 — fall back to unpinned reads
+            block_tag = None
+
+        chain = self.get_epoch(epoch_id, block_tag=block_tag)
         if not chain["published"]:
             raise ManifestMismatchError(
                 f"epoch {epoch_id} is not published on chain — the manifest is "
@@ -248,7 +268,8 @@ class OperatorRewardPoolClient:
             amount_wei=amount_wei,
             proof=proof,
             on_chain_root=chain["merkle_root"],
-            already_claimed=self.has_claimed(epoch_id, account),
+            already_claimed=self.has_claimed(epoch_id, account, block_tag=block_tag),
+            read_at_block=block_tag,
         )
 
     # ── Write ───────────────────────────────────────────────────────────

@@ -15,6 +15,7 @@ the operator exactly what is wrong.)
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
@@ -57,10 +58,16 @@ class _StubClient:
     """Duck-typed stand-in so the REAL resolve_claimable logic is exercised
     without web3. Only the two chain reads it uses are stubbed."""
 
-    def __init__(self, root: bytes, published: bool = True, claimed: bool = False):
+    def __init__(self, root: bytes, published: bool = True, claimed: bool = False,
+                 head_block: int = 1234):
         self._root, self._published, self._claimed = root, published, claimed
+        # sp1481 — resolve_claimable pins both reads to ONE height, so the stub
+        # must expose a head like the real client does.
+        self.seen_block_tags = []
+        self.web3 = SimpleNamespace(eth=SimpleNamespace(block_number=head_block))
 
-    def get_epoch(self, epoch_id):
+    def get_epoch(self, epoch_id, block_tag=None):
+        self.seen_block_tags.append(("get_epoch", block_tag))
         return {
             "epoch_id": epoch_id,
             "merkle_root": self._root,
@@ -71,7 +78,8 @@ class _StubClient:
             "published": self._published,
         }
 
-    def has_claimed(self, epoch_id, account):
+    def has_claimed(self, epoch_id, account, block_tag=None):
+        self.seen_block_tags.append(("has_claimed", block_tag))
         return self._claimed
 
     def resolve_claimable(self, manifest, account):
@@ -159,6 +167,23 @@ def test_verify_helper_uses_supplied_chain_root():
     assert not verify_manifest_entry_against_chain(
         epoch_id=EPOCH_ID, account=e["account"], amount_wei=int(e["amount_wei"]),
         proof=proof, on_chain_root=b"\x00" * 32)
+
+
+def test_both_chain_reads_are_pinned_to_the_same_block():
+    """★ Live Base Sepolia finding: reading the epoch record and the claimed flag
+    separately at "latest" lets load-balanced replicas answer from DIFFERENT
+    heights — re-running right after a successful claim reported "claimable"
+    because hasClaimed was still false on a lagging replica, which would send the
+    operator into a tx that reverts AlreadyClaimed. Same mixed-height class as the
+    sp1474 reconciler bug. Both reads must be pinned to ONE height."""
+    ep, manifest = _epoch_and_manifest()
+    stub = _StubClient(ep.merkle_root, head_block=999)
+    got = _resolve(stub, manifest, ALICE)
+    assert got is not None
+    tags = [t for _name, t in stub.seen_block_tags]
+    assert tags, "no chain reads recorded"
+    assert all(t == 999 for t in tags), f"reads at mixed heights: {stub.seen_block_tags}"
+    assert got.read_at_block == 999, "the height the answer reflects must be surfaced"
 
 
 # ───────────────────────── CLI behaviour ─────────────────────────
