@@ -227,8 +227,20 @@ class PaymentEscrow:
             if self.broadcast_tx:
                 try:
                     await self.broadcast_tx(tx)
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    # sp1489 — do NOT roll back: the local transfer already
+                    # committed and reversing it here would reopen the TOCTOU
+                    # this ordering exists to close. But do not stay SILENT
+                    # either: this was a bare `pass`, so a broadcast that never
+                    # landed left no trace anywhere, and an operator cannot
+                    # reconcile a divergence they were never told about.
+                    logger.error(
+                        "escrow-create broadcast FAILED for job %s (escrow %s, "
+                        "%.6f FTNS, tx %s): %s: %s — local ledger committed, "
+                        "network/chain did NOT. Reconciliation required.",
+                        job_id[:8], escrow.escrow_id[:8], amount, tx.tx_id,
+                        type(exc).__name__, exc,
+                    )
             return escrow
         except ValueError as e:
             logger.warning(f"Escrow transfer failed: {e}")
@@ -373,8 +385,21 @@ class PaymentEscrow:
                     await self.broadcast_tx(tx)
                     if refund_tx:
                         await self.broadcast_tx(refund_tx)
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    # sp1489 — same reasoning as create: no rollback (the local
+                    # release already committed and the provider did honest
+                    # work), but this must NOT be silent. This is the payout
+                    # leg — a swallowed failure here means the provider is paid
+                    # locally and NOT on chain, which is exactly the divergence
+                    # an operator needs to know about to reconcile.
+                    logger.error(
+                        "escrow-release broadcast FAILED for job %s (%.6f FTNS "
+                        "-> provider %s, tx %s%s): %s: %s — local ledger "
+                        "committed, on-chain did NOT. Reconciliation required.",
+                        job_id[:8], amount, provider_id[:12], tx.tx_id,
+                        f", refund {refund_tx.tx_id}" if refund_tx else "",
+                        type(exc).__name__, exc,
+                    )
 
             logger.info(
                 f"Escrow released: {amount:.6f} FTNS -> {provider_id[:12]}... "
