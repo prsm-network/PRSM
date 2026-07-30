@@ -23,6 +23,7 @@ This creates a single Web3 connection that:
 
 import asyncio
 import logging
+import math
 import os
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
@@ -249,9 +250,38 @@ def scan_inbound_transfers(
             "log_index": getattr(log, "logIndex", 0),
             "from_address": from_addr,
             "to_address": to_addr,
+            # sp1490 — the EXACT deposited amount. `amount_ftns` below goes through
+            # float64, which holds integers exactly only to 2**53 while 1 FTNS is
+            # 10**18 wei, so it can round UP and credit more than was deposited
+            # (999999999999999999 wei -> exactly 1.0 FTNS). Crediting is done from
+            # this int; amount_ftns is kept for display and back-compat.
+            "amount_wei": int(amount_wei),
             "amount_ftns": amount_wei / 1e18,
         })
     return out
+
+
+def wei_to_ftns_floor(amount_wei: int, decimals: int = 18) -> float:
+    """sp1490 — exact wei -> FTNS, never rounding UP.
+
+    ``amount_wei / 1e18`` converts the int through float64, which represents
+    integers exactly only up to 2**53. One FTNS is 10**18 wei, so real deposit
+    amounts exceed that and the result is rounded to nearest — which can round UP.
+    On the deposit path that is an unbacked credit: 999999999999999999 wei (one wei
+    short of 1 FTNS) becomes exactly 1.0 FTNS.
+
+    The magnitude is tiny, but the DIRECTION is the one the whole money-in audit arc
+    cared about, and "slightly under" is always recoverable while "slightly over" is
+    a mint. So this floors: the credited value is guaranteed <= the true amount.
+    """
+    from decimal import Decimal
+
+    exact = Decimal(int(amount_wei)) / (Decimal(10) ** int(decimals))
+    f = float(exact)
+    if Decimal(f) > exact:
+        # float() rounded up; step to the next representable value toward zero.
+        f = math.nextafter(f, 0.0)
+    return f
 
 
 def scan_inbound_transfers_chunked(
@@ -822,7 +852,14 @@ class InboundMonitor:
         if self._local_ledger is None:
             return
         from_addr = transfer.get("from_address")
-        amount = transfer.get("amount_ftns", 0) or 0
+        # sp1490 — credit from the EXACT wei when the scanner supplied it. The
+        # float amount_ftns can round UP (999999999999999999 wei -> 1.0), which on
+        # the deposit path is an unbacked credit. Fall back to amount_ftns only for
+        # transfer dicts built before amount_wei existed.
+        if transfer.get("amount_wei") is not None:
+            amount = wei_to_ftns_floor(transfer["amount_wei"])
+        else:
+            amount = transfer.get("amount_ftns", 0) or 0
         tx_hash = transfer.get("tx_hash") or ""
         if not from_addr or amount <= 0 or not tx_hash:
             return
