@@ -42,7 +42,7 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol
+from typing import Any, Iterable, List, Optional, Protocol, runtime_checkable
 
 from prsm.settlement.emission_epoch import (
     EmissionEpochPlan,
@@ -66,12 +66,15 @@ class WatermarkLostError(EpochRunAborted):
     """
 
 
+@runtime_checkable
 class PoolChain(Protocol):
     """The narrow slice of OperatorRewardPool this job needs.
 
     A Protocol rather than the concrete web3 client so the ordering and refusal
     logic is testable without a chain — the parts most likely to be wrong are the
-    ones hardest to exercise against a real node.
+    ones hardest to exercise against a real node. runtime_checkable so a test can
+    assert the REAL client still satisfies it; isinstance only compares method
+    names, so the conformance test checks signatures separately.
     """
 
     def epoch_exists(self, epoch_id: int) -> bool: ...

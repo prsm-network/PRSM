@@ -65,6 +65,14 @@ OPERATOR_REWARD_POOL_ABI = [
                 {"name": "amount", "type": "uint256"},
                 {"name": "proof", "type": "bytes32[]"}],
      "outputs": []},
+    # sp1487 — the epoch job's two calls: how much may be distributed, and the publish.
+    {"name": "surplus", "type": "function", "stateMutability": "view",
+     "inputs": [], "outputs": [{"name": "", "type": "uint256"}]},
+    {"name": "publishEpoch", "type": "function", "stateMutability": "nonpayable",
+     "inputs": [{"name": "epochId", "type": "uint256"},
+                {"name": "merkleRoot", "type": "bytes32"},
+                {"name": "totalAmount", "type": "uint256"}],
+     "outputs": []},
     {"name": "totalReserved", "type": "function", "stateMutability": "view",
      "inputs": [], "outputs": [{"type": "uint256"}]},
     {"name": "paused", "type": "function", "stateMutability": "view",
@@ -289,6 +297,63 @@ class OperatorRewardPoolClient:
         with self._tx_lock:
             tx = self.pool.functions.claim(
                 int(epoch_id), acct, int(amount_wei), [bytes(p) for p in proof]
+            ).build_transaction({
+                "from": self._account.address,
+                "nonce": self.web3.eth.get_transaction_count(
+                    self._account.address, "pending"),
+                "gasPrice": self.web3.eth.gas_price,
+                "chainId": self.web3.eth.chain_id,
+            })
+            signed = self.web3.eth.account.sign_transaction(tx, self._account.key)
+            raw = (getattr(signed, "raw_transaction", None)
+                   or getattr(signed, "rawTransaction", None))
+            tx_hash = self.web3.eth.send_raw_transaction(raw)
+        return "0x" + tx_hash.hex()
+
+    # ── sp1487: the epoch job's PoolChain surface ───────────────────────
+
+    def epoch_exists(self, epoch_id: int) -> bool:
+        """Has this epoch id ever been published?
+
+        This is the reading the epoch job trusts over its own watermark file when
+        the two disagree, so it must answer for the id itself and not for "the
+        latest" — an unpublished epoch reads back as an all-zero struct.
+        """
+        return bool(self.get_epoch(int(epoch_id))["published"])
+
+    def unreserved_balance_wei(self, block_tag: Optional[int] = None) -> int:
+        """FTNS held but NOT reserved against an earlier epoch's unclaimed leaves.
+
+        Reads the contract's own surplus() rather than subtracting two separately
+        fetched values: a load-balanced RPC can serve two reads from replicas at
+        DIFFERENT heights, and a balance from one height minus a reserve from
+        another is a number that was never true (the sp1474 class). One call at one
+        height cannot be internally inconsistent.
+        """
+        call_kwargs = {"block_identifier": block_tag} if block_tag is not None else {}
+        return int(self.pool.functions.surplus().call(**call_kwargs))
+
+    def publish_epoch(
+        self, epoch_id: int, merkle_root: bytes, total_amount_wei: int,
+    ) -> str:
+        """Publish an epoch root. Requires the rootPublisher key. Returns the tx hash.
+
+        Irreversible and unrepeatable: the contract rejects a second publish for the
+        same id, which is what makes the id safe to use as a recovery marker.
+        """
+        if self._account is None:
+            raise RuntimeError(
+                "no private key configured — cannot publish an epoch. The epoch job "
+                "needs the rootPublisher key (see contracts/scripts/gen-publisher-key.py)"
+            )
+        root = bytes(merkle_root)
+        if len(root) != 32:
+            raise ValueError(f"merkle_root must be 32 bytes, got {len(root)}")
+        if int(total_amount_wei) <= 0:
+            raise ValueError("total_amount_wei must be positive")
+        with self._tx_lock:
+            tx = self.pool.functions.publishEpoch(
+                int(epoch_id), root, int(total_amount_wei)
             ).build_transaction({
                 "from": self._account.address,
                 "nonce": self.web3.eth.get_transaction_count(
