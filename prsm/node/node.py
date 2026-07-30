@@ -4450,12 +4450,18 @@ class PRSMNode:
 
             from prsm.compute.model_sharding.models import PipelineStakeTier
 
-            node_id = assignment.get("node_id", "")
-            job_id = assignment.get("job_id", "")
+            # sp1488 — fail closed on an assignment that cannot be paid for.
+            # node_id / job_id / escrow_amount_ftns each used to have a default,
+            # and every one of them was a money bug: "" job_id collapses the
+            # escrow key to ":shard:<n>" so concurrent jobs share an escrow;
+            # 1.0 FTNS invents a price nobody quoted. Refusing costs one job;
+            # a mis-settled escrow cannot be undone from here.
+            from prsm.compute.remote_dispatcher import validate_dispatch_assignment
+
+            node_id, job_id, escrow_amount = validate_dispatch_assignment(assignment)
             tier_label = assignment.get("stake_tier", "standard")
             tier_map = {t.label: t for t in PipelineStakeTier}
             stake_tier = tier_map.get(tier_label, PipelineStakeTier.STANDARD)
-            escrow_amount = float(assignment.get("escrow_amount_ftns", 1.0))
 
             input_arr = _np.frombuffer(input_data, dtype=_np.float64)
             if input_arr.size == 0:

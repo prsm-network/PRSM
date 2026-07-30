@@ -713,6 +713,27 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1487_finalized_batch_scan.py",
         kills_test_id="test_scan_STOPS_at_the_confirmation_depth",
     ),
+    Guard(
+        id="dispatch-assignment-fails-closed",
+        sprint="sp1488",
+        file="prsm/compute/remote_dispatcher.py",
+        anchor="def validate_dispatch_assignment(",
+        protects="concurrent remote-inference jobs SHARING ONE ESCROW, and providers being paid "
+                 "a price nobody quoted. The adapter bridging TensorParallelExecutor to "
+                 "RemoteShardDispatcher read the three fields deciding who is paid, how much, and "
+                 "which escrow via assignment.get(k, <default>) — and each default is a money bug, "
+                 "not a fallback: job_id -> '' collapses the escrow key to ':shard:<n>', which "
+                 "EVERY concurrent job also produces, so one job's release settles another job's "
+                 "escrow; escrow_amount_ftns -> 1.0 invents a price never quoted or agreed; "
+                 "node_id -> '' creates an escrow for a dispatch that can never happen and strands "
+                 "it. This refuses instead — a missing field means the caller is broken, and "
+                 "refusing costs one job while a mis-settled escrow cannot be undone. _escrow_job_id "
+                 "also rejects an empty job_id directly, so a caller that skips validation still "
+                 "cannot mint the colliding key. Restore any of the .get() defaults and concurrent "
+                 "paid dispatch mis-settles",
+        killed_by="tests/unit/test_sprint_1488_dispatch_assignment_validation.py",
+        kills_test_id="test_missing_job_id_is_REFUSED_not_defaulted",
+    ),
 ]
 
 

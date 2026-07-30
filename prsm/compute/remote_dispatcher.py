@@ -108,8 +108,89 @@ def _escrow_job_id(job_id: str, shard_index: int) -> str:
 
     PaymentEscrow is keyed by job_id; one model-exec job fans out to
     N shards, each needing its own escrow, so we namespace by shard.
+
+    sp1488 — the uniqueness this key promises is only as good as ``job_id``.
+    An empty one collapses every concurrent job's shard 0 to ``":shard:0"``,
+    so callers must validate before composing (see
+    ``validate_dispatch_assignment``).
     """
+    if not job_id:
+        raise InvalidDispatchAssignment(
+            "refusing to build an escrow key from an EMPTY job_id: every "
+            "concurrent job's shard would collapse onto ':shard:<n>' and share "
+            "one escrow, so one job's release would settle another job's funds"
+        )
     return f"{job_id}:shard:{shard_index}"
+
+
+class InvalidDispatchAssignment(ValueError):
+    """The assignment cannot be paid for safely. Nothing was dispatched.
+
+    Raised INSTEAD of substituting a default, because every plausible default
+    here is a money bug rather than a degraded mode.
+    """
+
+
+def validate_dispatch_assignment(assignment: dict) -> tuple:
+    """sp1488 — fail closed on an assignment that cannot be paid for correctly.
+
+    The adapter that bridges TensorParallelExecutor to RemoteShardDispatcher used
+    ``assignment.get(k, <default>)`` for the three fields that decide WHO gets
+    paid, HOW MUCH, and WHICH ESCROW — and each default is a distinct money bug,
+    not a graceful fallback:
+
+      * ``job_id`` -> ``""``   collapses the escrow key to ``":shard:<n>"``, so
+        two concurrent jobs share one escrow and one job's release settles the
+        other's funds.
+      * ``escrow_amount_ftns`` -> ``1.0`` invents a price nobody quoted or
+        agreed to, silently over- or under-paying against the real quote.
+      * ``node_id`` -> ``""``  dispatches to no one while still creating (and
+        potentially stranding) an escrow.
+
+    A missing field means the caller is broken, and the only safe response is to
+    dispatch nothing: an unpaid provider or a mis-settled escrow cannot be undone
+    from here, while refusing costs one failed job.
+
+    Returns ``(node_id, job_id, escrow_amount_ftns)``.
+    """
+    node_id = (assignment.get("node_id") or "").strip()
+    job_id = (assignment.get("job_id") or "").strip()
+    if not node_id:
+        raise InvalidDispatchAssignment(
+            "assignment has no node_id — refusing to dispatch: there is no "
+            "provider to pay, and creating the escrow anyway would strand funds"
+        )
+    if not job_id:
+        raise InvalidDispatchAssignment(
+            "assignment has no job_id — refusing to dispatch: the escrow key "
+            f"would be ':shard:<n>', which every CONCURRENT job also produces, "
+            "so one job's release would settle another job's escrow"
+        )
+
+    if "escrow_amount_ftns" not in assignment:
+        raise InvalidDispatchAssignment(
+            "assignment has no escrow_amount_ftns — refusing to dispatch rather "
+            "than inventing a price. The amount must come from the accepted "
+            "quote; a default silently pays something nobody agreed to"
+        )
+    try:
+        amount = float(assignment["escrow_amount_ftns"])
+    except (TypeError, ValueError) as exc:
+        raise InvalidDispatchAssignment(
+            f"escrow_amount_ftns is not a number: "
+            f"{assignment['escrow_amount_ftns']!r}"
+        ) from exc
+    if amount != amount or amount in (float("inf"), float("-inf")):
+        # NaN/Inf survive float() and would poison every downstream balance —
+        # the sp1468 DAGLedger lesson.
+        raise InvalidDispatchAssignment(
+            f"escrow_amount_ftns is not finite: {amount!r}")
+    if amount <= 0:
+        raise InvalidDispatchAssignment(
+            f"escrow_amount_ftns must be positive, got {amount} — a zero or "
+            "negative escrow means the provider works for nothing"
+        )
+    return node_id, job_id, amount
 
 
 class RemoteShardDispatcher:
