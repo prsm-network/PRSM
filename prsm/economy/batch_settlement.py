@@ -72,6 +72,22 @@ class SettlementResult:
     duration_seconds: float = 0.0
 
 
+def _looks_like_node_id(wallet_id: str) -> bool:
+    """sp1492 — is this wallet a PEER NODE_ID rather than an internal wallet?
+
+    Node ids are ``sha256(pubkey).hexdigest()[:32]`` — 32 lowercase hex chars with
+    no ``0x`` prefix. Internal wallets are prefixed/named (``escrow-<uuid>``,
+    ``system``, …), so the shape is unambiguous.
+
+    Used only to decide LOG LEVEL: a skipped internal wallet is routine, a skipped
+    peer node_id is a real payee whose on-chain leg silently did not run.
+    """
+    if not wallet_id or wallet_id.startswith("0x") or "-" in wallet_id:
+        return False
+    return len(wallet_id) == 32 and all(
+        c in "0123456789abcdef" for c in wallet_id.lower())
+
+
 class BatchSettlementManager:
     """Queues on-chain FTNS transfers and settles in batches.
 
@@ -281,9 +297,33 @@ class BatchSettlementManager:
         # Resolve to_wallet to 0x address
         target_address = self._resolve_address(to_wallet)
         if not target_address:
-            logger.debug(
-                f"BatchSettlement: skipping non-chain wallet {to_wallet[:20]}…"
-            )
+            # sp1492 — two very different situations reach this branch, and
+            # collapsing both to DEBUG is why a whole class of bug survived three
+            # audits.
+            #
+            #   * An INTERNAL wallet (escrow-<uuid>, system, named wallets) has no
+            #     on-chain identity by design. Skipping is correct and routine.
+            #   * A PEER NODE_ID is a real payee we simply cannot pay on chain,
+            #     because _resolve_address only accepts 0x addresses and this
+            #     node's own id — while a node_id is 32 hex chars with no 0x
+            #     prefix. That silently drops the on-chain leg of a real payment,
+            #     leaving a credit that exists ONLY on the paying node's ledger.
+            #
+            # The second case must be visible: the caller logs "Escrow released:
+            # … -> <provider>" either way, so without this an operator has no way
+            # to learn the on-chain half never ran.
+            if _looks_like_node_id(to_wallet):
+                logger.warning(
+                    "BatchSettlement: NO on-chain leg for payee %s — it is a peer "
+                    "node_id, not a 0x address, so this payment exists only on "
+                    "THIS node's ledger. The payee's own node will not see it "
+                    "unless the credit is gossiped. tx=%s amount=%.6f",
+                    to_wallet[:20], tx_id, float(amount or 0),
+                )
+            else:
+                logger.debug(
+                    f"BatchSettlement: skipping internal wallet {to_wallet[:20]}…"
+                )
             return False
 
         # Queue it
