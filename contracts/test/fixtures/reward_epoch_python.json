@@ -1,0 +1,51 @@
+{
+  "epoch_id": 11,
+  "merkle_root": "0x91c17cce9effbbe354b045b28f6965a76623b7fc7c63b570a37a26254d6d54a8",
+  "total_amount_wei": "11330000000000000000",
+  "entries": [
+    {
+      "account": "0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65",
+      "amount_wei": "7000000000000000000",
+      "proof": [
+        "0x33c89a2d0593e6bf1cbb0a7ef69b5fa5d639ffd98a82ca6d27fda0362c0159a4",
+        "0x1edb60f9873459b542c42b5f80926b9d9958cf3948c01bfb824465d525347e6b",
+        "0xcffffb9c9d9c8d7c04bfee1ecd244582f014b43430a0a6338e888a00bb7702a1"
+      ]
+    },
+    {
+      "account": "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+      "amount_wei": "500000000000000000",
+      "proof": [
+        "0x3378c8a5af6b9c8c95d843bbdc06da0e7d23233c94d1ba226c4cbdcb67353d25",
+        "0x1edb60f9873459b542c42b5f80926b9d9958cf3948c01bfb824465d525347e6b",
+        "0xcffffb9c9d9c8d7c04bfee1ecd244582f014b43430a0a6338e888a00bb7702a1"
+      ]
+    },
+    {
+      "account": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+      "amount_wei": "2500000000000000000",
+      "proof": [
+        "0xa8b788beef1980326b2269da06cf5651c06654380be4a84727b6e8c659c6fd53",
+        "0x554177cec40d1210e566985a377c01ac30650713b76458b545df38dc8db91d45",
+        "0xcffffb9c9d9c8d7c04bfee1ecd244582f014b43430a0a6338e888a00bb7702a1"
+      ]
+    },
+    {
+      "account": "0x90F79bf6EB2c4f870365E785982E1f101E93b906",
+      "amount_wei": "330000000000000000",
+      "proof": [
+        "0x59eb6859c9012c57ccd232dd35db74ee54df4ffcb8a0a35165a33d12044252c5",
+        "0x554177cec40d1210e566985a377c01ac30650713b76458b545df38dc8db91d45",
+        "0xcffffb9c9d9c8d7c04bfee1ecd244582f014b43430a0a6338e888a00bb7702a1"
+      ]
+    },
+    {
+      "account": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+      "amount_wei": "1000000000000000000",
+      "proof": [
+        "0xbbfe85ec0684b65f652f0c70663bd81fb9eec3ff9a888da9c21aac273568b1fa"
+      ]
+    }
+  ],
+  "_generated_by": "prsm.settlement.reward_epoch.build_reward_epoch (sp1481 parity fixture)"
+}
