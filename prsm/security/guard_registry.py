@@ -752,6 +752,29 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1490_deposit_wei_precision.py",
         kills_test_id="test_never_credits_more_than_deposited",
     ),
+    Guard(
+        id="compute-job-offchain-onchain-double-pay",
+        sprint="sp1493",
+        file="prsm/node/compute_requester.py",
+        anchor="_onchain_settlement_expected(provider_id)",
+        protects="the requester being charged TWICE for one ComputeJob. Two independent legs pay "
+                 "for the same job and neither consulted the other: the requester transfers "
+                 "off-chain and gossips it (so the provider's own node credits itself, spendable "
+                 "via /wallet/withdraw), while the provider accumulates the SAME job on-chain "
+                 "(compute_provider._maybe_accumulate_onchain_earning) and finalization calls "
+                 "EscrowPool.settleFromRequester, which moves FTNS FROM THE REQUESTER again. The "
+                 "receipt's local_escrow_id is only a per-stage idempotency key and is never "
+                 "cross-checked against the off-chain payment. Latent because both legs also need "
+                 "PRSM_ONCHAIN_SETTLEMENT (default off), but a real double-spend once enabled. This "
+                 "guard skips the off-chain leg when the on-chain one is expected — and REFUNDS any "
+                 "escrow locked at submit-time rather than merely skipping, which would strand it. "
+                 "Deliberately conservative: it cannot observe the provider's settlement_client, so "
+                 "it returns True only when every visible gate passes, failing toward paying "
+                 "off-chain (recoverable) over double-paying (not). Bypass it and the double-spend "
+                 "returns the moment on-chain settlement is switched on",
+        killed_by="tests/unit/test_sprint_1493_offchain_onchain_double_pay.py",
+        kills_test_id="test_the_payment_path_CONSULTS_the_guard",
+    ),
 ]
 
 

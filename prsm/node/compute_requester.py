@@ -173,6 +173,42 @@ class ComputeRequester:
             sample_rate=rate,
         )
 
+    def _onchain_settlement_expected(self, provider_id: str) -> bool:
+        """sp1493 — will THIS job be settled on chain by the provider?
+
+        If so, the requester must NOT also pay off-chain: the on-chain leg moves
+        FTNS from the requester (EscrowPool.settleFromRequester) and the off-chain
+        leg moves it again, so one job charges the requester twice.
+
+        Mirrors the provider's own gate in
+        ``compute_provider._maybe_accumulate_onchain_earning``, which requires:
+          * on-chain settlement enabled,
+          * the PROVIDER's operator_address, and
+          * the REQUESTER's operator_address (which we put in the offer).
+
+        DELIBERATELY CONSERVATIVE. We cannot observe the provider's
+        ``settlement_client``, so a true here is a prediction, not a fact. Getting
+        it wrong in this direction leaves the provider unpaid — visible, disputable
+        and recoverable — whereas the opposite error double-spends the requester
+        and cannot be undone. That is the same asymmetry the rest of the money path
+        is built on, so this returns True only when every gate we CAN see is
+        satisfied, and the caller logs loudly when it skips.
+        """
+        import os
+
+        if str(os.environ.get("PRSM_ONCHAIN_SETTLEMENT", "")).strip().lower() \
+                not in ("1", "true", "yes"):
+            return False
+        # Our own operator address is what populates the offer's
+        # requester_operator_address — without it the provider's gate cannot pass.
+        if not (getattr(self, "operator_address", "") or "").strip():
+            return False
+        try:
+            _bonded, _stake, provider_addr = self._resolve_stake_posture(provider_id)
+        except Exception:  # noqa: BLE001 — an unresolvable provider is not "on-chain"
+            return False
+        return bool((provider_addr or "").strip())
+
     def _resolve_stake_posture(self, provider_id: str):
         """Resolve a provider's on-chain bond posture for evidence routing.
 
@@ -622,43 +658,70 @@ class ComputeRequester:
 
         # Record payment — only for remote providers.
         # Self-compute payment is handled by the API escrow release.
-        try:
+        try:  # noqa: PLR1702 — sp1493 guard adds one level; splitting would scatter the money path
             if provider_id != self.identity.node_id and job.ftns_budget > 0:
-                # sp1401 — if this job locked ESCROW at submit-time, RELEASE that escrow to the
-                # provider. A second direct transfer here would DOUBLE-PAY: the requester's funds are
-                # already locked in the escrow wallet. release_escrow moves the locked funds to the
-                # provider and is idempotent (returns None on an already-released escrow). Only fall
-                # back to a direct transfer for a non-escrow job.
-                if getattr(job, "escrow_id", None) and self.escrow is not None:
-                    tx = await self.escrow.release_escrow(
-                        job_id=job_id,
-                        provider_id=provider_id,
-                        consensus_reached=True,
+                # sp1493 — DOUBLE-PAY GUARD. If this job will be settled ON CHAIN by
+                # the provider, paying off-chain here as well charges the requester
+                # TWICE for one job: EscrowPool.settleFromRequester moves FTNS from
+                # the requester on chain, while the transfer/release below moves it
+                # again off chain. Nothing coordinated the two — the provider's
+                # accumulate (compute_provider._maybe_accumulate_onchain_earning)
+                # never consulted this path, and its local_escrow_id is only an
+                # idempotency key, never a cross-check.
+                if self._onchain_settlement_expected(provider_id):
+                    # Funds locked at submit-time must NOT simply be skipped — that
+                    # strands them in the escrow wallet forever. Return them to the
+                    # requester; the provider is paid by the on-chain leg.
+                    if getattr(job, "escrow_id", None) and self.escrow is not None:
+                        await self.escrow.refund_escrow(
+                            job_id,
+                            reason="settled on-chain by provider (sp1493 double-pay guard)",
+                        )
+                    logger.warning(
+                        "job %s: SKIPPING the off-chain payment of %.6f FTNS to %s "
+                        "— this job settles ON CHAIN (both operator addresses are "
+                        "known and PRSM_ONCHAIN_SETTLEMENT is on), and paying here "
+                        "too would charge the requester twice. If the provider "
+                        "reports non-payment, check that its settlement client "
+                        "actually committed the batch.",
+                        job_id[:8], float(job.ftns_budget), provider_id[:12],
                     )
                 else:
-                    tx = await self.ledger.transfer(
-                        from_wallet=self.identity.node_id,
-                        to_wallet=provider_id,
-                        amount=job.ftns_budget,
-                        tx_type=TransactionType.COMPUTE_PAYMENT,
-                        description=f"Payment for job {job_id[:8]}",
-                    )
+                    # sp1401 — if this job locked ESCROW at submit-time, RELEASE that escrow to the
+                    # provider. A second direct transfer here would DOUBLE-PAY: the requester's funds are
+                    # already locked in the escrow wallet. release_escrow moves the locked funds to the
+                    # provider and is idempotent (returns None on an already-released escrow). Only fall
+                    # back to a direct transfer for a non-escrow job.
+                    if getattr(job, "escrow_id", None) and self.escrow is not None:
+                        tx = await self.escrow.release_escrow(
+                            job_id=job_id,
+                            provider_id=provider_id,
+                            consensus_reached=True,
+                        )
+                    else:
+                        tx = await self.ledger.transfer(
+                            from_wallet=self.identity.node_id,
+                            to_wallet=provider_id,
+                            amount=job.ftns_budget,
+                            tx_type=TransactionType.COMPUTE_PAYMENT,
+                            description=f"Payment for job {job_id[:8]}",
+                        )
 
-                # Broadcast payment via ledger sync so the provider's OWN ledger credits itself
-                # (its _on_ftns_transaction applies the tx whose to_wallet is the provider).
-                if tx is not None and self.ledger_sync:
-                    try:
-                        await self.ledger_sync.broadcast_transaction(tx)
-                    except Exception:
-                        pass
+                    # Broadcast payment via ledger sync so the provider's OWN ledger credits itself
+                    # (its _on_ftns_transaction applies the tx whose to_wallet is the provider).
+                    if tx is not None and self.ledger_sync:
+                        try:
+                            await self.ledger_sync.broadcast_transaction(tx)
+                        except Exception:
+                            pass
 
-                # Confirm payment on network
-                await self.gossip.publish(GOSSIP_PAYMENT_CONFIRM, {
-                    "job_id": job_id,
-                    "requester_id": self.identity.node_id,
-                    "provider_id": provider_id,
-                    "amount": job.ftns_budget,
-                })
+                    # Confirm payment on network
+                    await self.gossip.publish(GOSSIP_PAYMENT_CONFIRM, {
+                        "job_id": job_id,
+                        "requester_id": self.identity.node_id,
+                        "provider_id": provider_id,
+                        "amount": job.ftns_budget,
+                    })
         except ValueError as e:
             logger.error(f"Payment failed for job {job_id[:8]}: {e}")
 
