@@ -16,6 +16,8 @@ import threading
 from functools import lru_cache
 import weakref
 
+from pydantic import ValidationError
+
 from .schemas import PRSMConfig, BaseConfigSchema
 from .loaders import ConfigLoader, EnvironmentConfigLoader, FileConfigLoader, DatabaseConfigLoader
 from .validators import ConfigValidator
@@ -149,7 +151,7 @@ class ConfigManager:
             
             # Create configuration object
             try:
-                self._config = PRSMConfig(**config_data)
+                self._config = _build_config_dropping_unknown_keys(config_data)
                 self._last_reload_time = datetime.now(timezone.utc)
                 
                 # Validate configuration if requested
@@ -483,6 +485,66 @@ class ConfigManager:
 
 # Global configuration manager instance
 _config_manager = None
+
+
+def _build_config_dropping_unknown_keys(config_data: dict) -> PRSMConfig:
+    """sp1491 — one unrecognised PRSM_* env var must not disable ALL config.
+
+    PRSMConfig is ``extra="forbid"``, which is right for catching typos. But the
+    env loader maps every ``PRSM_FOO_BAR`` into a nested key, so setting any env
+    var the schema does not model made the WHOLE PRSMConfig fail to construct.
+    get_config() then returned None process-wide — and of its callers, only one
+    guards against None.
+
+    That is a silent, operator-triggerable degradation of everything at once,
+    caused by one unrelated setting. It was found live on the sfo operator, where
+    the sp1482 marketplace drop-in (PRSM_MARKETPLACE_ADVERTISE and friends) made
+    every subsequent get_config() return None while the node otherwise looked
+    healthy.
+
+    So: drop only the keys the schema rejects, keep the rest, and log LOUDLY which
+    ones were ignored. The operator's real problem is not the exception — it is not
+    knowing their setting did nothing. A raise or a None both hide that; naming the
+    dropped keys is the whole point.
+    """
+    try:
+        return PRSMConfig(**config_data)
+    except ValidationError as exc:
+        unknown: list = []
+        for err in exc.errors():
+            if err.get("type") == "extra_forbidden" and err.get("loc"):
+                unknown.append(".".join(str(p) for p in err["loc"]))
+        if not unknown:
+            raise  # a REAL validation problem (bad type/value) — do not mask it
+
+        pruned = _prune_keys(config_data, unknown)
+        config = PRSMConfig(**pruned)
+        logger.warning(
+            "config: IGNORED %d unrecognised setting(s) — these had NO EFFECT: %s. "
+            "The rest of the configuration loaded normally. Check for a typo, or "
+            "for an env var whose feature reads it directly instead of via "
+            "PRSMConfig.",
+            len(unknown), ", ".join(sorted(unknown)),
+        )
+        return config
+
+
+def _prune_keys(data: dict, dotted_keys: list) -> dict:
+    """Return a deep copy of ``data`` with each dotted path removed."""
+    import copy
+
+    out = copy.deepcopy(data)
+    for path in dotted_keys:
+        parts = path.split(".")
+        node = out
+        for p in parts[:-1]:
+            if not isinstance(node, dict) or p not in node:
+                node = None
+                break
+            node = node[p]
+        if isinstance(node, dict):
+            node.pop(parts[-1], None)
+    return out
 
 
 @lru_cache(maxsize=1)
