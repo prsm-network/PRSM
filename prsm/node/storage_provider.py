@@ -126,6 +126,30 @@ class StorageProvider:
         # race on MSG_DIRECT. storage_provider still handles pin-only
         # content (CIDs not tracked by ContentProvider).
         self._content_provider = content_provider
+
+        # sp1484 — replication controls. Fetching on a REMOTE peer's request is the
+        # point of pledging storage, so this is ON by default for a storage node
+        # (pledging GB IS the opt-in); PRSM_REPLICATION_ENABLED=0 disables it.
+        # `max_replica_bytes` bounds any SINGLE replica independently of the
+        # gossiped size, which an attacker controls. The semaphore stops a burst of
+        # storage requests from opening unbounded simultaneous fetches.
+        import os as _os_env
+        self.replication_enabled = (
+            str(_os_env.environ.get("PRSM_REPLICATION_ENABLED", "1")).strip().lower()
+            not in ("0", "false", "no")
+        )
+        try:
+            self.max_replica_bytes = int(
+                _os_env.environ.get("PRSM_MAX_REPLICA_BYTES", "")
+                or 2 * 1024 * 1024 * 1024)
+        except (TypeError, ValueError):
+            self.max_replica_bytes = 2 * 1024 * 1024 * 1024
+        try:
+            _rep_conc = max(1, int(
+                _os_env.environ.get("PRSM_REPLICATION_CONCURRENCY", "") or 2))
+        except (TypeError, ValueError):
+            _rep_conc = 2
+        self._replication_sem = asyncio.Semaphore(_rep_conc)
         
         # Bandwidth limits (0 = unlimited)
         # Sprint 761 — operator-facing env vars exposing the
@@ -288,11 +312,32 @@ class StorageProvider:
             return False
 
     async def pin_content(self, cid: str) -> bool:
-        """Pin content in the local ContentStore.
+        """Pin content locally, FETCHING it first when we do not already hold it.
 
-        The content is expected to already be present in the store; this
-        method promotes it to "pinned" status (protected from GC) and
-        records the authoritative size returned by ContentStore.
+        sp1484 — until now this only "promoted" content that happened to be local:
+        `exists_local(...)` False -> return False, without ever fetching the bytes.
+        So `replicas=N` on every upload and CLI flag was DECORATIVE — no copy was
+        ever placed on any other node, and published content died with the
+        publisher's box. The handler around it already emitted STORAGE_CONFIRM +
+        CONTENT_ADVERTISE on success, i.e. it advertised a pin that could never
+        happen. This is what makes replication real.
+
+        Safety properties (this method now pulls bytes on a REMOTE peer's request,
+        so each one is load-bearing):
+          * INTEGRITY — request_content_to_file re-verifies the CID with a streaming
+            read and deletes the partial on mismatch, so a peer cannot poison us
+            with bytes that are not the content we asked for.
+          * OPERATOR CONSENT — a CID the operator's content filter blocks is never
+            fetched or stored. A moderation decision must not be overridable by a
+            stranger's gossip.
+          * DECLARED SIZE IS UNTRUSTED — the caller's capacity check uses the
+            gossiped `size_bytes`, which an attacker controls ("declare 1 byte,
+            serve 10 GiB"). We therefore re-check the ACTUAL on-disk size after the
+            fetch and discard it if it no longer fits. The transport's own
+            gateway ceiling bounds the transfer itself.
+          * BOUNDED CONCURRENCY — a burst of storage requests must not open
+            unbounded simultaneous fetches; replication fetches are serialized
+            through a semaphore.
         """
         if not self.storage_available:
             return False
@@ -302,18 +347,117 @@ class StorageProvider:
             store = get_content_store()
             if store is None:
                 return False
-            exists = await store.exists_local(ContentHash.from_hex(cid))
-            if not exists:
+            try:
+                exists = await store.exists_local(ContentHash.from_hex(cid))
+            except ValueError:
+                # Malformed content hash hex — preserved legacy behavior.
                 return False
-            size = await self._get_content_size(cid)
+            if exists:
+                size = await self._get_content_size(cid)
+                self.pinned_content[cid] = PinnedContent(cid=cid, size_bytes=size)
+                return True
+
+            # Not local — replicate it.
+            size = await self._replicate_content(cid)
+            if size is None:
+                return False
             self.pinned_content[cid] = PinnedContent(cid=cid, size_bytes=size)
             return True
         except ValueError:
-            # Malformed content hash hex.
             return False
         except Exception as e:
             logger.error(f"Failed to pin {cid}: {e}")
             return False
+
+    async def _replicate_content(self, cid: str) -> Optional[int]:
+        """Fetch ``cid`` from the network and stage it so this node can SERVE it.
+
+        Returns the stored size in bytes, or None if replication was refused or
+        failed (in which case nothing is stored, pinned, confirmed or advertised).
+        """
+        if not self.replication_enabled:
+            return None
+        provider = getattr(self, "_content_provider", None)
+        if provider is None or not hasattr(provider, "request_content_to_file"):
+            logger.debug("sp1484 replication skipped for %s: no content provider", cid[:12])
+            return None
+
+        # Operator consent: never fetch or host content this operator blocked.
+        blocked = getattr(self, "_content_filter_store", None)
+        if blocked is not None:
+            try:
+                if blocked.is_cid_blocked(cid):
+                    logger.info(
+                        "sp1484 refusing to replicate %s — blocked by this "
+                        "operator's content filter", cid[:12])
+                    return None
+            except Exception:  # noqa: BLE001 — a filter error must not force a store
+                return None
+
+        publisher = getattr(provider, "content_publisher", None)
+        staging_dir = getattr(publisher, "staging_dir", None)
+        if publisher is None or staging_dir is None:
+            logger.debug(
+                "sp1484 replication skipped for %s: no staging publisher", cid[:12])
+            return None
+
+        import hashlib
+        import os as _os
+        from pathlib import Path as _Path
+
+        tmp_path = _Path(staging_dir) / f".replicating-{cid[:24]}.part"
+        async with self._replication_sem:
+            try:
+                got = await provider.request_content_to_file(cid, tmp_path)
+                if got is None:
+                    return None
+
+                actual = _os.path.getsize(tmp_path)
+                # The gossiped size was untrusted; this one is measured.
+                if actual > self.available_gb * (1024 ** 3):
+                    logger.warning(
+                        "sp1484 discarding replicated %s: actual %.1fMB exceeds "
+                        "available %.1fGB (declared size was untrusted)",
+                        cid[:12], actual / (1024 ** 2), self.available_gb)
+                    return None
+                if self.max_replica_bytes and actual > self.max_replica_bytes:
+                    logger.warning(
+                        "sp1484 discarding replicated %s: actual %.1fMB exceeds the "
+                        "per-item replication cap %.1fMB",
+                        cid[:12], actual / (1024 ** 2),
+                        self.max_replica_bytes / (1024 ** 2))
+                    return None
+
+                # Content-address the staged file so the streaming serve path
+                # (local_publish_path -> _local_stream_info) can find it.
+                h = hashlib.sha256()
+                with open(tmp_path, "rb") as fh:
+                    for block in iter(lambda: fh.read(1024 * 1024), b""):
+                        h.update(block)
+                content_hash = h.hexdigest()
+                final_path = _Path(staging_dir) / content_hash
+                _os.replace(tmp_path, final_path)
+
+                if not publisher.register_local_publish_tier_a(cid, content_hash):
+                    logger.warning(
+                        "sp1484 staged %s but re-registration failed", cid[:12])
+                    return None
+                provider.register_local_content(
+                    cid=cid, size_bytes=actual, content_hash=content_hash,
+                    filename=None, metadata={"tier": "A", "replica": True},
+                )
+                logger.info(
+                    "sp1484 replicated %s (%.1fMB) — now serving a durable copy",
+                    cid[:12], actual / (1024 ** 2))
+                return actual
+            except Exception as exc:  # noqa: BLE001 — never break the storage loop
+                logger.warning("sp1484 replication of %s failed: %s", cid[:12], exc)
+                return None
+            finally:
+                try:
+                    _Path(tmp_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     async def _get_content_size(self, cid: str) -> int:
         """Get the size of stored content from ContentStore.
