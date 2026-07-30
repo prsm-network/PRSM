@@ -179,6 +179,12 @@ PUBLIC_ALLOWLIST_EXACT: Set[str] = {
     # storage / marketplace aggregate reads
     "/storage/stats", "/storage/pinned-stats", "/storage/provider-reputations",
     "/marketplace/reputation",
+    # sp1482 — the ingested provider listing set. Read-only aggregate, and the data
+    # is ALREADY public: every listing is a signed broadcast on
+    # GOSSIP_MARKETPLACE_LISTING that any peer joining the network receives, so
+    # serving it over HTTP discloses nothing new. Public because discoverability is
+    # the point — a would-be requester must be able to see that supply exists.
+    "/marketplace/providers",
     # dashboard sub-app public reads + login (a blanket /api/ would break /api/auth/login)
     "/api/auth/login", "/api/auth/logout", "/api/auth/me", "/api/status", "/api/node",
     "/api/health", "/api/peers", "/api/agents", "/api/content/search", "/api/distillation",

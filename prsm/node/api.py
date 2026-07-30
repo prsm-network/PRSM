@@ -15197,6 +15197,78 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
             "last_seen_unix": rep.last_seen_unix,
         }
 
+    @app.get("/marketplace/providers", tags=["marketplace"])
+    async def list_marketplace_providers(
+        limit: int = 100,
+        verified_stake_only: bool = False,
+    ) -> Dict[str, Any]:
+        """sp1482 — the provider listings this node has ingested from gossip.
+
+        The supply side (sp1459) broadcasts signed listings, but until sp1482 the
+        directory that ingests them was built only inside the QUERY-ORCHESTRATOR
+        block (default OFF), so a default node dropped every listing and there was
+        no way to see whether ANY supply existed. This is that view.
+
+        Public read: each listing is already a signed public broadcast that any
+        peer on the gossip network receives, so this discloses nothing new — and
+        discoverability is the point.
+
+        `verified_stake_only=true` returns only listings carrying a cryptographic
+        stake binding (sp1457), i.e. those the selector weights by REAL on-chain
+        stake rather than a self-asserted tier.
+        """
+        if limit <= 0 or limit > 10000:
+            raise HTTPException(
+                status_code=422, detail=f"limit must be in [1, 10000], got {limit}")
+
+        directory = getattr(node, "marketplace_directory", None)
+        if directory is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Marketplace directory not initialized — the node has no "
+                    "gossip transport, so no listings can be ingested."
+                ),
+            )
+
+        listings = directory.list_active_providers()
+        rows = []
+        for lst in listings:
+            try:
+                verified = bool(lst.has_verified_stake_binding())
+            except Exception:  # noqa: BLE001 — a malformed binding is just unverified
+                verified = False
+            if verified_stake_only and not verified:
+                continue
+            rows.append({
+                "provider_id": lst.provider_id,
+                "listing_id": lst.listing_id,
+                "price_per_shard_ftns": lst.price_per_shard_ftns,
+                "capacity_shards_per_sec": lst.capacity_shards_per_sec,
+                "max_shard_bytes": lst.max_shard_bytes,
+                "supported_dtypes": list(lst.supported_dtypes or []),
+                "tee_capable": bool(lst.tee_capable),
+                # The SELF-ASSERTED tier. Only meaningful for selection weight when
+                # verified_stake_binding is true (sp1457/sp1463) — surfaced together
+                # so a reader is never misled by an unbacked tier claim.
+                "stake_tier": lst.stake_tier,
+                "verified_stake_binding": verified,
+                "stake_eth_address": lst.stake_eth_address if verified else None,
+                "advertised_at_unix": lst.advertised_at_unix,
+                "ttl_seconds": lst.ttl_seconds,
+                "expires_at_unix": lst.advertised_at_unix + lst.ttl_seconds,
+            })
+        rows.sort(key=lambda r: (not r["verified_stake_binding"],
+                                 r["price_per_shard_ftns"]))
+        return {
+            "providers": rows[:limit],
+            "count": len(rows),
+            "total_active": len(listings),
+            "verified_stake_count": sum(
+                1 for r in rows if r["verified_stake_binding"]),
+            "limit": limit,
+        }
+
     @app.get("/marketplace/reputation", tags=["marketplace"])
     async def list_marketplace_reputation(
         limit: int = 100,

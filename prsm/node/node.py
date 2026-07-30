@@ -2203,6 +2203,35 @@ class PRSMNode:
                 logger.warning("marketplace advertiser wiring skipped: %s", exc)
                 self._marketplace_advertiser = None
 
+        # ── Marketplace DEMAND side (sp1482) ─────────────────────
+        # The directory is the counterpart to the advertiser above: the advertiser
+        # BROADCASTS this node's listing, the directory INGESTS everyone else's.
+        #
+        # It used to be constructed in exactly one place — inside
+        # _build_query_orchestrator_or_none, behind PRSM_QUERY_ORCHESTRATOR_ENABLED
+        # (default OFF). So on a default node NOTHING subscribed to
+        # GOSSIP_MARKETPLACE_LISTING and every advertised listing was dropped on the
+        # floor: sp1459 activated the supply side into a network where nobody was
+        # listening. Hoisted here and built UNCONDITIONALLY so a default node
+        # accumulates the provider set.
+        #
+        # Cheap and already hardened: it is a gossip subscriber whose ingest is
+        # signature-verified + replay-guarded (sp1008), rate-limited per frame
+        # (sp936), TTL-bounded and capacity-capped (sp1460), and future-skew
+        # rejected (sp1462). Bounded memory, no network calls, no timers.
+        self.marketplace_directory = None
+        if self.gossip is not None:
+            try:
+                from prsm.marketplace.directory import MarketplaceDirectory
+                self.marketplace_directory = MarketplaceDirectory(self.gossip)
+                logger.info(
+                    "marketplace directory ingesting listings "
+                    "(GOSSIP_MARKETPLACE_LISTING)"
+                )
+            except Exception as exc:  # noqa: BLE001 — never break node bring-up
+                logger.warning("marketplace directory wiring skipped: %s", exc)
+                self.marketplace_directory = None
+
         self.compute_requester = ComputeRequester(
             identity=self.identity,
             transport=self.transport,
@@ -6251,11 +6280,18 @@ class PRSMNode:
                     "MarketplaceDirectory"
                 )
 
-            # Marketplace + reputation primitives are constructed here
-            # because node.py doesn't currently own them. Once the
-            # marketplace orchestrator becomes a top-level node
-            # subsystem (separate sprint), pull these from self.* instead.
-            marketplace_directory = MarketplaceDirectory(self.gossip)
+            # sp1482 — the directory is now a top-level node subsystem built
+            # unconditionally in initialize() (see the demand-side block there), so
+            # reuse THAT instance rather than constructing a second one. Two
+            # instances would both subscribe to GOSSIP_MARKETPLACE_LISTING and keep
+            # divergent views of the provider set — the QO would select against a
+            # directory that /marketplace/providers never shows. Fall back to a
+            # fresh instance only if the hoisted one is somehow absent.
+            marketplace_directory = (
+                getattr(self, "marketplace_directory", None)
+                or MarketplaceDirectory(self.gossip)
+            )
+            self.marketplace_directory = marketplace_directory
             reputation_tracker = ReputationTracker()
             # Sprint 275 — expose tracker on Node so operator
             # endpoints (/marketplace/reputation/*) can read it.
