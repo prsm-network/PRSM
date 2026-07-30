@@ -195,7 +195,17 @@ PUBLIC_ALLOWLIST_EXACT: Set[str] = {
 # (POST /content/upload, GET /content/mine, POST /api/jobs/submit, /api/distillation/submit,
 # /api/teacher/create) OUT of the public {param} match — those fall through to default-deny.
 PUBLIC_ALLOWLIST_PATTERNS = [
-    re.compile(r"^/content/(?!upload$|mine$)[^/]+$"),   # GET /content/{cid} (free commons)
+    # GET /content/{cid} (free commons).
+    # sp1485 SECURITY FIX — the exclusion list previously read `(?!upload$|mine$)`,
+    # which anchors on the FULL segment. `/content/upload-stream` therefore did NOT
+    # match `upload$` and fell through to this PUBLIC pattern, leaving the
+    # large-file publish endpoint reachable WITHOUT the operator key on a keyed
+    # node — an unauthenticated stranger could write multi-GB content to the
+    # operator's disk (and, after sp1483, get it gossip-advertised + persisted).
+    # Same class as the sp1444 deny-list gaps. Every WRITE segment under /content/
+    # must be enumerated here; a bare `(?!upload)` would also swallow legitimate
+    # CIDs that happen to start with "upload".
+    re.compile(r"^/content/(?!upload$|upload-stream$|mine$)[^/]+$"),
     re.compile(r"^/content/retrieve/[^/]+$"),           # GET /content/retrieve/{cid}
     re.compile(r"^/content/recipient-manifest/[^/]+$"), # GET /content/recipient-manifest/{cid}
     re.compile(r"^/content/paid-key/[^/]+$"),           # GET /content/paid-key/{hash} (SELF_AUTH)
@@ -204,6 +214,18 @@ PUBLIC_ALLOWLIST_PATTERNS = [
     re.compile(r"^/api/distillation/(?!submit$)[^/]+$"),# dashboard read (not /submit)
     re.compile(r"^/api/teacher/(?!create$)[^/]+$"),     # dashboard read (not /create)
 ]
+
+
+def _public_gateway_mode() -> bool:
+    """sp1485 — True when this node is a read-only PUBLIC GATEWAY.
+
+    Read at call time (not import time) so tests and operators can flip it without
+    re-importing. Any of 1/true/yes enables it; default OFF, so an ordinary node's
+    behavior is unchanged.
+    """
+    import os
+    return str(os.environ.get("PRSM_PUBLIC_GATEWAY", "")).strip().lower() in (
+        "1", "true", "yes")
 
 
 def is_protected_path(path: str) -> bool:
@@ -274,6 +296,30 @@ class NodeAuthMiddleware(BaseHTTPMiddleware):
 
         # Check if this is a protected endpoint (sp1012 — prefix OR templated).
         is_protected = is_protected_path(path)
+
+        # sp1485 — PUBLIC GATEWAY mode. A gateway binds the API on a PUBLIC
+        # interface so people who do not run a node can read the free Tier-A
+        # commons. On a publicly-bound node, "protected" must mean DENIED, not
+        # "needs the operator key": otherwise a single leaked/reused node key
+        # would let anyone on the internet drive the operator's wallet, uploads
+        # and admin surface. Gateway mode therefore hard-refuses every
+        # non-allowlisted path REGARDLESS of credentials, so the blast radius of
+        # exposing the port is exactly the public read allowlist and nothing else.
+        # Deliberately checked BEFORE the auth branch so a valid key cannot widen
+        # it. Loopback/private binds are unaffected (flag off by default).
+        if is_protected and _public_gateway_mode():
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "forbidden",
+                    "detail": (
+                        "This node runs in PUBLIC GATEWAY mode and serves only "
+                        "public read endpoints. Write/admin/wallet surfaces are "
+                        "disabled here regardless of credentials — run your own "
+                        "node for those."
+                    ),
+                },
+            )
 
         if is_protected and self.auth_enabled:
             # Extract API key from headers.
