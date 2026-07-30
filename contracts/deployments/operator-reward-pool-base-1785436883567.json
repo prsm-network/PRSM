@@ -1,0 +1,13 @@
+{
+  "network": "base",
+  "chainId": "8453",
+  "contracts": {
+    "OperatorRewardPool": "0xFEc4E85597e0749492a615FBb9FE92ab1554EaEf",
+    "FTNSToken": "0x5276a3756C85f2E9e46f6D34386167a209aa16e5"
+  },
+  "owner": "0x91b0e6F85A371D82De94eD13A3812d9f5A4E5791",
+  "rootPublisher": "0x2aF5E504C6735fF1Fa07f19c145aF79B8AF459e9",
+  "deployer": "0xF7d88c943B048dAd2e5178E40DaaD545dB3311c2",
+  "txHash": "0x79848dc21902757eb49fe03d9253df5971429c8d44a1a1c0797642e5a93e5fd7",
+  "nextStep": "Foundation Safe (2-of-3) must call CompensationDistributor.setPoolAddresses to point operatorPool here — build the payload with scripts/build-setpooladdresses-safe-tx.js"
+}
