@@ -775,6 +775,25 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1493_offchain_onchain_double_pay.py",
         kills_test_id="test_the_payment_path_CONSULTS_the_guard",
     ),
+    Guard(
+        id="escrow-gossip-follows-broadcast-axis",
+        sprint="sp1494",
+        file="prsm/node/payment_escrow.py",
+        anchor="if not _looks_like_node_id(payee) or payee == self.node_id:",
+        protects="a stage/swarm node being paid TWICE for one job. sp1494 added the cross-node "
+                 "credit rail so an escrow release reaches the PAYEE's own node (previously the "
+                 "credit existed only on the paying node's ledger — a silent strand, since "
+                 "broadcast_tx cannot resolve a 32-hex node_id). But gossip must follow the SAME "
+                 "axis as `broadcast`, which is not an 'on-chain?' switch but a 'does something "
+                 "ELSE settle this payee?' switch: with broadcast=False (credit_policy.py under "
+                 "PRSM_MULTISTAGE_SETTLEMENT) per-stage on-chain commit already settles the payee, "
+                 "so gossiping too credits them once withdrawable off-chain AND once on chain. This "
+                 "gate also excludes 0x payees (broadcast_tx CAN mirror those, so gossip would "
+                 "double-pay) and self-releases. Widen it to gossip unconditionally — the obvious "
+                 "'just tell everyone' simplification — and multistage settlement double-pays",
+        killed_by="tests/unit/test_sprint_1494_escrow_gossip_rail.py",
+        kills_test_id="test_does_NOT_gossip_when_broadcast_is_False",
+    ),
 ]
 
 

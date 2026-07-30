@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 
+from prsm.economy.batch_settlement import _looks_like_node_id
 from prsm.node.local_ledger import LocalLedger, Transaction
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,7 @@ class PaymentEscrow:
         node_id: str,
         broadcast_transaction: Optional[Callable] = None,
         *,
+        gossip_transaction: Optional[Callable] = None,
         default_timeout: Optional[float] = None,
         cleanup_interval: Optional[float] = None,
         on_cleanup_callback: Optional[Callable] = None,
@@ -89,6 +91,12 @@ class PaymentEscrow:
         self.ledger = ledger
         self.node_id = node_id
         self.broadcast_tx = broadcast_transaction  # async func(tx)
+        # sp1494 — the CROSS-NODE credit rail. Until now a release to a REMOTE
+        # payee produced a credit that existed only on THIS node's ledger: the
+        # payee's own node never learned of it, and broadcast_tx cannot help
+        # because it resolves node_ids to None (sp1492). Set by node.py to
+        # ledger_sync.broadcast_transaction. See _maybe_gossip for the gating.
+        self.gossip_tx = gossip_transaction  # async func(tx)
         self._escrows: Dict[str, EscrowEntry] = {}
         # sp907 — per-job_id locks serialize release/refund/split so the
         # PENDING->terminal status transition is not a check-then-act race
@@ -401,6 +409,10 @@ class PaymentEscrow:
                         type(exc).__name__, exc,
                     )
 
+            # sp1494 — tell the PAYEE's own node. Without this the credit exists
+            # only here and the payee never learns they were paid.
+            await self._maybe_gossip(tx, provider_id, broadcast=True)
+
             logger.info(
                 f"Escrow released: {amount:.6f} FTNS -> {provider_id[:12]}... "
                 f"for job {job_id[:8]}..."
@@ -670,22 +682,89 @@ class PaymentEscrow:
         # broadcast=False (multi-stage: the per-stage escrow commit settles these
         # shares on-chain via the registry; a second broadcast here double-pays).
         if broadcast and self.broadcast_tx:
-            for tx in txs:
+            for tx in list(txs) + ([refund_tx] if refund_tx else []):
                 try:
                     await self.broadcast_tx(tx)
-                except Exception:
-                    pass
-            if refund_tx:
-                try:
-                    await self.broadcast_tx(refund_tx)
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    # sp1494 — the THIRD broadcast site; sp1489 loudened the other
+                    # two and missed this one. No rollback (the local split already
+                    # committed), but not silent either: the local ledger says paid
+                    # while the chain does not.
+                    logger.error(
+                        "escrow-split broadcast FAILED for payee %s (tx %s, job "
+                        "%s): %s: %s — local ledger committed, on-chain did NOT. "
+                        "Reconciliation required.",
+                        str(getattr(tx, "to_wallet", "?"))[:16],
+                        getattr(tx, "tx_id", "?"), job_id[:8],
+                        type(exc).__name__, exc,
+                    )
+
+        # sp1494 — cross-node credit rail. Paired off each tx's OWN to_wallet
+        # rather than by index into `splits`, so a partially-failed split cannot
+        # misattribute a credit to the wrong recipient.
+        for tx in txs:
+            await self._maybe_gossip(
+                tx, str(getattr(tx, "to_wallet", "")), broadcast=broadcast)
 
         logger.info(
             f"Escrow split-released: {total_split:.6f} FTNS across "
             f"{len(splits)} recipients for job {job_id[:8]}..."
         )
         return txs
+
+    async def _maybe_gossip(self, tx, payee: str, broadcast: bool) -> bool:
+        """sp1494 — publish a release so the PAYEE's own node credits itself.
+
+        Closes the silent cross-node strand: `release_escrow` moves funds to the
+        payee on THIS node's ledger only. For a remote payee that credit is
+        invisible — the payee's node never sees it, and it cannot even be
+        reconciled, because the tx's parties are ``escrow-<uuid>`` and the payee,
+        neither of which is this node's own id, so `get_transaction_history()`
+        never returns it.
+
+        GATED ON THE SAME AXIS AS ``broadcast``, which is the whole subtlety.
+        ``broadcast`` is not really an "on-chain?" switch — it answers "does
+        something ELSE settle this payee?":
+
+          * ``broadcast=False`` (credit_policy.py with PRSM_MULTISTAGE_SETTLEMENT)
+            means the payee is settled on chain by per-stage self-commit. Gossiping
+            as well would credit them TWICE — once withdrawable off-chain, once on
+            chain. So: no gossip.
+          * ``broadcast=True`` with a REMOTE NODE_ID payee means nothing else pays
+            them at all: broadcast_tx routes to BatchSettlementManager, whose
+            _resolve_address rejects a 32-hex node_id (sp1492). This is exactly the
+            strand, and exactly where gossip belongs.
+
+        Deliberately NOT gossiped:
+          * a ``0x`` payee — broadcast_tx CAN mirror that on chain, so gossiping too
+            would double-pay;
+          * our OWN node_id — a self-release is already local;
+          * internal wallets (``escrow-…``) — not a payee at all.
+
+        Gossip itself cannot double-credit: the receiver dedups on tx_id through
+        three independent gates (seen-nonce, an atomic INSERT-OR-IGNORE nonce claim,
+        and has_transaction), so even a duplicate broadcast applies once.
+        """
+        if tx is None or self.gossip_tx is None or not broadcast:
+            return False
+        payee = (payee or "").strip()
+        if not _looks_like_node_id(payee) or payee == self.node_id:
+            return False
+        try:
+            await self.gossip_tx(tx)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            # Non-fatal: the local release already committed and the payee can
+            # still be reconciled. But NOT silent — sp1489's lesson: this is the
+            # only rail that tells the payee they were paid.
+            logger.error(
+                "escrow-release GOSSIP FAILED for payee %s (tx %s): %s: %s — the "
+                "payee's own node will NOT see this credit. Reconciliation "
+                "required.",
+                payee[:16], getattr(tx, "tx_id", "?"),
+                type(exc).__name__, exc,
+            )
+            return False
 
     async def refund_escrow(self, job_id: str, reason: str = "") -> bool:
         """Refund escrow to the requester — sp907 lock wrapper.

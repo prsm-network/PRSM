@@ -5108,6 +5108,13 @@ class PRSMNode:
             # Wire batch settlement as the on-chain broadcast handler
             if self.ftns_ledger is not None:
                 self._payment_escrow.broadcast_tx = self._on_chain_ftns_transfer
+        # sp1494 — the CROSS-NODE credit rail. broadcast_tx cannot pay a remote
+        # payee (BatchSettlementManager._resolve_address rejects a 32-hex node_id),
+        # so without this an escrow release to a peer credits ONLY this node's
+        # ledger and the payee never learns of it. Wired unconditionally, like the
+        # requester's own ledger_sync — the gating lives in _maybe_gossip.
+        if self._payment_escrow is not None and self.ledger_sync is not None:
+            self._payment_escrow.gossip_tx = self.ledger_sync.broadcast_transaction
         self.compute_requester.ledger_sync = self.ledger_sync
         # sp1405 — on-chain settlement is PROVIDER-side (the earner commits: commitBatch →
         # provider=msg.sender). The node that SERVES a remote job accumulates its OWN earning, so the
