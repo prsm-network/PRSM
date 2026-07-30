@@ -16547,6 +16547,159 @@ def node_verify_receipts_cli(
 # ──────────────────────────────────────────────────────────────
 # Sprint 434 — `prsm node incident ...` CLI trifecta gap
 #
+@node.command("claim-emissions")
+@click.option("--manifest", "manifest_source", default=None,
+              help="Epoch manifest (local path or https URL). Defaults to "
+                   "$PRSM_EMISSION_MANIFEST.")
+@click.option("--pool-address", default=None,
+              help="OperatorRewardPool address. Defaults to $PRSM_REWARD_POOL_ADDRESS.")
+@click.option("--account", "account_override", default=None,
+              help="Earner address to claim FOR. Defaults to your operator address. "
+                   "Funds always go to this address, never to the signer.")
+@click.option("--network", default=None, help="Network name (default: resolved).")
+@click.option("--dry-run", is_flag=True,
+              help="Verify and report what is claimable; send nothing.")
+@click.option("--format", "output_format",
+              type=click.Choice(["text", "json"]), default="text")
+def node_claim_emissions_cli(
+    manifest_source: Optional[str],
+    pool_address: Optional[str],
+    account_override: Optional[str],
+    network: Optional[str],
+    dry_run: bool,
+    output_format: str,
+) -> None:
+    """Sprint 1481 — claim your share of a protocol emission epoch.
+
+    EmissionController mints protocol FTNS, CompensationDistributor splits it into
+    pools, and OperatorRewardPool distributes a pool to the operators who actually
+    earned it. Entitlements are published as a per-epoch Merkle root; this command
+    finds yours, verifies it, and claims it.
+
+    Merkle PROOFS are not on chain — only the root is — so your (amount, proof)
+    comes from an off-chain epoch manifest. That manifest is UNTRUSTED: this
+    command re-derives the leaf and folds the proof locally, then compares against
+    the root READ FROM THE CONTRACT (never the root the manifest asserts). A
+    manifest that disagrees with the chain is refused before any gas is spent.
+
+    Exit codes:
+      0 — claimed (or, with --dry-run, a valid claim is available)
+      1 — nothing claimable (no entry, or already claimed)
+      2 — misconfigured (no manifest / pool address / key)
+      3 — the manifest does NOT match the on-chain root (refused)
+    """
+    import json as _json
+    import os as _os
+
+    def _emit(payload: dict, text: str, code: int) -> None:
+        if output_format == "json":
+            click.echo(_json.dumps(payload, indent=2))
+        else:
+            click.echo(text)
+        raise SystemExit(code)
+
+    manifest_source = manifest_source or _os.environ.get("PRSM_EMISSION_MANIFEST", "").strip()
+    pool_address = pool_address or _os.environ.get("PRSM_REWARD_POOL_ADDRESS", "").strip()
+    if not manifest_source:
+        _emit({"error": "no_manifest"},
+              "❌ No epoch manifest. Pass --manifest <path|url> or set "
+              "PRSM_EMISSION_MANIFEST.", 2)
+    if not pool_address:
+        _emit({"error": "no_pool_address"},
+              "❌ No OperatorRewardPool address. Pass --pool-address or set "
+              "PRSM_REWARD_POOL_ADDRESS.", 2)
+
+    try:
+        from prsm.config.networks import resolve_endpoints
+        _ep = resolve_endpoints(network)
+        rpc_url, chain_id = _ep.rpc_url, _ep.chain_id
+    except Exception as exc:  # noqa: BLE001
+        _emit({"error": "network_unresolved", "detail": str(exc)},
+              f"❌ Could not resolve network endpoints: {exc}", 2)
+
+    private_key = (_os.environ.get("FTNS_WALLET_PRIVATE_KEY") or "").strip()
+    account = account_override or (_os.environ.get("PRSM_OPERATOR_ADDRESS") or "").strip()
+    if not account and private_key:
+        try:
+            from eth_account import Account as _Acct
+            account = _Acct.from_key(private_key).address
+        except Exception:  # noqa: BLE001
+            account = ""
+    if not account:
+        _emit({"error": "no_account"},
+              "❌ No earner address. Pass --account, or set PRSM_OPERATOR_ADDRESS / "
+              "FTNS_WALLET_PRIVATE_KEY.", 2)
+    if not dry_run and not private_key:
+        _emit({"error": "no_key"},
+              "❌ Claiming needs a funded signer: set FTNS_WALLET_PRIVATE_KEY "
+              "(or re-run with --dry-run to just check).", 2)
+
+    from prsm.economy.web3.operator_reward_pool_client import (
+        ManifestMismatchError, OperatorRewardPoolClient, load_epoch_manifest,
+    )
+    try:
+        manifest = load_epoch_manifest(manifest_source)
+    except Exception as exc:  # noqa: BLE001
+        _emit({"error": "manifest_unreadable", "detail": str(exc)},
+              f"❌ Could not read manifest {manifest_source}: {exc}", 2)
+
+    try:
+        client = OperatorRewardPoolClient(
+            rpc_url=rpc_url, pool_address=pool_address,
+            private_key=private_key or None, expected_chain_id=chain_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _emit({"error": "client_init_failed", "detail": str(exc)},
+              f"❌ Could not connect to the reward pool: {exc}", 2)
+
+    try:
+        claimable = client.resolve_claimable(manifest, account)
+    except ManifestMismatchError as exc:
+        # The security-relevant outcome: refuse rather than burn gas on a bad proof.
+        _emit({"error": "manifest_mismatch", "detail": str(exc)},
+              f"🚨 REFUSING TO CLAIM — {exc}", 3)
+    except Exception as exc:  # noqa: BLE001
+        _emit({"error": "resolve_failed", "detail": str(exc)},
+              f"❌ Could not resolve your entitlement: {exc}", 2)
+
+    if claimable is None:
+        _emit({"claimable": False, "reason": "no_entry", "account": account},
+              f"No entitlement for {account} in epoch "
+              f"{manifest.get('epoch_id')} — nothing to claim.", 1)
+    if claimable.already_claimed:
+        _emit({"claimable": False, "reason": "already_claimed",
+               "epoch_id": claimable.epoch_id, "account": account,
+               "amount_wei": str(claimable.amount_wei)},
+              f"Epoch {claimable.epoch_id}: already claimed "
+              f"{claimable.amount_ftns:.6f} FTNS.", 1)
+
+    if dry_run:
+        _emit({"claimable": True, "epoch_id": claimable.epoch_id,
+               "account": account, "amount_wei": str(claimable.amount_wei),
+               "amount_ftns": claimable.amount_ftns,
+               "on_chain_root": "0x" + claimable.on_chain_root.hex(),
+               "verified_against_chain": True},
+              f"✅ Claimable: {claimable.amount_ftns:.6f} FTNS from epoch "
+              f"{claimable.epoch_id}\n"
+              f"   account : {account}\n"
+              f"   root    : 0x{claimable.on_chain_root.hex()} (verified on chain)\n"
+              f"   Re-run without --dry-run to claim.", 0)
+
+    try:
+        tx_hash = client.claim(
+            claimable.epoch_id, account, claimable.amount_wei, claimable.proof)
+    except Exception as exc:  # noqa: BLE001
+        _emit({"error": "claim_failed", "detail": str(exc),
+               "epoch_id": claimable.epoch_id},
+              f"❌ Claim broadcast failed: {exc}", 2)
+
+    _emit({"claimed": True, "epoch_id": claimable.epoch_id, "account": account,
+           "amount_wei": str(claimable.amount_wei),
+           "amount_ftns": claimable.amount_ftns, "tx_hash": tx_hash},
+          f"✅ Claimed {claimable.amount_ftns:.6f} FTNS from epoch "
+          f"{claimable.epoch_id}\n   to : {account}\n   tx : {tx_hash}", 0)
+
+
 # The /admin/incident/* REST surface (sprint <pre-roadmap>) +
 # `prsm_incident` MCP tool exist; the CLI lane was the gap per
 # PRSM_Testing.md §13 "Operator-trifecta gaps". This block adds
