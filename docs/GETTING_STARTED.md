@@ -9,14 +9,14 @@ This guide has two tracks. Start with **Quick Start (5 minutes)** if you want to
 ### 1. Install
 
 ```bash
-pip install prsm-network
+pip install "prsm-network[ml]"
 ```
 
 Or from source:
 ```bash
 git clone https://github.com/prsm-network/PRSM.git
 cd PRSM
-pip install -e .
+pip install -e ".[ml]"
 ```
 
 ### 2. Configure

@@ -56,9 +56,103 @@ _GPT2_FAMILY_DIMS = dict(
 )
 logger = logging.getLogger(__name__)
 
-_KNOWN_MODELS: Dict[str, int] = {"gpt2": 12, "distilgpt2": 6}
+_KNOWN_MODELS: Dict[str, int] = {
+    "gpt2": 12, "distilgpt2": 6,
+    # sp1480 ladder models (layer counts are the FALLBACK — _derive_model_info
+    # reads the real HF config when the model is present).
+    "Qwen/Qwen2.5-0.5B-Instruct": 24,
+    "Qwen/Qwen2.5-3B-Instruct": 36,
+    "Qwen/Qwen2.5-7B-Instruct": 28,
+}
 
-DEFAULT_LOCAL_MODEL = "distilgpt2"  # fastest on CPU
+DEFAULT_LOCAL_MODEL = "distilgpt2"  # LAST-RESORT fallback — see resolve_default_local_model
+
+# ── sp1480 — hardware-aware default model ───────────────────────────────────
+# Until sp1480 every node defaulted to distilgpt2: a 6-layer 2019 base model that
+# emits word salad, on a 64GB Mac or an A10 alike. The only escape was
+# PRSM_LOCAL_INFERENCE_MODEL, which appeared nowhere in the docs, the CLI help or
+# the wizard — so "PRSM gives you real inference" was technically true and
+# practically useless. These pick the largest INSTRUCT model the box can actually
+# hold, so a first-time user gets a coherent answer with zero configuration.
+LADDER_7B = "Qwen/Qwen2.5-7B-Instruct"
+LADDER_3B = "Qwen/Qwen2.5-3B-Instruct"
+LADDER_05B = "Qwen/Qwen2.5-0.5B-Instruct"
+
+# Approximate first-run download, GB. Surfaced in the startup log so a multi-GB
+# fetch is never a silent surprise.
+APPROX_DOWNLOAD_GB: Dict[str, float] = {
+    LADDER_7B: 15.2, LADDER_3B: 6.2, LADDER_05B: 1.0,
+    "gpt2": 0.55, "distilgpt2": 0.35,
+}
+
+
+def resolve_default_local_model(
+    *,
+    device: str,
+    vram_gb: Optional[float] = None,
+    free_ram_gb: Optional[float] = None,
+) -> str:
+    """Pick the default local model for this hardware. PURE — inject the values.
+
+    Sized for fp16 on CUDA (resolve_dtype) and fp32 elsewhere, leaving headroom for
+    the KV cache and the OS. Deliberately conservative: picking a model that OOMs
+    mid-generation is a far worse first run than picking one size down.
+
+      cuda  >=16GB VRAM            -> 7B instruct  (fp16 ~15GB)
+      cuda  >= 8GB VRAM            -> 3B instruct  (fp16 ~6GB)
+      mps   >=32GB unified RAM     -> 3B instruct  (fp32 on MPS is memory-hungry)
+      mps   >=16GB unified RAM     -> 0.5B instruct
+      cpu   >= 8GB free RAM        -> 0.5B instruct
+      otherwise                    -> distilgpt2 (last resort; not useful, but runs)
+
+    Unknown/None capacity is treated as "too small to promise" and falls to the
+    conservative branch rather than guessing big.
+    """
+    v = float(vram_gb) if vram_gb else 0.0
+    r = float(free_ram_gb) if free_ram_gb else 0.0
+    if device == "cuda":
+        if v >= 16.0:
+            return LADDER_7B
+        if v >= 8.0:
+            return LADDER_3B
+        # A small/unknown-VRAM GPU still beats CPU for a 0.5B.
+        return LADDER_05B if v >= 4.0 else DEFAULT_LOCAL_MODEL
+    if device == "mps":
+        # Unified memory: the GPU shares system RAM, so size off total RAM.
+        if r >= 32.0:
+            return LADDER_3B
+        return LADDER_05B if r >= 16.0 else DEFAULT_LOCAL_MODEL
+    # cpu
+    return LADDER_05B if r >= 8.0 else DEFAULT_LOCAL_MODEL
+
+
+def detect_local_hardware() -> Dict[str, Any]:
+    """Best-effort (device, vram_gb, total_ram_gb) for resolve_default_local_model.
+    Never raises — a detection failure degrades to the conservative branch."""
+    device, vram_gb, ram_gb = "cpu", None, None
+    try:
+        import torch  # noqa: PLC0415
+        cuda = bool(torch.cuda.is_available())
+        mps = bool(getattr(torch.backends, "mps", None)
+                   and torch.backends.mps.is_available())
+        device = resolve_device(None, cuda=cuda, mps=mps)
+        if cuda:
+            try:
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            except Exception:  # noqa: BLE001
+                vram_gb = None
+    except Exception:  # noqa: BLE001 — torch absent/broken → cpu
+        pass
+    try:
+        import psutil  # noqa: PLC0415
+        ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+    except Exception:  # noqa: BLE001
+        try:
+            import os as _os
+            ram_gb = (_os.sysconf("SC_PAGE_SIZE") * _os.sysconf("SC_PHYS_PAGES")) / (1024 ** 3)
+        except Exception:  # noqa: BLE001
+            ram_gb = None
+    return {"device": device, "vram_gb": vram_gb, "ram_gb": ram_gb}
 _DEFAULT_MAX_TOKENS = 32
 _MAX_TOKENS_CEILING = 256
 

@@ -2986,14 +2986,46 @@ class PRSMNode:
             # (TEEType.SOFTWARE, vendor_verified=false) — real hardware TEE is
             # a separate (Tier 3) item. Not for confidential Tier B/C content.
             from prsm.compute.inference.local_inference import (
+                APPROX_DOWNLOAD_GB,
                 DEFAULT_LOCAL_MODEL,
                 build_local_inference_executor,
+                detect_local_hardware,
+                resolve_default_local_model,
                 start_local_prewarm,
             )
-            _local_model = (
-                os.environ.get("PRSM_LOCAL_INFERENCE_MODEL", "").strip()
-                or DEFAULT_LOCAL_MODEL
-            )
+            # sp1480 — pick the largest INSTRUCT model this box can hold instead of
+            # always defaulting to distilgpt2 (a 6-layer 2019 base model whose
+            # output is word salad). PRSM_LOCAL_INFERENCE_MODEL still wins.
+            _local_model = os.environ.get("PRSM_LOCAL_INFERENCE_MODEL", "").strip()
+            if _local_model:
+                logger.info(
+                    "Local inference model: %s (pinned via "
+                    "PRSM_LOCAL_INFERENCE_MODEL)", _local_model,
+                )
+            else:
+                try:
+                    _hw = detect_local_hardware()
+                    _local_model = resolve_default_local_model(
+                        device=_hw.get("device", "cpu"),
+                        vram_gb=_hw.get("vram_gb"),
+                        free_ram_gb=_hw.get("ram_gb"),
+                    )
+                    _dl = APPROX_DOWNLOAD_GB.get(_local_model)
+                    logger.info(
+                        "Local inference model: %s (auto-selected for device=%s "
+                        "vram=%s ram=%s%s). Override with "
+                        "PRSM_LOCAL_INFERENCE_MODEL=<hf-model-id>.",
+                        _local_model, _hw.get("device"),
+                        (f"{_hw['vram_gb']:.0f}GB" if _hw.get("vram_gb") else "n/a"),
+                        (f"{_hw['ram_gb']:.0f}GB" if _hw.get("ram_gb") else "n/a"),
+                        (f"; ~{_dl:.1f}GB on first use" if _dl else ""),
+                    )
+                except Exception as _sel_exc:  # noqa: BLE001 — never block startup
+                    _local_model = DEFAULT_LOCAL_MODEL
+                    logger.warning(
+                        "Local inference model auto-selection failed (%s); "
+                        "falling back to %s", _sel_exc, _local_model,
+                    )
             _local_max_raw = os.environ.get(
                 "PRSM_LOCAL_INFERENCE_MAX_TOKENS", "",
             ).strip()

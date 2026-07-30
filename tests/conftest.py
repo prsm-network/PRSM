@@ -681,7 +681,14 @@ def _allow_real_subprocess_for_marked_tests(request):
             suite = runner.run("MySpec")
             assert suite.status == SymbolicProofStatus.PASSED
     """
-    if 'requires_halmos' not in request.keywords:
+    # sp1480 — generalized beyond halmos. The session-wide mock silently turns
+    # any real subprocess call into Mock(returncode=0, stdout=b'', stderr=b''),
+    # which makes a test that shells out LOOK like it ran and passed/skipped
+    # cleanly. The wheel-packaging guard (test_sprint_1480_wheel_assets.py) has
+    # to actually BUILD a wheel, so it needs the same surgical bypass. Opt-in per
+    # test, so the broad subprocess-safety default is unchanged.
+    _bypass_markers = ('requires_halmos', 'requires_real_subprocess')
+    if not any(m in request.keywords for m in _bypass_markers):
         yield
         return
     _stop_subprocess_mocks()
@@ -1410,6 +1417,7 @@ def pytest_configure(config):
         "network: marks tests that require network simulation",
         "api: marks tests that test API endpoints",
         "requires_halmos: bypasses the session-wide subprocess mock so the test can invoke real halmos/forge; auto-skips when tools aren't on PATH",
+        "requires_real_subprocess: bypasses the session-wide subprocess mock for a test that must genuinely shell out (e.g. building a wheel to inspect its contents); skips gracefully when the tool is unavailable",
     ]
     
     for marker in markers:

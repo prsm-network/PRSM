@@ -58,7 +58,7 @@ Share your computer's processing power to help run AI queries and earn FTNS auto
 PRSM is a Python package. Install with `pip` on any platform (macOS, Linux, Windows with WSL):
 
 ```bash
-pip install prsm-network
+pip install "prsm-network[ml]"
 ```
 
 Requires Python 3.11+. For the full installation walkthrough including virtualenv setup and first-run configuration, see [`GETTING_STARTED.md`](GETTING_STARTED.md).

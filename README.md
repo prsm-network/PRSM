@@ -68,7 +68,7 @@ To stand up your own anchor-registered operator node, follow
 
 ```bash
 # Install
-pip install prsm-network
+pip install "prsm-network[ml]"   # [ml] ships the local inference engine
 
 # Check your hardware
 prsm node benchmark

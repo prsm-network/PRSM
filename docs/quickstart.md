@@ -19,7 +19,7 @@ Storage uses PRSM's native content store (ContentStore + BitTorrent layer) — n
 ### Install from PyPI
 
 ```bash
-pip install prsm-network
+pip install "prsm-network[ml]"
 ```
 
 ### Install from Source
@@ -36,7 +36,7 @@ python3 -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
 # Install PRSM
-pip install -e .
+pip install -e ".[ml]"
 ```
 
 This installs the `prsm` CLI command. Verify it works:
@@ -304,7 +304,7 @@ Make sure you've activated the virtual environment and installed PRSM:
 
 ```bash
 source .venv/bin/activate
-pip install -e .
+pip install -e ".[ml]"
 ```
 
 ### `Address already in use`

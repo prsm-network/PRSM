@@ -336,7 +336,44 @@ exclude = [
 include-package-data = false
 
 [tool.setuptools.package-data]
-prsm = ["*.py", "*/*.py", "*/*/*.py", "py.typed", "skills/*.yaml", "ui_mockup/*.html", "ui_mockup/css/*.css", "ui_mockup/js/*.js", "ui_mockup/assets/*", "compute/inference/vendor_anchors/*.pem"]
+# sp1480 — every path here is loaded at RUNTIME by code in prsm/. The wheel is
+# built with include-package-data = false, so anything missing from this list is
+# silently un-shipped: the source tree works, CI (which runs from source) stays
+# green, and only a `pip install prsm-network` user sees the dead surface. That
+# is exactly how the dashboard, the onboarding wizard, the WASM executor and the
+# model catalog shipped broken. tests/unit/test_sprint_1480_wheel_assets.py walks
+# the BUILT wheel and fails if any runtime-loaded asset is absent — keep that
+# test passing rather than trusting this list by eye.
+prsm = [
+    "*.py", "*/*.py", "*/*/*.py",
+    # NOTE: "py.typed" was listed here but prsm/py.typed does not exist, so the
+    # glob shipped nothing. Not creating the marker as a drive-by: [tool.mypy]
+    # enforces strict typing only on new + audited modules, so a PEP 561 marker
+    # would tell downstream type-checkers the WHOLE package is typed. Adding it
+    # is a deliberate typing-completeness decision, not a packaging fix.
+    # Operator dashboard — prsm/dashboard/app.py Jinja2Templates + the
+    # /static mount in prsm/node/api.py (_DASHBOARD_STATIC).
+    "dashboard/templates/*.html",
+    "dashboard/static/css/*.css",
+    "dashboard/static/js/*.js",
+    # Onboarding wizard + docs UI — prsm/interface/api/onboarding_router.py
+    # and docs_ui.py both Jinja2Templates(Path(__file__).parent/"templates").
+    # The wizard's 8 step templates are NESTED under onboarding/ and a bare
+    # "*.html" does NOT reach them (setuptools globs do not cross separators) —
+    # that omission is what made /onboarding/ 500 on the wheel.
+    "interface/api/templates/*.html",
+    "interface/api/templates/onboarding/*.html",
+    # Real WASM executor binaries (sp1177) — compute/wasm loads these at runtime.
+    "compute/wasm/binaries/*.wasm",
+    # Model catalog / pricing / providers / capability maps.
+    "core/config/models/*.yaml",
+    "data/*.yaml",
+    # Built-in skills. NOTE the previous "skills/*.yaml" glob matched NOTHING and
+    # was removed — the real files are skills/builtins/<name>/SKILL.yaml.
+    "skills/builtins/*/SKILL.yaml",
+    "ui_mockup/*.html", "ui_mockup/css/*.css", "ui_mockup/js/*.js", "ui_mockup/assets/*",
+    "compute/inference/vendor_anchors/*.pem",
+]
 
 [tool.setuptools.exclude-package-data]
 "*" = [
