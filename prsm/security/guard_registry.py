@@ -734,6 +734,24 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1488_dispatch_assignment_validation.py",
         kills_test_id="test_missing_job_id_is_REFUSED_not_defaulted",
     ),
+    Guard(
+        id="deposit-credit-floors-wei-conversion",
+        sprint="sp1490",
+        file="prsm/economy/ftns_onchain.py",
+        anchor="if Decimal(f) > exact:",
+        protects="a bridge deposit crediting MORE FTNS than actually arrived on chain — an "
+                 "unbacked credit on the money-IN path. wei->FTNS via `amount_wei / 1e18` sends the "
+                 "int through float64, which holds integers exactly only to 2**53 while ONE FTNS is "
+                 "10**18 wei, so the quotient is rounded to NEAREST and can round UP: "
+                 "999999999999999999 wei (one wei short of 1 FTNS) becomes exactly 1.0. "
+                 "wei_to_ftns_floor converts exactly via Decimal and steps one ULP toward zero when "
+                 "float() rounded up, so the credited value is provably <= the deposit. The "
+                 "magnitude is sub-wei, but the DIRECTION is what sp1472/1473/1478 hardened this "
+                 "path against — an over-credit is a mint, an under-credit is recoverable. Delete "
+                 "this step-down (it reads like a redundant float nicety) and the round-UP returns",
+        killed_by="tests/unit/test_sprint_1490_deposit_wei_precision.py",
+        kills_test_id="test_never_credits_more_than_deposited",
+    ),
 ]
 
 
