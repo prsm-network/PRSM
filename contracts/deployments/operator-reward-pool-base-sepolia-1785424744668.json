@@ -1,0 +1,13 @@
+{
+  "network": "base-sepolia",
+  "chainId": "84532",
+  "contracts": {
+    "OperatorRewardPool": "0xb099269BCd6EE1b72d771eE0ef326910DC25d7f9",
+    "FTNSToken": "0x0BD24e03e5A913Ce24D20Ad4eB9F08D45145f098"
+  },
+  "owner": "0xBbEB1cb42F1D5ad05B46eE023D6e4871D813C9a0",
+  "rootPublisher": "0xBbEB1cb42F1D5ad05B46eE023D6e4871D813C9a0",
+  "rehearsedEpoch": 21,
+  "potWei": "1000000000000000000000",
+  "note": "REHEARSAL deployment (testnet). Mainnet deploy is a Safe ceremony."
+}

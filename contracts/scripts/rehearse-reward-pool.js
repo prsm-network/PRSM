@@ -27,6 +27,51 @@ const fs = require("fs");
 const path = require("path");
 
 const FTNS = (n) => hre.ethers.parseEther(String(n));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Read an ERC-20 balance PINNED to a specific block.
+//
+// Live-network lesson (found by this very rehearsal on Base Sepolia): reading
+// `balanceOf` at "latest" immediately after tx.wait() can return PRE-tx state.
+// The receipt proves inclusion, but a load-balanced public RPC may serve the
+// follow-up read from a replica that has not applied that block yet — so the
+// verification saw a zero delta for a claim that had in fact succeeded. Same root
+// cause as the sp1474 reconciler bug (receipt and nonce reads landing on replicas
+// at different heights), and invisible on hardhat's instantly-consistent local
+// chain. Pinning to an explicit blockTag makes the read deterministic; a replica
+// that lacks the block errors rather than lying, so we retry until it catches up.
+async function balanceAtBlock(token, address, blockTag, tries = 20) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await token.balanceOf(address, { blockTag });
+    } catch (e) {
+      lastErr = e;
+      await sleep(1500);
+    }
+  }
+  throw new Error(
+    `could not read balanceOf(${address}) at block ${blockTag} after ${tries} ` +
+    `attempts (RPC replica lag?): ${lastErr && lastErr.message}`
+  );
+}
+
+// Generic pinned read with the same replica-lag retry as balanceAtBlock.
+async function readAtBlock(callFn, blockTag, tries = 20) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await callFn({ blockTag });
+    } catch (e) {
+      lastErr = e;
+      await sleep(1500);
+    }
+  }
+  throw new Error(
+    `pinned read at block ${blockTag} failed after ${tries} attempts ` +
+    `(RPC replica lag?): ${lastErr && lastErr.message}`
+  );
+}
 
 async function main() {
   const { ethers, upgrades } = hre;
@@ -135,7 +180,9 @@ async function main() {
   const pubTx = await pool.publishEpoch(plan.epoch_id, plan.merkle_root, pot);
   const pubRcpt = await pubTx.wait();
   console.log(`      tx: ${pubRcpt.hash}`);
-  const onChain = await pool.epochs(plan.epoch_id);
+  // Pinned to the publish block for the same replica-lag reason as balanceAtBlock.
+  const onChain = await readAtBlock(
+    (o) => pool.epochs(plan.epoch_id, o), pubRcpt.blockNumber);
   if (onChain[0].toLowerCase() !== plan.merkle_root.toLowerCase()) {
     throw new Error("published root does not match the builder's root");
   }
@@ -145,19 +192,26 @@ async function main() {
   // ── 6. Claim every entitlement ──────────────────────────────────────
   console.log(`\n[6/6] Claiming…`);
   let paid = 0n;
+  let lastClaimBlock = null;
   for (const e of plan.entries) {
     const amount = BigInt(e.amount_wei);
-    const before = await ftns.balanceOf(e.account);
     if (!(await pool.isClaimable(plan.epoch_id, e.account, amount, e.proof))) {
       throw new Error(`isClaimable=false for ${e.account} — proof/root mismatch`);
     }
     const rcpt = await (await pool.claim(
       plan.epoch_id, e.account, amount, e.proof)).wait();
-    const after = await ftns.balanceOf(e.account);
+    // Compare the balance ACROSS the claim's own block, both reads pinned, so the
+    // delta cannot be corrupted by RPC replica lag (see balanceAtBlock).
+    const after = await balanceAtBlock(ftns, e.account, rcpt.blockNumber);
+    const before = await balanceAtBlock(ftns, e.account, rcpt.blockNumber - 1);
     if (after - before !== amount) {
-      throw new Error(`payout mismatch for ${e.account}: ${after - before} != ${amount}`);
+      throw new Error(
+        `payout mismatch for ${e.account} at block ${rcpt.blockNumber}: ` +
+        `${after - before} != ${amount}`
+      );
     }
     paid += amount;
+    lastClaimBlock = rcpt.blockNumber;
     console.log(`      ✓ ${e.account} +${ethers.formatEther(amount)} FTNS (gas tx ${rcpt.hash.slice(0, 12)}…)`);
 
     // Double-claim must revert.
@@ -170,8 +224,14 @@ async function main() {
   }
 
   // ── Invariants ──────────────────────────────────────────────────────
-  const leftReserved = await pool.totalReserved();
-  const leftBalance = await ftns.balanceOf(poolAddr);
+  // Pinned to the final claim's block so the closing invariants are not read
+  // from a replica that is still behind (the failure this rehearsal first hit).
+  const leftReserved = lastClaimBlock === null
+    ? await pool.totalReserved()
+    : await readAtBlock((o) => pool.totalReserved(o), lastClaimBlock);
+  const leftBalance = lastClaimBlock === null
+    ? await ftns.balanceOf(poolAddr)
+    : await balanceAtBlock(ftns, poolAddr, lastClaimBlock);
   console.log(`\n=== Invariants ===`);
   console.log(`  distributed:    ${ethers.formatEther(paid)} FTNS`);
   console.log(`  pot:            ${ethers.formatEther(pot)} FTNS`);
