@@ -661,6 +661,23 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1455_content_royalty_collection_gate.py",
         kills_test_id="test_remote_uncollected_access_does_not_fund_onchain_royalty",
     ),
+    Guard(
+        id="epoch-watermark-refuses-empty-on-corruption",
+        sprint="sp1486",
+        file="prsm/settlement/epoch_watermark.py",
+        anchor="is unreadable (",
+        protects="every historical finalized batch being PAID A SECOND TIME out of the shared "
+                 "operator pot. The emission epoch job's exactly-once attribution rests entirely on "
+                 "the persisted consumed-batch-id set: an EMPTY set is indistinguishable from "
+                 "'nothing has ever been paid', so a corrupt or truncated watermark that is treated "
+                 "as empty re-attributes the entire history into the next epoch — over-paying whoever "
+                 "is in it and silently under-paying everyone else, with no on-chain signal that "
+                 "anything went wrong. This raises WatermarkIntegrityError instead. Soften it to a "
+                 "`except: self._consumed = set()` fallback — the obvious 'make it robust' edit — and "
+                 "the job double-pays on the first bad read",
+        killed_by="tests/unit/test_sprint_1486_epoch_watermark.py",
+        kills_test_id="test_corrupt_watermark_refuses_rather_than_starting_empty",
+    ),
 ]
 
 
