@@ -678,6 +678,24 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1486_epoch_watermark.py",
         kills_test_id="test_corrupt_watermark_refuses_rather_than_starting_empty",
     ),
+    Guard(
+        id="epoch-runner-refuses-lost-watermark",
+        sprint="sp1487",
+        file="prsm/settlement/epoch_runner.py",
+        anchor="watermark.last_epoch_id is None and chain.epoch_exists(",
+        protects="the emission epoch job re-attributing the ENTIRE settled history into one "
+                 "epoch. A lost/deleted watermark file is indistinguishable, from the file alone, "
+                 "from a genuine cold start — both say 'next epoch is 1, nothing consumed'. Only the "
+                 "CHAIN can tell them apart, so the job asks whether the pool already has that epoch "
+                 "id before it plans anything. Without this check a restored-from-bare-metal or "
+                 "wrong-directory run silently re-pays every historical batch out of the shared pot, "
+                 "over-paying whoever lands in the new epoch and under-paying everyone else, with no "
+                 "on-chain signal. Note it must run BEFORE planning, not just before publishing — the "
+                 "plan is itself the dangerous artifact. Delete it and the first watermark loss "
+                 "double-pays",
+        killed_by="tests/unit/test_sprint_1487_epoch_runner.py",
+        kills_test_id="test_LOST_watermark_is_refused_not_treated_as_a_cold_start",
+    ),
 ]
 
 
