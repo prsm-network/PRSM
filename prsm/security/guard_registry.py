@@ -794,6 +794,27 @@ GUARDS: List[Guard] = [
         killed_by="tests/unit/test_sprint_1494_escrow_gossip_rail.py",
         kills_test_id="test_does_NOT_gossip_when_broadcast_is_False",
     ),
+    Guard(
+        id="paid-tee-dispatch-verifies-attestation",
+        sprint="sp1495",
+        file="prsm/compute/remote_dispatcher.py",
+        anchor="def _enforce_tee_attestation(",
+        protects="a requester PAYING a TEE-tier price for confidentiality that was never checked. "
+                 "The gate was `if not receipt.get('tee_attestation'): raise` — a PRESENCE check "
+                 "that confirmed the field existed but never that it attested to anything, so a "
+                 "provider satisfied require_tee with the string 'yes' or with the dev-only "
+                 "SOFTWARE-FALLBACK blob this repo ships for local testing. The real machinery "
+                 "already existed (verify_attestation with Intel SGX DCAP + AMD SEV-SNP backends, "
+                 "plus the tiered tee_policy engine, used by three other call sites) — the paid path "
+                 "simply ignored it. This routes the blob through verify_attestation and requires at "
+                 "least HARDWARE_UNVERIFIED, which rejects software-fallback while still accepting a "
+                 "genuine SGX/SEV-SNP quote on an operator without vendor root CAs configured; a bad "
+                 "PRSM_TEE_MIN_TIER falls back to that safe default rather than downgrading. Revert "
+                 "it to a presence check and the confidentiality guarantee is hollow again — and it "
+                 "looks like it is working right up until it matters",
+        killed_by="tests/unit/test_sprint_1495_tee_attestation_enforced.py",
+        kills_test_id="test_the_dev_SOFTWARE_FALLBACK_blob_is_REJECTED",
+    ),
 ]
 
 

@@ -131,6 +131,98 @@ class InvalidDispatchAssignment(ValueError):
     """
 
 
+def _enforce_tee_attestation(blob, shard_index: int, node_id: str) -> None:
+    """sp1495 — a paid TEE dispatch must get a REAL attestation, not any truthy value.
+
+    This used to be ``if not receipt.get("tee_attestation"): raise`` — a PRESENCE
+    check. It verified that the field existed, never that it attested to anything,
+    so a provider could satisfy a requester's paid ``require_tee`` with the string
+    "yes", or with the dev-only SOFTWARE-FALLBACK blob this repo ships for local
+    testing. The requester pays a TEE-tier price for a confidentiality guarantee
+    that was never checked — the hollowest possible defence, and one that looks
+    like it is working right up until it matters.
+
+    The repo already has the real machinery: ``verify_attestation`` (Intel SGX DCAP
+    + AMD SEV-SNP backends, cryptographic ``vendor_verified``) and the tiered
+    ``tee_policy`` engine. Three other call sites use them. This one did not, so the
+    verification capability existed while the paid path ignored it.
+
+    MINIMUM TIER IS ``HARDWARE_UNVERIFIED``, deliberately, not HARDWARE_VERIFIED.
+    That rejects the software fallback — the actual hole — while still accepting a
+    genuine SGX/SEV-SNP quote on an operator who has not configured vendor root CAs
+    (``PRSM_INTEL_SGX_ROOT_CA_PEM`` / ``PRSM_AMD_SEV_SNP_ARK_PEM``). Demanding full
+    cryptographic verification by default would reject real TEE hardware on every
+    node that has not run that setup, which is a different kind of wrong.
+    Operators wanting the strict bar set ``PRSM_TEE_MIN_TIER=hardware_verified``.
+
+    Accepting HARDWARE_UNVERIFIED is logged at WARNING: the requester should be able
+    to tell that the vendor signature chain was not checked.
+    """
+    import os
+
+    from prsm.compute.inference.attestation_backends import (
+        AttestationVerificationResult, verify_attestation,
+    )
+    from prsm.enterprise.tee_policy import (
+        AttestationTier, effective_tier_from_result, tier_rank,
+    )
+
+    if not blob:
+        raise MissingAttestationError(
+            f"shard {shard_index} dispatched with require_tee_attestation=True "
+            f"but provider {node_id[:12]}… returned a receipt with no "
+            "tee_attestation field"
+        )
+
+    if isinstance(blob, str):
+        # Receipts cross a JSON boundary; accept hex/base64-ish text but never
+        # treat an arbitrary string as an attestation.
+        try:
+            blob = bytes.fromhex(blob[2:] if blob.startswith("0x") else blob)
+        except ValueError:
+            try:
+                import base64
+                blob = base64.b64decode(blob, validate=True)
+            except Exception:  # noqa: BLE001
+                raise MissingAttestationError(
+                    f"shard {shard_index}: provider {node_id[:12]}… returned a "
+                    "tee_attestation that is not decodable as bytes — refusing to "
+                    "treat an opaque string as proof of a TEE"
+                ) from None
+
+    try:
+        result = verify_attestation(bytes(blob))
+    except Exception as exc:  # noqa: BLE001
+        result = AttestationVerificationResult(
+            vendor="unknown", error=f"verify_attestation raised: {exc}")
+
+    effective = effective_tier_from_result(result)
+    required_name = (os.environ.get("PRSM_TEE_MIN_TIER") or "").strip().lower()
+    try:
+        required = (AttestationTier(required_name) if required_name
+                    else AttestationTier.HARDWARE_UNVERIFIED)
+    except ValueError:
+        required = AttestationTier.HARDWARE_UNVERIFIED
+
+    if tier_rank(effective) < tier_rank(required):
+        raise MissingAttestationError(
+            f"shard {shard_index}: provider {node_id[:12]}… supplied a "
+            f"tee_attestation of tier '{effective.value}' (vendor "
+            f"'{result.vendor}'{', error: ' + result.error if result.error else ''})"
+            f", below the required '{required.value}'. Refusing to accept a paid "
+            "TEE dispatch whose confidentiality is not actually attested."
+        )
+
+    if effective == AttestationTier.HARDWARE_UNVERIFIED:
+        logger.warning(
+            "shard %s: TEE attestation from %s… accepted at HARDWARE_UNVERIFIED "
+            "(vendor %s) — the vendor signature chain was NOT cryptographically "
+            "verified. Configure PRSM_INTEL_SGX_ROOT_CA_PEM / "
+            "PRSM_AMD_SEV_SNP_ARK_PEM to get hardware_verified.",
+            shard_index, node_id[:12], result.vendor,
+        )
+
+
 def validate_dispatch_assignment(assignment: dict) -> tuple:
     """sp1488 — fail closed on an assignment that cannot be paid for correctly.
 
@@ -510,13 +602,9 @@ class RemoteShardDispatcher:
                 f"receipt verification failed for shard {shard.shard_index}"
             )
 
-        if require_tee_attestation and not receipt.get("tee_attestation"):
-            raise MissingAttestationError(
-                f"shard {shard.shard_index} dispatched with "
-                f"require_tee_attestation=True but provider "
-                f"{node_id[:12]}… returned a receipt with no "
-                f"tee_attestation field"
-            )
+        if require_tee_attestation:
+            _enforce_tee_attestation(
+                receipt.get("tee_attestation"), shard.shard_index, node_id)
 
         return output, receipt
 
