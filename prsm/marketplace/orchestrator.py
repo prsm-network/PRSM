@@ -34,7 +34,10 @@ from prsm.compute.remote_dispatcher import (
     ShardPreemptedError,
 )
 from prsm.marketplace.directory import MarketplaceDirectory
-from prsm.marketplace.errors import NoEligibleProvidersError
+from prsm.marketplace.errors import (
+    JobBudgetExceededError,
+    NoEligibleProvidersError,
+)
 from prsm.marketplace.filter import EligibilityFilter
 from prsm.marketplace.listing import ProviderListing
 from prsm.marketplace.policy import DispatchPolicy
@@ -135,6 +138,25 @@ class MarketplaceOrchestrator:
                 f"directory has {len(listings)} listings, filter excluded all"
             )
 
+        # sp1498 — CHEAPEST FIRST. EligibilityFilter deliberately preserves input
+        # order, and that input is gossip-ARRIVAL order — so dispatch used to take
+        # whichever provider happened to gossip first and pay its asking price.
+        # That is not a market: it rewards being early, not being cheap, and it is
+        # the selection half of the unbounded-spend problem. The filter's ordering
+        # contract is unchanged; the ordering decision belongs here, to the caller.
+        # Ties break on provider_id so two requesters with the same directory make
+        # the same choice.
+        eligible = sorted(
+            eligible, key=lambda l: (float(l.price_per_shard_ftns), str(l.provider_id)))
+
+        # sp1498 — PER-JOB ceiling. A per-shard cap alone does not bound a job:
+        # N shards at the cap is N times the cap, and N comes from the model, not
+        # from the requester. Budget is enforced against the QUOTED prices as they
+        # are agreed, in _dispatch_one_shard.
+        self._job_budget_ftns = float(
+            getattr(policy, "max_total_job_ftns", 0.0) or 0.0)
+        self._job_spent_ftns = 0.0
+
         outputs: List[np.ndarray] = []
         for shard in shards:
             if self._consensus_requested(policy):
@@ -206,6 +228,38 @@ class MarketplaceOrchestrator:
                 last_reason = f"quote_rejected:{quote.reason}"
                 continue
 
+            # sp1498 — enforce the per-shard ceiling against the QUOTE, not just
+            # the advertised listing. request_quote passes the ceiling to the
+            # provider, but the provider is the one answering: an honest ceiling
+            # check on the far side is not a check. Verify locally before escrow.
+            quoted = float(quote.quoted_price_ftns)
+            if quoted > float(policy.max_price_per_shard_ftns):
+                last_reason = (
+                    f"quote_over_ceiling:{quoted}>{policy.max_price_per_shard_ftns}")
+                logger.warning(
+                    "job %s shard %s: provider %s quoted %.6f FTNS, above the "
+                    "policy ceiling %.6f — skipping. A provider cannot be trusted "
+                    "to enforce the requester's own limit.",
+                    job_id[:8], shard.shard_index, listing.provider_id[:12],
+                    quoted, policy.max_price_per_shard_ftns)
+                continue
+            if quoted < 0 or quoted != quoted:
+                last_reason = f"quote_not_finite:{quoted}"
+                continue
+
+            # sp1498 — and against the per-JOB budget, so N shards at the per-shard
+            # cap cannot silently multiply into N times the cap.
+            budget = getattr(self, "_job_budget_ftns", 0.0)
+            if budget > 0:
+                spent = getattr(self, "_job_spent_ftns", 0.0)
+                if spent + quoted > budget:
+                    raise JobBudgetExceededError(
+                        f"job {job_id!r} would spend {spent + quoted:.6f} FTNS "
+                        f"(shard {shard.shard_index} quoted {quoted:.6f}) against a "
+                        f"budget of {budget:.6f}. Aborting before escrow rather "
+                        "than part-paying a job that cannot complete."
+                    )
+
             # Step 2: dispatch the shard under the quoted price.
             # Use dispatch_with_receipt when Phase 3.1 batched settlement
             # is wired so we can forward the verified receipt to the
@@ -260,6 +314,9 @@ class MarketplaceOrchestrator:
             # Success.
             latency_ms = (time.time() - started) * 1000
             self.reputation.record_success(listing.provider_id, latency_ms)
+            # sp1498 — count the spend only once the shard actually succeeded, so a
+            # failed attempt that was never escrow-released does not consume budget.
+            self._job_spent_ftns = getattr(self, "_job_spent_ftns", 0.0) + quoted
 
             # Phase 3.1 (Task 7): accumulate the verified receipt for
             # batched on-chain settlement, when wired. Silently skip if

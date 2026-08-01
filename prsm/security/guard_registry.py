@@ -813,6 +813,23 @@ GUARDS: List[Guard] = [
         kills_test_id="test_a_placeholder_shard_is_REFUSED",
     ),
     Guard(
+        id="marketplace-price-ceiling-is-finite",
+        sprint="sp1498",
+        file="prsm/marketplace/policy.py",
+        anchor="max_price_per_shard_ftns: float = DEFAULT_MAX_PRICE_PER_SHARD_FTNS",
+        protects="a requester being drained to whatever a provider chose to advertise. This default "
+                 "was float('inf'), which made the price check in EligibilityFilter.filter DEAD "
+                 "CODE — `listing.price > inf` is always False, so no listing was ever excluded on "
+                 "price. Listing validation rejects only NEGATIVE prices, and selection walked the "
+                 "pool in gossip-ARRIVAL order, so a provider advertising 1e9 FTNS/shard early was "
+                 "picked first, quoted its own listing price, and was escrowed and paid: the spend "
+                 "was bounded by the requester's BALANCE, not by anything they intended. Restoring "
+                 "an infinite default (or accepting 'inf' from PRSM_MARKETPLACE_MAX_PRICE_FTNS, "
+                 "which _default_max_price refuses) silently reopens the whole class",
+        killed_by="tests/unit/test_sprint_1498_price_ceiling_bounded.py",
+        kills_test_id="test_the_default_ceiling_is_FINITE",
+    ),
+    Guard(
         id="paid-tee-dispatch-verifies-attestation",
         sprint="sp1495",
         file="prsm/compute/remote_dispatcher.py",

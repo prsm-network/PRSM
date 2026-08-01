@@ -16,8 +16,34 @@ Defaults rationale (docs/2026-04-20-phase3-marketplace-design.md §8.4):
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Optional
+
+
+def _default_max_price() -> float:
+    """sp1498 — the per-shard sanity ceiling, overridable by the operator.
+
+    Env ``PRSM_MARKETPLACE_MAX_PRICE_FTNS``. A non-finite or non-positive value is
+    REFUSED rather than honoured, because "inf" is exactly the value that made the
+    price filter dead code in the first place — accepting it from the environment
+    would reopen the hole through a different door.
+    """
+    raw = (os.environ.get("PRSM_MARKETPLACE_MAX_PRICE_FTNS") or "").strip()
+    if not raw:
+        return 1.0
+    try:
+        v = float(raw)
+    except ValueError:
+        return 1.0
+    if v != v or v in (float("inf"), float("-inf")) or v <= 0:
+        return 1.0
+    return v
+
+
+#: Per-shard price ceiling applied when a caller does not set one. NOT a market
+#: price — a bound that stops an unconfigured requester being drained.
+DEFAULT_MAX_PRICE_PER_SHARD_FTNS: float = _default_max_price()
 
 
 @dataclass(frozen=True)
@@ -27,7 +53,24 @@ class DispatchPolicy:
     Consumed by EligibilityFilter.filter() to narrow a directory's
     listing set down to a policy-compliant subset.
     """
-    max_price_per_shard_ftns: float = float("inf")
+    # sp1498 — a FINITE default. This was float("inf"), which made the price check
+    # in EligibilityFilter.filter dead code: `listing.price > inf` is always False,
+    # so no listing was ever excluded on price. Listing validation only rejects
+    # NEGATIVE prices, and selection walks the eligible list in gossip-arrival
+    # order — so a provider advertising 1e9 FTNS/shard early was selected first,
+    # quoted its own listing price (the quote ceiling compares against the
+    # listing, not the requester's policy), and got escrowed and paid. The spend
+    # was bounded by the requester's balance, not by anything they intended.
+    #
+    # DEFAULT_MAX_PRICE_PER_SHARD_FTNS is a sanity ceiling, not a market price:
+    # it exists so that an unconfigured requester cannot be drained. Callers who
+    # genuinely want to pay more must say so explicitly.
+    max_price_per_shard_ftns: float = DEFAULT_MAX_PRICE_PER_SHARD_FTNS
+    #: sp1498 — total FTNS this job may spend across ALL shards. 0 disables the
+    #: check. A per-shard cap does not bound a job, because the shard COUNT comes
+    #: from the model rather than from the requester: N shards at the cap costs N
+    #: times the cap. Enforced against agreed quotes, before escrow.
+    max_total_job_ftns: float = 0.0
     min_price_per_shard_ftns: float = 0.01
     require_tee: bool = False
     min_stake_tier: str = "open"

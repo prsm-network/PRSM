@@ -173,8 +173,11 @@ def test_orchestrator_empty_directory_raises():
 
 def test_orchestrator_quote_rejection_tries_next_provider():
     """First provider rejects the quote; orchestrator moves to the second."""
-    listing_bad = _make_listing()
-    listing_good = _make_listing()
+    # sp1498 — selection is now CHEAPEST-first with a provider_id tie-break, so
+    # the order these are tried in must be stated by price, not by construction
+    # order. The behaviour under test (reject -> try next) is unchanged.
+    listing_bad = _make_listing(price_per_shard_ftns=0.04)
+    listing_good = _make_listing(price_per_shard_ftns=0.05)
     orch, quoter, dispatcher, reputation = _make_orchestrator(
         [listing_bad, listing_good]
     )
@@ -208,8 +211,8 @@ def test_orchestrator_quote_rejection_tries_next_provider():
 def test_orchestrator_preemption_reroutes_to_fresh_pool():
     """Preempted provider → record_preemption (no reputation penalty),
     try next. Honest-work failure stays off the score denominator."""
-    listing_preempted = _make_listing()
-    listing_ok = _make_listing()
+    listing_preempted = _make_listing(price_per_shard_ftns=0.04)
+    listing_ok = _make_listing(price_per_shard_ftns=0.05)
     orch, quoter, dispatcher, reputation = _make_orchestrator(
         [listing_preempted, listing_ok]
     )
@@ -248,8 +251,10 @@ def test_orchestrator_missing_attestation_penalizes_and_retries():
     Orchestrator records failure (liar penalty) and moves on."""
     identity_bad = generate_node_identity(display_name="liar")
     identity_ok = generate_node_identity(display_name="honest")
-    listing_liar = _make_listing(identity=identity_bad, tee_capable=True)
-    listing_honest = _make_listing(identity=identity_ok, tee_capable=True)
+    listing_liar = _make_listing(identity=identity_bad, tee_capable=True,
+                                 price_per_shard_ftns=0.04)
+    listing_honest = _make_listing(identity=identity_ok, tee_capable=True,
+                                   price_per_shard_ftns=0.05)
     orch, quoter, dispatcher, reputation = _make_orchestrator(
         [listing_liar, listing_honest]
     )
@@ -726,8 +731,8 @@ def test_onchain_tier_gate_rejects_cheater_and_retries_next():
     """Provider listing claims 'premium' but StakeBond says 'standard'
     (or 'open') → gate rejects, reputation.record_failure, move to next
     provider. The quote RPC is never issued for the cheater."""
-    listing_cheater = _make_listing(stake_tier="premium")
-    listing_honest = _make_listing(stake_tier="premium")
+    listing_cheater = _make_listing(stake_tier="premium", price_per_shard_ftns=0.04)
+    listing_honest = _make_listing(stake_tier="premium", price_per_shard_ftns=0.05)
     orch, quoter, dispatcher, reputation, stake_manager = (
         _make_orchestrator_with_stake_gate([listing_cheater, listing_honest])
     )

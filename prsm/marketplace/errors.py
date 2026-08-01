@@ -23,3 +23,13 @@ __all__ = [
     "NoEligibleProvidersError",
     "PriceQuoteRejectedError",
 ]
+
+
+class JobBudgetExceededError(RuntimeError):
+    """sp1498 — the job's quoted prices would exceed its total budget.
+
+    Raised BEFORE escrow so a job that cannot complete within budget does not
+    part-pay for the shards it managed to buy first. A per-shard ceiling alone
+    does not bound a job: N shards at the cap is N times the cap, and N comes
+    from the model, not from the requester.
+    """
