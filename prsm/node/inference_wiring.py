@@ -1227,17 +1227,23 @@ def ensure_hf_model_staged(identity, env=None) -> str:
             FilesystemModelRegistry,
             ModelAlreadyRegisteredError,
         )
+        from prsm.compute.model_sharding.executor import PLACEHOLDER_SHARD_SUFFIX
         from prsm.compute.model_sharding.models import ShardedModel, ModelShard
 
         registry_root.mkdir(parents=True, exist_ok=True)
         registry = FilesystemModelRegistry(root=registry_root)
         shard = ModelShard(
-            shard_id=f"{model_id}-shard-0",
+            # sp1497 — explicitly a PLACEHOLDER, and self-consistent: 32 bytes is
+            # 4 float64, not 32. The old (32,) shape made every dispatch of this
+            # shard raise out of the reshape, which the requester then scored as a
+            # provider failure. The suffix makes execute_shard_locally refuse it
+            # outright rather than computing zeros and calling them an answer.
+            shard_id=f"{model_id}-shard-0{PLACEHOLDER_SHARD_SUFFIX}",
             model_id=model_id,
             shard_index=0,
             total_shards=1,
             tensor_data=b"\x00" * 32,
-            tensor_shape=(32,),
+            tensor_shape=(4,),
             layer_range=(0, num_layers),
             size_bytes=32,
         )

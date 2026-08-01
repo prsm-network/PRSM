@@ -795,6 +795,24 @@ GUARDS: List[Guard] = [
         kills_test_id="test_does_NOT_gossip_when_broadcast_is_False",
     ),
     Guard(
+        id="placeholder-shard-refused-not-computed",
+        sprint="sp1497",
+        file="prsm/compute/model_sharding/executor.py",
+        anchor="if is_placeholder_shard(shard):",
+        protects="a registration PLACEHOLDER being executed as if it were real model weights. Every "
+                 "production model registration builds an all-zero shard so the model appears in the "
+                 "registry; it carries no weights. Executing one returns ZEROS, which the pipeline "
+                 "would present as a genuine inference result — a silent wrong answer, worse than a "
+                 "failure. Before sp1497 it instead CRASHED: the same registrations declared "
+                 "tensor_shape=(32,) for 32 BYTES = 4 float64, and the reshape sat outside the try, "
+                 "so the provider returned failed and the requester scored a REPUTATION FAILURE "
+                 "against a node that did nothing wrong. Detection is by explicit shard_id marker, "
+                 "NOT by sniffing for all-zero bytes, because a genuine tensor may legitimately be "
+                 "all zeros and must still execute. Delete this and placeholders compute silently",
+        killed_by="tests/unit/test_sprint_1497_placeholder_shard_refused.py",
+        kills_test_id="test_a_placeholder_shard_is_REFUSED",
+    ),
+    Guard(
         id="paid-tee-dispatch-verifies-attestation",
         sprint="sp1495",
         file="prsm/compute/remote_dispatcher.py",

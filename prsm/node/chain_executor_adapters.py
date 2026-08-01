@@ -1641,10 +1641,12 @@ def ensure_hf_model_registered(
             ModelShard,
             ShardedModel,
         )
+        from prsm.compute.model_sharding.executor import PLACEHOLDER_SHARD_SUFFIX
         registry = FilesystemModelRegistry(root=Path(str(registry_root)))
         shard = ModelShard(
-            shard_id=f"{model_id.replace('/', '_')}-shard-0", model_id=model_id,
-            shard_index=0, total_shards=1, tensor_data=b"\x00" * 32, tensor_shape=(32,),
+            shard_id=f"{model_id.replace('/', '_')}-shard-0{PLACEHOLDER_SHARD_SUFFIX}", model_id=model_id,
+            shard_index=0, total_shards=1, tensor_data=b"\x00" * 32, tensor_shape=(4,),
+            # sp1497 — placeholder marker + self-consistent shape; see executor.py
             layer_range=(0, int(num_layers)), size_bytes=32)
         model = ShardedModel(
             model_id=model_id, model_name=f"HF runner sentinel for {model_id}",

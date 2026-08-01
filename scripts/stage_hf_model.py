@@ -39,6 +39,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+from prsm.compute.model_sharding.executor import PLACEHOLDER_SHARD_SUFFIX
 import json
 import sys
 from pathlib import Path
@@ -202,12 +203,14 @@ def main(argv: Optional[list] = None) -> int:
     # id. Sanitize the model_id portion ('/'->'_'); the id is just a stored, read-back
     # label so this is self-consistent.
     shard = ModelShard(
-        shard_id=f"{args.model_id.replace('/', '_')}-shard-0",
+        # sp1497 — mark as a registration PLACEHOLDER so execute_shard_locally
+        # refuses it rather than computing zeros and calling them an answer.
+        shard_id=f"{args.model_id.replace('/', '_')}-shard-0{PLACEHOLDER_SHARD_SUFFIX}",
         model_id=args.model_id,
         shard_index=0,
         total_shards=1,
-        tensor_data=b"\x00" * 32,
-        tensor_shape=(32,),
+        tensor_data=b"\x00" * 32,  # sp1497: 4 float64 — shape must match
+        tensor_shape=(4,),
         layer_range=(0, num_layers),
         size_bytes=32,
     )

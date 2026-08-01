@@ -27,6 +27,31 @@ from prsm.compute.model_sharding.models import ShardedModel, PipelineConfig
 logger = logging.getLogger(__name__)
 
 
+#: sp1497 — shard_id suffix marking a REGISTRATION PLACEHOLDER: a shard that exists
+#: only so a model appears in the registry, carrying no real weights. Explicit
+#: marker rather than sniffing for all-zero bytes, because a genuine tensor may
+#: legitimately be all zeros and must still execute.
+PLACEHOLDER_SHARD_SUFFIX = "-placeholder"
+
+
+class MalformedShardError(ValueError):
+    """A shard's declared tensor_shape disagrees with its tensor_data length.
+
+    Raised INSTEAD of letting numpy's reshape fail, so callers can tell a bad
+    SHARD apart from a bad PROVIDER. Scoring this against the provider defames a
+    node that did nothing wrong.
+    """
+
+
+class PlaceholderShardError(MalformedShardError):
+    """The shard is a registration placeholder, not real model weights."""
+
+
+def is_placeholder_shard(shard) -> bool:
+    """Is this a registration placeholder rather than real weights?"""
+    return str(getattr(shard, "shard_id", "")).endswith(PLACEHOLDER_SHARD_SUFFIX)
+
+
 # A RemoteShardDispatcher takes (shard, input_data, assignment) and returns
 # a dict in the same shape as TensorParallelExecutor._execute_local. It is
 # the integration seam between Ring 8 (sharding) and Ring 2 (mobile-agent
@@ -59,6 +84,28 @@ def execute_shard_locally(shard, input_data: bytes) -> np.ndarray:
         returns tensor @ input_array. Otherwise returns a truncated flat
         slice (legacy fallback preserved for existing test contracts).
     """
+    # sp1497 — validate BEFORE reshaping. This reshape used to sit outside the try
+    # below, so a shard whose declared shape disagreed with its bytes raised a bare
+    # ValueError out of here; the provider caught it, returned status="failed", and
+    # the requester scored a REPUTATION FAILURE against a provider that did nothing
+    # wrong. Every production shard registration was such a shard (see
+    # PLACEHOLDER_SHARD_SUFFIX below), so the marketplace dispatched guaranteed
+    # failures and blamed honest providers for them.
+    if is_placeholder_shard(shard):
+        raise PlaceholderShardError(
+            f"shard {shard.shard_id!r} is a registration PLACEHOLDER, not real "
+            "model weights — refusing to execute it. Computing on it would return "
+            "zeros and present them as a genuine inference result. Stage real "
+            "weights (ModelSharder.shard_model) before dispatching this model."
+        )
+    expected = int(np.prod(shard.tensor_shape)) * 8 if shard.tensor_shape else 0
+    if len(shard.tensor_data) != expected:
+        raise MalformedShardError(
+            f"shard {shard.shard_id!r} declares shape {tuple(shard.tensor_shape)} "
+            f"({expected} bytes of float64) but carries "
+            f"{len(shard.tensor_data)} bytes. The SHARD is malformed — this is not "
+            "a provider failure and must not be scored as one."
+        )
     tensor = np.frombuffer(shard.tensor_data, dtype=np.float64).reshape(shard.tensor_shape)
 
     try:
