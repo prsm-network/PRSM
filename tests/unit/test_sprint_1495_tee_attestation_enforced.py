@@ -77,16 +77,42 @@ def test_a_raising_verifier_is_rejected(monkeypatch):
 
 # ── still accepts genuine hardware ──────────────────────────────────
 
-def test_real_sgx_hardware_is_accepted_even_without_vendor_roots(monkeypatch, caplog):
-    """★ The deliberate calibration. Minimum is HARDWARE_UNVERIFIED, not
-    HARDWARE_VERIFIED, so a genuine SGX quote still works on an operator who has
-    not configured vendor root CAs — but the gap is LOGGED."""
+def test_a_FORGED_sgx_quote_is_rejected_by_default():
+    """★★ THE fix. This test previously asserted the OPPOSITE and passed, because
+    sp1495 shipped with a HARDWARE_UNVERIFIED default. Measured against the REAL
+    verifier (no mock): 206 random bytes behind a two-byte prefix parse as
+    intel-sgx. 'Structure parsed' is not evidence of a TEE."""
+    import os as _os
+    forged = bytes([3, 0]) + _os.urandom(206)
+
+    from prsm.compute.inference.attestation_backends import verify_attestation
+    probe = verify_attestation(forged)
+    assert probe.vendor == "intel-sgx"          # it really does look like SGX
+    assert probe.structural_parse_ok is True    # ...structurally
+    assert probe.vendor_verified is False       # ...but nothing was verified
+
+    with pytest.raises(MissingAttestationError, match="hardware_verified"):
+        _enforce_tee_attestation(forged, 0, NODE)
+
+
+def test_unverified_hardware_is_rejected_by_default(monkeypatch):
+    """★ The corrected calibration. On a node without vendor roots a real quote and
+    a forgery are INDISTINGUISHABLE, so accepting is a guess — and the requester has
+    already paid for confidentiality on the strength of it."""
     _patch(monkeypatch, "intel-sgx", verified=False)
+    with pytest.raises(MissingAttestationError, match="hardware_verified"):
+        _enforce_tee_attestation(b"\x01" * 64, 3, NODE)
+
+
+def test_an_operator_can_still_opt_down_but_it_is_LOUD(monkeypatch, caplog):
+    """Opting down must remain possible, but be an explicit choice that says
+    plainly what the requester is paying for."""
+    _patch(monkeypatch, "intel-sgx", verified=False)
+    monkeypatch.setenv("PRSM_TEE_MIN_TIER", "hardware_unverified")
     with caplog.at_level(logging.WARNING):
         _enforce_tee_attestation(b"\x01" * 64, 3, NODE)
     msg = " ".join(r.getMessage() for r in caplog.records)
-    assert "HARDWARE_UNVERIFIED" in msg
-    assert "NOT cryptographically verified" in msg
+    assert "forgeable" in msg and "NO confidentiality guarantee" in msg
 
 
 def test_fully_verified_hardware_is_accepted_quietly(monkeypatch, caplog):
@@ -116,19 +142,22 @@ def test_hex_and_base64_receipts_are_decoded(monkeypatch):
 
 # ── operator can tighten, and a bad value fails safe ────────────────
 
-def test_operator_can_require_full_verification(monkeypatch):
+def test_explicitly_requiring_full_verification_still_works(monkeypatch):
     _patch(monkeypatch, "intel-sgx", verified=False)
     monkeypatch.setenv("PRSM_TEE_MIN_TIER", "hardware_verified")
     with pytest.raises(MissingAttestationError, match="hardware_verified"):
         _enforce_tee_attestation(b"\x01" * 64, 0, NODE)
 
 
-def test_a_garbage_min_tier_falls_back_to_the_SAFE_default(monkeypatch):
-    """★ A typo in the env must not silently downgrade to accepting anything."""
-    _patch(monkeypatch, "software-fallback")
+def test_a_garbage_min_tier_falls_back_to_the_STRICT_default(monkeypatch, caplog):
+    """★ A typo in the env must not silently downgrade. It now falls back to
+    hardware_verified — the strict end — and says so."""
+    _patch(monkeypatch, "intel-sgx", verified=False)   # would pass the OLD default
     monkeypatch.setenv("PRSM_TEE_MIN_TIER", "lol-whatever")
-    with pytest.raises(MissingAttestationError):
-        _enforce_tee_attestation(b"\x01" * 64, 0, NODE)
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(MissingAttestationError, match="hardware_verified"):
+            _enforce_tee_attestation(b"\x01" * 64, 0, NODE)
+    assert "not a valid tier" in " ".join(r.getMessage() for r in caplog.records)
 
 
 # ── wired into the dispatch path ────────────────────────────────────

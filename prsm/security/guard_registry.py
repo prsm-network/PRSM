@@ -806,12 +806,17 @@ GUARDS: List[Guard] = [
                  "SOFTWARE-FALLBACK blob this repo ships for local testing. The real machinery "
                  "already existed (verify_attestation with Intel SGX DCAP + AMD SEV-SNP backends, "
                  "plus the tiered tee_policy engine, used by three other call sites) — the paid path "
-                 "simply ignored it. This routes the blob through verify_attestation and requires at "
-                 "least HARDWARE_UNVERIFIED, which rejects software-fallback while still accepting a "
-                 "genuine SGX/SEV-SNP quote on an operator without vendor root CAs configured; a bad "
-                 "PRSM_TEE_MIN_TIER falls back to that safe default rather than downgrading. Revert "
-                 "it to a presence check and the confidentiality guarantee is hollow again — and it "
-                 "looks like it is working right up until it matters",
+                 "simply ignored it. This routes the blob through verify_attestation and requires "
+                 "HARDWARE_VERIFIED. sp1495 first shipped with a HARDWARE_UNVERIFIED default, which "
+                 "an adversarial re-check proved was still no security: that tier means only that a "
+                 "backend recognised the quote's STRUCTURE, so bytes([3,0]) + os.urandom(206) passed "
+                 "as intel-sgx. On a node without vendor roots a real quote and a forgery are "
+                 "INDISTINGUISHABLE, so accepting is a guess the requester has already paid for. "
+                 "Lowering the default back to hardware_unverified (or to a presence check) makes "
+                 "the confidentiality guarantee hollow again while still looking like it works. An "
+                 "unrecognised PRSM_TEE_MIN_TIER falls back to the STRICT tier. KNOWN GAP, not "
+                 "covered by this guard: a verified quote is not bound to the provider/request, so "
+                 "replay from another machine is still possible",
         killed_by="tests/unit/test_sprint_1495_tee_attestation_enforced.py",
         kills_test_id="test_the_dev_SOFTWARE_FALLBACK_blob_is_REJECTED",
     ),

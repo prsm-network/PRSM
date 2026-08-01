@@ -147,16 +147,38 @@ def _enforce_tee_attestation(blob, shard_index: int, node_id: str) -> None:
     ``tee_policy`` engine. Three other call sites use them. This one did not, so the
     verification capability existed while the paid path ignored it.
 
-    MINIMUM TIER IS ``HARDWARE_UNVERIFIED``, deliberately, not HARDWARE_VERIFIED.
-    That rejects the software fallback — the actual hole — while still accepting a
-    genuine SGX/SEV-SNP quote on an operator who has not configured vendor root CAs
-    (``PRSM_INTEL_SGX_ROOT_CA_PEM`` / ``PRSM_AMD_SEV_SNP_ARK_PEM``). Demanding full
-    cryptographic verification by default would reject real TEE hardware on every
-    node that has not run that setup, which is a different kind of wrong.
-    Operators wanting the strict bar set ``PRSM_TEE_MIN_TIER=hardware_verified``.
+    MINIMUM TIER IS ``HARDWARE_VERIFIED``.
 
-    Accepting HARDWARE_UNVERIFIED is logged at WARNING: the requester should be able
-    to tell that the vendor signature chain was not checked.
+    sp1495 originally defaulted to HARDWARE_UNVERIFIED, reasoning that demanding
+    cryptographic verification would reject real TEE hardware on operators who had
+    not configured vendor root CAs. That reasoning was WRONG, and an adversarial
+    re-check proved it: HARDWARE_UNVERIFIED means only "a backend recognised the
+    quote's STRUCTURE" — for SGX, essentially a version prefix. Measured:
+
+        verify_attestation(bytes([3, 0]) + os.urandom(206))
+          -> vendor='intel-sgx', structural_parse_ok=True, vendor_verified=False
+
+    i.e. 206 random bytes with a two-byte prefix passed as a hardware attestation.
+    So the original default raised the bar from "any truthy value" to "a one-line
+    forgery" — still no security, while the commit message claimed the attestation
+    was verified.
+
+    The corrected reasoning: on a node WITHOUT vendor roots configured, a real quote
+    and a forgery are INDISTINGUISHABLE. Accepting is therefore not a graceful
+    degradation, it is a guess — and the requester has PAID for confidentiality on
+    the strength of it. Failing the dispatch costs one retry elsewhere; accepting an
+    unverifiable quote sells a guarantee that was never checked. Same asymmetry as
+    the rest of the money path: refuse rather than pretend.
+
+    An operator may still opt down with ``PRSM_TEE_MIN_TIER=hardware_unverified``,
+    but that is now an explicit, loudly-logged choice rather than the default.
+
+    KNOWN REMAINING GAP (not closed here, do not claim otherwise): even a
+    HARDWARE_VERIFIED quote is not bound to this provider or this request, so a
+    genuine quote could be replayed from another machine. Closing that needs the
+    provider to embed a challenge nonce in the quote's ``report_data``, which the
+    verifier does not currently surface (``vendor_data`` exposes mrenclave/mrsigner/
+    version only). Tracked separately.
     """
     import os
 
@@ -199,26 +221,42 @@ def _enforce_tee_attestation(blob, shard_index: int, node_id: str) -> None:
     effective = effective_tier_from_result(result)
     required_name = (os.environ.get("PRSM_TEE_MIN_TIER") or "").strip().lower()
     try:
+        # Default HARDWARE_VERIFIED — see the docstring. An unrecognised value must
+        # NOT silently downgrade, so it also falls back to the strict tier.
         required = (AttestationTier(required_name) if required_name
-                    else AttestationTier.HARDWARE_UNVERIFIED)
+                    else AttestationTier.HARDWARE_VERIFIED)
     except ValueError:
-        required = AttestationTier.HARDWARE_UNVERIFIED
+        logger.warning(
+            "PRSM_TEE_MIN_TIER=%r is not a valid tier — falling back to "
+            "'hardware_verified'. Valid: none, software, hardware_unverified, "
+            "hardware_verified.", required_name)
+        required = AttestationTier.HARDWARE_VERIFIED
 
     if tier_rank(effective) < tier_rank(required):
+        structural_only = bool(result.vendor_data.get("structural_only"))
+        detail = (
+            " The quote's STRUCTURE parsed but its signature chain was never "
+            "checked, which any 208 crafted bytes can achieve — this is not "
+            "evidence of a TEE. Configure PRSM_INTEL_SGX_ROOT_CA_PEM / "
+            "PRSM_AMD_SEV_SNP_ARK_PEM so quotes can be cryptographically "
+            "verified." if structural_only else ""
+        )
         raise MissingAttestationError(
             f"shard {shard_index}: provider {node_id[:12]}… supplied a "
             f"tee_attestation of tier '{effective.value}' (vendor "
             f"'{result.vendor}'{', error: ' + result.error if result.error else ''})"
             f", below the required '{required.value}'. Refusing to accept a paid "
-            "TEE dispatch whose confidentiality is not actually attested."
+            f"TEE dispatch whose confidentiality is not actually attested.{detail}"
         )
 
     if effective == AttestationTier.HARDWARE_UNVERIFIED:
+        # Only reachable when an operator explicitly opted down.
         logger.warning(
-            "shard %s: TEE attestation from %s… accepted at HARDWARE_UNVERIFIED "
-            "(vendor %s) — the vendor signature chain was NOT cryptographically "
-            "verified. Configure PRSM_INTEL_SGX_ROOT_CA_PEM / "
-            "PRSM_AMD_SEV_SNP_ARK_PEM to get hardware_verified.",
+            "shard %s: accepting an UNVERIFIED TEE attestation from %s… (vendor "
+            "%s) because PRSM_TEE_MIN_TIER was lowered to 'hardware_unverified'. "
+            "The signature chain was NOT checked, so this quote is forgeable and "
+            "provides NO confidentiality guarantee — the requester is paying a TEE "
+            "price for an unverified claim.",
             shard_index, node_id[:12], result.vendor,
         )
 
