@@ -848,6 +848,26 @@ GUARDS: List[Guard] = [
         kills_test_id="test_a_ZERO_quote_is_rejected",
     ),
     Guard(
+        id="commit-batch-provider-address-bound-at-write-time",
+        sprint="sp1500",
+        file="prsm/settlement/client.py",
+        anchor="raise ProviderAddressMismatchError(",
+        protects="committing another party's batch on chain. commitBatch records provider = "
+                 "msg.sender, so submitting a batch whose provider_address is not this signing key "
+                 "records the REAL provider as having done nothing — paid zero on chain — while "
+                 "exposing THIS key's bond to a successful challenge for work it never performed. "
+                 "client_wiring's module docstring states this write-time re-verification as a MUST "
+                 "('a view-only build binding does not prove key control'), and it was never "
+                 "implemented: _commit_one's own docstring said it 'trusts the accumulator's keyed "
+                 "batches'. Accumulate-time checking is insufficient because _restore_pending "
+                 "rehydrates batches from disk, bypassing this process's accumulate path entirely, "
+                 "and because that gate compares a configured STRING rather than proving key "
+                 "control. Enforced only when the client reports a real 0x address — None means "
+                 "view-only (cannot broadcast), and a non-address is a test double",
+        killed_by="tests/unit/test_sprint_1500_commit_provider_address_bound.py",
+        kills_test_id="test_committing_ANOTHER_providers_batch_is_REFUSED",
+    ),
+    Guard(
         id="paid-tee-dispatch-verifies-attestation",
         sprint="sp1495",
         file="prsm/compute/remote_dispatcher.py",

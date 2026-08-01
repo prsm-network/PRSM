@@ -82,6 +82,17 @@ def _locked(method):
     return wrapper
 
 
+class ProviderAddressMismatchError(RuntimeError):
+    """sp1500 — a batch's provider_address is not controlled by the signing key.
+
+    commitBatch records provider = msg.sender, so committing such a batch would
+    name the WRONG party on chain: the real provider is recorded as having done
+    nothing and is paid zero, while a successful challenge slashes THIS key's bond
+    for work it never performed. Raised at write time, which client_wiring's
+    module docstring specifies as a MUST and which was never implemented.
+    """
+
+
 class SettlementContractClient(Protocol):
     """Abstract surface of the BatchSettlementRegistry + EscrowPool
     contracts. Production implementation wraps web3.py; unit tests
@@ -535,10 +546,49 @@ class BatchSettlementClient:
         Architectural note: this client is side-agnostic (provider-side
         batching or requester-side auditing both route through the same
         _commit_one code path). The on-chain contract enforces commit
-        authority via `msg.sender`; the Python client trusts the
-        accumulator's keyed batches."""
+        authority via `msg.sender`, so the SIGNING KEY decides who is
+        recorded as provider — which is why the batch's provider_address
+        is re-verified against it below (sp1500)."""
         # AccumulatorKey is (requester, provider, group_id, slash_rate_bps).
         requester_address, provider_address, group_id, slash_rate_bps = ready.key
+
+        # sp1500 — WRITE-TIME funds-safety check. client_wiring's module docstring
+        # states this as a MUST ("Brick 2 ... MUST re-verify the signing key
+        # controls provider_address AT WRITE TIME — a view-only build binding does
+        # not prove key control"), and it was never implemented: this method's own
+        # docstring used to say it "trusts the accumulator's keyed batches".
+        #
+        # Accumulate-time checking (the br.provider_address != self._provider gate)
+        # is NOT sufficient, for two reasons:
+        #   * _restore_pending rehydrates batches from disk, so a batch can reach
+        #     commit without ever passing through this process's accumulate path;
+        #   * that gate compares against a configured string, which does not prove
+        #     the signing key CONTROLS that address. The build-time guard in
+        #     client_wiring does prove it, but only when a key was supplied then.
+        #
+        # commitBatch records provider = msg.sender. So committing a batch whose
+        # provider_address is not this signer means the real provider is recorded
+        # as having done nothing — paid zero on chain — while a successful
+        # challenge slashes THIS key's bond for work it never performed. Refuse.
+        # Enforce only when the contract client reports a REAL eth address. None
+        # means view-only (no key), which client_wiring explicitly allows and which
+        # cannot broadcast anyway; anything that is not address-shaped is a test
+        # double or an adapter that does not expose a signer, and comparing against
+        # it would refuse every commit rather than the wrong ones.
+        signer = getattr(self._contract, "address", None)
+        if isinstance(signer, str) and signer.startswith("0x") and len(signer) == 42:
+            want = str(provider_address or "").strip()
+            if want and not want.startswith("0x"):
+                want = "0x" + want          # tolerate a 0x-less operator address
+            # .lower() compare is checksum-correct (EIP-55 is case-only).
+            if want and str(signer).lower() != want.lower():
+                raise ProviderAddressMismatchError(
+                    f"refusing to commit a batch for provider {provider_address!r} "
+                    f"with signing key {signer!r}: commitBatch records "
+                    "provider = msg.sender, so this would credit the wrong party "
+                    "on chain and expose this key's bond to a challenge for work "
+                    "it did not perform."
+                )
 
         if leaf_hashes is None or root is None:
             leaf_hashes, root = self._build_leaves_root(ready)
