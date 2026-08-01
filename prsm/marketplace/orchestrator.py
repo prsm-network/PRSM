@@ -219,6 +219,9 @@ class MarketplaceOrchestrator:
                 shard_index=shard.shard_index,
                 shard_size_bytes=len(shard.tensor_data),
                 max_acceptable_price_ftns=policy.max_price_per_shard_ftns,
+                # sp1499 — the floor was enforced on LISTINGS but never on the
+                # QUOTE, which is the number actually escrowed.
+                min_acceptable_price_ftns=policy.min_price_per_shard_ftns,
             )
             if quote is None:
                 last_reason = "quote_timeout"

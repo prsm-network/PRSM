@@ -830,6 +830,24 @@ GUARDS: List[Guard] = [
         kills_test_id="test_the_default_ceiling_is_FINITE",
     ),
     Guard(
+        id="quote-price-floor-and-finiteness",
+        sprint="sp1499",
+        file="prsm/marketplace/price_handshake.py",
+        anchor="if quoted_price <= 0:",
+        protects="a provider performing real work against an escrow holding NOTHING, and a "
+                 "non-finite price reaching the ledger. Quote validation was one-sided — only "
+                 "`quoted > listing_ceiling` — and every comparison against NaN, a negative, or "
+                 "zero is False, so all three passed. Zero is the sharpest: dag_ledger.py states "
+                 "'amount == 0 is a harmless no-op — left to outer endpoints', and this IS the "
+                 "outer endpoint that never checked. NaN would otherwise be caught only by the "
+                 "sp1468 ledger gate, after the orchestrator had already committed to the provider. "
+                 "min_price_per_shard_ftns existed and was enforced on LISTINGS by "
+                 "EligibilityFilter, but never on the QUOTE — the number actually escrowed. Delete "
+                 "this and a zero-priced quote silently buys free work",
+        killed_by="tests/unit/test_sprint_1499_quote_price_floor.py",
+        kills_test_id="test_a_ZERO_quote_is_rejected",
+    ),
+    Guard(
         id="paid-tee-dispatch-verifies-attestation",
         sprint="sp1495",
         file="prsm/compute/remote_dispatcher.py",

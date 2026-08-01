@@ -10,6 +10,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+import math
 import time
 import uuid
 from dataclasses import dataclass
@@ -70,6 +71,9 @@ class PriceNegotiator:
         shard_index: int,
         shard_size_bytes: int,
         max_acceptable_price_ftns: float,
+        # sp1499 — the requester's price FLOOR. Defaults to 0.0 so existing callers
+        # keep working, but the orchestrator passes policy.min_price_per_shard_ftns.
+        min_acceptable_price_ftns: float = 0.0,
     ):
         """Send a shard_price_quote_request to the listing's provider
         and return a PriceQuote on accept or PriceQuoteRejected on
@@ -128,6 +132,45 @@ class PriceNegotiator:
             return None
 
         quoted_price = float(response.get("quoted_price_ftns", 0))
+
+        # sp1499 — the FLOOR. This check was one-sided: only `quoted > ceiling`.
+        # That let three distinct values through, because comparisons against them
+        # are all False:
+        #   NaN       — `nan > x` is False. Poisons every downstream balance;
+        #               DAGLedger's sp1468 gate catches it, but only AFTER the
+        #               orchestrator has committed to this provider.
+        #   negative  — `-1 > x` is False. A reverse transfer by intent.
+        #   zero      — dag_ledger treats amount == 0 as "a harmless no-op — left
+        #               to outer endpoints", and this IS the outer endpoint that
+        #               never checked. The provider then does real work and is
+        #               paid nothing, with an escrow record behind no funds.
+        # `min_price_per_shard_ftns` already existed and was enforced on LISTINGS
+        # by EligibilityFilter — never on the QUOTE, which is the number actually
+        # escrowed. Same asymmetry sp1498 closed on the ceiling side.
+        if not math.isfinite(quoted_price):
+            logger.warning(
+                f"provider {listing.provider_id[:12]}… quoted a non-finite price "
+                f"{quoted_price!r}; rejecting")
+            return PriceQuoteRejected(
+                request_id=request_id, listing_id=listing.listing_id,
+                reason="quote_not_finite")
+        if quoted_price <= 0:
+            logger.warning(
+                f"provider {listing.provider_id[:12]}… quoted {quoted_price}; "
+                "rejecting — a zero or negative quote means work is performed "
+                "against an escrow holding nothing")
+            return PriceQuoteRejected(
+                request_id=request_id, listing_id=listing.listing_id,
+                reason="quote_not_positive")
+        if quoted_price < float(min_acceptable_price_ftns):
+            logger.warning(
+                f"provider {listing.provider_id[:12]}… quoted {quoted_price}, "
+                f"below the requester's floor {min_acceptable_price_ftns}; "
+                "rejecting")
+            return PriceQuoteRejected(
+                request_id=request_id, listing_id=listing.listing_id,
+                reason="quote_below_floor")
+
         if quoted_price > listing.price_per_shard_ftns:
             # Provider lied above the listing ceiling — treat as reject.
             logger.warning(
