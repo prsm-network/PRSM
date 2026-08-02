@@ -868,6 +868,23 @@ GUARDS: List[Guard] = [
         kills_test_id="test_committing_ANOTHER_providers_batch_is_REFUSED",
     ),
     Guard(
+        id="marketplace-chain-tiles-the-model-exactly",
+        sprint="sp1501",
+        file="prsm/marketplace/chain_builder.py",
+        anchor="verify_tiling(ranges, num_layers)",
+        protects="a paid inference returning a CONFIDENTLY WRONG answer. A GPUChain's layer_ranges "
+                 "must tile [0, num_layers) exactly; a gap SKIPS layers and an overlap applies them "
+                 "TWICE. Neither fails — the chain still runs, the final activation still decodes to "
+                 "plausible text, and no downstream check compares the output against anything. The "
+                 "requester has already paid, and the per-stage signatures all verify because every "
+                 "stage did exactly the work it was asked to do. This verification runs on the "
+                 "allocator's own output deliberately (belt and braces), because the failure is "
+                 "invisible rather than loud: an off-by-one in the allocator produces a chain that "
+                 "looks entirely healthy. Delete it and a silent-wrong-answer regression ships green",
+        killed_by="tests/unit/test_sprint_1501_marketplace_chain_builder.py",
+        kills_test_id="test_allocation_always_tiles_exactly",
+    ),
+    Guard(
         id="paid-tee-dispatch-verifies-attestation",
         sprint="sp1495",
         file="prsm/compute/remote_dispatcher.py",
