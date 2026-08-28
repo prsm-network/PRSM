@@ -87,7 +87,7 @@ jobs:
         echo "\`\`\`" >> security-report.md
         
     - name: 📋 Upload Security Artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: security-audit-results
         path: |
@@ -263,7 +263,7 @@ jobs:
         
     - name: 📋 Upload JavaScript Security Artifacts
       if: steps.check-js-projects.outputs.has_js_projects == 'true'
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: javascript-security-audit-results
         path: |
@@ -311,7 +311,7 @@ jobs:
         echo "*This summary combines results from all security audits*" >> combined-security-summary.md
         
     - name: 📋 Upload Combined Summary
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: combined-security-summary
         path: combined-security-summary.md

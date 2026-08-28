@@ -157,7 +157,7 @@ jobs:
           echo "✅ GitHub release updated with changelog"
       
       - name: Upload changelog artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: changelog
           path: |
