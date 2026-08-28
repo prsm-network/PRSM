@@ -100,7 +100,7 @@ jinja2>=3.1.0
 
 # Alerting and Notifications
 slack-sdk>=3.23.0
-twilio>=8.10.0
+twilio>=9.10.5
 pypd>=1.1.0
 
 # OpenTelemetry and Observability
