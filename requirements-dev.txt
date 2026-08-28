@@ -97,7 +97,7 @@ codecov>=2.1.13
 # Build Tools
 build>=1.0.0
 twine>=4.0.0
-wheel>=0.42.0
+wheel>=0.47.0
 
 # Environment Variable Loading
 python-decouple>=3.8
