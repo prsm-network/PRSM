@@ -24,7 +24,7 @@
 | **L7** | [L7-economic-game-theory-audit-rfp.md](L7-economic-game-theory-audit-rfp.md) | Gauntlet + Chaos Labs + BlockScience + MIT DCI | $50K-$100K | 4-8 weeks | **DEFERRED — DEX listing also deferred.** No CEX/DEX listing application before L7. |
 | **L8 Track A** | [L8-legal-counsel-rfp.md](L8-legal-counsel-rfp.md) | Mourant + Walkers + Ogier (Cayman) | $30K-$80K | 8 weeks + retainer | **DEFERRED.** Re-fires when Foundation hires non-founder personnel OR Foundation real-asset custody event. |
 | **L8 Track B** | [L8-legal-counsel-rfp.md](L8-legal-counsel-rfp.md) | Cooley + Lowenstein + DLx Law (US securities) | $50K-$150K | 8 weeks + retainer | **NOT DEFERRED — HARD GATE RETAINED.** Fires before any Reg D 506(c) Prismatica solicitation. Personal-liability legal exposure for founder. |
-| **L9** | [L9-bug-bounty-program-design.md](L9-bug-bounty-program-design.md) | Immunefi (Channel A) + self-hosted security@prsm.network (Channel B) | $50K + $25K initial pool | Continuous | **GATE FLIPPED PER POL-2:** Channel B (security@prsm.network) is **active now**, pre-L4. Channel A (Immunefi) deferred. |
+| **L9** | [L9-bug-bounty-program-design.md](L9-bug-bounty-program-design.md) | Immunefi (Channel A) + self-hosted security@prsm.network (Channel B) | $50K + $25K initial pool (proposal only; not active) | Continuous | **GATE FLIPPED PER POL-2:** Channel B (security@prsm.network) is **active now**, pre-L4, as a disclosure channel only (no payouts; see `SECURITY.md` for current channel status). Channel A (Immunefi) deferred. |
 
 **Total combined budget envelope: ~$280K - $645K.** Per POL-2, this envelope is held until §5 revisit triggers fire (e.g., first VC term sheet, FTNS market-cap > $1M, EscrowPool+StakeBond TVL > $50K, etc.).
 

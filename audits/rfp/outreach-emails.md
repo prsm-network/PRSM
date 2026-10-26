@@ -46,6 +46,9 @@ L9 (Immunefi bounty) is **NOT** in this packet — its activation is
 gated POST-L4 clear. Send the L9 outreach email post-2026-08-15
 target.
 
+> **Status (2026-10-26):** Proposal only; L9 was never activated.
+> PRSM does not run a bug bounty program and does not pay for vulnerability reports.
+
 ---
 
 # §1 — L4 Firm Pair-Review (audit-bundle smart contracts)

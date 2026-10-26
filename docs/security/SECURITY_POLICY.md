@@ -159,24 +159,11 @@ We follow responsible disclosure:
 4. **Do** provide us reasonable time to fix the issue before disclosure
 5. **Do** report vulnerabilities in good faith
 
-### Bug Bounty Program
+### Bug Bounty
 
-> **Status: not yet launched.** A formal bug-bounty program is planned but is
-> **not currently live** — there is no active payout budget or program terms
-> yet. The tiers below are an *illustrative proposal* for the future program,
-> not a current reward commitment. Valid reports are still welcomed and credited
-> via the responsible-disclosure process above.
-
-Proposed (future) reward tiers:
-
-| Severity | Proposed Reward |
-|----------|-----------------|
-| P0 Critical | $5,000 - $10,000 |
-| P1 High | $1,000 - $5,000 |
-| P2 Medium | $500 - $1,000 |
-| P3 Low | $100 - $500 |
-
-*Rewards will be subject to the program's terms and conditions once it launches.*
+PRSM does not run a bug bounty program and does not pay for vulnerability
+reports. Valid reports are welcomed and, with the reporter's consent, credited
+in the published advisory per [SECURITY.md](../../SECURITY.md#recognition).
 
 ---
 
@@ -418,7 +405,6 @@ export VAULT_ADDR=https://vault.example.com
 |------|---------|
 | Security Lead | security@prsm-network.com |
 | Incident Response | incident@prsm-network.com |
-| Bug Bounty | bounty@prsm-network.com |
 
 ### External Contacts
 

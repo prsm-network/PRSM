@@ -1,6 +1,6 @@
 # Security Policy
 
-**Last updated:** 2026-05-22
+**Last updated:** 2026-10-26
 **Related documents:** [`audits/AUDIT_PLAN.md`](audits/AUDIT_PLAN.md) (master audit plan, §12 disclosure policy) · [`docs/security/EXPLOIT_RESPONSE_PLAYBOOK.md`](docs/security/EXPLOIT_RESPONSE_PLAYBOOK.md) (incident response) · [`docs/2026-05-22-parallax-inference-audit-readiness.md`](docs/2026-05-22-parallax-inference-audit-readiness.md) (wire-protocol hardening audit, F30-F65)
 
 ## What we protect
@@ -56,7 +56,7 @@ We follow a **90-day coordinated disclosure window** as defined in
 | 2–14 | Reproduction | Foundation engineering reproduces and confirms |
 | 14–60 | Remediation | Fix development + audit of the fix |
 | 60–75 | Coordinated deploy | Fix deployed; integrators privately notified ≥72 hours pre-disclosure |
-| 75–90 | Public disclosure | GHSA + blog post + bounty payout |
+| 75–90 | Public disclosure | GHSA + blog post + researcher credit (with consent) |
 | 90 | Hard cap | Public disclosure even if remediation is incomplete |
 
 ### Critical-severity exception
@@ -89,29 +89,18 @@ contracts + L4 contest + L3 specialist crypto audit), the disclosure model is:
 - **Self-discovered findings** (internal review L0 / static-analysis L1):
   triaged internally; no external disclosure required pre-mainnet.
 
-## Bounty program
+## Recognition
 
-Pre-mainnet bounty program design is at `audits/AUDIT_PLAN.md` §5 L9
-(pending; cannot launch until L4 contest first-pass complete).
-
-When live, payout scale follows Immunefi conventions:
-
-| Severity | Range | Examples |
-|----------|-------|----------|
-| Critical | $50K–$1M | Funds drainable, mint forgery, total treasury compromise |
-| High | $10K–$50K | Conditional fund loss, signature forgery on challenge path |
-| Medium | $2K–$10K | Best-practice violation with conditional exploit, griefing |
-| Low | $500–$2K | Minor invariant breach, no direct exploit path |
-| Informational | $0–$500 | Code quality, docs, naming |
-
-Payout in USDC from Foundation Safe within 14 days of fix deployment.
-Researchers credited (with consent) in `audits/hall-of-fame.md` at L9 launch.
+PRSM does not currently run a bug bounty program and does not offer
+payment for vulnerability reports. Valid reports are acknowledged and,
+with the reporter's consent, credited in the published advisory and in
+`audits/hall-of-fame.md` once that roster is published.
 
 ### Duplicate handling
 
-First valid report wins, determined by submission timestamp on
+Credit goes to the first valid report, determined by submission timestamp on
 `security@prsm-network.com` inbox or GHSA timestamp. Subsequent identical
-reports receive acknowledgment but no bounty.
+reports receive acknowledgment.
 
 ## Scope
 
@@ -142,7 +131,7 @@ reports receive acknowledgment but no bounty.
   engineering attack against a Foundation signer, or compromise of a third-
   party service we use (these are non-PRSM attack surfaces).
 - Best-practice / code-quality suggestions without an exploit (these are
-  welcome as PRs or discussions, but not bounty-eligible).
+  welcome as PRs or discussions rather than security reports).
 
 ## Defense-in-depth posture
 
@@ -163,7 +152,7 @@ Pending external layers (per `audits/AUDIT_PLAN.md` §6 Gate B):
 - **L6f** — network infrastructure pen-test
 - **L7** — economic / game-theory audit
 - **L8** — legal / regulatory review
-- **L9** — public bug bounty (post-L4)
+- **L9** — public bug bounty (proposed only, not launched)
 
 ## Recent hardening — wire-protocol audit arc (2026-05-22 to 2026-05-23)
 
@@ -308,9 +297,8 @@ not be pursued legally; coordinate with us before testing edge cases.
 ## Acknowledgments
 
 PRSM thanks the security research community. Researchers who report valid
-findings are credited (with consent) in `audits/hall-of-fame.md` after fix
-deployment. Significant findings receive bounty payout per the scale above
-once the L9 program launches.
+findings are credited (with consent) in the published advisory and, once
+that roster is published, in `audits/hall-of-fame.md` after fix deployment.
 
 ---
 
@@ -322,7 +310,6 @@ PRSM task list:
 - [ ] `security@prsm-network.com` inbox setup (DNS/MX + email provider).
 - [ ] Foundation PGP keypair generation + publication.
 - [ ] `audits/hall-of-fame.md` initial commit (empty roster).
-- [ ] L9 Immunefi listing draft (post-L4 first-pass clearance).
 - [ ] L10a alert routing wired to PagerDuty + Foundation council Slack.
 
 Until these complete, the GHSA channel is the primary reporting path and

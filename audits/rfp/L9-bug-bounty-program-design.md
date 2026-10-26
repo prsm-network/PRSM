@@ -1,5 +1,10 @@
 # L9 Public Bug Bounty Program — Design Specification
 
+> **Status (2026-10-26): Proposal only — never activated.** PRSM does
+> not run a bug bounty program and does not pay for vulnerability
+> reports. All pool sizes and payout figures in this document were
+> proposed figures and are not commitments.
+
 **Type:** Bug bounty program design (not a vendor RFP)
 **Issuing organization:** PRSM Foundation (Cayman Islands nonprofit)
 **Issued:** 2026-05-05
@@ -258,6 +263,9 @@ features):
 
 **Status (2026-05-05):** Design spec drafted. Activation gated on
 L4 contest + firm pair-review completion (target: 2026-08-15).
+
+**Status (2026-10-26):** Proposal only; never activated. PRSM does not
+run a bug bounty program and does not pay for vulnerability reports.
 
 **Next actions:**
 1. ☐ Complete L1-L5 audit pipeline.

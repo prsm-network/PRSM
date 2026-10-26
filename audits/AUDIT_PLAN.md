@@ -104,7 +104,7 @@ runs annually.
 | **L6** | Operational security audit | Annual + per-ceremony | $0–20K | ✅ Multi-sig + deploy ceremony done; ongoing |
 | **L7** | Economic / game-theory audit | Pre-mainnet + per-emission-change | $20–50K | 🟡 Internal modeling done; external review pending |
 | **L8** | Legal / regulatory review | Pre-mainnet + per-jurisdiction-expansion | $15–40K/jurisdiction | 🟡 Counsel briefing memo done; engagement pending |
-| **L9** | Public bug bounty | Continuous post-mainnet | $50K–500K pool | 🔴 Pending |
+| **L9** | Public bug bounty | Continuous post-mainnet | $50K–500K pool (proposed) | 🔴 Proposal only; not launched |
 | **L10** | Continuous on-chain monitoring + IR | Continuous | $200/mo + on-call | 🟡 Forta wired; alert routing pending |
 | **L11** | Annual re-audit on cumulative changes | Annual | $40–80K | 🔴 Future state |
 
@@ -504,6 +504,11 @@ Awaiting founder execution of vendor outreach.
 
 ### L9 — Public bug bounty
 
+> **Status (2026-10-26): Proposal only — not launched.** PRSM does not
+> run a bug bounty program and does not pay for vulnerability reports.
+> The pool sizing and payout figures in this section and in the L9
+> design spec were proposed figures and are not commitments.
+
 **What:** Continuous post-mainnet adversarial coverage from the global
 researcher community.
 
@@ -662,8 +667,8 @@ Wall-clock weeks. Activities on the same row run in parallel.
 | **W7** | L4 contest closes; finding triage begins | L5 + L7 mid-engagement | Contest report draft |
 | **W8** | L4 remediation sprint (fix High/Critical); L3 specialist report (if path b) | L7 final report; L8 counsel opinions land | Code-frozen post-fix |
 | **W9** | L4 second-pass review (Spearbit pair-review or solo-firm follow-up) | L5 final report; L6f pen-test active | Confirmation pass |
-| **W10** | L4 final sign-off; L9 Immunefi listing draft | L10a alert routing live; L11 first-cycle baseline established | Pre-Gate-B checklist |
-| **W11** | Final preflight: re-run L1 + L2 + verify-audit-bundle-deployment | L9 bounty soft-launch with low pool | All-green gate state |
+| **W10** | L4 final sign-off; L9 Immunefi listing draft (proposed; not launched) | L10a alert routing live; L11 first-cycle baseline established | Pre-Gate-B checklist |
+| **W11** | Final preflight: re-run L1 + L2 + verify-audit-bundle-deployment | L9 bounty soft-launch with low pool (proposed; not launched) | All-green gate state |
 | **W12** | **Gate B ceremony — audit-bundle stack deploys to Base mainnet** | — | #31, #40 closed |
 
 **Critical-path bottleneck:** L4 contest (~4 weeks: setup + run + remediate +
@@ -704,7 +709,7 @@ serially instead of parallel — adds 4–8 weeks but reduces peak burn.
 | Per-crypto-change | L3 | Specialist review |
 | Per-emission-change | L7 | Economic re-validation |
 | Per-jurisdiction-expansion | L8 | Counsel review |
-| Continuous | L9 | Bug bounty open-ended |
+| Continuous | L9 | Bug bounty open-ended (proposed only; not launched) |
 | Quarterly | L6e | Operational hygiene review |
 | Annually | L11 | Full cumulative re-audit |
 
@@ -723,12 +728,12 @@ serially instead of parallel — adds 4–8 weeks but reduces peak burn.
 | L6 | $0–20K (operational, mostly internal) | $5K |
 | L7 | $20–50K | $10K |
 | L8 | $15–40K per jurisdiction | $5K/jurisdiction |
-| L9 | $50K seed pool | Pool grows with TVL |
+| L9 | $50K seed pool (proposed) | Pool grows with TVL |
 | L10 | $200/mo Forta + on-call setup | $5K |
 | L11 | — | $40–80K |
 
 **Pre-mainnet total (one-time):** ~$200K–400K depending on choices in L3 + L4.
-**Annual ongoing:** ~$100K–200K + bounty pool.
+**Annual ongoing:** ~$100K–200K + bounty pool (proposed; L9 not launched).
 
 These are unsubsidized estimates. **Cost-reduction levers:**
 - Replace Ed25519Lib with battle-tested alternative → L3 → $0
@@ -857,7 +862,7 @@ agenda.
 ## 12. Disclosure & coordinated-vulnerability policy
 
 When a finding exists, who is told what, when? This section sets the policy
-that bug-bounty researchers, audit firms, integrators, and the public can
+that security researchers, audit firms, integrators, and the public can
 expect.
 
 ### Pre-mainnet (now → Gate B)
@@ -868,9 +873,10 @@ expect.
   resolved findings annotated.
 - **Self-discovered findings** (L0/L1): triaged internally; no external
   disclosure required pre-mainnet.
-- **Researcher-discovered findings**: there is no public bounty pre-mainnet;
-  researchers who discover issues should email `security@prsm-network.com` (to
-  be set up — action item) with PGP-encrypted reports. Acknowledgment within
+- **Researcher-discovered findings**: PRSM does not run a bug bounty
+  program and does not pay for vulnerability reports; researchers who
+  discover issues should email `security@prsm-network.com` (to be set
+  up — action item) with PGP-encrypted reports. Acknowledgment within
   48 hours.
 
 ### Post-mainnet (Gate B onwards)
@@ -884,7 +890,7 @@ expect.
 - Day 60–75: Coordinated deployment window. Foundation deploys fix; known
   integrators are notified privately ≥72 hours before public disclosure.
 - Day 75–90: Public disclosure on GitHub Security Advisory + blog post +
-  bounty payout (if applicable).
+  reporter credit (with consent).
 - Day 90: Hard cap. Even if fix incomplete, public disclosure happens at day
   90 to prevent indefinite suppression.
 
@@ -902,6 +908,11 @@ The 90-day window does not apply to actively-exploited bugs.
 
 ### Bounty payout criteria
 
+> **Status (2026-10-26): Proposal only — no payouts are offered.** PRSM
+> does not run a bug bounty program and does not pay for vulnerability
+> reports. The scale and payout terms below were proposed for the L9
+> layer, were never activated, and are not commitments.
+
 Per Immunefi standard scale (see L9 §5):
 
 - Critical: $50K–$1M (proportional to TVL at risk and quality of report)
@@ -914,8 +925,8 @@ Payout in USDC from Foundation Safe within 14 days of fix deployment.
 
 ### Duplicate handling
 
-First valid report wins. Subsequent identical reports receive acknowledgment
-but no bounty. Determined by submission timestamp on `security@prsm-network.com`
+First valid report receives credit. Subsequent identical reports receive
+acknowledgment. Determined by submission timestamp on `security@prsm-network.com`
 inbox.
 
 ### Public artifacts
@@ -924,8 +935,8 @@ inbox.
   README) — published security email + PGP key + reporting guidelines.
 - GitHub Security Advisory (GHSA) — used for all post-mainnet disclosures.
 - Foundation blog — post-mortem narrative for Critical findings.
-- Public bounty hall-of-fame — researchers credited (with consent) at
-  `audits/hall-of-fame.md`.
+- Public hall-of-fame — researchers credited (with consent) at
+  `audits/hall-of-fame.md` (not yet published).
 
 **Status:** Policy drafted here. Operationalization (security email, PGP key,
 SECURITY.md presence) is part of L10d (action item).

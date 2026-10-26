@@ -1,5 +1,9 @@
 # PRSM — Protocol for Research, Storage, and Modeling
 
+> **Project status (2026-10-26): Paused.** PRSM is not actively maintained
+> right now, and this repository is kept for reference. There are no active
+> bug bounty or reward programs.
+
 **The code goes to the data. Not the other way around.**
 
 PRSM is a peer-to-peer protocol that unifies three resource markets — data, compute, economic settlement — under one token. Frontier LLMs (Claude, GPT, Gemini, or local MCP-compatible models) call PRSM via MCP as a retrieval and heavy-compute substrate whenever a query needs data the model doesn't have, compute beyond its context budget, or verifiable provenance. Contributors earn **FTNS** (*Fungible Token for Node Support*) for sharing storage, compute, and data from idle consumer devices. Reasoning happens in your LLM; execution happens on PRSM nodes with cryptographically-enforced creator royalties.
@@ -346,7 +350,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 ## Reporting Security Issues
 
 Found a vulnerability? See [SECURITY.md](SECURITY.md) for the disclosure
-policy, scope, and bounty information. **Do not** file public issues for
+policy and scope. **Do not** file public issues for
 security reports — use [GitHub Security Advisories](https://github.com/prsm-network/PRSM/security/advisories/new)
 or `security@prsm-network.com`.
 

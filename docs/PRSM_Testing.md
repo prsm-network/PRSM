@@ -454,7 +454,7 @@ Every operator-facing feature should have REST + CLI + MCP coverage
 | Emergency pause status (mainnet contracts) | `/admin/emergency-pause/status` | — | `prsm_emergency_pause` | ✅ Sprint 455 (live: ftns_token + royalty_distributor + BSR + EscrowPool + StakeBond + Ed25519Verifier + StorageSlashing + KeyDistribution + EmissionController all reported with paused state + commissioned flag against chain_id=8453 Base mainnet) |
 | Upgrade proposal | `/admin/upgrade/...` | — | `prsm_upgrade` | ✅ Sprint 471, 475 (full lifecycle live: POST /propose → proposed; GET /{id} round-trips; /update advances proposed→reviewed→safe_uploaded with safe_tx_hash; /compose-upgrade returns Safe-uploadable tx with `upgradeToAndCall` calldata, chain_id=8453, explicit storage-layout warning + 4-step instructions; /compose-rollback enforces `status==executed` invariant — Vision §14 "composer produces tx, doesn't execute" verified) |
 | TEE policy | `/admin/tee-policy/evaluate` | — | `prsm_tee_policy` | ✅ Sprint 436, 471 (live: `evaluate` → 422 with clear `policy` required-field; `/admin/tee-policy/node-status` → `{effective_tier, vendor, vendor_verified, diagnostic}`) |
-| Vulnerability disclosure | `/admin/disclosure/...` | — | `prsm_disclosure` | ✅ Sprint 471, 475 (full lifecycle live: POST /submit → received; GET /{id} round-trips with details_b64 (privacy-preserving); /update advances received→triaged→awarded with triage_notes + payout_ftns; /compose-payout enforces `status==AWARDED` state-machine invariant; on awarded → returns Safe-uploadable bug-bounty payout tx (FTNS ERC-20 `transfer(recipient, 1000e18)` calldata, chain_id=8453, warning + 4-step Safe UI instructions); /record-payout-tx closes audit trail with on-chain tx hash) |
+| Vulnerability disclosure | `/admin/disclosure/...` | — | `prsm_disclosure` | ✅ Sprint 471, 475 (full lifecycle live: POST /submit → received; GET /{id} round-trips with details_b64 (privacy-preserving); /update advances received→triaged→awarded with triage_notes + payout_ftns; /compose-payout enforces `status==AWARDED` state-machine invariant; on awarded → returns Safe-uploadable bug-bounty payout tx (FTNS ERC-20 `transfer(recipient, 1000e18)` calldata, chain_id=8453, warning + 4-step Safe UI instructions); /record-payout-tx closes audit trail with on-chain tx hash. Admin tooling only; PRSM does not run a bug bounty program and does not pay for vulnerability reports) |
 
 ---
 
@@ -1467,6 +1467,8 @@ arc proved we need.
     rejects pre-execution rollback attempts).
 
   **Disclosure-payout** (`/admin/disclosure/...`):
+  > Status (2026-10-26): this describes admin tooling in the code.
+  > PRSM does not run a bug bounty program and does not pay for vulnerability reports.
   - POST /submit → status=received; details stored as
     base64 (privacy-preserving).
   - /update advances received → triaged → awarded with
