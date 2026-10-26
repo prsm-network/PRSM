@@ -1,27 +1,26 @@
 """Sprint 300 — DisclosureIntake + payout composer.
 
-Vision §14 mitigation item 3: "Bug bounty program at $1M+
-payout. Immunefi-tier program incentivizes responsible
-disclosure rather than malicious exploitation."
+PRSM does not run a bug bounty program and does not pay for
+vulnerability reports. The payout composer was built for a
+proposed program (Vision §14 mitigation item 3) that was never
+launched.
 
-The actual Immunefi program lives on Immunefi's platform.
 This module gives operators a DIRECT-CONTACT path for
-researchers who prefer (or need) to bypass Immunefi:
-sensitive findings, anonymous submissions, time-critical
-disclosures during active incidents, or out-of-scope items
-that Immunefi has policy delays on.
+security researchers: sensitive findings, anonymous
+submissions, and time-critical disclosures during active
+incidents.
 
 Scope this sprint:
-  DisclosureSeverity — Immunefi-aligned bands
+  DisclosureSeverity — severity bands
   DisclosureStatus — workflow: received → triaged →
                      confirmed|rejected → awarded
   DisclosureRecord — persistent record (filesystem-backed,
                      same pattern as sprint 272 TakedownNoticeRing)
   DisclosureIntake — submit / update_status / list / get
-  compose_bounty_payout_tx — Safe-uploadable ERC-20 transfer
-                              (composer-only, mirrors
-                              sprint 299 insurance-fund
-                              recovery composer)
+  compose_disclosure_payout_tx — Safe-uploadable ERC-20 transfer
+                                 (composer-only, mirrors
+                                 sprint 299 insurance-fund
+                                 recovery composer)
 """
 from __future__ import annotations
 
@@ -35,7 +34,7 @@ from prsm.economy.web3.disclosure_intake import (
     DisclosureRecord,
     DisclosureSeverity,
     DisclosureStatus,
-    compose_bounty_payout_tx,
+    compose_disclosure_payout_tx,
 )
 
 
@@ -43,7 +42,7 @@ from prsm.economy.web3.disclosure_intake import (
 
 
 def test_severity_values():
-    """Immunefi-aligned bands."""
+    """Severity bands."""
     assert DisclosureSeverity.CRITICAL.value == "critical"
     assert DisclosureSeverity.HIGH.value == "high"
     assert DisclosureSeverity.MEDIUM.value == "medium"
@@ -67,9 +66,8 @@ def test_status_values():
 
 
 def test_default_payout_bands_in_ftns():
-    """Vision §14 names $1M+ for critical; default bands map
-    severity → FTNS amount under PRSM_FTNS_USD_RATE=1.0
-    starter assumption. Tunable via env."""
+    """Proposed bands (proposal only; never activated) map
+    severity → FTNS amount."""
     bands = DEFAULT_PAYOUT_BANDS_FTNS
     assert bands[DisclosureSeverity.CRITICAL] >= 1_000_000
     assert (
@@ -482,7 +480,7 @@ def test_from_env_with_dir(tmp_path, monkeypatch):
     assert intake._persist_dir == tmp_path
 
 
-# ── compose_bounty_payout_tx ─────────────────────────────
+# ── compose_disclosure_payout_tx ─────────────────────────
 
 
 def test_compose_payout_happy_path():
@@ -507,14 +505,14 @@ def test_compose_payout_happy_path():
         new_status=DisclosureStatus.AWARDED,
         payout_ftns=1_500_000,
     )
-    tx = compose_bounty_payout_tx(
+    tx = compose_disclosure_payout_tx(
         intake=intake,
         disclosure_id=r.disclosure_id,
         recipient="0x" + "ab" * 20,
         ftns_token_address="0x" + "11" * 20,
         chain_id=8453,
     )
-    assert tx["action"] == "bounty_payout"
+    assert tx["action"] == "disclosure_payout"
     assert tx["disclosure_id"] == r.disclosure_id
     assert tx["recipient"] == "0x" + "ab" * 20
     # amount in wei = payout_ftns × 10^18
@@ -540,7 +538,7 @@ def test_compose_payout_rejects_non_awarded():
         details="x",
     )
     with pytest.raises(ValueError, match="AWARDED"):
-        compose_bounty_payout_tx(
+        compose_disclosure_payout_tx(
             intake=intake,
             disclosure_id=r.disclosure_id,
             recipient="0x" + "ab" * 20,
@@ -551,7 +549,7 @@ def test_compose_payout_rejects_non_awarded():
 def test_compose_payout_unknown_disclosure_raises():
     intake = DisclosureIntake()
     with pytest.raises(ValueError, match="not found"):
-        compose_bounty_payout_tx(
+        compose_disclosure_payout_tx(
             intake=intake,
             disclosure_id="no-such-id",
             recipient="0x" + "ab" * 20,
@@ -561,7 +559,7 @@ def test_compose_payout_unknown_disclosure_raises():
 
 def test_compose_payout_zero_amount_rejected():
     """payout_ftns=0 (set by the status update) means no
-    bounty earned — composer should refuse."""
+    payout — composer should refuse."""
     intake = DisclosureIntake()
     r = intake.submit(
         severity=DisclosureSeverity.LOW,
@@ -586,7 +584,7 @@ def test_compose_payout_zero_amount_rejected():
     with pytest.raises(
         ValueError, match="payout_ftns=0|nothing to pay out",
     ):
-        compose_bounty_payout_tx(
+        compose_disclosure_payout_tx(
             intake=intake,
             disclosure_id=r.disclosure_id,
             recipient="0x" + "ab" * 20,
@@ -614,7 +612,7 @@ def test_compose_payout_validates_recipient():
         payout_ftns=1_500_000,
     )
     with pytest.raises(ValueError):
-        compose_bounty_payout_tx(
+        compose_disclosure_payout_tx(
             intake=intake,
             disclosure_id=r.disclosure_id,
             recipient="not-an-address",

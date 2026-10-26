@@ -3612,7 +3612,7 @@ class PRSMNode:
 
         # Sprint 300 — responsible-disclosure intake (Vision
         # §14 mitigation item 3). Filesystem-persisted via
-        # PRSM_DISCLOSURE_INTAKE_DIR; bounty payouts are
+        # PRSM_DISCLOSURE_INTAKE_DIR; payouts are
         # composer-only (Foundation Safe multisig gates
         # execution). Also pins FTNS token address + chain_id
         # for the payout composer.
