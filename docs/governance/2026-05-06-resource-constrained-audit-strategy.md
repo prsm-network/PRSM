@@ -42,6 +42,8 @@ At the present council size (1), council unanimity (1-of-1) is the operative quo
 | **L9** Bug bounty | (gated post-L4) | **Gate flipped: now firing pre-L4.** A `security@prsm.network` channel is already live (L10d task #342). POL-2 ratifies that the security@ email is the active disclosure surface in lieu of Immunefi pending funding. | Disclosure policy in `SECURITY.md` (already published) governs incoming reports. |
 | **L11** Treasury policy | (separate) | Already ratified via PRSM-POL-1 + PRSM-CR-2026-05-06-1. POL-2 does not modify. | n/a |
 
+> **Status note (2026-10-26), L9 row:** No bug bounty program was launched. The security@ address is a disclosure channel only and does not pay bounties (see `SECURITY.md` for current reporting channels; GHSA preferred); amounts referenced in L9 planning were proposals only.
+
 ## 4. Mitigations adopted in lieu of external audits
 
 For each deferred layer, POL-2 records the substitute mitigations. These are not equivalent to a paid external audit but represent good-faith effort to surface obvious issues before going live.
@@ -111,6 +113,8 @@ The council accepts that under POL-2:
 3. **The off-chain ML pipeline has not been adversarially reviewed.** Tier C TEE attestation, model loading, and prompt-injection surfaces are internally hardened but not third-party probed.
 4. **The bootstrap infrastructure has not been pen-tested.** Bootstrap nodes carry SLA risk for the network's discoverability layer.
 5. **Public bug bounty pool is small.** A self-hosted security@ channel pays out per-finding from Foundation Safe at council discretion (per PRSM-POL-1 §5). This is significantly lower-friction than Immunefi but provides smaller incentive for serious researchers.
+
+   > **Status note (2026-10-26):** No bug bounty program was launched. The security@ address is a disclosure channel only and does not pay bounties (see `SECURITY.md` for current reporting channels; GHSA preferred); the per-finding payout described here was a proposal only and was never activated.
 
 The council judges these accepted risks **lower in expected impact than the alternative risk of indefinite project freeze pending unfunded audits**, while PRSM is small enough that catastrophic loss is bounded by §4.3 caps + Pausable.
 

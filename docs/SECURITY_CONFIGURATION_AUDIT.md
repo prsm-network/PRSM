@@ -256,7 +256,7 @@ pytest tests/security/ tests/integration/ -v --tb=short
 
 4. **Database Encryption at Rest** — enable at infrastructure level
 5. **Redis TLS** — enable in production deployment
-6. **Bug Bounty Program** — Immunefi-tier coverage for smart contracts (target ≥$1M payout per Risk Register A1 mitigation) plus HackerOne or equivalent for application surface
+6. **Bug Bounty Program** — *proposal only, not launched.* Proposed scope: Immunefi-tier coverage for smart contracts (target ≥$1M payout per Risk Register A1 mitigation) plus HackerOne or equivalent for application surface. PRSM does not run a bug bounty program and does not pay for vulnerability reports; disclosures go through [`SECURITY.md`](../SECURITY.md) (GHSA / security@)
 7. **Security Training** — team security awareness
 
 ### Long-Term

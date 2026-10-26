@@ -29,7 +29,7 @@ PRSM is a peer-to-peer protocol for distributed AI compute, storage, and data wi
 
 ### 🟢 I think I found a security vulnerability
 
-**Do not file a public issue.** See [`SECURITY.md`](SECURITY.md) for responsible disclosure process. Critical vulnerabilities have a $1M+ bounty (Immunefi, post-mainnet).
+**Do not file a public issue.** See [`SECURITY.md`](SECURITY.md) for responsible disclosure process.
 
 ### 🟢 I have a governance proposal (parameter change, policy change)
 

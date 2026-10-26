@@ -12528,9 +12528,10 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         return tx
 
     # ── Sprint 300 — responsible-disclosure intake ────────
-    # Vision §14 mitigation item 3: bug bounty / coordinated
-    # disclosure surface. /submit is intentionally open (no
-    # auth) — security researchers may be anonymous. Workflow
+    # Vision §14 mitigation item 3: coordinated disclosure
+    # surface (PRSM does not run a bug bounty program).
+    # /submit is intentionally open (no auth) — security
+    # researchers may be anonymous. Workflow
     # transitions + payout composer are admin paths (gated by
     # the same security middleware as other /admin/* routes).
     # Payout itself is composer-only — Foundation Safe.
@@ -12694,7 +12695,7 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
         body: _DisclosureComposePayoutRequest,
     ) -> Dict[str, Any]:
         from prsm.economy.web3.disclosure_intake import (
-            compose_bounty_payout_tx,
+            compose_disclosure_payout_tx,
         )
         intake = _require_disclosure_intake()
         if intake.get(disclosure_id) is None:
@@ -12725,7 +12726,7 @@ def create_api_app(node: Any, enable_security: bool = True) -> FastAPI:
                 detail="invalid recipient address format",
             )
         try:
-            tx = compose_bounty_payout_tx(
+            tx = compose_disclosure_payout_tx(
                 intake=intake,
                 disclosure_id=disclosure_id,
                 recipient=body.recipient,

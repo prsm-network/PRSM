@@ -306,8 +306,9 @@ differs from above.
   publication. Foundation publishes the consolidated report.
 - **Embargo:** Standard Code4rena embargo (typically 30 days post-
   contest for fixes).
-- **Bug bounty hand-off:** After this contest closes, an Immunefi
-  bounty (L9 layer of audit plan) will go live for ongoing protection.
+- **Bug bounty hand-off:** An Immunefi bounty (L9 layer of audit plan)
+  was proposed to follow this contest for ongoing protection. It was
+  not launched; PRSM does not run a bug bounty program.
 
 ---
 

@@ -2266,7 +2266,8 @@ TOOLS = [
         name="prsm_disclosure",
         description=(
             "Vision §14 mitigation item 3: responsible-"
-            "disclosure intake + bounty payout composer. "
+            "disclosure intake + payout composer (PRSM does "
+            "not run a bug bounty program). "
             "Single tool with `action` selector: "
             "submit | list | lookup | update | "
             "compose_payout | record_payout_tx. submit takes "
@@ -10540,13 +10541,15 @@ def _short_disclosure_id(did: str) -> str:
 async def handle_prsm_disclosure(
     arguments: Dict[str, Any],
 ) -> str:
-    """Sprint 300 — responsible-disclosure intake + bounty
-    payout composer (Vision §14 mitigation item 3).
+    """Sprint 300 — responsible-disclosure intake + payout
+    composer (Vision §14 mitigation item 3). PRSM does not
+    run a bug bounty program; the composer was built for a
+    proposal that was never launched.
 
     Wraps /admin/disclosure/* endpoints. The compose_payout
     action returns a Foundation-Safe-uploadable ERC-20
-    transfer payload — PRSM never executes the bounty
-    payment; the multisig is the gate."""
+    transfer payload — PRSM never executes the payment;
+    the multisig is the gate."""
     action = (arguments.get("action") or "").strip().lower()
     if not action:
         return (
@@ -10732,7 +10735,7 @@ async def handle_prsm_disclosure(
         explorer = r.get("explorer_url") or "(no explorer)"
         amt_ftns = r.get("amount_ftns", 0)
         lines = [
-            f"⚠ BOUNTY PAYOUT COMPOSED — Foundation Safe "
+            f"⚠ DISCLOSURE PAYOUT COMPOSED — Foundation Safe "
             f"upload required ⚠",
             "",
             f"  WARNING: {r.get('warning', '')}",

@@ -532,13 +532,12 @@ infrastructure. High-priority contribution areas include:
 - **Community building** through workshops and events
 - **Developer tool creation** for easier PRSM adoption
 
-## 🏆 Recognition & Rewards
+## 🏆 Recognition
 
 We believe in recognizing our contributors:
 
 ### **Recognition Programs**
 - **Contributor spotlight** in project documentation
-- **FTNS token rewards** for significant contributions
 - **Conference speaking** opportunities
 - **Research collaboration** invitations
 - **Advisory board** positions for major contributors

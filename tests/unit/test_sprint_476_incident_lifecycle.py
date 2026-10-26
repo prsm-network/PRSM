@@ -87,7 +87,7 @@ def test_incident_recommendations_keyed_by_severity_and_phase():
 def test_incident_record_includes_related_disclosure_id():
     """Incidents may stem from a disclosure — the audit-trail
     must record the parent disclosure_id when present.
-    Without this, the bug-bounty → exploit → incident chain
+    Without this, the disclosure → exploit → incident chain
     is broken at the operator-visible layer."""
     src = _ir_source()
     assert "related_disclosure_id" in src

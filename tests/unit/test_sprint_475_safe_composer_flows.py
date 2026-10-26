@@ -125,7 +125,7 @@ def test_disclosure_compose_payout_uses_ftns_token():
     with a `transfer(recipient, amount)` calldata — sprint
     475 caught the 0xa9059cbb selector (ERC-20 transfer)
     in the live response. This is the load-bearing
-    correctness claim: bounty payouts come from FTNS,
+    correctness claim: disclosure payouts come from FTNS,
     not from raw ETH or some other token."""
     intake = (
         REPO_ROOT / "prsm" / "economy" / "web3"

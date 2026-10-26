@@ -1,34 +1,34 @@
-"""Sprint 300 — DisclosureIntake + bounty payout composer.
+"""Sprint 300 — DisclosureIntake + disclosure payout composer.
 
-Vision §14 mitigation item 3: "Bug bounty program at $1M+
-payout. Immunefi-tier program incentivizes responsible
-disclosure rather than malicious exploitation."
+PRSM does not run a bug bounty program and does not pay for
+vulnerability reports. The payout composer and payout bands
+below were built for a proposed program (Vision §14
+mitigation item 3) that was never launched; their figures are
+proposals only, not commitments.
 
-The actual Immunefi program lives on Immunefi's platform.
 This module gives operators a DIRECT-CONTACT path for
-researchers who prefer (or need) to bypass Immunefi: sensitive
-findings, anonymous submissions, time-critical disclosures
-during active incidents, or out-of-scope items that Immunefi
-has policy delays on.
+security researchers: sensitive findings, anonymous
+submissions, and time-critical disclosures during active
+incidents.
 
 Components:
-  DisclosureSeverity — Immunefi-aligned bands (critical /
+  DisclosureSeverity — severity bands (critical /
                        high / medium / low / informational)
   DisclosureStatus — workflow: received → triaged →
                      confirmed | rejected | duplicate |
                      out_of_scope → awarded (terminal)
-  DEFAULT_PAYOUT_BANDS_FTNS — suggested payout per severity
-                              (1M FTNS for critical;
-                              tunable via env in follow-on)
+  DEFAULT_PAYOUT_BANDS_FTNS — proposed payout per severity
+                              (proposal only; never
+                              activated)
   DisclosureRecord — persistent record (filesystem-backed,
                      same pattern as sprint 272
                      TakedownNoticeRing)
   DisclosureIntake — submit / update_status / list / get /
                      record_payout_tx
-  compose_bounty_payout_tx — composer-only Safe-uploadable
-                              ERC-20 transfer for awarded
-                              bounties (reuses sprint 299
-                              encode_erc20_transfer_calldata)
+  compose_disclosure_payout_tx — composer-only Safe-uploadable
+                                 ERC-20 transfer for awarded
+                                 disclosures (reuses sprint 299
+                                 encode_erc20_transfer_calldata)
 
 State workflow (one-way; no transitions back to RECEIVED):
   RECEIVED → TRIAGED → CONFIRMED → AWARDED   (terminal)
@@ -81,10 +81,9 @@ _TERMINAL_STATUSES = {
 }
 
 
-# Suggested default payouts in whole FTNS units. Vision §14
-# names $1M+ for critical; at PRSM_FTNS_USD_RATE=1.0 starter
-# assumption this is 1M FTNS. Operators can override via
-# follow-on env tuning (PRSM_DISCLOSURE_BANDS_*).
+# Proposed payouts in whole FTNS units, from the Vision §14
+# proposal. Proposal only: no payout program was launched and
+# PRSM does not pay for vulnerability reports.
 DEFAULT_PAYOUT_BANDS_FTNS: Dict[DisclosureSeverity, int] = {
     DisclosureSeverity.CRITICAL: 1_000_000,
     DisclosureSeverity.HIGH: 100_000,
@@ -294,7 +293,7 @@ class DisclosureIntake:
     def record_payout_tx(
         self, disclosure_id: str, *, tx_hash: str,
     ) -> DisclosureRecord:
-        """After Safe-executed bounty payout, record the
+        """After a Safe-executed payout, record the
         on-chain tx hash for audit trail."""
         existing = self._records.get(disclosure_id)
         if existing is None:
@@ -383,11 +382,12 @@ class DisclosureIntake:
             )
 
 
-# ── compose_bounty_payout_tx (top-level helper) ──────────
+# ── compose_disclosure_payout_tx (top-level helper) ──────
 
 
-_BOUNTY_WARNING = (
-    "DESTRUCTIVE: this transfer pays out a bug-bounty award. "
+_PAYOUT_WARNING = (
+    "DESTRUCTIVE: this transfer pays FTNS to a disclosure "
+    "reporter. "
     "Requires Foundation Safe 2-of-3 hardware multisig "
     "approval. Upload the encoded calldata to the Safe UI; "
     "signers verify the target token address + transfer "
@@ -410,7 +410,7 @@ def _explorer_url_for_address(
     return None
 
 
-def compose_bounty_payout_tx(
+def compose_disclosure_payout_tx(
     *,
     intake: DisclosureIntake,
     disclosure_id: str,
@@ -433,7 +433,7 @@ def compose_bounty_payout_tx(
         raise ValueError(
             f"disclosure {disclosure_id!r} has "
             f"payout_ftns=0; nothing to pay out (informational "
-            f"disclosures earn recognition, not bounty)"
+            f"disclosures earn recognition, not payment)"
         )
 
     amount_wei = record.payout_ftns * (10 ** 18)
@@ -443,7 +443,7 @@ def compose_bounty_payout_tx(
         recipient, amount_wei,
     )
     return {
-        "action": "bounty_payout",
+        "action": "disclosure_payout",
         "disclosure_id": disclosure_id,
         "to": ftns_token_address,
         "data": data,
@@ -454,7 +454,7 @@ def compose_bounty_payout_tx(
         "severity": record.severity.value,
         "summary": record.summary,
         "chain_id": chain_id,
-        "warning": _BOUNTY_WARNING,
+        "warning": _PAYOUT_WARNING,
         "explorer_url": _explorer_url_for_address(
             ftns_token_address, chain_id,
         ),

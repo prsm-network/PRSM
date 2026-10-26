@@ -5,7 +5,7 @@ GET  /admin/disclosure                  — list (filtered)
 GET  /admin/disclosure/{id}             — single record
 POST /admin/disclosure/{id}/update      — workflow transition
 POST /admin/disclosure/{id}/compose-payout — Safe-uploadable
-                                              bounty payout
+                                              payout tx
 POST /admin/disclosure/{id}/record-payout-tx — close audit
 
 The submit endpoint is intentionally accessible (researchers
@@ -346,7 +346,7 @@ def test_compose_payout_happy_path():
     )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["action"] == "bounty_payout"
+    assert body["action"] == "disclosure_payout"
     assert body["recipient"] == "0x" + "ab" * 20
     assert body["amount_ftns"] == 1_500_000
 
@@ -594,7 +594,7 @@ async def test_mcp_compose_payout_action():
     with patch(
         "prsm.mcp_server._call_node_api",
         new=AsyncMock(return_value={
-            "action": "bounty_payout",
+            "action": "disclosure_payout",
             "disclosure_id": "d-1",
             "to": "0x" + "11" * 20,
             "data": "0xa9059cbb" + "0" * 128,
